@@ -2,14 +2,18 @@
 //! Vector indexes for Quiver, pluggable per collection (ADR-0007).
 //!
 //! Phase 1 ships an in-memory **HNSW** graph ([`Hnsw`]) — high recall, lowest
-//! latency — behind the [`Index`] trait. The memory-frugal disk path
-//! (DiskANN/Vamana and IVF + quantization) lands in Phase 2 behind the same
-//! trait. Distance math is delegated to `quiver-simd`. Design:
-//! `docs/index/design.md`.
+//! latency — behind the [`Index`] trait. Phase 2 adds the memory-frugal pieces:
+//! the [`Quantizer`] implementations (scalar, product, binary) that compress
+//! vectors for RAM-resident codes, with the disk-resident graph (DiskANN/Vamana)
+//! and IVF landing behind the same [`Index`] trait. Distance math is delegated
+//! to `quiver-simd`. Design: `docs/index/design.md`, ADR-0007, ADR-0008.
 
 mod hnsw;
+mod quant;
+mod rng;
 
 pub use hnsw::{Hnsw, HnswConfig};
+pub use quant::{BinaryQuantizer, CodeScorer, ProductQuantizer, Quantizer, ScalarQuantizer};
 pub use quiver_simd::Metric;
 
 use thiserror::Error;
@@ -26,6 +30,10 @@ pub enum IndexError {
         /// Dimensionality of the offending vector.
         got: usize,
     },
+    /// A quantizer was configured with invalid parameters (e.g. a subspace
+    /// count that does not divide the dimensionality).
+    #[error("invalid quantizer configuration: {0}")]
+    InvalidConfig(&'static str),
 }
 
 /// A search result: an external id and its distance under the index metric.
