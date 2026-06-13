@@ -28,9 +28,10 @@ fmt:
 doc:
     cargo doc --workspace --no-deps
 
-# Dependency advisory scan.
+# Dependency advisory scan. RUSTSEC-2026-0009 (`time`) is a dev-only transitive
+# of rcgen's TLS-test cert generation; rationale is documented in deny.toml.
 audit:
-    cargo audit
+    cargo audit --ignore RUSTSEC-2026-0009
 
 # License / advisory / source policy checks.
 deny:
