@@ -58,7 +58,12 @@ cargo run -p quiver-cli -- --help
 cargo install quiver-cli       # or: docker run ghcr.io/achref-soua/quiver
 quiver serve                   # gRPC + REST, encrypted by default
 quiver tui                     # the cockpit
+quiver mcp                     # MCP server (stdio) so AI agents can drive Quiver
 ```
+
+The [MCP server](./docs/mcp.md) exposes `create_collection`, `upsert`, `search`,
+`get`, and `delete` as tools over JSON-RPC stdio, operating an encrypted
+in-process database.
 
 ## Command reference
 

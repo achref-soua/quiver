@@ -1932,6 +1932,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "quiver-mcp",
  "quiver-server",
  "quiver-tui",
  "tokio",
@@ -1991,6 +1992,17 @@ dependencies = [
 [[package]]
 name = "quiver-mcp"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "quiver-core",
+ "quiver-crypto",
+ "quiver-embed",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "quiver-proto"
