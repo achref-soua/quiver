@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use quiver_simd::Metric;
 
-use super::kmeans::{kmeans, nearest_centroid};
 use super::{CodeScorer, Quantizer, prepare, uses_inner_product};
 use crate::IndexError;
+use crate::kmeans::{kmeans, nearest_centroid};
 
 /// Centroids per subspace (1 byte per code).
 const KSUB: usize = 256;

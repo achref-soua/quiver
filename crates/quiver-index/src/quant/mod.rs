@@ -18,7 +18,6 @@
 //! normalized first, reducing cosine to inner product).
 
 mod binary;
-mod kmeans;
 mod product;
 mod scalar;
 

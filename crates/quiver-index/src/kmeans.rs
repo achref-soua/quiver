@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Seeded Lloyd's k-means with k-means++ initialization.
 //!
-//! Shared by the product quantizer (one run per subspace, ADR-0008) and, later,
-//! the IVF coarse quantizer. Deterministic for a fixed seed so codebooks — and
-//! therefore recall — are reproducible. Distances use the SIMD L2 kernel; means
-//! accumulate in `f64` for numerical stability, then round to `f32` centroids.
+//! Shared by the product quantizer (one run per subspace, ADR-0008) and the IVF
+//! coarse quantizer (one run over the whole set, ADR-0007). Deterministic for a
+//! fixed seed so codebooks — and therefore recall — are reproducible. Distances
+//! use the SIMD L2 kernel; means accumulate in `f64` for numerical stability,
+//! then round to `f32` centroids.
 
 use quiver_simd::l2_sq_f32;
 

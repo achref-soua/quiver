@@ -10,12 +10,15 @@
 
 pub mod disk;
 mod hnsw;
+mod ivf;
+mod kmeans;
 mod quant;
 mod rng;
 mod vamana;
 
 pub use disk::{DiskError, DiskSearchParams, DiskVamana};
 pub use hnsw::{Hnsw, HnswConfig};
+pub use ivf::{Ivf, IvfConfig};
 pub use quant::{BinaryQuantizer, CodeScorer, ProductQuantizer, Quantizer, ScalarQuantizer};
 pub use quiver_simd::Metric;
 pub use vamana::{Vamana, VamanaConfig};
