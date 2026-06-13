@@ -29,6 +29,10 @@ todo = "warn"
 # External dependencies are pinned once here and referenced from crates with
 # `dep = { workspace = true }`. Added as features land.
 [workspace.dependencies]
+# Internal crates (path deps with a version so `cargo deny` sees no wildcard),
+# referenced as `quiver-x = { workspace = true }`.
+quiver-simd = { path = "crates/quiver-simd", version = "0.1" }
+
 clap = { version = "4.5", features = ["derive"] }
 crc32c = "0.6"
 criterion = { version = "0.5", default-features = false, features = [

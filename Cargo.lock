@@ -560,6 +560,10 @@ version = "0.1.0"
 [[package]]
 name = "quiver-index"
 version = "0.1.0"
+dependencies = [
+ "quiver-simd",
+ "thiserror",
+]
 
 [[package]]
 name = "quiver-mcp"

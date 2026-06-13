@@ -1,12 +1,66 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Vector indexes for Quiver, pluggable per collection: HNSW (in-memory) now;
-//! DiskANN/Vamana and IVF with quantization in Phase 2.
+//! Vector indexes for Quiver, pluggable per collection (ADR-0007).
 //!
-//! Status: scaffolding — HNSW lands in Phase 1. Design: `docs/index/design.md`
-//! and ADR-0007 / ADR-0008.
+//! Phase 1 ships an in-memory **HNSW** graph ([`Hnsw`]) — high recall, lowest
+//! latency — behind the [`Index`] trait. The memory-frugal disk path
+//! (DiskANN/Vamana and IVF + quantization) lands in Phase 2 behind the same
+//! trait. Distance math is delegated to `quiver-simd`. Design:
+//! `docs/index/design.md`.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds() {}
+mod hnsw;
+
+pub use hnsw::{Hnsw, HnswConfig};
+pub use quiver_simd::Metric;
+
+use thiserror::Error;
+
+/// Errors returned by an index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum IndexError {
+    /// A query or inserted vector did not match the index dimensionality.
+    #[error("vector has {got} dims, index expects {expected}")]
+    DimensionMismatch {
+        /// Dimensionality the index was built with.
+        expected: usize,
+        /// Dimensionality of the offending vector.
+        got: usize,
+    },
+}
+
+/// A search result: an external id and its distance under the index metric.
+///
+/// `distance` is the metric value: lower is closer for [`Metric::L2`]; higher is
+/// closer for [`Metric::Dot`] and [`Metric::Cosine`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Neighbor {
+    /// The external id supplied at insert time.
+    pub id: u64,
+    /// Distance / similarity to the query under the index metric.
+    pub distance: f32,
+}
+
+/// A pluggable vector index (ADR-0007): `insert` points, then `search` for the
+/// `k` nearest to a query. `ef_search` trades recall for latency at query time.
+pub trait Index {
+    /// Insert a point under external id `id`. Ids are append-only in Phase 1;
+    /// updates and deletes are handled by rebuilding from the store.
+    fn insert(&mut self, id: u64, vector: &[f32]) -> Result<(), IndexError>;
+
+    /// Return the `k` nearest neighbors to `query`, closest first. `ef_search`
+    /// is the search beam width (clamped up to at least `k`).
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<Neighbor>, IndexError>;
+
+    /// Number of points in the index.
+    fn len(&self) -> usize;
+
+    /// Whether the index holds no points.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
