@@ -2,6 +2,8 @@
 
 The project's credibility rests on this document. Every memory/performance claim in the README is reproducible from here. **Adjectives are banned in the README — numbers replace them**, with a link back to these steps. We never fabricate results, and if Quiver loses on a metric we report it.
 
+The recall ↔ latency ↔ memory tradeoffs and the tunable knobs for each quantizer and index are catalogued in [`quantization-tradeoffs.md`](./quantization-tradeoffs.md).
+
 ## What we measure
 
 The four-way tradeoff, with **memory as the headline**:

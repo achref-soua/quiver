@@ -105,6 +105,8 @@ An `ann-benchmarks`-style harness lives in [`bench/`](./bench). On **SIFT1M** (1
 
 Recall is a property of the index and the data (host-independent), so these figures stand; reproduce with `cargo run --release --example sift_recall` ([details](./docs/benchmarks/results/sift1m.md)). **Throughput, memory (RSS — the headline metric), and the head-to-head vs Qdrant/LanceDB are reference-hardware-pending**: per the [methodology](./docs/benchmarks/methodology.md) those require identical dedicated hardware, this shared dev box is not a source for them, and we never fabricate.
 
+The per-collection **recall ↔ latency ↔ memory** knobs — quantizers (scalar/product/binary), the disk-resident DiskANN path, and IVF — are documented with a tradeoff table in [`docs/benchmarks/quantization-tradeoffs.md`](./docs/benchmarks/quantization-tradeoffs.md).
+
 ## Configuration
 
 Every option is an environment variable with a secure default; see [`.env.example`](./.env.example) and [ADR-0013](./docs/adr/0013-config-and-secure-defaults.md). Encryption-at-rest is on by default: the server requires a 256-bit key in `QUIVER_ENCRYPTION_KEY` (generate one with `openssl rand -hex 32`) unless `QUIVER_INSECURE=true`, and seals segments, the manifest, and the WAL alike. TLS is required for any non-loopback bind.
