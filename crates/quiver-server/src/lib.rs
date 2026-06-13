@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use axum_server::tls_rustls::RustlsConfig;
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -53,7 +53,9 @@ pub struct Config {
     pub rest_addr: SocketAddr,
     /// gRPC (HTTP/2) bind address.
     pub grpc_addr: SocketAddr,
-    /// Accepted API keys. Empty is allowed only with `insecure = true`.
+    /// Accepted API keys, from a comma-separated `QUIVER_API_KEYS` (the env
+    /// form) or a TOML sequence. Empty is allowed only with `insecure = true`.
+    #[serde(default, deserialize_with = "de_api_keys")]
     pub api_keys: Vec<String>,
     /// Hex-encoded 256-bit key for encryption-at-rest (64 hex characters).
     /// Required unless `insecure = true`; source it from the environment or a
@@ -520,6 +522,28 @@ pub fn init_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
+// Accept `api_keys` as a comma-separated string (the `QUIVER_API_KEYS` env form,
+// which figment surfaces as a scalar) or as a sequence (TOML / programmatic).
+fn de_api_keys<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrSeq {
+        String(String),
+        Seq(Vec<String>),
+    }
+    Ok(match StringOrSeq::deserialize(deserializer)? {
+        StringOrSeq::String(s) => s
+            .split(',')
+            .map(|part| part.trim().to_owned())
+            .filter(|part| !part.is_empty())
+            .collect(),
+        StringOrSeq::Seq(v) => v,
+    })
+}
+
 // Length-checked constant-time byte comparison for API keys.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -617,5 +641,23 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
+    }
+
+    #[test]
+    fn api_keys_parse_from_csv_or_sequence() {
+        #[derive(Deserialize)]
+        struct Wrap {
+            #[serde(deserialize_with = "de_api_keys")]
+            keys: Vec<String>,
+        }
+        // Comma-separated string (the env form), trimmed and emptied-filtered.
+        let csv: Wrap = serde_json::from_str(r#"{"keys":"a, b ,c"}"#).unwrap();
+        assert_eq!(csv.keys, ["a", "b", "c"]);
+        // A sequence (TOML / programmatic) passes through unchanged.
+        let seq: Wrap = serde_json::from_str(r#"{"keys":["x","y"]}"#).unwrap();
+        assert_eq!(seq.keys, ["x", "y"]);
+        // An empty string yields no keys.
+        let empty: Wrap = serde_json::from_str(r#"{"keys":""}"#).unwrap();
+        assert!(empty.keys.is_empty());
     }
 }
