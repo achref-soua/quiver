@@ -32,6 +32,25 @@ with Client("http://127.0.0.1:6333", api_key="your-api-key") as q:
         print(hit.id, hit.score, hit.payload)
 ```
 
+`create_collection` also takes `index` (`hnsw` | `vamana` | `disk_vamana` | `ivf`)
+and `pq_subspaces` to select the memory-frugal disk-resident path.
+
+## LangChain
+
+A LangChain `VectorStore` adapter ships in `quiver.langchain` (install
+`quiver-client[langchain]`):
+
+```python
+from quiver import Client
+from quiver.langchain import QuiverVectorStore
+
+store = QuiverVectorStore.from_texts(
+    texts, embedding, client=Client(api_key="…"),
+    collection="docs", index="disk_vamana", pq_subspaces=48,
+)
+docs = store.similarity_search("query", k=4)
+```
+
 ## Development
 
 ```bash
