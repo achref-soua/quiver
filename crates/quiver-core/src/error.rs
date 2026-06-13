@@ -69,6 +69,18 @@ pub enum CoreError {
     /// page body, or a WAL record over the size cap).
     #[error("value too large: {0}")]
     TooLarge(String),
+
+    /// A referenced collection or record does not exist.
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    /// A resource that must be unique already exists (e.g. a collection name).
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
+
+    /// A caller supplied an invalid argument (e.g. a vector of the wrong dim).
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 impl CoreError {

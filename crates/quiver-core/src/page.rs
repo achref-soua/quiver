@@ -54,12 +54,15 @@ const CRC_HEADER_BYTES: usize = OFF_CRC; // 28
 pub enum PageType {
     /// A manifest (catalog) page.
     Manifest = 1,
+    /// A sealed-segment page.
+    Segment = 2,
 }
 
 impl PageType {
     fn from_u8(v: u8) -> Result<Self> {
         match v {
             1 => Ok(Self::Manifest),
+            2 => Ok(Self::Segment),
             other => Err(CoreError::MalformedPage(format!(
                 "unknown page type {other}"
             ))),
