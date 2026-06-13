@@ -56,6 +56,8 @@ pub enum PageType {
     Manifest = 1,
     /// A sealed-segment page.
     Segment = 2,
+    /// An index-artifact page (e.g. a disk-resident graph block, ADR-0019).
+    IndexBlock = 3,
 }
 
 impl PageType {
@@ -63,6 +65,7 @@ impl PageType {
         match v {
             1 => Ok(Self::Manifest),
             2 => Ok(Self::Segment),
+            3 => Ok(Self::IndexBlock),
             other => Err(CoreError::MalformedPage(format!(
                 "unknown page type {other}"
             ))),

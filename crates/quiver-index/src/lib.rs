@@ -8,11 +8,13 @@
 //! and IVF landing behind the same [`Index`] trait. Distance math is delegated
 //! to `quiver-simd`. Design: `docs/index/design.md`, ADR-0007, ADR-0008.
 
+pub mod disk;
 mod hnsw;
 mod quant;
 mod rng;
 mod vamana;
 
+pub use disk::{DiskError, DiskSearchParams, DiskVamana};
 pub use hnsw::{Hnsw, HnswConfig};
 pub use quant::{BinaryQuantizer, CodeScorer, ProductQuantizer, Quantizer, ScalarQuantizer};
 pub use quiver_simd::Metric;

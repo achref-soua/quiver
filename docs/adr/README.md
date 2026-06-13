@@ -37,5 +37,6 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0016](0016-license-agpl.md) | License — AGPL-3.0 | Accepted | 0 |
 | [0017](0017-error-handling.md) | Error handling | Accepted | 0 |
 | [0018](0018-sdk-and-integration-strategy.md) | SDK & integration strategy | Accepted | 0 |
+| [0019](0019-disk-index-format.md) | Disk-resident index format (DiskANN on encrypted pages) | Accepted | 2 |
 
-All Phase-0 ADRs (0001–0018) are Accepted. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.
+Phase-0 ADRs (0001–0018) are Accepted; Phase-2 decisions begin at 0019. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.

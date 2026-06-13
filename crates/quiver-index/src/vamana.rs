@@ -215,6 +215,24 @@ impl Vamana {
         self.metric
     }
 
+    /// Dimensionality of the indexed vectors.
+    #[must_use]
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Maximum out-degree (`R`) the graph was built with.
+    #[must_use]
+    pub fn max_degree(&self) -> usize {
+        self.r
+    }
+
+    /// External ids, indexed by internal node id.
+    #[must_use]
+    pub fn ids(&self) -> &[u64] {
+        &self.ids
+    }
+
     /// The medoid node id (the navigation start, useful to the disk layout).
     #[must_use]
     pub fn medoid(&self) -> u32 {
