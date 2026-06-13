@@ -31,17 +31,33 @@ enum Metric {
   METRIC_DOT = 3;
 }
 
+// The index structure a collection is served by (ADR-0007). UNSPECIFIED is
+// treated as the default (in-memory HNSW).
+enum IndexKind {
+  INDEX_KIND_UNSPECIFIED = 0;
+  INDEX_KIND_HNSW = 1;
+  INDEX_KIND_VAMANA = 2;
+  INDEX_KIND_DISK_VAMANA = 3;
+  INDEX_KIND_IVF = 4;
+}
+
 message Collection {
   string name = 1;
   uint32 dim = 2;
   Metric metric = 3;
   uint64 count = 4;
+  IndexKind index = 5;
+  // Product-quantization subspaces for quantized kinds; unset = default.
+  optional uint32 pq_subspaces = 6;
 }
 
 message CreateCollectionRequest {
   string name = 1;
   uint32 dim = 2;
   Metric metric = 3;
+  IndexKind index = 4;
+  // Product-quantization subspaces for the disk graph / IVF+PQ; unset = default.
+  optional uint32 pq_subspaces = 5;
 }
 
 message GetCollectionRequest {

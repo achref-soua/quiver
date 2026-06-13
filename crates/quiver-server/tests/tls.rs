@@ -128,6 +128,8 @@ async fn tls_secures_both_rest_and_grpc() {
                 name: "secure".to_owned(),
                 dim: 4,
                 metric: v1::Metric::L2 as i32,
+                index: v1::IndexKind::Unspecified as i32,
+                pq_subspaces: None,
             },
         ))
         .await

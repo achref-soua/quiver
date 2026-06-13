@@ -13,7 +13,7 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use quiver_embed::DistanceMetric;
+use quiver_embed::{DistanceMetric, IndexKind, IndexSpec};
 use quiver_query::Filter;
 
 use crate::{AppState, CollectionInfo, Error, MatchOut, PointIn, PointOut};
@@ -112,12 +112,48 @@ impl From<DistanceMetric> for MetricDto {
     }
 }
 
+/// The index structure, in REST JSON (`hnsw` | `vamana` | `disk_vamana` | `ivf`).
+#[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum IndexKindDto {
+    #[default]
+    Hnsw,
+    Vamana,
+    DiskVamana,
+    Ivf,
+}
+
+impl From<IndexKindDto> for IndexKind {
+    fn from(k: IndexKindDto) -> Self {
+        match k {
+            IndexKindDto::Hnsw => IndexKind::Hnsw,
+            IndexKindDto::Vamana => IndexKind::Vamana,
+            IndexKindDto::DiskVamana => IndexKind::DiskVamana,
+            IndexKindDto::Ivf => IndexKind::Ivf,
+        }
+    }
+}
+
+impl From<IndexKind> for IndexKindDto {
+    fn from(k: IndexKind) -> Self {
+        match k {
+            IndexKind::Vamana => IndexKindDto::Vamana,
+            IndexKind::DiskVamana => IndexKindDto::DiskVamana,
+            IndexKind::Ivf => IndexKindDto::Ivf,
+            _ => IndexKindDto::Hnsw,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct CollectionDto {
     name: String,
     dim: u32,
     metric: MetricDto,
     count: u64,
+    index: IndexKindDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pq_subspaces: Option<u32>,
 }
 
 impl From<CollectionInfo> for CollectionDto {
@@ -127,6 +163,8 @@ impl From<CollectionInfo> for CollectionDto {
             dim: info.dim,
             metric: info.metric.into(),
             count: info.count,
+            index: info.index.kind.into(),
+            pq_subspaces: info.index.pq_subspaces,
         }
     }
 }
@@ -137,14 +175,22 @@ struct CreateCollectionBody {
     dim: u32,
     #[serde(default)]
     metric: MetricDto,
+    #[serde(default)]
+    index: IndexKindDto,
+    #[serde(default)]
+    pq_subspaces: Option<u32>,
 }
 
 async fn create_collection(
     State(state): State<AppState>,
     Json(body): Json<CreateCollectionBody>,
 ) -> Result<Json<CollectionDto>, Error> {
+    let index = IndexSpec {
+        kind: body.index.into(),
+        pq_subspaces: body.pq_subspaces,
+    };
     let info = state
-        .create_collection(body.name, body.dim, body.metric.into())
+        .create_collection(body.name, body.dim, body.metric.into(), index)
         .await?;
     Ok(Json(info.into()))
 }

@@ -58,6 +58,12 @@ message SearchResponse { repeated Match matches = 1; string next_cursor = 2; }
 | `GET /v1/collections/{id}/stats` | Stats |
 | `GET /healthz` · `GET /readyz` · `GET /metrics` | ops |
 
+`CreateCollection` selects the per-collection index (ADR-0007): the JSON body and
+the proto request carry `index` (`hnsw` | `vamana` | `disk_vamana` | `ivf`,
+default `hnsw`) and an optional `pq_subspaces` for the quantized kinds. `Collection`
+responses echo both, so a client can confirm the memory-frugal `disk_vamana` path
+was selected. Inner-product (`dot`) is rejected for the graph/IVF kinds (400).
+
 REST bodies are JSON; vectors are JSON arrays (or base64 for `int8`/`binary`). Errors are RFC-9457 `application/problem+json`; gRPC uses the mapped `Status` (ADR-0017).
 
 ## Auth, idempotency, limits (applied uniformly)
