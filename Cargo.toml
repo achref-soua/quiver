@@ -31,6 +31,9 @@ todo = "warn"
 [workspace.dependencies]
 # Internal crates (path deps with a version so `cargo deny` sees no wildcard),
 # referenced as `quiver-x = { workspace = true }`.
+quiver-core = { path = "crates/quiver-core", version = "0.1" }
+quiver-index = { path = "crates/quiver-index", version = "0.1" }
+quiver-query = { path = "crates/quiver-query", version = "0.1" }
 quiver-simd = { path = "crates/quiver-simd", version = "0.1" }
 
 clap = { version = "4.5", features = ["derive"] }
@@ -40,6 +43,7 @@ criterion = { version = "0.5", default-features = false, features = [
 ] }
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 
 # Dev-only dependencies (tests, property tests, fixtures).
