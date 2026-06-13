@@ -15,6 +15,10 @@ build:
 test:
     cargo test --workspace
 
+# Run the Python SDK test suite (requires uv; HTTP is mocked, no server needed).
+test-py:
+    cd sdks/python && uv run --quiet pytest -q
+
 # Format check + clippy with warnings denied.
 lint:
     cargo fmt --all --check
