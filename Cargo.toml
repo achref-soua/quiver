@@ -42,9 +42,17 @@ criterion = { version = "0.5", default-features = false, features = [
     "cargo_bench_support",
 ] }
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+tonic = "0.14"
+tonic-prost = "0.14"
+
+# Build-time codegen for the gRPC contract. protoc is vendored so a clean clone
+# builds with no system protobuf compiler installed.
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
 
 # Dev-only dependencies (tests, property tests, fixtures).
 proptest = "1"

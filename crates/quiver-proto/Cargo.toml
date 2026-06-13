@@ -1,12 +1,21 @@
 [package]
 name = "quiver-proto"
-description = "Wire types for Quiver: gRPC service, REST DTOs, and OpenAPI."
+description = "Wire types for Quiver: the gRPC service contract and generated code."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+
+[dependencies]
+prost = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
 
 [lints]
 workspace = true
