@@ -47,3 +47,13 @@ pub(crate) fn l2_sq_i8(a: &[i8], b: &[i8]) -> i32 {
         })
         .sum()
 }
+
+pub(crate) fn hamming_u64(a: &[u64], b: &[u64]) -> u32 {
+    // `count_ones` lowers to a hardware POPCNT on any x86_64/aarch64 Quiver
+    // targets, so the scalar path is itself fast; the AVX2 path widens it to
+    // four words per step.
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x ^ y).count_ones())
+        .sum()
+}
