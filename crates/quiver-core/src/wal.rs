@@ -49,10 +49,13 @@ pub const MAX_RECORD_BYTES: u32 = 64 * 1024 * 1024;
 /// validated JSON), keeping the log a dumb, stable durability primitive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WalOp {
-    /// Create a collection with the given id and postcard-encoded descriptor.
+    /// Create a collection with the given id, name, and postcard-encoded
+    /// descriptor.
     CreateCollection {
         /// Identifier assigned to the new collection.
         collection_id: CollectionId,
+        /// Human-readable collection name, unique within the store.
+        name: String,
         /// Postcard-encoded collection descriptor (schema, dim, dtype, metric).
         descriptor: Vec<u8>,
     },
@@ -357,6 +360,7 @@ mod tests {
         vec![
             WalOp::CreateCollection {
                 collection_id: CollectionId(1),
+                name: "alpha".into(),
                 descriptor: vec![1, 2, 3, 4],
             },
             WalOp::Upsert {

@@ -14,13 +14,23 @@
 //!   is `fsync`'d to the log first, so it survives `kill -9`.
 //! - [`manifest`] — the versioned catalog, made current via an atomic
 //!   write-new + fsync + rename of `CURRENT`.
-//! - [`ids`] — strongly-typed [`ids::Lsn`] and [`ids::CollectionId`].
+//! - [`store`] — the [`store::Store`] engine: the write path, checkpointing, and
+//!   crash recovery that compose the primitives above, over internal sealed
+//!   segments.
+//! - [`descriptor`] — collection schema; [`ids`] — typed [`ids::Lsn`] /
+//!   [`ids::CollectionId`].
 
+pub mod descriptor;
 pub mod error;
 pub mod ids;
 pub mod manifest;
 pub mod page;
+mod paged;
+mod segment;
+pub mod store;
 pub mod wal;
 
+pub use descriptor::{Descriptor, DistanceMetric, Dtype};
 pub use error::{CoreError, Result};
 pub use ids::{CollectionId, Lsn};
+pub use store::{Record, Store};
