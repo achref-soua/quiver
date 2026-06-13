@@ -51,7 +51,7 @@ impl ProductQuantizer {
         seed: u64,
     ) -> Result<Self, IndexError> {
         assert_eq!(sample.len(), n * dim, "sample must be n*dim");
-        if m == 0 || dim == 0 || dim % m != 0 {
+        if m == 0 || dim == 0 || !dim.is_multiple_of(m) {
             return Err(IndexError::InvalidConfig(
                 "PQ requires m > 0 and dim divisible by m",
             ));

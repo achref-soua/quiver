@@ -41,11 +41,11 @@ async fn cockpit_reads_live_server_snapshot() {
 
     let mut ready = false;
     for _ in 0..200 {
-        if let Ok(resp) = client.get(format!("{base_url}/readyz")).send().await {
-            if resp.status().is_success() {
-                ready = true;
-                break;
-            }
+        if let Ok(resp) = client.get(format!("{base_url}/readyz")).send().await
+            && resp.status().is_success()
+        {
+            ready = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

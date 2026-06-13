@@ -24,10 +24,10 @@ fn auth_request<T>(key: &str, message: T) -> tonic::Request<T> {
 
 async fn wait_ready(http: &reqwest::Client, base: &str) {
     for _ in 0..200 {
-        if let Ok(resp) = http.get(format!("{base}/healthz")).send().await {
-            if resp.status().is_success() {
-                return;
-            }
+        if let Ok(resp) = http.get(format!("{base}/healthz")).send().await
+            && resp.status().is_success()
+        {
+            return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

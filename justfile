@@ -32,10 +32,9 @@ fmt:
 doc:
     cargo doc --workspace --no-deps
 
-# Dependency advisory scan. The ignored advisories are dev-only / compile-time
-# transitives (rcgen's `time`, ratatui's `paste`); rationale is in deny.toml.
+# Dependency advisory scan — no suppressions; the tree is advisory-clean.
 audit:
-    cargo audit --ignore RUSTSEC-2026-0009 --ignore RUSTSEC-2024-0436
+    cargo audit
 
 # License / advisory / source policy checks.
 deny:
