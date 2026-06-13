@@ -67,7 +67,7 @@ A dense, fixed-stride column: `stride = dim × sizeof(dtype)`, `dtype ∈ {f32, 
 
 ## Payload heap (`.pay`) and the row directory
 
-Variable-length payloads (validated JSON, see ADR-0003) live in a paged heap. A per-segment **row directory** maps `row → (page, offset, len)`. Filterable fields declared in the collection schema are additionally extracted into secondary indexes at flush time. The external id (caller-supplied string / `u128`) maps to `(segment, row)` via a persisted primary index (a hash index checkpointed with the manifest); identity resolution and updates go through this map.
+Variable-length payloads (validated JSON, see ADR-0003) live in a paged heap (`seg-*.pay`). A per-segment **row directory** (`seg-*.dir`) maps `row → (external_id, payload offset, payload len)`, serialized as a paged `postcard` blob so it inherits per-page CRC integrity. Filterable fields declared in the collection schema are additionally extracted into secondary indexes at flush time. The external id (caller-supplied string / `u128`) maps to `(segment, row)` via a **primary index**; identity resolution and updates go through this map. The current implementation rebuilds the primary index on open from the segment directories (oldest-to-newest) plus the WAL tail (ADR-0020); checkpointing it to disk with the manifest is a deferred open-latency optimization.
 
 ## Secondary indexes (`.sec`)
 

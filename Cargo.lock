@@ -1943,6 +1943,7 @@ name = "quiver-core"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "memmap2",
  "postcard",
  "proptest",
  "serde",

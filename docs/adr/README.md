@@ -38,5 +38,6 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0017](0017-error-handling.md) | Error handling | Accepted | 0 |
 | [0018](0018-sdk-and-integration-strategy.md) | SDK & integration strategy | Accepted | 0 |
 | [0019](0019-disk-index-format.md) | Disk-resident index format (DiskANN on encrypted pages) | Accepted | 2 |
+| [0020](0020-row-addressed-segment-storage.md) | Row-addressed segment storage (`.vec`/`.pay`/`.dir`, mmap) | Accepted | 2 |
 
 Phase-0 ADRs (0001–0018) are Accepted; Phase-2 decisions begin at 0019. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.
