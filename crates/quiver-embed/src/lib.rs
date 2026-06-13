@@ -2,18 +2,19 @@
 //! The embeddable, in-process Quiver database handle.
 //!
 //! [`Database`] composes the storage engine ([`quiver_core::Store`]) with a
-//! per-collection vector index ([`quiver_index::Hnsw`]) and payload filtering
-//! ([`quiver_query::Filter`]) into one handle. It exposes the same logical
-//! operations the server speaks (`docs/api/wire-protocol.md`), so library mode
-//! and server mode exercise identical engine semantics — the server is a thin
-//! transport/policy shell over this.
+//! per-collection vector index and payload filtering ([`quiver_query::Filter`])
+//! into one handle. It exposes the same logical operations the server speaks
+//! (`docs/api/wire-protocol.md`), so library mode and server mode exercise
+//! identical engine semantics — the server is a thin transport/policy shell.
 //!
-//! ## Index lifecycle (Phase 1)
-//! The store is the source of truth. The HNSW index is rebuilt from the store on
-//! open. Inserts of new ids are applied incrementally; an update of an existing
-//! id or a delete marks the index stale, and the next search rebuilds it from
-//! the store (HNSW has no in-place delete in Phase 1 — that is Phase 4,
-//! SpFresh). Bulk-load-then-query, the common path, stays incremental.
+//! ## Index lifecycle
+//! The store is the source of truth. Each collection chooses its index via the
+//! descriptor's [`IndexSpec`] (default in-memory HNSW); the index is built from
+//! the store on open. HNSW applies new-id inserts incrementally; an update, a
+//! delete, or any write to a batch index (Vamana / IVF, built over the whole
+//! collection) marks the index stale, and the next search rebuilds it — so batch
+//! indexes suit bulk-load-then-query. In-place incremental update for the disk
+//! graph is Phase 4 (SpFresh).
 //!
 //! ## Concurrency (Phase 1)
 //! Single-writer: every operation takes `&mut self` (a search may rebuild a
@@ -24,7 +25,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use quiver_core::{CollectionId, Store};
-use quiver_index::{Hnsw, HnswConfig, Index, Metric};
+use quiver_index::{
+    Hnsw, HnswConfig, Index, Ivf, IvfConfig, Metric, Neighbor, Vamana, VamanaConfig,
+};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -49,6 +52,9 @@ pub enum Error {
     /// The named collection is not loaded in this database.
     #[error("collection not found: {0}")]
     CollectionNotFound(String),
+    /// The requested index / metric combination is not supported.
+    #[error("unsupported configuration: {0}")]
+    Unsupported(&'static str),
 }
 
 /// Result alias for database operations.
@@ -98,10 +104,36 @@ impl Default for SearchParams {
 // still has enough survivors to fill `k`.
 const FILTER_OVERFETCH: usize = 8;
 
+// The vector index backing one collection. HNSW is incremental; Vamana and IVF
+// are batch-built from the store (the `Option` is `None` until first build), so
+// they suit bulk-load-then-query and rebuild lazily after writes.
+enum CollectionIndex {
+    Hnsw(Hnsw),
+    Vamana(Option<Vamana>),
+    Ivf(Option<Ivf>),
+}
+
+impl CollectionIndex {
+    // Search, mapping the generic `ef` knob onto each index's search width.
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> std::result::Result<Vec<Neighbor>, quiver_index::IndexError> {
+        match self {
+            CollectionIndex::Hnsw(h) => h.search(query, k, ef),
+            CollectionIndex::Vamana(Some(g)) => g.search(query, k, ef),
+            CollectionIndex::Ivf(Some(i)) => i.search(query, k, ef),
+            CollectionIndex::Vamana(None) | CollectionIndex::Ivf(None) => Ok(Vec::new()),
+        }
+    }
+}
+
 struct CollectionHandle {
     id: CollectionId,
     descriptor: Descriptor,
-    index: Hnsw,
+    index: CollectionIndex,
     int_to_ext: Vec<String>,
     ext_to_int: HashMap<String, u64>,
     stale: bool,
@@ -140,11 +172,7 @@ impl Database {
             };
             let mut handle = CollectionHandle {
                 id,
-                index: Hnsw::new(
-                    descriptor.dim as usize,
-                    to_index_metric(descriptor.metric),
-                    HnswConfig::default(),
-                ),
+                index: empty_index(&descriptor),
                 descriptor,
                 int_to_ext: Vec::new(),
                 ext_to_int: HashMap::new(),
@@ -156,14 +184,12 @@ impl Database {
         Ok(Self { store, collections })
     }
 
-    /// Create a collection. Errors if the name already exists.
+    /// Create a collection. Errors if the name already exists, or if the index
+    /// specification is unsupported for the metric.
     pub fn create_collection(&mut self, name: &str, descriptor: Descriptor) -> Result<()> {
+        validate_index(&descriptor)?;
         let id = self.store.create_collection(name, descriptor.clone())?;
-        let index = Hnsw::new(
-            descriptor.dim as usize,
-            to_index_metric(descriptor.metric),
-            HnswConfig::default(),
-        );
+        let index = empty_index(&descriptor);
         self.collections.insert(
             name.to_owned(),
             CollectionHandle {
@@ -222,16 +248,21 @@ impl Database {
             .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
         let payload_bytes = serde_json::to_vec(payload)?;
         self.store.upsert(handle.id, id, vector, &payload_bytes)?;
-        if handle.stale {
-            // A rebuild is already pending; it will pick up this write.
-        } else if handle.ext_to_int.contains_key(id) {
-            // An existing id changed: HNSW can't update in place, so rebuild lazily.
-            handle.stale = true;
-        } else {
+        // Only an in-memory HNSW can absorb a brand-new id incrementally; an
+        // existing id (no in-place update), a batch index, or an already-stale
+        // index defers to a lazy rebuild on the next search.
+        let new_id = !handle.ext_to_int.contains_key(id);
+        let incremental =
+            !handle.stale && new_id && matches!(handle.index, CollectionIndex::Hnsw(_));
+        if incremental {
             let internal = handle.int_to_ext.len() as u64;
-            handle.index.insert(internal, vector)?;
+            if let CollectionIndex::Hnsw(h) = &mut handle.index {
+                h.insert(internal, vector)?;
+            }
             handle.ext_to_int.insert(id.to_owned(), internal);
             handle.int_to_ext.push(id.to_owned());
+        } else {
+            handle.stale = true;
         }
         Ok(())
     }
@@ -356,22 +387,76 @@ fn to_index_metric(metric: DistanceMetric) -> Metric {
     }
 }
 
+// Reject index/metric combinations the engine cannot serve.
+fn validate_index(descriptor: &Descriptor) -> Result<()> {
+    match descriptor.index.kind {
+        IndexKind::DiskVamana => Err(Error::Unsupported(
+            "the disk-resident index is not yet available in this build; use vamana or ivf",
+        )),
+        IndexKind::Vamana | IndexKind::Ivf if descriptor.metric == DistanceMetric::Dot => Err(
+            Error::Unsupported("vamana and ivf support l2 and cosine; use hnsw for dot"),
+        ),
+        _ => Ok(()),
+    }
+}
+
+// An empty index of the kind the descriptor selects. Batch kinds start unbuilt.
+fn empty_index(descriptor: &Descriptor) -> CollectionIndex {
+    match descriptor.index.kind {
+        IndexKind::Vamana | IndexKind::DiskVamana => CollectionIndex::Vamana(None),
+        IndexKind::Ivf => CollectionIndex::Ivf(None),
+        _ => CollectionIndex::Hnsw(Hnsw::new(
+            descriptor.dim as usize,
+            to_index_metric(descriptor.metric),
+            HnswConfig::default(),
+        )),
+    }
+}
+
+// Build the descriptor's index over `ids` (internal 0..n) and their flat vectors.
+fn build_index(descriptor: &Descriptor, ids: &[u64], flat: &[f32]) -> Result<CollectionIndex> {
+    let dim = descriptor.dim as usize;
+    let metric = to_index_metric(descriptor.metric);
+    Ok(match descriptor.index.kind {
+        // DiskVamana is gated at creation; until its disk wiring lands it would
+        // build the in-memory Vamana graph (same recall, not yet frugal).
+        IndexKind::Vamana | IndexKind::DiskVamana => CollectionIndex::Vamana(Some(Vamana::build(
+            ids,
+            flat,
+            dim,
+            metric,
+            VamanaConfig::default(),
+        )?)),
+        IndexKind::Ivf => {
+            let cfg = IvfConfig {
+                quantization: descriptor.index.pq_subspaces.map(|m| m as usize),
+                ..IvfConfig::default()
+            };
+            CollectionIndex::Ivf(Some(Ivf::build(ids, flat, dim, metric, cfg)?))
+        }
+        _ => {
+            let mut h = Hnsw::new(dim, metric, HnswConfig::default());
+            for (i, &id) in ids.iter().enumerate() {
+                h.insert(id, &flat[i * dim..(i + 1) * dim])?;
+            }
+            CollectionIndex::Hnsw(h)
+        }
+    })
+}
+
 // Rebuild a collection's index from the store's current live rows.
 fn rebuild_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
-    let mut index = Hnsw::new(
-        handle.descriptor.dim as usize,
-        to_index_metric(handle.descriptor.metric),
-        HnswConfig::default(),
-    );
     let mut int_to_ext = Vec::new();
     let mut ext_to_int = HashMap::new();
+    let mut flat: Vec<f32> = Vec::new();
     for (ext_id, record) in store.scan(handle.id)? {
         let internal = int_to_ext.len() as u64;
-        index.insert(internal, &record.vector)?;
+        flat.extend_from_slice(&record.vector);
         ext_to_int.insert(ext_id.clone(), internal);
         int_to_ext.push(ext_id);
     }
-    handle.index = index;
+    let ids: Vec<u64> = (0..int_to_ext.len() as u64).collect();
+    handle.index = build_index(&handle.descriptor, &ids, &flat)?;
     handle.int_to_ext = int_to_ext;
     handle.ext_to_int = ext_to_int;
     handle.stale = false;
@@ -535,6 +620,83 @@ mod tests {
         assert!(matches!(
             db.create_collection("c", desc()),
             Err(Error::Core(quiver_core::CoreError::AlreadyExists(_)))
+        ));
+    }
+
+    fn desc_with(kind: IndexKind) -> Descriptor {
+        Descriptor::new(4, Dtype::F32, DistanceMetric::L2).with_index(IndexSpec {
+            kind,
+            pq_subspaces: None,
+        })
+    }
+
+    #[test]
+    fn vamana_and_ivf_collections_find_the_nearest_point() {
+        for kind in [IndexKind::Vamana, IndexKind::Ivf] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut db = open(tmp.path());
+            db.create_collection("c", desc_with(kind)).unwrap();
+            for i in 0..40u32 {
+                db.upsert(
+                    "c",
+                    &format!("p{i}"),
+                    &[i as f32, 0.0, 0.0, 0.0],
+                    &json!({}),
+                )
+                .unwrap();
+            }
+            // ef_search maps onto the index's search width (l_search / nprobe).
+            let res = db
+                .search("c", &[7.0, 0.0, 0.0, 0.0], &SearchParams::default())
+                .unwrap();
+            assert_eq!(res[0].id, "p7", "{kind:?} nearest");
+        }
+    }
+
+    #[test]
+    fn index_kind_persists_and_rebuilds_on_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut db = open(tmp.path());
+            db.create_collection("v", desc_with(IndexKind::Vamana))
+                .unwrap();
+            for i in 0..20u32 {
+                db.upsert(
+                    "v",
+                    &format!("p{i}"),
+                    &[i as f32, 1.0, 2.0, 3.0],
+                    &json!({}),
+                )
+                .unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        let mut db = open(tmp.path());
+        assert_eq!(db.descriptor("v").unwrap().index.kind, IndexKind::Vamana);
+        let res = db
+            .search("v", &[7.0, 1.0, 2.0, 3.0], &SearchParams::default())
+            .unwrap();
+        assert_eq!(res[0].id, "p7");
+    }
+
+    #[test]
+    fn unsupported_index_configurations_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        // Vamana/IVF do not support inner product.
+        let dot_vamana =
+            Descriptor::new(4, Dtype::F32, DistanceMetric::Dot).with_index(IndexSpec {
+                kind: IndexKind::Vamana,
+                pq_subspaces: None,
+            });
+        assert!(matches!(
+            db.create_collection("a", dot_vamana),
+            Err(Error::Unsupported(_))
+        ));
+        // The disk-resident index is gated until its wiring lands.
+        assert!(matches!(
+            db.create_collection("b", desc_with(IndexKind::DiskVamana)),
+            Err(Error::Unsupported(_))
         ));
     }
 }
