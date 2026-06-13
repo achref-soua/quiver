@@ -24,10 +24,10 @@ Quiver's security design — assets, adversaries, trust boundaries, and what the
 
 Key facts worth stating up front:
 
-- Encryption-at-rest is **on by default**; it protects against stolen disks/backups, **not** against an attacker with root on a live host reading process memory.
+- Encryption-at-rest is **on by default** and covers **every durable byte** — segments, the manifest, and the record-framed write-ahead log — sealed with XChaCha20-Poly1305 under HKDF-SHA256 subkeys. It protects against stolen disks/backups, **not** against an attacker with root on a live host reading process memory.
 - **Client-side payload encryption protects payloads, not vectors** — standard ANN requires plaintext vectors server-side.
-- Quiver uses **only audited cryptographic libraries** (`rustls`, RustCrypto/`ring`) and implements no primitives of its own. Any property-preserving encryption for vectors is experimental, behind a feature flag, with documented leakage caveats.
+- Quiver uses **only audited cryptographic libraries** (RustCrypto AEAD/KDF and `rustls`) and implements no primitives of its own. Any property-preserving encryption for vectors is experimental, behind a feature flag, with documented leakage caveats.
 
 ## Hardening checklist (operators)
 
-Set a master key (file `0600` or KMS), require TLS on non-loopback binds, scope API keys to least privilege, enable audit log retention, and keep Quiver updated.
+Set a strong `QUIVER_ENCRYPTION_KEY` (256-bit, e.g. `openssl rand -hex 32`) sourced from a secret store or `0600` file — never the committed config; require TLS on non-loopback binds; scope API keys to least privilege; enable audit log retention; and keep Quiver updated.

@@ -28,6 +28,7 @@ use quiver_index::{Hnsw, HnswConfig, Index, Metric};
 use serde_json::Value;
 use thiserror::Error;
 
+pub use quiver_core::page::PageCodec;
 pub use quiver_core::{Descriptor, DistanceMetric, Dtype};
 pub use quiver_query::Filter;
 
@@ -113,10 +114,22 @@ pub struct Database {
 }
 
 impl Database {
-    /// Open (creating if absent) the database at `dir`, rebuilding each
-    /// collection's index from the store.
+    /// Open (creating if absent) the database at `dir` with encryption-at-rest
+    /// disabled, rebuilding each collection's index from the store.
     pub fn open(dir: &Path) -> Result<Self> {
-        let store = Store::open(dir)?;
+        Self::from_store(Store::open(dir)?)
+    }
+
+    /// Open the database with a specific page codec — used to enable
+    /// encryption-at-rest by passing `quiver-crypto`'s AEAD codec. Mirrors
+    /// [`quiver_core::Store::open_with_codec`]; the codec seals both paged files
+    /// and the WAL, so no plaintext user data reaches the disk.
+    pub fn open_with_codec(dir: &Path, codec: Box<dyn PageCodec>) -> Result<Self> {
+        Self::from_store(Store::open_with_codec(dir, codec)?)
+    }
+
+    // Build the in-memory handles (and their HNSW indexes) over an opened store.
+    fn from_store(store: Store) -> Result<Self> {
         let mut collections = HashMap::new();
         for name in store.collection_names() {
             let Some(id) = store.collection_id(&name) else {

@@ -32,6 +32,7 @@ todo = "warn"
 # Internal crates (path deps with a version so `cargo deny` sees no wildcard),
 # referenced as `quiver-x = { workspace = true }`.
 quiver-core = { path = "crates/quiver-core", version = "0.1" }
+quiver-crypto = { path = "crates/quiver-crypto", version = "0.1" }
 quiver-embed = { path = "crates/quiver-embed", version = "0.1" }
 quiver-index = { path = "crates/quiver-index", version = "0.1" }
 quiver-proto = { path = "crates/quiver-proto", version = "0.1" }
@@ -41,8 +42,15 @@ quiver-simd = { path = "crates/quiver-simd", version = "0.1" }
 
 anyhow = "1"
 axum = "0.8"
+# Audited cryptography (RustCrypto; never `ring`, never a home-grown primitive)
+# for encryption-at-rest: XChaCha20-Poly1305 AEAD, HKDF-SHA256 per-page subkeys,
+# and zeroized key material. See ADR-0010 and docs/security/crypto.md.
+chacha20poly1305 = { version = "0.10", features = ["getrandom"] }
 clap = { version = "4.5", features = ["derive"] }
 crc32c = "0.6"
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = "1"
 criterion = { version = "0.5", default-features = false, features = [
     "cargo_bench_support",
 ] }

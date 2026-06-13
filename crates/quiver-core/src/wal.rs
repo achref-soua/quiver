@@ -13,13 +13,21 @@
 //! only and each record is `fsync`'d before acknowledgement, the only place an
 //! invalid frame can legitimately appear is the tail.
 //!
+//! Each record's bytes pass through a [`PageCodec`] before framing, so when
+//! encryption-at-rest is enabled the AEAD codec seals every record and the log
+//! holds no plaintext user data; under the plaintext codec the bytes are written
+//! verbatim. The frame CRC is computed over the on-disk (sealed) bytes, so a
+//! torn or bit-rotted tail is still detected without a key, and the AEAD tag
+//! additionally authenticates each record (a wrong key or tampering on an
+//! otherwise-intact frame is a hard error, never silently dropped).
+//!
 //! File layout (little-endian):
 //!
 //! ```text
 //! 0  magic:u32  4  format_ver:u16  6  _pad:u16  8  base_lsn:u64   (16-byte header)
 //! 16 frame[0] | frame[1] | ...
 //!
-//! frame: len:u32 | crc32c:u32 | record: postcard(WalEntry) [len bytes]
+//! frame: len:u32 | crc32c:u32 | record: codec.seal_record(postcard(WalEntry)) [len bytes]
 //! ```
 
 use std::fs::{File, OpenOptions};
@@ -30,6 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
 use crate::ids::{CollectionId, Lsn};
+use crate::page::PageCodec;
 
 /// Magic identifying a WAL segment file (`b"QVWL"`, little-endian).
 pub const WAL_MAGIC: u32 = u32::from_le_bytes(*b"QVWL");
@@ -168,22 +177,26 @@ impl WalWriter {
         })
     }
 
-    /// Frame and append a record. Does not `fsync`; the record is durable only
-    /// after a subsequent [`WalWriter::sync`].
-    pub fn append(&mut self, entry: &WalEntry) -> Result<()> {
-        let bytes = postcard::to_allocvec(entry)?;
-        let len = u32::try_from(bytes.len())
-            .map_err(|_| CoreError::TooLarge(format!("wal record {} bytes", bytes.len())))?;
+    /// Frame and append a record, sealing its bytes with `codec` first (so an
+    /// encrypting codec leaves no plaintext in the log). Does not `fsync`; the
+    /// record is durable only after a subsequent [`WalWriter::sync`].
+    pub fn append(&mut self, codec: &dyn PageCodec, entry: &WalEntry) -> Result<()> {
+        let plaintext = postcard::to_allocvec(entry)?;
+        let sealed = codec.seal_record(&plaintext)?;
+        let len = u32::try_from(sealed.len())
+            .map_err(|_| CoreError::TooLarge(format!("wal record {} bytes", sealed.len())))?;
         if len > MAX_RECORD_BYTES {
             return Err(CoreError::TooLarge(format!(
                 "wal record {len} bytes exceeds cap {MAX_RECORD_BYTES}"
             )));
         }
-        let crc = crc32c::crc32c(&bytes);
-        let mut frame = Vec::with_capacity(FRAME_PREFIX_SIZE + bytes.len());
+        // The CRC covers the on-disk (sealed) bytes, so a torn or bit-rotted
+        // tail is detected on recovery without needing the key.
+        let crc = crc32c::crc32c(&sealed);
+        let mut frame = Vec::with_capacity(FRAME_PREFIX_SIZE + sealed.len());
         frame.extend_from_slice(&len.to_le_bytes());
         frame.extend_from_slice(&crc.to_le_bytes());
-        frame.extend_from_slice(&bytes);
+        frame.extend_from_slice(&sealed);
         self.file
             .write_all(&frame)
             .map_err(|e| CoreError::io(&self.path, e))?;
@@ -203,8 +216,8 @@ impl WalWriter {
     }
 
     /// Append a record and immediately `fsync` — strict per-commit durability.
-    pub fn append_sync(&mut self, entry: &WalEntry) -> Result<()> {
-        self.append(entry)?;
+    pub fn append_sync(&mut self, codec: &dyn PageCodec, entry: &WalEntry) -> Result<()> {
+        self.append(codec, entry)?;
         self.sync()
     }
 }
@@ -255,10 +268,13 @@ fn read_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<ReadOutcome> {
 }
 
 /// Read every intact record from a WAL segment, stopping cleanly at a torn
-/// trailing record. Errors only on a structurally invalid header or an
-/// underlying I/O failure — a torn tail is a normal, expected outcome reported
-/// via [`WalReplay::torn_at`].
-pub fn read_all(path: &Path) -> Result<WalReplay> {
+/// trailing record. Each record is opened with `codec` (the identity transform
+/// under the plaintext codec; authenticated decryption under the AEAD codec).
+/// Errors on a structurally invalid header, an underlying I/O failure, or a
+/// frame that is intact on disk yet fails authentication (a wrong key or
+/// tampering) — a torn tail is a normal, expected outcome reported via
+/// [`WalReplay::torn_at`].
+pub fn read_all(path: &Path, codec: &dyn PageCodec) -> Result<WalReplay> {
     let file = File::open(path).map_err(|e| CoreError::io(path, e))?;
     let file_len = file.metadata().map_err(|e| CoreError::io(path, e))?.len();
     let mut reader = BufReader::new(file);
@@ -329,13 +345,18 @@ pub fn read_all(path: &Path) -> Result<WalReplay> {
             torn_at = Some(offset);
             break;
         }
-        match postcard::from_bytes::<WalEntry>(&buf) {
+        // The frame is intact on disk (the CRC covers the sealed bytes). Open it:
+        // under the plaintext codec this is the identity, and under the AEAD codec
+        // a failure means a wrong key or tampering on an otherwise-complete,
+        // acknowledged record — a hard error, not a recoverable torn tail.
+        let plaintext = codec.open_record(&buf)?;
+        match postcard::from_bytes::<WalEntry>(&plaintext) {
             Ok(entry) => {
                 entries.push(entry);
                 offset += FRAME_PREFIX_SIZE as u64 + u64::from(len);
             }
             Err(_) => {
-                // CRC matched but the bytes do not decode: defensively torn.
+                // Authenticated bytes that nonetheless do not decode: torn.
                 torn_at = Some(offset);
                 break;
             }
@@ -351,9 +372,11 @@ pub fn read_all(path: &Path) -> Result<WalReplay> {
 #[cfg(test)]
 mod tests {
     // `super::*` also re-exports the parent module's imports (`OpenOptions`,
-    // `Write`, `Path`, `CoreError`, `CollectionId`, `Lsn`), so they need no
-    // separate `use` here.
+    // `Write`, `Path`, `CoreError`, `CollectionId`, `Lsn`, `PageCodec`), so they
+    // need no separate `use` here. The concrete plaintext codec is a sibling type
+    // the parent does not import, so bring it in explicitly.
     use super::*;
+    use crate::page::PlainCodec;
     use proptest::prelude::*;
 
     fn sample_ops() -> Vec<WalOp> {
@@ -396,7 +419,7 @@ mod tests {
     fn write_log(path: &Path, entries: &[WalEntry]) {
         let mut w = WalWriter::create(path, Lsn(1)).unwrap();
         for e in entries {
-            w.append(e).unwrap();
+            w.append(&PlainCodec, e).unwrap();
         }
         w.sync().unwrap();
     }
@@ -408,7 +431,7 @@ mod tests {
         let entries = entries_from(&sample_ops());
         write_log(&path, &entries);
 
-        let replay = read_all(&path).unwrap();
+        let replay = read_all(&path, &PlainCodec).unwrap();
         assert_eq!(replay.entries, entries);
         assert_eq!(replay.torn_at, None);
         assert_eq!(replay.base_lsn, Lsn(1));
@@ -420,7 +443,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal-1.log");
         let _w = WalWriter::create(&path, Lsn(10)).unwrap();
-        let replay = read_all(&path).unwrap();
+        let replay = read_all(&path, &PlainCodec).unwrap();
         assert!(replay.entries.is_empty());
         assert_eq!(replay.torn_at, None);
         assert_eq!(replay.base_lsn, Lsn(10));
@@ -434,17 +457,17 @@ mod tests {
         let entries = entries_from(&sample_ops());
         {
             let mut w = WalWriter::create(&path, Lsn(1)).unwrap();
-            w.append_sync(&entries[0]).unwrap();
-            w.append_sync(&entries[1]).unwrap();
+            w.append_sync(&PlainCodec, &entries[0]).unwrap();
+            w.append_sync(&PlainCodec, &entries[1]).unwrap();
         }
         {
             let mut w = WalWriter::open_append(&path).unwrap();
             for e in &entries[2..] {
-                w.append(e).unwrap();
+                w.append(&PlainCodec, e).unwrap();
             }
             w.sync().unwrap();
         }
-        let replay = read_all(&path).unwrap();
+        let replay = read_all(&path, &PlainCodec).unwrap();
         assert_eq!(replay.entries, entries);
         assert_eq!(replay.torn_at, None);
     }
@@ -462,7 +485,7 @@ mod tests {
             f.write_all(&[0xFF, 0xFF, 0xFF]).unwrap();
             f.sync_data().unwrap();
         }
-        let replay = read_all(&path).unwrap();
+        let replay = read_all(&path, &PlainCodec).unwrap();
         assert_eq!(replay.entries, entries);
         assert_eq!(replay.torn_at, Some(clean_len));
     }
@@ -482,7 +505,7 @@ mod tests {
             f.write_all(&[1, 2, 3]).unwrap();
             f.sync_data().unwrap();
         }
-        let replay = read_all(&path).unwrap();
+        let replay = read_all(&path, &PlainCodec).unwrap();
         assert_eq!(replay.entries, entries);
         assert_eq!(replay.torn_at, Some(clean_len));
     }
@@ -505,7 +528,7 @@ mod tests {
         bytes[corrupt_at as usize] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
 
-        let replay = read_all(&path).unwrap();
+        let replay = read_all(&path, &PlainCodec).unwrap();
         assert_eq!(replay.entries, vec![entries[0].clone()]);
         assert_eq!(replay.torn_at, Some(second_frame_offset));
     }
@@ -515,7 +538,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal-1.log");
         std::fs::write(&path, vec![0u8; WAL_FILE_HEADER_SIZE + 4]).unwrap();
-        assert!(matches!(read_all(&path), Err(CoreError::BadMagic { .. })));
+        assert!(matches!(
+            read_all(&path, &PlainCodec),
+            Err(CoreError::BadMagic { .. })
+        ));
     }
 
     proptest! {
@@ -530,7 +556,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("wal.log");
             write_log(&path, &entries);
-            let replay = read_all(&path).unwrap();
+            let replay = read_all(&path, &PlainCodec).unwrap();
             prop_assert_eq!(replay.entries, entries);
             prop_assert_eq!(replay.torn_at, None);
         }
@@ -565,7 +591,7 @@ mod tests {
             f.set_len(cut).unwrap();
             drop(f);
 
-            let replay = read_all(&path).unwrap();
+            let replay = read_all(&path, &PlainCodec).unwrap();
             let survivors = frame_ends.iter().filter(|&&end| end <= cut).count();
             prop_assert_eq!(replay.entries.as_slice(), &entries[..survivors]);
             // A clean cut at a frame boundary has no torn tail; otherwise it does.

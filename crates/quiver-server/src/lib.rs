@@ -9,9 +9,11 @@
 //! Phase 2.
 //!
 //! Phase 1 auth is a configured API key (Bearer / gRPC `authorization`
-//! metadata), default-deny, with a fail-fast secure config (ADR-0011/0013). TLS,
-//! RBAC scopes, multi-tenancy, audit logging, and rate limiting are later
-//! phases. Design: `docs/api/rest-grpc.md`.
+//! metadata), default-deny, with a fail-fast secure config (ADR-0011/0013).
+//! Encryption-at-rest is on by default (ADR-0010): unless `insecure` is set, an
+//! `encryption_key` is required and the engine is opened through
+//! `quiver-crypto`'s AEAD codec. TLS, RBAC scopes, multi-tenancy, audit logging,
+//! and rate limiting are later phases. Design: `docs/api/rest-grpc.md`.
 
 mod error;
 mod grpc;
@@ -28,6 +30,7 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
+use quiver_crypto::AeadCodec;
 use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, SearchParams};
 use quiver_query::Filter;
 
@@ -46,8 +49,14 @@ pub struct Config {
     pub grpc_addr: SocketAddr,
     /// Accepted API keys. Empty is allowed only with `insecure = true`.
     pub api_keys: Vec<String>,
-    /// Opt out of the secure defaults (no auth, allow non-loopback bind without
-    /// TLS). For local development only; never the default.
+    /// Hex-encoded 256-bit key for encryption-at-rest (64 hex characters).
+    /// Required unless `insecure = true`; source it from the environment or a
+    /// secret store, never the committed config. `None` ⇒ data is stored
+    /// unencrypted (only valid in `insecure` mode).
+    pub encryption_key: Option<String>,
+    /// Opt out of the secure defaults (no auth, no encryption-at-rest, allow a
+    /// non-loopback bind without TLS). For local development only; never the
+    /// default.
     pub insecure: bool,
 }
 
@@ -58,6 +67,7 @@ impl Default for Config {
             rest_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6333),
             grpc_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6334),
             api_keys: Vec::new(),
+            encryption_key: None,
             insecure: false,
         }
     }
@@ -75,8 +85,8 @@ impl Config {
     }
 
     /// Reject insecure configurations unless explicitly opted out (ADR-0013):
-    /// no anonymous access, and no non-loopback bind without TLS (TLS lands with
-    /// encryption-at-rest).
+    /// no anonymous access, encryption-at-rest on by default with a valid key,
+    /// and no non-loopback bind without TLS (TLS lands in the next slice).
     pub fn validate(&self) -> Result<(), Error> {
         if self.api_keys.is_empty() && !self.insecure {
             return Err(Error::Config(
@@ -84,6 +94,19 @@ impl Config {
                  set insecure=true for local development"
                     .to_owned(),
             ));
+        }
+        if self.encryption_key.is_none() && !self.insecure {
+            return Err(Error::Config(
+                "no encryption_key configured: encryption-at-rest is on by default — \
+                 set QUIVER_ENCRYPTION_KEY to a 64-hex-character (256-bit) key, or set \
+                 insecure=true to store data unencrypted (development only)"
+                    .to_owned(),
+            ));
+        }
+        // Fail fast on a malformed key rather than at first write.
+        if let Some(key) = &self.encryption_key {
+            AeadCodec::from_hex(key)
+                .map_err(|e| Error::Config(format!("invalid encryption_key: {e}")))?;
         }
         let non_loopback = !self.rest_addr.ip().is_loopback() || !self.grpc_addr.ip().is_loopback();
         if non_loopback && !self.insecure {
@@ -344,7 +367,7 @@ pub async fn serve(
     rest_listener: TcpListener,
     grpc_listener: TcpListener,
 ) -> Result<(), Error> {
-    let db = Database::open(&config.data_dir)?;
+    let db = open_database(&config)?;
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         api_keys: Arc::new(config.api_keys.clone()),
@@ -368,6 +391,23 @@ pub async fn serve(
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+// Open the engine, enabling encryption-at-rest when a key is configured. With no
+// key (only valid in `insecure` mode, enforced by `Config::validate`) the engine
+// is opened in plaintext.
+fn open_database(config: &Config) -> Result<Database, Error> {
+    match &config.encryption_key {
+        Some(key) => {
+            let codec = AeadCodec::from_hex(key)
+                .map_err(|e| Error::Config(format!("invalid encryption_key: {e}")))?;
+            Ok(Database::open_with_codec(
+                &config.data_dir,
+                Box::new(codec),
+            )?)
+        }
+        None => Ok(Database::open(&config.data_dir)?),
+    }
 }
 
 /// Initialize structured logging from `RUST_LOG` (defaulting to `info`). Safe to
@@ -394,6 +434,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    // A valid 64-hex-character (256-bit) test key.
+    const TEST_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
     #[test]
     fn config_rejects_missing_keys_unless_insecure() {
         let mut config = Config::default();
@@ -402,6 +445,26 @@ mod tests {
         assert!(config.validate().is_ok());
         config.insecure = false;
         config.api_keys = vec!["secret".to_owned()];
+        config.encryption_key = Some(TEST_KEY.to_owned());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_requires_encryption_key_unless_insecure() {
+        let mut config = Config {
+            api_keys: vec!["secret".to_owned()],
+            ..Config::default()
+        };
+        // API key set but no encryption key, not insecure ⇒ rejected.
+        assert!(config.validate().is_err());
+        config.encryption_key = Some(TEST_KEY.to_owned());
+        assert!(config.validate().is_ok());
+        // A malformed key is rejected up front, not at first write.
+        config.encryption_key = Some("not-a-valid-hex-key".to_owned());
+        assert!(config.validate().is_err());
+        // Insecure mode may run without encryption-at-rest.
+        config.insecure = true;
+        config.encryption_key = None;
         assert!(config.validate().is_ok());
     }
 
@@ -409,9 +472,11 @@ mod tests {
     fn config_rejects_public_bind_without_optout() {
         let mut config = Config {
             api_keys: vec!["secret".to_owned()],
+            encryption_key: Some(TEST_KEY.to_owned()),
             ..Config::default()
         };
         config.rest_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 6333);
+        // Auth and encryption are satisfied, so the only failure is the bind rule.
         assert!(config.validate().is_err());
         config.insecure = true;
         assert!(config.validate().is_ok());
