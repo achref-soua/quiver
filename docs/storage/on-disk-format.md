@@ -83,7 +83,7 @@ Indexes are built per-segment and merged across segments at query time; the plan
 
 1. **Active segment (in memory).** Upserts append to an in-RAM active segment, *after* the WAL record is durably appended. The vector goes into the live index immediately.
 2. **Seal & flush.** When the active segment exceeds a size/row threshold it is **sealed** (made immutable) and flushed to `seg-NNNNNN.*` files: write data → `fsync` files → `fsync` directory → publish a new manifest version that references the segment → `fsync` manifest → atomically swap `CURRENT`. A crash *before* the swap leaves the segment orphaned (GC'd on recovery); *after*, it is durable. There is never a partially-visible segment.
-3. **Tombstones & deletes.** Segments are immutable; deletes and updates write to the `.del` roaring bitmap (logically; physically appended via WAL + manifest). 
+3. **Tombstones & deletes.** Segments are immutable; a delete or an update is first `fsync`'d to the WAL, then — at the next checkpoint — the dead `(segment, row)` is merged into that segment's `.del` roaring bitmap, which is rewritten atomically (temp + rename). A row tombstoned in its segment is skipped on recovery. The crash-safety argument (atomic `.del` writes, monotonic deletes, WAL backstop) is [ADR-0021](../adr/0021-tombstones-and-compaction.md).
 4. **Compaction.** A background job merges small segments and rewrites live (non-tombstoned) rows into a fresh segment, then atomically updates the manifest and reclaims the old segments and their index artifacts. Compaction is crash-safe for the same reason flush is: old inputs remain valid until the manifest swap.
 
 ## Manifest: catalog + durability anchor

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Sealed, immutable segments in the row-addressed on-disk format (ADR-0004).
+//! Sealed, immutable segments in the row-addressed on-disk format (ADR-0004),
+//! with per-segment tombstones as roaring bitmaps (ADR-0020).
 //!
-//! Each checkpoint seals the rows changed since the previous checkpoint into a
+//! Each checkpoint seals the rows upserted since the previous checkpoint into a
 //! new immutable segment, written as three companion files named by a monotonic
-//! segment id:
+//! segment id, plus an optional fourth that records which of its rows have since
+//! died:
 //!
 //! - `seg-NNNNNNNNNN.vec` — the **vector column**: each live row's raw
 //!   little-endian vector bytes, packed tightly at `row × stride`, read through
@@ -11,28 +13,33 @@
 //! - `seg-NNNNNNNNNN.pay` — the **payload heap**: each row's opaque payload bytes
 //!   concatenated, also `mmap`-read.
 //! - `seg-NNNNNNNNNN.dir` — the **row directory** ([`SegmentDir`]): per row, the
-//!   external id and the payload's `(offset, length)` in the heap, plus the ids
-//!   **tombstoned** in this checkpoint window. Serialized as a paged `postcard`
-//!   blob ([`crate::paged`]), so it inherits per-page CRC integrity.
+//!   external id and the payload's `(offset, length)` in the heap. A paged
+//!   `postcard` blob ([`crate::paged`]) with per-page CRC integrity.
+//! - `seg-NNNNNNNNNN.del` — the **tombstone bitmap**: a `roaring` bitmap of this
+//!   segment's row indices that are no longer live (deleted, or shadowed by a
+//!   newer upsert). Written atomically (temp + rename) since, unlike the other
+//!   three files, it is rewritten as rows die; absent means no dead rows.
 //!
-//! Vectors and payloads therefore live on disk and are decrypted on demand; only
-//! the row directory (external ids + payload offsets) is read into RAM, where it
-//! seeds the engine's primary index. Recovery still replays segments
-//! oldest-to-newest — a later row shadows an earlier one for the same id, and a
-//! segment's tombstones remove ids — then applies the WAL tail on top.
+//! Vectors and payloads live on disk and are decrypted on demand; only the row
+//! directory (external ids + payload offsets) and the tombstone bitmap are read
+//! into RAM, where they seed the engine's primary index. On recovery, a row that
+//! is tombstoned in its segment is skipped, so each external id is live in at
+//! most one segment; the WAL tail is then applied on top.
 
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::blockfile::{BlockFile, write_blocks};
 use crate::error::{CoreError, Result};
 use crate::page::{PageCodec, PageType};
 
-/// Current row-directory schema version. (v1 was the Phase-1 snapshot-delta
-/// `postcard` blob; v2 is this row-addressed layout.)
-pub(crate) const SEGMENT_FORMAT_VERSION: u16 = 2;
+/// Current segment schema version. (v1 was the Phase-1 snapshot-delta `postcard`
+/// blob; v2 the row-addressed layout with string tombstones; v3 moves tombstones
+/// out of the directory into the roaring `.del` bitmap.)
+pub(crate) const SEGMENT_FORMAT_VERSION: u16 = 3;
 
-/// One live row's entry in the segment directory. The row's vector lives at
+/// One row's entry in the segment directory. The row's vector lives at
 /// `row_index × stride` in the `.vec` column; its payload at `(pay_off, pay_len)`
 /// in the `.pay` heap. `row_index` is the entry's position in [`SegmentDir::rows`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,17 +52,15 @@ pub(crate) struct RowEntry {
     pub pay_len: u32,
 }
 
-/// The `.dir` file: the row directory plus the ids tombstoned in this window.
+/// The `.dir` file: the row directory of a sealed segment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SegmentDir {
     /// Schema version of this segment's files.
     pub format_version: u16,
     /// Segment id (matches its [`crate::manifest::SegmentRef`] and file names).
     pub segment_id: u64,
-    /// Live rows sealed into this segment, in `.vec`/`.pay` row order.
+    /// Rows sealed into this segment, in `.vec`/`.pay` row order.
     pub rows: Vec<RowEntry>,
-    /// Ids deleted in this window, removing rows from older segments on replay.
-    pub tombstones: Vec<String>,
 }
 
 /// A row to seal, borrowing its bytes from the engine's active buffer.
@@ -77,13 +82,15 @@ pub(crate) struct PayLoc {
 }
 
 /// A sealed segment opened for reads: `mmap` handles for the vector column and
-/// payload heap, plus the row → payload-location directory.
+/// payload heap, the row → payload-location directory, and the tombstone bitmap.
 pub(crate) struct SealedSegment {
     /// Segment id; names the files and matches the manifest.
     pub seg_id: u64,
     vec: BlockFile,
     pay: BlockFile,
     paylocs: Vec<PayLoc>,
+    // Rows of this segment that are no longer live.
+    dead: RoaringBitmap,
 }
 
 impl SealedSegment {
@@ -109,19 +116,45 @@ impl SealedSegment {
         self.pay
             .read_range(codec, loc.off as usize, loc.len as usize)
     }
+
+    /// Number of rows physically stored in this segment (live and dead).
+    pub(crate) fn row_count(&self) -> u32 {
+        self.paylocs.len() as u32
+    }
+
+    /// Whether row `row` has been tombstoned.
+    pub(crate) fn is_dead(&self, row: u32) -> bool {
+        self.dead.contains(row)
+    }
+
+    /// The number of live (non-tombstoned) rows.
+    pub(crate) fn live_count(&self) -> u64 {
+        u64::from(self.row_count()) - self.dead.len()
+    }
+
+    /// Mark `rows` of this segment as dead, updating the in-memory bitmap. The
+    /// caller persists the merged bitmap with [`write_del`].
+    pub(crate) fn mark_dead(&mut self, rows: &RoaringBitmap) {
+        self.dead |= rows;
+    }
+
+    /// A clone of the current tombstone bitmap, for persisting via [`write_del`].
+    pub(crate) fn dead_bitmap(&self) -> RoaringBitmap {
+        self.dead.clone()
+    }
 }
 
-/// Write a new sealed segment's three files into `seg_dir` and `fsync` each.
+/// Write a new sealed segment's `.vec`, `.pay`, and `.dir` files into `seg_dir`
+/// and `fsync` each. A new segment has no tombstones, so no `.del` is written.
 ///
-/// `rows` are sealed in the given order (row `i` → `.vec` slot `i`); `tombstones`
-/// records ids deleted in this window. The directory is *not* `fsync`'d here —
-/// the engine sequences directory `fsync`s against the manifest swap.
+/// `rows` are sealed in the given order (row `i` → `.vec` slot `i`). The directory
+/// is *not* `fsync`'d here — the engine sequences directory `fsync`s against the
+/// manifest swap.
 pub(crate) fn write_segment(
     seg_dir: &Path,
     segment_id: u64,
     codec: &dyn PageCodec,
     rows: &[SealRow<'_>],
-    tombstones: &[String],
 ) -> Result<()> {
     let mut vec_blob = Vec::new();
     let mut pay_blob = Vec::new();
@@ -140,7 +173,6 @@ pub(crate) fn write_segment(
         format_version: SEGMENT_FORMAT_VERSION,
         segment_id,
         rows: dir_rows,
-        tombstones: tombstones.to_vec(),
     };
     let dir_blob = postcard::to_allocvec(&dir)?;
 
@@ -168,14 +200,46 @@ pub(crate) fn write_segment(
     Ok(())
 }
 
+/// Atomically write a segment's tombstone bitmap to `seg-NNN.del`.
+///
+/// Unlike the immutable `.vec`/`.pay`/`.dir`, the `.del` is rewritten as rows
+/// die, so it is written to a temp file and `rename`d into place — a crash leaves
+/// the previous `.del` (or its absence) intact, never a torn bitmap. The segment
+/// directory is `fsync`'d so the rename is durable.
+pub(crate) fn write_del(
+    seg_dir: &Path,
+    segment_id: u64,
+    codec: &dyn PageCodec,
+    dead: &RoaringBitmap,
+) -> Result<()> {
+    let mut blob = Vec::with_capacity(dead.serialized_size());
+    dead.serialize_into(&mut blob)?;
+    let tmp = del_tmp_path(seg_dir, segment_id);
+    crate::paged::write_paged(&tmp, codec, PageType::Segment, segment_id, &blob)?;
+    let final_path = del_path(seg_dir, segment_id);
+    std::fs::rename(&tmp, &final_path).map_err(|e| CoreError::io(&final_path, e))?;
+    crate::paged::fsync_dir(seg_dir)?;
+    Ok(())
+}
+
+/// Read a segment's tombstone bitmap, or an empty bitmap if no `.del` exists.
+fn read_del(seg_dir: &Path, segment_id: u64, codec: &dyn PageCodec) -> Result<RoaringBitmap> {
+    let path = del_path(seg_dir, segment_id);
+    if !path.exists() {
+        return Ok(RoaringBitmap::new());
+    }
+    let blob = crate::paged::read_paged(&path, codec, PageType::Segment)?;
+    Ok(RoaringBitmap::deserialize_from(&blob[..])?)
+}
+
 /// Open a sealed segment for reads, returning the `mmap`-backed handle together
-/// with the external ids (in row order) and the ids it tombstones — the engine
-/// uses those two lists to (re)build the primary index.
+/// with the external ids in row order — the engine uses them, minus the segment's
+/// dead rows, to (re)build the primary index.
 pub(crate) fn open_segment(
     seg_dir: &Path,
     segment_id: u64,
     codec: &dyn PageCodec,
-) -> Result<(SealedSegment, Vec<String>, Vec<String>)> {
+) -> Result<(SealedSegment, Vec<String>)> {
     let dir_blob =
         crate::paged::read_paged(&dir_path(seg_dir, segment_id), codec, PageType::Segment)?;
     let dir: SegmentDir = postcard::from_bytes(&dir_blob)?;
@@ -187,6 +251,7 @@ pub(crate) fn open_segment(
     }
     let vec = BlockFile::open(&vec_path(seg_dir, segment_id), codec, PageType::Segment)?;
     let pay = BlockFile::open(&pay_path(seg_dir, segment_id), codec, PageType::Segment)?;
+    let dead = read_del(seg_dir, segment_id, codec)?;
 
     let mut ext_ids = Vec::with_capacity(dir.rows.len());
     let mut paylocs = Vec::with_capacity(dir.rows.len());
@@ -203,33 +268,49 @@ pub(crate) fn open_segment(
             vec,
             pay,
             paylocs,
+            dead,
         },
         ext_ids,
-        dir.tombstones,
     ))
 }
 
 /// File name of a segment's vector column.
-fn vec_path(seg_dir: &Path, seg_id: u64) -> std::path::PathBuf {
+fn vec_path(seg_dir: &Path, seg_id: u64) -> PathBuf {
     seg_dir.join(format!("seg-{seg_id:010}.vec"))
 }
 
 /// File name of a segment's payload heap.
-fn pay_path(seg_dir: &Path, seg_id: u64) -> std::path::PathBuf {
+fn pay_path(seg_dir: &Path, seg_id: u64) -> PathBuf {
     seg_dir.join(format!("seg-{seg_id:010}.pay"))
 }
 
 /// File name of a segment's row directory.
-fn dir_path(seg_dir: &Path, seg_id: u64) -> std::path::PathBuf {
+fn dir_path(seg_dir: &Path, seg_id: u64) -> PathBuf {
     seg_dir.join(format!("seg-{seg_id:010}.dir"))
 }
 
+/// File name of a segment's tombstone bitmap.
+fn del_path(seg_dir: &Path, seg_id: u64) -> PathBuf {
+    seg_dir.join(format!("seg-{seg_id:010}.del"))
+}
+
+/// Temp file name used while atomically rewriting a segment's tombstone bitmap.
+fn del_tmp_path(seg_dir: &Path, seg_id: u64) -> PathBuf {
+    seg_dir.join(format!("seg-{seg_id:010}.del.tmp"))
+}
+
 /// Parse the segment id from any of a segment's companion file names
-/// (`seg-NNNNNNNNNN.{vec,pay,dir}`), for garbage-collecting orphans.
+/// (`seg-NNNNNNNNNN.{vec,pay,dir,del}`), for garbage-collecting orphans.
 pub(crate) fn seg_id_of_file(name: &str) -> Option<u64> {
     let stem = name.strip_prefix("seg-")?;
     let dot = stem.find('.')?;
     stem[..dot].parse::<u64>().ok()
+}
+
+/// Whether a file name is a crash-leftover temp file that should always be
+/// removed on recovery.
+pub(crate) fn is_temp_file(name: &str) -> bool {
+    name.ends_with(".tmp")
 }
 
 #[cfg(test)]
@@ -237,12 +318,8 @@ mod tests {
     use super::*;
     use crate::page::PlainCodec;
 
-    #[test]
-    fn segment_roundtrips() {
-        let dir = tempfile::tempdir().unwrap();
-        let seg_dir = dir.path();
-        let stride = 4; // 1-dim f32 rows for the test
-        let rows = vec![
+    fn rows() -> Vec<SealRow<'static>> {
+        vec![
             SealRow {
                 external_id: "a",
                 vector: &[0, 1, 2, 3],
@@ -253,17 +330,25 @@ mod tests {
                 vector: &[4, 5, 6, 7],
                 payload: b"[1,2,3]",
             },
-        ];
-        write_segment(seg_dir, 1, &PlainCodec, &rows, &["old".to_owned()]).unwrap();
-        let (seg, ext_ids, tombstones) = open_segment(seg_dir, 1, &PlainCodec).unwrap();
+        ]
+    }
+
+    #[test]
+    fn segment_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path();
+        write_segment(seg_dir, 1, &PlainCodec, &rows()).unwrap();
+        let (seg, ext_ids) = open_segment(seg_dir, 1, &PlainCodec).unwrap();
         assert_eq!(ext_ids, vec!["a".to_owned(), "b".to_owned()]);
-        assert_eq!(tombstones, vec!["old".to_owned()]);
+        assert_eq!(seg.row_count(), 2);
+        assert_eq!(seg.live_count(), 2);
+        assert!(!seg.is_dead(0));
         assert_eq!(
-            seg.read_vector(&PlainCodec, 0, stride).unwrap(),
+            seg.read_vector(&PlainCodec, 0, 4).unwrap(),
             vec![0, 1, 2, 3]
         );
         assert_eq!(
-            seg.read_vector(&PlainCodec, 1, stride).unwrap(),
+            seg.read_vector(&PlainCodec, 1, 4).unwrap(),
             vec![4, 5, 6, 7]
         );
         assert_eq!(seg.read_payload(&PlainCodec, 0).unwrap(), b"{}");
@@ -271,38 +356,37 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_only_segment_has_empty_columns() {
+    fn tombstone_bitmap_roundtrips_atomically() {
         let dir = tempfile::tempdir().unwrap();
-        write_segment(dir.path(), 5, &PlainCodec, &[], &["gone".to_owned()]).unwrap();
-        let (seg, ext_ids, tombstones) = open_segment(dir.path(), 5, &PlainCodec).unwrap();
-        assert!(ext_ids.is_empty());
-        assert_eq!(tombstones, vec!["gone".to_owned()]);
-        // A tombstone-only segment has empty columns; reading any row errors.
-        assert!(seg.read_payload(&PlainCodec, 0).is_err());
+        let seg_dir = dir.path();
+        write_segment(seg_dir, 1, &PlainCodec, &rows()).unwrap();
+        // Absent .del => no dead rows.
+        let (seg, _) = open_segment(seg_dir, 1, &PlainCodec).unwrap();
+        assert_eq!(seg.live_count(), 2);
+
+        // Persist a tombstone for row 0, then reopen.
+        let mut dead = RoaringBitmap::new();
+        dead.insert(0);
+        write_del(seg_dir, 1, &PlainCodec, &dead).unwrap();
+        assert!(
+            !del_tmp_path(seg_dir, 1).exists(),
+            "temp must be renamed away"
+        );
+
+        let (seg, _) = open_segment(seg_dir, 1, &PlainCodec).unwrap();
+        assert!(seg.is_dead(0));
+        assert!(!seg.is_dead(1));
+        assert_eq!(seg.live_count(), 1);
     }
 
     #[test]
-    fn empty_payloads_roundtrip() {
+    fn empty_segment_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
-        let rows = vec![
-            SealRow {
-                external_id: "a",
-                vector: &[1, 2, 3, 4],
-                payload: b"",
-            },
-            SealRow {
-                external_id: "b",
-                vector: &[5, 6, 7, 8],
-                payload: b"",
-            },
-        ];
-        write_segment(dir.path(), 2, &PlainCodec, &rows, &[]).unwrap();
-        let (seg, _, _) = open_segment(dir.path(), 2, &PlainCodec).unwrap();
-        assert_eq!(seg.read_payload(&PlainCodec, 0).unwrap(), Vec::<u8>::new());
-        assert_eq!(
-            seg.read_vector(&PlainCodec, 1, 4).unwrap(),
-            vec![5, 6, 7, 8]
-        );
+        write_segment(dir.path(), 5, &PlainCodec, &[]).unwrap();
+        let (seg, ext_ids) = open_segment(dir.path(), 5, &PlainCodec).unwrap();
+        assert!(ext_ids.is_empty());
+        assert_eq!(seg.row_count(), 0);
+        assert!(seg.read_payload(&PlainCodec, 0).is_err());
     }
 
     #[test]
@@ -310,7 +394,10 @@ mod tests {
         assert_eq!(seg_id_of_file("seg-0000000007.vec"), Some(7));
         assert_eq!(seg_id_of_file("seg-0000000042.pay"), Some(42));
         assert_eq!(seg_id_of_file("seg-0000000003.dir"), Some(3));
+        assert_eq!(seg_id_of_file("seg-0000000009.del"), Some(9));
         assert_eq!(seg_id_of_file("CURRENT"), None);
         assert_eq!(seg_id_of_file("seg-bogus.vec"), None);
+        assert!(is_temp_file("seg-0000000001.del.tmp"));
+        assert!(!is_temp_file("seg-0000000001.del"));
     }
 }

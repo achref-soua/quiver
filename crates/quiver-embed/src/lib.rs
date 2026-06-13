@@ -379,6 +379,13 @@ impl Database {
         Ok(self.store.checkpoint()?)
     }
 
+    /// Compact every collection with reclaimable space, merging its sealed
+    /// segments and dropping deleted/shadowed rows. Crash-safe; a no-op for
+    /// collections with nothing to reclaim.
+    pub fn compact(&mut self) -> Result<()> {
+        Ok(self.store.compact()?)
+    }
+
     fn handle(&self, name: &str) -> Result<&CollectionHandle> {
         self.collections
             .get(name)
