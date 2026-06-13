@@ -27,12 +27,20 @@ dbg_macro = "deny"
 todo = "warn"
 
 # External dependencies are pinned once here and referenced from crates with
-# `dep = { workspace = true }`. Added as features land; clap is used by the CLI.
+# `dep = { workspace = true }`. Added as features land.
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
+crc32c = "0.6"
 criterion = { version = "0.5", default-features = false, features = [
     "cargo_bench_support",
 ] }
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+# Dev-only dependencies (tests, property tests, fixtures).
+proptest = "1"
+tempfile = "3"
 
 [profile.release]
 lto = "thin"
