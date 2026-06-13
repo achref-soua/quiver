@@ -54,17 +54,22 @@ and competitor-configuration rules are in the methodology.
 
 ## Reproduce
 
+The example builds and serves in two phases, so the frugal **serve-time** RSS can
+be measured on the `serve` process alone:
+
 ```bash
-# SIFTSMALL ships small; for SIFT1M / Deep10M fetch into bench/datasets/ first.
-cargo run --release --example disk_recall -- \
-  bench/datasets/siftsmall/siftsmall_base.fvecs \
-  bench/datasets/siftsmall/siftsmall_query.fvecs \
+# build the encrypted disk index (RAM-heavy, one-time)
+cargo run --release --example disk_recall -- build \
+  bench/datasets/siftsmall/siftsmall_base.fvecs /tmp/sift.qvx
+# serve it (only PQ codes resident) — measure this process's RSS
+cargo run --release --example disk_recall -- serve \
+  /tmp/sift.qvx bench/datasets/siftsmall/siftsmall_query.fvecs \
   bench/datasets/siftsmall/siftsmall_groundtruth.ivecs
 ```
 
-The same example runs at 1 M / 10 M scale (the build is slower); the
-reference-hardware RSS/QPS comparison runs the end-to-end harness in
-[`../../../bench`](../../../bench) against Quiver and the competitors.
+The same example runs at 1 M / 10 M scale (the build is slower). To produce the
+full head-to-head **vs Qdrant and LanceDB on dedicated hardware**, follow the
+[reference-hardware runbook](../reference-hardware-runbook.md).
 
 > Measured on: WSL2 (Linux 6.6, x86-64), release profile, single thread, shared
 > box — recall and footprints are host-independent; throughput and the competitor
