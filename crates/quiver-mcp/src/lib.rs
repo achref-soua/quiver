@@ -134,15 +134,8 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
             let collection = want_str(args, "name")?;
             let dim = want_u64(args, "dim")? as u32;
             let metric = want_metric(args)?;
-            db.create_collection(
-                collection,
-                Descriptor {
-                    dim,
-                    dtype: Dtype::F32,
-                    metric,
-                },
-            )
-            .map_err(|e| e.to_string())?;
+            db.create_collection(collection, Descriptor::new(dim, Dtype::F32, metric))
+                .map_err(|e| e.to_string())?;
             Ok(format!("created collection '{collection}' (dim {dim})"))
         }
         "upsert" => {

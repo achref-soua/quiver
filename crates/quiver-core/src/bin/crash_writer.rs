@@ -28,11 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(c) => c,
         None => store.create_collection(
             "crash",
-            Descriptor {
-                dim: DIM as u32,
-                dtype: Dtype::F32,
-                metric: DistanceMetric::L2,
-            },
+            Descriptor::new(DIM as u32, Dtype::F32, DistanceMetric::L2),
         )?,
     };
 
