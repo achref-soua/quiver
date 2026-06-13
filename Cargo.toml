@@ -39,6 +39,7 @@ quiver-proto = { path = "crates/quiver-proto", version = "0.1" }
 quiver-query = { path = "crates/quiver-query", version = "0.1" }
 quiver-server = { path = "crates/quiver-server", version = "0.1" }
 quiver-simd = { path = "crates/quiver-simd", version = "0.1" }
+quiver-tui = { path = "crates/quiver-tui", version = "0.1" }
 
 anyhow = "1"
 axum = "0.8"
@@ -68,7 +69,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 # AEAD, HKDF-SHA256 per-page subkeys, and zeroized key material. See ADR-0010
 # and docs/security/crypto.md.
 chacha20poly1305 = { version = "0.10", features = ["getrandom"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 crc32c = "0.6"
 hkdf = "0.12"
 sha2 = "0.10"
@@ -88,6 +89,12 @@ tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Retro terminal cockpit (quiver-tui): ratatui renders; crossterm drives input
+# (its version is pinned to the one ratatui 0.29 re-exports so they share a
+# single backend). The `event-stream` feature gives an async input stream.
+crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.29"
 
 # Build-time codegen for the gRPC contract. protoc is vendored so a clean clone
 # builds with no system protobuf compiler installed.

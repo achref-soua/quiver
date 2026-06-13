@@ -10,6 +10,10 @@ ignore = [
     # adversarial format descriptions) is not exercised by deterministic cert
     # generation, and no `time` release that fixes it supports our MSRV (1.85).
     { id = "RUSTSEC-2026-0009", reason = "dev-only (rcgen test certs); no MSRV-1.85-compatible fix; vulnerable path unused" },
+    # `paste` is an *unmaintained* (not vulnerable) compile-time proc-macro pulled
+    # transitively by `ratatui` (the cockpit's renderer). It never ships in the
+    # binary; there is no maintained drop-in at ratatui's pinned version yet.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro via ratatui; compile-time only, not in any artifact" },
 ]
 
 [licenses]

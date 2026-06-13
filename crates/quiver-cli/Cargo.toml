@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 quiver-server = { workspace = true }
+quiver-tui = { workspace = true }
 
 anyhow = { workspace = true }
 clap = { workspace = true }
