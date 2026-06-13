@@ -1,12 +1,40 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Wire types for Quiver: the gRPC service (`tonic`/`prost`), REST DTOs, and the
-//! generated OpenAPI 3.1 document — the single source of truth for the API.
+//! Generated wire types and gRPC service stubs for Quiver (`tonic`/`prost`).
 //!
-//! Status: scaffolding — the `.proto` and DTOs land in Phase 1. Design:
-//! `docs/api/wire-protocol.md` and `docs/api/rest-grpc.md`.
+//! The `.proto` in `proto/quiver.proto` is the source of truth (ADR-0018); this
+//! crate compiles it at build time and re-exports the generated client, server,
+//! and message types under [`v1`]. Design: `docs/api/wire-protocol.md`,
+//! `docs/api/rest-grpc.md`.
+
+/// The `quiver.v1` package: generated messages, `quiver_client`, and
+/// `quiver_server`.
+pub mod v1 {
+    // Generated code is trusted; suppress the workspace's strict lints for it.
+    #![allow(
+        missing_docs,
+        clippy::all,
+        clippy::pedantic,
+        clippy::nursery,
+        clippy::unwrap_used,
+        clippy::expect_used
+    )]
+    include!(concat!(env!("OUT_DIR"), "/quiver.v1.rs"));
+}
 
 #[cfg(test)]
 mod tests {
+    use super::v1;
+
     #[test]
-    fn crate_builds() {}
+    fn generated_types_are_present() {
+        // Construct a couple of generated messages to prove codegen ran.
+        let req = v1::CreateCollectionRequest {
+            name: "demo".to_owned(),
+            dim: 8,
+            metric: v1::Metric::L2 as i32,
+        };
+        assert_eq!(req.dim, 8);
+        let resp = v1::SearchResponse::default();
+        assert!(resp.matches.is_empty());
+    }
 }

@@ -1,0 +1,120 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// The Quiver gRPC contract — the source of truth for the API (ADR-0018). The
+// REST surface mirrors it (docs/api/rest-grpc.md). Phase 1 ships the unary
+// subset; client-streaming Upsert, BatchSearch, key admin, and a structured
+// Filter message are later additions. Filters are carried as JSON bytes
+// (the quiver-query Filter, serialized) in Phase 1.
+
+syntax = "proto3";
+
+package quiver.v1;
+
+service Quiver {
+  rpc CreateCollection(CreateCollectionRequest) returns (Collection);
+  rpc GetCollection(GetCollectionRequest) returns (Collection);
+  rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
+  rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse);
+
+  rpc Upsert(UpsertRequest) returns (UpsertResponse);
+  rpc DeletePoints(DeletePointsRequest) returns (DeletePointsResponse);
+  rpc GetPoints(GetPointsRequest) returns (GetPointsResponse);
+
+  rpc Search(SearchRequest) returns (SearchResponse);
+}
+
+// Distance / similarity metric.
+enum Metric {
+  METRIC_UNSPECIFIED = 0;
+  METRIC_L2 = 1;
+  METRIC_COSINE = 2;
+  METRIC_DOT = 3;
+}
+
+message Collection {
+  string name = 1;
+  uint32 dim = 2;
+  Metric metric = 3;
+  uint64 count = 4;
+}
+
+message CreateCollectionRequest {
+  string name = 1;
+  uint32 dim = 2;
+  Metric metric = 3;
+}
+
+message GetCollectionRequest {
+  string name = 1;
+}
+
+message ListCollectionsRequest {}
+
+message ListCollectionsResponse {
+  repeated Collection collections = 1;
+}
+
+message DeleteCollectionRequest {
+  string name = 1;
+}
+
+message DeleteCollectionResponse {
+  bool existed = 1;
+}
+
+// A point: external id, dense f32 vector, and an opaque (JSON) payload.
+message Point {
+  string id = 1;
+  repeated float vector = 2;
+  bytes payload = 3;
+}
+
+message UpsertRequest {
+  string collection = 1;
+  repeated Point points = 2;
+}
+
+message UpsertResponse {
+  uint64 upserted = 1;
+}
+
+message DeletePointsRequest {
+  string collection = 1;
+  repeated string ids = 2;
+}
+
+message DeletePointsResponse {
+  uint64 deleted = 1;
+}
+
+message GetPointsRequest {
+  string collection = 1;
+  repeated string ids = 2;
+  bool with_vector = 3;
+}
+
+message GetPointsResponse {
+  repeated Point points = 1;
+}
+
+message SearchRequest {
+  string collection = 1;
+  repeated float vector = 2;
+  uint32 k = 3;
+  // JSON-encoded quiver-query Filter; empty = no filter.
+  bytes filter = 4;
+  uint32 ef_search = 5;
+  bool with_payload = 6;
+  bool with_vector = 7;
+}
+
+message Match {
+  string id = 1;
+  float score = 2;
+  bytes payload = 3;
+  repeated float vector = 4;
+}
+
+message SearchResponse {
+  repeated Match matches = 1;
+}
