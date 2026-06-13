@@ -30,6 +30,9 @@ todo = "warn"
 # `dep = { workspace = true }`. Added as features land; clap is used by the CLI.
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }
 
 [profile.release]
 lto = "thin"

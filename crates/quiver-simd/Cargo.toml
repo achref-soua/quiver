@@ -8,5 +8,12 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "distance"
+harness = false
+
 [lints]
 workspace = true
