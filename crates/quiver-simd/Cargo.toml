@@ -8,6 +8,15 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dependencies]
+# Optional: derive serde on `Metric` so trained quantizers (which carry their
+# metric) can be persisted as encrypted index artifacts. Off by default to keep
+# this pure-compute leaf crate dependency-free.
+serde = { workspace = true, optional = true }
+
+[features]
+serde = ["dep:serde"]
+
 [dev-dependencies]
 criterion = { workspace = true }
 

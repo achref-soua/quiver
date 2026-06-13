@@ -1825,6 +1825,8 @@ name = "quiver-index"
 version = "0.1.0"
 dependencies = [
  "quiver-simd",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1884,6 +1886,7 @@ name = "quiver-simd"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "serde",
 ]
 
 [[package]]

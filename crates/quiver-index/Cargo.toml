@@ -9,8 +9,12 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-quiver-simd = { workspace = true }
+quiver-simd = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

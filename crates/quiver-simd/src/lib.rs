@@ -15,6 +15,7 @@ mod avx2;
 
 /// A supported distance / similarity metric over dense vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Metric {
     /// Inner product — higher is more similar.
     Dot,
