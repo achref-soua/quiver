@@ -43,6 +43,7 @@ impl Error {
             }
             Error::Engine(EngineError::Core(CoreError::InvalidArgument(_)))
             | Error::Engine(EngineError::Index(_))
+            | Error::Engine(EngineError::Unsupported(_))
             | Error::Engine(EngineError::Json(_)) => {
                 (StatusCode::BAD_REQUEST, tonic::Code::InvalidArgument)
             }

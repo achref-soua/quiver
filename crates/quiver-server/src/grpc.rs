@@ -5,7 +5,7 @@
 use serde_json::Value;
 use tonic::{Request, Response, Status};
 
-use quiver_embed::DistanceMetric;
+use quiver_embed::{DistanceMetric, IndexKind, IndexSpec};
 use quiver_proto::v1::{
     self,
     quiver_server::{Quiver, QuiverServer},
@@ -60,12 +60,34 @@ fn metric_to_proto(metric: DistanceMetric) -> i32 {
     value as i32
 }
 
+fn index_spec_from_proto(kind: i32, pq_subspaces: Option<u32>) -> IndexSpec {
+    let kind = match v1::IndexKind::try_from(kind) {
+        Ok(v1::IndexKind::Vamana) => IndexKind::Vamana,
+        Ok(v1::IndexKind::DiskVamana) => IndexKind::DiskVamana,
+        Ok(v1::IndexKind::Ivf) => IndexKind::Ivf,
+        _ => IndexKind::Hnsw,
+    };
+    IndexSpec { kind, pq_subspaces }
+}
+
+fn index_kind_to_proto(kind: IndexKind) -> i32 {
+    let value = match kind {
+        IndexKind::Vamana => v1::IndexKind::Vamana,
+        IndexKind::DiskVamana => v1::IndexKind::DiskVamana,
+        IndexKind::Ivf => v1::IndexKind::Ivf,
+        _ => v1::IndexKind::Hnsw,
+    };
+    value as i32
+}
+
 fn collection_to_proto(info: CollectionInfo) -> v1::Collection {
     v1::Collection {
         name: info.name,
         dim: info.dim,
         metric: metric_to_proto(info.metric),
         count: info.count,
+        index: index_kind_to_proto(info.index.kind),
+        pq_subspaces: info.index.pq_subspaces,
     }
 }
 
@@ -107,9 +129,10 @@ impl Quiver for QuiverService {
     ) -> Result<Response<v1::Collection>, Status> {
         self.check_auth(&request)?;
         let req = request.into_inner();
+        let index = index_spec_from_proto(req.index, req.pq_subspaces);
         let info = self
             .state
-            .create_collection(req.name, req.dim, metric_from_proto(req.metric))
+            .create_collection(req.name, req.dim, metric_from_proto(req.metric), index)
             .await
             .map_err(|e| e.to_status())?;
         Ok(Response::new(collection_to_proto(info)))

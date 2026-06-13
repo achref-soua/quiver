@@ -37,7 +37,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Identity, ServerTlsConfig};
 
 use quiver_crypto::AeadCodec;
-use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, SearchParams};
+use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, IndexSpec, SearchParams};
 use quiver_query::Filter;
 
 pub use error::Error;
@@ -157,6 +157,7 @@ pub(crate) struct CollectionInfo {
     pub dim: u32,
     pub metric: DistanceMetric,
     pub count: u64,
+    pub index: IndexSpec,
 }
 
 /// A point to upsert.
@@ -218,8 +219,9 @@ impl AppState {
         name: String,
         dim: u32,
         metric: DistanceMetric,
+        index: IndexSpec,
     ) -> Result<CollectionInfo, Error> {
-        let descriptor = Descriptor::new(dim, Dtype::F32, metric);
+        let descriptor = Descriptor::new(dim, Dtype::F32, metric).with_index(index);
         let owned = name.clone();
         self.run_blocking(move |db| db.create_collection(&owned, descriptor))
             .await?;
@@ -228,6 +230,7 @@ impl AppState {
             dim,
             metric,
             count: 0,
+            index,
         })
     }
 
@@ -243,6 +246,7 @@ impl AppState {
                 dim: descriptor.dim,
                 metric: descriptor.metric,
                 count,
+                index: descriptor.index,
             })
         })
         .await
@@ -259,6 +263,7 @@ impl AppState {
                         dim: descriptor.dim,
                         metric: descriptor.metric,
                         count,
+                        index: descriptor.index,
                     });
                 }
             }

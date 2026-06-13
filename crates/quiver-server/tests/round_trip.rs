@@ -76,7 +76,7 @@ async fn rest_and_grpc_round_trip() {
         .unwrap();
     assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    // --- REST: create collection ---
+    // --- REST: create collection (index defaults to hnsw) ---
     let resp = http
         .post(format!("{base}/v1/collections"))
         .bearer_auth(key)
@@ -85,6 +85,33 @@ async fn rest_and_grpc_round_trip() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["index"], "hnsw");
+
+    // --- REST: the index choice flows through (the memory-frugal disk path) ---
+    let resp = http
+        .post(format!("{base}/v1/collections"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({
+            "name": "frugal", "dim": 4, "metric": "l2",
+            "index": "disk_vamana", "pq_subspaces": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["index"], "disk_vamana");
+    assert_eq!(body["pq_subspaces"], 1);
+    // And inner product with a non-HNSW index is a 400, not a 500.
+    let resp = http
+        .post(format!("{base}/v1/collections"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({"name": "bad", "dim": 4, "metric": "dot", "index": "vamana"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
     // --- REST: upsert points with payloads ---
     let resp = http
