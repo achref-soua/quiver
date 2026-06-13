@@ -97,6 +97,17 @@ with Client("http://127.0.0.1:6333", api_key="…") as q:
     hits = q.search("items", [0.1, 0.2, 0.3], k=5)
 ```
 
+The **TypeScript SDK** lives in [`sdks/typescript`](./sdks/typescript) (`pnpm add quiver-client`), dependency-free over the global `fetch`, and can pick the memory-frugal disk index:
+
+```ts
+import { Client } from "quiver-client";
+
+const q = new Client("http://127.0.0.1:6333", { apiKey: "…" });
+await q.createCollection("items", 3, { metric: "cosine", index: "disk_vamana", pqSubspaces: 1 });
+await q.upsert("items", [{ id: "a", vector: [0.1, 0.2, 0.3], payload: { tag: "x" } }]);
+const hits = await q.search("items", [0.1, 0.2, 0.3], { k: 5 });
+```
+
 An `ann-benchmarks`-style harness lives in [`bench/`](./bench). On **SIFT1M** (1M × 128, L2), in-memory HNSW (`M=16`, `efC=200`), recall@10 vs exact ground truth:
 
 | `ef_search` | 16 | 32 | 64 | 128 | 256 |

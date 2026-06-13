@@ -19,6 +19,10 @@ test:
 test-py:
     cd sdks/python && uv run --quiet pytest -q
 
+# Run the TypeScript SDK suite: typecheck + tests (requires pnpm; fetch is mocked).
+test-ts:
+    cd sdks/typescript && pnpm install --silent && pnpm typecheck && pnpm test
+
 # Format check + clippy with warnings denied.
 lint:
     cargo fmt --all --check
