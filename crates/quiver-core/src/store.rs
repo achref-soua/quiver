@@ -1,29 +1,40 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The storage engine: a durable, crash-safe key/vector store per collection.
+//! The storage engine: a durable, crash-safe vector store per collection.
 //!
 //! A [`Store`] ties the [`crate::wal`] and [`crate::manifest`] primitives,
-//! together with internal sealed segments, into a recoverable engine. The
-//! durability contract (ADR-0005): a mutation is acknowledged only after its WAL
-//! record is `fsync`'d, so an acknowledged write survives `kill -9`.
+//! together with immutable `segment`s in the row-addressed on-disk
+//! format (ADR-0004), into a recoverable engine. The durability contract
+//! (ADR-0005): a mutation is acknowledged only after its WAL record is `fsync`'d,
+//! so an acknowledged write survives `kill -9`.
+//!
+//! ## Memory model
+//! Vectors and payloads live on disk in sealed segments and are read through an
+//! `mmap`, decrypted on demand — only the working set is resident. The engine
+//! keeps in RAM a **primary index** (external id → row location) per collection,
+//! plus the **active buffer**: the rows upserted since the last checkpoint, which
+//! are also durable in the WAL. A read resolves the id to either an active row or
+//! a `(segment, row)` and fetches the bytes from the active buffer or the segment.
 //!
 //! ## Write path
 //! `upsert`/`delete`/`create_collection`/`drop_collection` append a WAL record,
 //! `fsync` it (acknowledgement), then update in-memory state. `checkpoint` seals
-//! the rows changed since the last checkpoint into a new immutable segment per
-//! collection, atomically swaps in a new manifest that references them, rotates
-//! the WAL, and garbage-collects superseded files.
+//! the active buffer (and the window's deletes, as tombstones) into a new
+//! immutable segment per collection, atomically swaps in a manifest that
+//! references them, rotates the WAL, and garbage-collects superseded files.
 //!
 //! ## Recovery (on open)
-//! Read `CURRENT` → load the manifest → rebuild live rows from the referenced
-//! segments → replay every WAL record with `lsn > last_checkpointed_lsn`
-//! idempotently → garbage-collect orphan segment files a crash left between a
-//! flush and the manifest swap. A torn trailing WAL record fails its frame check
-//! and is dropped; it was never acknowledged.
+//! Read `CURRENT` → load the manifest → for each referenced segment, read its
+//! row directory and rebuild the primary index (a later segment shadows an
+//! earlier one for the same id; a segment's tombstones remove ids) → replay every
+//! WAL record with `lsn > last_checkpointed_lsn` idempotently into the active
+//! buffer → garbage-collect orphan segment files a crash left between a flush and
+//! the manifest swap. A torn trailing WAL record fails its frame check and is
+//! dropped; it was never acknowledged.
 //!
 //! ## Concurrency
-//! Phase 1 is a single-writer engine: mutations take `&mut self`, reads take
-//! `&self`. The lock-free MVCC snapshot model (ADR-0006) is introduced with the
-//! index/server integration; until then a server wraps the store in a lock.
+//! Phase 1/2 is a single-writer engine: mutations take `&mut self`, reads take
+//! `&self`. The lock-free MVCC snapshot model (ADR-0006) arrives with the
+//! server integration; until then a server wraps the store in a lock.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -35,7 +46,7 @@ use crate::ids::{CollectionId, Lsn};
 use crate::manifest::{self, CollectionEntry, MANIFEST_FORMAT_VERSION, Manifest, SegmentRef};
 use crate::page::{PageCodec, PlainCodec};
 use crate::paged::fsync_dir;
-use crate::segment::{self, SEGMENT_FORMAT_VERSION, SegmentData, SegmentRow};
+use crate::segment::{self, SealRow, SealedSegment};
 use crate::wal::{self, WalEntry, WalOp, WalWriter};
 
 /// A stored record returned by reads: the decoded vector and opaque payload.
@@ -47,9 +58,18 @@ pub struct Record {
     pub payload: Vec<u8>,
 }
 
-// A live row in memory: raw little-endian vector bytes plus payload bytes.
+// Where a live row's bytes are: in the in-RAM active buffer, or in a sealed
+// segment at `(segment index, row)`.
+#[derive(Debug, Clone, Copy)]
+enum Loc {
+    Active(u32),
+    Sealed { seg: u32, row: u32 },
+}
+
+// A row buffered in RAM since the last checkpoint. Also durable in the WAL until
+// the checkpoint seals it to disk.
 #[derive(Debug, Clone)]
-struct Row {
+struct ActiveRow {
     vector: Vec<u8>,
     payload: Vec<u8>,
 }
@@ -59,32 +79,52 @@ struct CollectionState {
     id: CollectionId,
     name: String,
     descriptor: Descriptor,
-    // Authoritative live rows, used by reads.
-    live: BTreeMap<String, Row>,
-    // Ids upserted since the last checkpoint (each still present in `live`).
-    dirty: BTreeSet<String>,
-    // Ids deleted since the last checkpoint (to tombstone older segments).
+    // Bytes per vector (`dim × dtype size`), cached from the descriptor.
+    stride: usize,
+    // Live external id → location. The authority for `get`/`len`/`scan`; ordered
+    // so `scan` yields ids deterministically.
+    primary: BTreeMap<String, Loc>,
+    // Sealed segments in creation order; `Loc::Sealed.seg` indexes this.
+    sealed: Vec<SealedSegment>,
+    // Manifest segment refs, parallel to `sealed`.
+    segments_meta: Vec<SegmentRef>,
+    // Rows upserted since the last checkpoint; index = `Loc::Active` row.
+    active: Vec<ActiveRow>,
+    // Live external id → its latest active row, for sealing at the next checkpoint.
+    active_index: BTreeMap<String, u32>,
+    // Ids deleted since the last checkpoint, sealed as tombstones next checkpoint.
     deleted: BTreeSet<String>,
-    // Sealed segments, in creation order (mirrors the manifest entry).
-    segments: Vec<SegmentRef>,
 }
 
 impl CollectionState {
     fn new(id: CollectionId, name: String, descriptor: Descriptor) -> Self {
+        let stride = descriptor.stride();
         Self {
             id,
             name,
             descriptor,
-            live: BTreeMap::new(),
-            dirty: BTreeSet::new(),
+            stride,
+            primary: BTreeMap::new(),
+            sealed: Vec::new(),
+            segments_meta: Vec::new(),
+            active: Vec::new(),
+            active_index: BTreeMap::new(),
             deleted: BTreeSet::new(),
-            segments: Vec::new(),
         }
     }
 
     fn has_pending(&self) -> bool {
-        !self.dirty.is_empty() || !self.deleted.is_empty()
+        !self.active_index.is_empty() || !self.deleted.is_empty()
     }
+}
+
+// A segment written during a checkpoint, opened and ready to install after the
+// manifest swap commits.
+struct PendingSegment {
+    seg_ref: SegmentRef,
+    sealed: SealedSegment,
+    // External ids in row order, used to repoint the primary index.
+    ext_ids: Vec<String>,
 }
 
 /// The durable storage engine for one data directory.
@@ -121,28 +161,33 @@ impl Store {
         // 1. Load the manifest (or start empty).
         let mfst = manifest::read_current(dir, codec.as_ref())?.unwrap_or_default();
 
-        // 2. Rebuild live rows from the sealed segments the manifest references.
+        // 2. Rebuild the primary index from the sealed segments the manifest
+        //    references. Segments are applied oldest-to-newest: a later row
+        //    shadows an earlier one for the same id, and tombstones remove ids.
         let mut collections: HashMap<CollectionId, CollectionState> = HashMap::new();
         let mut name_index: HashMap<String, CollectionId> = HashMap::new();
         for entry in &mfst.collections {
             let descriptor = Descriptor::decode(&entry.descriptor)?;
             let mut state = CollectionState::new(entry.id, entry.name.clone(), descriptor);
-            state.segments = entry.segments.clone();
+            state.segments_meta = entry.segments.clone();
+            let seg_dir = segments_dir(dir, entry.id);
             for seg in &entry.segments {
-                let path = segment_path(dir, entry.id, seg.id);
-                let data = segment::read_segment(&path, codec.as_ref())?;
-                for row in data.rows {
-                    state.live.insert(
-                        row.external_id,
-                        Row {
-                            vector: row.vector,
-                            payload: row.payload,
+                let (sealed, ext_ids, tombstones) =
+                    segment::open_segment(&seg_dir, seg.id, codec.as_ref())?;
+                let seg_idx = state.sealed.len() as u32;
+                for (row, ext_id) in ext_ids.into_iter().enumerate() {
+                    state.primary.insert(
+                        ext_id,
+                        Loc::Sealed {
+                            seg: seg_idx,
+                            row: row as u32,
                         },
                     );
                 }
-                for id in data.tombstones {
-                    state.live.remove(&id);
+                for t in &tombstones {
+                    state.primary.remove(t);
                 }
+                state.sealed.push(sealed);
             }
             name_index.insert(state.name.clone(), state.id);
             collections.insert(state.id, state);
@@ -302,14 +347,15 @@ impl Store {
             .collections
             .get_mut(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
-        state.live.insert(
-            external_id.to_owned(),
-            Row {
-                vector: vector_bytes,
-                payload: payload.to_vec(),
-            },
-        );
-        state.dirty.insert(external_id.to_owned());
+        let row = state.active.len() as u32;
+        state.active.push(ActiveRow {
+            vector: vector_bytes,
+            payload: payload.to_vec(),
+        });
+        state.active_index.insert(external_id.to_owned(), row);
+        state
+            .primary
+            .insert(external_id.to_owned(), Loc::Active(row));
         state.deleted.remove(external_id);
         Ok(lsn)
     }
@@ -320,7 +366,7 @@ impl Store {
             .collections
             .get(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?
-            .live
+            .primary
             .contains_key(external_id);
         if !existed {
             return Ok(false);
@@ -341,8 +387,8 @@ impl Store {
             .collections
             .get_mut(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
-        state.live.remove(external_id);
-        state.dirty.remove(external_id);
+        state.primary.remove(external_id);
+        state.active_index.remove(external_id);
         state.deleted.insert(external_id.to_owned());
         Ok(true)
     }
@@ -353,10 +399,10 @@ impl Store {
             .collections
             .get(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
-        Ok(state.live.get(external_id).map(|row| Record {
-            vector: le_bytes_to_f32(&row.vector),
-            payload: row.payload.clone(),
-        }))
+        match state.primary.get(external_id).copied() {
+            Some(loc) => Ok(Some(self.record_at(state, loc)?)),
+            None => Ok(None),
+        }
     }
 
     /// Iterate every live `(external_id, record)` in a collection, in id order.
@@ -366,19 +412,39 @@ impl Store {
             .collections
             .get(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
-        Ok(state
-            .live
-            .iter()
-            .map(|(id, row)| {
-                (
-                    id.clone(),
-                    Record {
-                        vector: le_bytes_to_f32(&row.vector),
-                        payload: row.payload.clone(),
-                    },
-                )
-            })
-            .collect())
+        let mut out = Vec::with_capacity(state.primary.len());
+        for (id, &loc) in &state.primary {
+            out.push((id.clone(), self.record_at(state, loc)?));
+        }
+        Ok(out)
+    }
+
+    // Materialize the record at `loc`, reading from the active buffer or the
+    // sealed segment (decrypting and CRC-checking the touched pages).
+    fn record_at(&self, state: &CollectionState, loc: Loc) -> Result<Record> {
+        match loc {
+            Loc::Active(r) => {
+                let row = state
+                    .active
+                    .get(r as usize)
+                    .ok_or_else(|| CoreError::MalformedPage(format!("dangling active row {r}")))?;
+                Ok(Record {
+                    vector: le_bytes_to_f32(&row.vector),
+                    payload: row.payload.clone(),
+                })
+            }
+            Loc::Sealed { seg, row } => {
+                let segment = state.sealed.get(seg as usize).ok_or_else(|| {
+                    CoreError::MalformedPage(format!("dangling segment index {seg}"))
+                })?;
+                let vector_bytes = segment.read_vector(self.codec.as_ref(), row, state.stride)?;
+                let payload = segment.read_payload(self.codec.as_ref(), row)?;
+                Ok(Record {
+                    vector: le_bytes_to_f32(&vector_bytes),
+                    payload,
+                })
+            }
+        }
     }
 
     /// The id of a collection by name, if it exists.
@@ -420,7 +486,7 @@ impl Store {
             .collections
             .get(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?
-            .live
+            .primary
             .len())
     }
 
@@ -448,57 +514,65 @@ impl Store {
         }
         let mut cids: Vec<CollectionId> = self.collections.keys().copied().collect();
         cids.sort();
-
-        // Phase A: write new segment files for collections with pending changes.
         let segment_lsn_low = self.last_checkpointed_lsn.next();
-        let mut new_segments: HashMap<CollectionId, SegmentRef> = HashMap::new();
+
+        // Phase A: write a new segment file set for each collection with pending
+        // changes, then re-open it (mmap) ready to install after the swap.
+        let mut pending: HashMap<CollectionId, PendingSegment> = HashMap::new();
         for &cid in &cids {
             if !self.collections[&cid].has_pending() {
                 continue;
             }
             let seg_id = self.next_segment_id;
             self.next_segment_id += 1;
-
-            let (rows, tombstones): (Vec<SegmentRow>, Vec<String>) = {
-                let state = &self.collections[&cid];
-                let rows = state
-                    .dirty
-                    .iter()
-                    .filter_map(|id| {
-                        state.live.get(id).map(|row| SegmentRow {
-                            external_id: id.clone(),
-                            vector: row.vector.clone(),
-                            payload: row.payload.clone(),
-                        })
-                    })
-                    .collect();
-                let tombstones = state.deleted.iter().cloned().collect();
-                (rows, tombstones)
-            };
-            let row_count = rows.len() as u64;
-            let data = SegmentData {
-                format_version: SEGMENT_FORMAT_VERSION,
-                segment_id: seg_id,
-                rows,
-                tombstones,
-            };
             let seg_dir = segments_dir(&self.dir, cid);
             fs::create_dir_all(&seg_dir).map_err(|e| CoreError::io(&seg_dir, e))?;
-            let path = seg_dir.join(segment_file_name(seg_id));
-            segment::write_segment(&path, self.codec.as_ref(), &data)?;
-            // Make the new segment file and its parent directories durable
-            // before the manifest references it.
+
+            // Seal the active rows (in deterministic id order) and the window's
+            // deletes (as tombstones). The borrow of `self.collections` ends with
+            // this block, before the commit phase mutates it.
+            let row_count = {
+                let state = &self.collections[&cid];
+                let seal_rows: Vec<SealRow<'_>> = state
+                    .active_index
+                    .iter()
+                    .map(|(id, &row)| SealRow {
+                        external_id: id,
+                        vector: &state.active[row as usize].vector,
+                        payload: &state.active[row as usize].payload,
+                    })
+                    .collect();
+                let tombstones: Vec<String> = state.deleted.iter().cloned().collect();
+                segment::write_segment(
+                    &seg_dir,
+                    seg_id,
+                    self.codec.as_ref(),
+                    &seal_rows,
+                    &tombstones,
+                )?;
+                seal_rows.len() as u64
+            };
+
+            // Make the new files and their parent directories durable before the
+            // manifest references them.
             fsync_dir(&seg_dir)?;
             fsync_dir(&collection_dir(&self.dir, cid))?;
             fsync_dir(&self.dir.join("collections"))?;
             fsync_dir(&self.dir)?;
-            new_segments.insert(
+
+            let (sealed, ext_ids, _tombstones) =
+                segment::open_segment(&seg_dir, seg_id, self.codec.as_ref())?;
+            pending.insert(
                 cid,
-                SegmentRef {
-                    id: seg_id,
-                    row_count,
-                    lsn_low: segment_lsn_low,
-                    lsn_high: last_lsn,
+                PendingSegment {
+                    seg_ref: SegmentRef {
+                        id: seg_id,
+                        row_count,
+                        lsn_low: segment_lsn_low,
+                        lsn_high: last_lsn,
+                    },
+                    sealed,
+                    ext_ids,
                 },
             );
         }
@@ -508,9 +582,9 @@ impl Store {
         let mut entries = Vec::with_capacity(cids.len());
         for &cid in &cids {
             let state = &self.collections[&cid];
-            let mut segs = state.segments.clone();
-            if let Some(seg) = new_segments.get(&cid) {
-                segs.push(seg.clone());
+            let mut segs = state.segments_meta.clone();
+            if let Some(p) = pending.get(&cid) {
+                segs.push(p.seg_ref.clone());
             }
             entries.push(CollectionEntry {
                 id: state.id,
@@ -533,11 +607,26 @@ impl Store {
         self.manifest_version = new_version;
         self.last_checkpointed_lsn = last_lsn;
         for &cid in &cids {
-            if let Some(seg) = new_segments.remove(&cid)
+            if let Some(p) = pending.remove(&cid)
                 && let Some(state) = self.collections.get_mut(&cid)
             {
-                state.segments.push(seg);
-                state.dirty.clear();
+                // Every active id now lives in the new segment; repoint it. Old
+                // sealed rows for updated ids are left shadowed (compaction
+                // reclaims them, PR 2).
+                let seg_idx = state.sealed.len() as u32;
+                for (row, ext_id) in p.ext_ids.into_iter().enumerate() {
+                    state.primary.insert(
+                        ext_id,
+                        Loc::Sealed {
+                            seg: seg_idx,
+                            row: row as u32,
+                        },
+                    );
+                }
+                state.sealed.push(p.sealed);
+                state.segments_meta.push(p.seg_ref);
+                state.active.clear();
+                state.active_index.clear();
                 state.deleted.clear();
             }
         }
@@ -566,8 +655,9 @@ impl Store {
     }
 }
 
-// Apply a recovered WAL record to the in-memory state during open. Upserts and
-// deletes are marked dirty/deleted so the next checkpoint re-seals them.
+// Apply a recovered WAL record to the in-memory state during open. Upserts land
+// in the active buffer (and are re-sealed at the next checkpoint); deletes remove
+// from the primary index and are recorded for tombstoning.
 fn apply_wal_entry(
     collections: &mut HashMap<CollectionId, CollectionState>,
     name_index: &mut HashMap<String, CollectionId>,
@@ -598,14 +688,13 @@ fn apply_wal_entry(
             payload,
         } => {
             if let Some(state) = collections.get_mut(collection_id) {
-                state.live.insert(
-                    external_id.clone(),
-                    Row {
-                        vector: vector.clone(),
-                        payload: payload.clone(),
-                    },
-                );
-                state.dirty.insert(external_id.clone());
+                let row = state.active.len() as u32;
+                state.active.push(ActiveRow {
+                    vector: vector.clone(),
+                    payload: payload.clone(),
+                });
+                state.active_index.insert(external_id.clone(), row);
+                state.primary.insert(external_id.clone(), Loc::Active(row));
                 state.deleted.remove(external_id);
             }
         }
@@ -614,13 +703,13 @@ fn apply_wal_entry(
             external_id,
         } => {
             if let Some(state) = collections.get_mut(collection_id) {
-                state.live.remove(external_id);
-                state.dirty.remove(external_id);
+                state.primary.remove(external_id);
+                state.active_index.remove(external_id);
                 state.deleted.insert(external_id.clone());
             }
         }
         // The manifest is the authoritative checkpoint record; explicit
-        // Checkpoint WAL records are not emitted in Phase 1 and are a no-op here.
+        // Checkpoint WAL records are not emitted and are a no-op here.
         WalOp::Checkpoint { .. } => {}
     }
     Ok(())
@@ -665,7 +754,7 @@ fn gc_orphan_segments(dir: &Path, mfst: &Manifest) -> Result<()> {
         for seg in fs::read_dir(&seg_dir).map_err(|e| CoreError::io(&seg_dir, e))? {
             let seg = seg.map_err(|e| CoreError::io(&seg_dir, e))?;
             let path = seg.path();
-            let Some(seg_id) = seg.file_name().to_str().and_then(parse_segment_file_name) else {
+            let Some(seg_id) = seg.file_name().to_str().and_then(segment::seg_id_of_file) else {
                 continue;
             };
             if !referenced.contains(&(cid, seg_id)) {
@@ -690,20 +779,6 @@ fn collection_dir(dir: &Path, cid: CollectionId) -> PathBuf {
 
 fn segments_dir(dir: &Path, cid: CollectionId) -> PathBuf {
     collection_dir(dir, cid).join("segments")
-}
-
-fn segment_file_name(seg_id: u64) -> String {
-    format!("seg-{seg_id:010}.seg")
-}
-
-fn parse_segment_file_name(name: &str) -> Option<u64> {
-    name.strip_prefix("seg-")
-        .and_then(|s| s.strip_suffix(".seg"))
-        .and_then(|s| s.parse::<u64>().ok())
-}
-
-fn segment_path(dir: &Path, cid: CollectionId, seg_id: u64) -> PathBuf {
-    segments_dir(dir, cid).join(segment_file_name(seg_id))
 }
 
 fn wal_file_path(wal_dir: &Path, seq: u64) -> PathBuf {
@@ -754,6 +829,11 @@ mod tests {
 
     fn open(dir: &Path) -> Store {
         Store::open(dir).unwrap()
+    }
+
+    // Path to a segment's row-directory file, for corruption/orphan tests.
+    fn seg_dir_file(dir: &Path, cid: CollectionId, seg_id: u64) -> PathBuf {
+        segments_dir(dir, cid).join(format!("seg-{seg_id:010}.dir"))
     }
 
     #[test]
@@ -892,6 +972,27 @@ mod tests {
     }
 
     #[test]
+    fn update_within_one_window_seals_latest() {
+        // Re-upsert the same id several times before any checkpoint: only the
+        // latest active row must be sealed and recoverable.
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut s = open(tmp.path());
+            let c = s.create_collection("c", desc()).unwrap();
+            s.upsert(c, "a", &[1.0; 4], b"v1").unwrap();
+            s.upsert(c, "a", &[2.0; 4], b"v2").unwrap();
+            s.upsert(c, "a", &[3.0; 4], b"v3").unwrap();
+            s.checkpoint().unwrap();
+        }
+        let s = open(tmp.path());
+        let c = s.collection_id("c").unwrap();
+        assert_eq!(s.len(c).unwrap(), 1);
+        let got = s.get(c, "a").unwrap().unwrap();
+        assert_eq!(got.vector, vec![3.0; 4]);
+        assert_eq!(got.payload, b"v3");
+    }
+
+    #[test]
     fn dropped_collection_is_gone_after_reopen() {
         let tmp = tempfile::tempdir().unwrap();
         {
@@ -919,7 +1020,7 @@ mod tests {
             s.checkpoint().unwrap();
         }
         // Drop a stray segment file the manifest does not reference.
-        let stray = segment_path(tmp.path(), cid, 9999);
+        let stray = segments_dir(tmp.path(), cid).join("seg-0000009999.vec");
         fs::write(&stray, b"junk").unwrap();
         assert!(stray.exists());
         let _s = open(tmp.path());
@@ -937,10 +1038,13 @@ mod tests {
             s.upsert(c, "a", &[1.0; 4], b"{}").unwrap();
             s.checkpoint().unwrap();
         }
-        // Corrupt the sealed segment file (segment id 0).
-        let path = segment_path(tmp.path(), cid, 0);
+        // Corrupt the sealed segment's row directory (read and verified at open).
+        // Flip a byte in page 0's live body (the 8-byte length prefix), which the
+        // CRC covers — a small directory's postcard body does not reach far into
+        // the 16 KiB page, so a deep offset would land in uncovered padding.
+        let path = seg_dir_file(tmp.path(), cid, 0);
         let mut bytes = fs::read(&path).unwrap();
-        bytes[64] ^= 0xFF;
+        bytes[33] ^= 0xFF;
         fs::write(&path, &bytes).unwrap();
         assert!(matches!(
             Store::open(tmp.path()),
@@ -971,5 +1075,50 @@ mod tests {
         let s = open(tmp.path());
         let c = s.collection_id("c").unwrap();
         assert_eq!(s.len(c).unwrap(), 3); // the 3 acked upserts recovered intact
+    }
+
+    #[test]
+    fn reads_served_from_disk_after_checkpoint() {
+        // After a checkpoint the active buffer is cleared, so a get must come
+        // from the sealed segment's mmap'd columns — exercising the disk path.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = open(tmp.path());
+        let c = s.create_collection("c", desc()).unwrap();
+        s.upsert(c, "a", &[1.0, 2.0, 3.0, 4.0], br#"{"k":1}"#)
+            .unwrap();
+        s.checkpoint().unwrap();
+        let got = s.get(c, "a").unwrap().unwrap();
+        assert_eq!(got.vector, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(got.payload, br#"{"k":1}"#);
+    }
+
+    #[test]
+    fn high_dim_vectors_straddle_pages() {
+        // A dimensionality whose stride does not divide the page body, forcing
+        // vectors to straddle 16 KiB block boundaries in the .vec column.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = open(tmp.path());
+        let dim = 1000usize; // stride = 4000 B; ~4 vectors per 16352-B page body
+        let c = s
+            .create_collection(
+                "c",
+                Descriptor::new(dim as u32, Dtype::F32, DistanceMetric::L2),
+            )
+            .unwrap();
+        for i in 0..20u32 {
+            let v: Vec<f32> = (0..dim).map(|j| (i as f32) * 1000.0 + j as f32).collect();
+            s.upsert(c, &format!("k{i}"), &v, b"{}").unwrap();
+        }
+        s.checkpoint().unwrap();
+        let s = open(tmp.path());
+        let c = s.collection_id("c").unwrap();
+        for i in 0..20u32 {
+            let got = s.get(c, &format!("k{i}")).unwrap().unwrap();
+            let want: Vec<f32> = (0..dim).map(|j| (i as f32) * 1000.0 + j as f32).collect();
+            assert_eq!(
+                got.vector, want,
+                "vector k{i} mismatch after straddling read"
+            );
+        }
     }
 }

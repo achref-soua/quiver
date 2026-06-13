@@ -20,6 +20,7 @@
 //! - [`descriptor`] — collection schema; [`ids`] — typed [`ids::Lsn`] /
 //!   [`ids::CollectionId`].
 
+mod blockfile;
 pub mod descriptor;
 pub mod error;
 pub mod ids;
