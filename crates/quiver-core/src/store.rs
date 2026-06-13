@@ -393,6 +393,27 @@ impl Store {
         self.collections.get(&collection).map(|s| &s.descriptor)
     }
 
+    /// A borrow of the page codec, for sealing one-off bytes with the store's
+    /// key (e.g. writing a disk-resident index artifact, ADR-0019).
+    #[must_use]
+    pub fn codec_ref(&self) -> &dyn PageCodec {
+        self.codec.as_ref()
+    }
+
+    /// A clone of the page codec, for a component that needs to own its own
+    /// handle (e.g. opening a disk-resident index that `mmap`s its files).
+    #[must_use]
+    pub fn codec_clone(&self) -> Box<dyn PageCodec> {
+        self.codec.clone_box()
+    }
+
+    /// The directory that holds a collection's index artifacts
+    /// (`<data_dir>/collections/<id>/index`). Not created by this call.
+    #[must_use]
+    pub fn index_dir(&self, collection: CollectionId) -> PathBuf {
+        collection_dir(&self.dir, collection).join("index")
+    }
+
     /// The number of live rows in a collection.
     pub fn len(&self, collection: CollectionId) -> Result<usize> {
         Ok(self

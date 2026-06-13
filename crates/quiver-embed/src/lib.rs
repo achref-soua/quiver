@@ -26,7 +26,8 @@ use std::path::Path;
 
 use quiver_core::{CollectionId, Store};
 use quiver_index::{
-    Hnsw, HnswConfig, Index, Ivf, IvfConfig, Metric, Neighbor, Vamana, VamanaConfig,
+    DiskSearchParams, DiskVamana, Hnsw, HnswConfig, Index, Ivf, IvfConfig, Metric, Neighbor,
+    ProductQuantizer, Vamana, VamanaConfig,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -46,6 +47,9 @@ pub enum Error {
     /// An error from the vector index.
     #[error(transparent)]
     Index(#[from] quiver_index::IndexError),
+    /// An error from the disk-resident index (build, open, or query).
+    #[error(transparent)]
+    Disk(#[from] quiver_index::DiskError),
     /// A payload could not be (de)serialized as JSON.
     #[error("payload json error: {0}")]
     Json(#[from] serde_json::Error),
@@ -111,22 +115,25 @@ enum CollectionIndex {
     Hnsw(Hnsw),
     Vamana(Option<Vamana>),
     Ivf(Option<Ivf>),
+    // The disk-resident DiskANN index: PQ codes in RAM, graph + full vectors on
+    // (encrypted) SSD, exact re-rank (ADR-0019).
+    Disk(Option<DiskVamana>),
 }
 
 impl CollectionIndex {
     // Search, mapping the generic `ef` knob onto each index's search width.
-    fn search(
-        &self,
-        query: &[f32],
-        k: usize,
-        ef: usize,
-    ) -> std::result::Result<Vec<Neighbor>, quiver_index::IndexError> {
-        match self {
-            CollectionIndex::Hnsw(h) => h.search(query, k, ef),
-            CollectionIndex::Vamana(Some(g)) => g.search(query, k, ef),
-            CollectionIndex::Ivf(Some(i)) => i.search(query, k, ef),
-            CollectionIndex::Vamana(None) | CollectionIndex::Ivf(None) => Ok(Vec::new()),
-        }
+    fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<Neighbor>> {
+        Ok(match self {
+            CollectionIndex::Hnsw(h) => h.search(query, k, ef)?,
+            CollectionIndex::Vamana(Some(g)) => g.search(query, k, ef)?,
+            CollectionIndex::Ivf(Some(i)) => i.search(query, k, ef)?,
+            CollectionIndex::Disk(Some(d)) => {
+                d.search(query, k, &DiskSearchParams { l_search: ef })?
+            }
+            CollectionIndex::Vamana(None)
+            | CollectionIndex::Ivf(None)
+            | CollectionIndex::Disk(None) => Vec::new(),
+        })
     }
 }
 
@@ -390,12 +397,13 @@ fn to_index_metric(metric: DistanceMetric) -> Metric {
 // Reject index/metric combinations the engine cannot serve.
 fn validate_index(descriptor: &Descriptor) -> Result<()> {
     match descriptor.index.kind {
-        IndexKind::DiskVamana => Err(Error::Unsupported(
-            "the disk-resident index is not yet available in this build; use vamana or ivf",
-        )),
-        IndexKind::Vamana | IndexKind::Ivf if descriptor.metric == DistanceMetric::Dot => Err(
-            Error::Unsupported("vamana and ivf support l2 and cosine; use hnsw for dot"),
-        ),
+        IndexKind::Vamana | IndexKind::Ivf | IndexKind::DiskVamana
+            if descriptor.metric == DistanceMetric::Dot =>
+        {
+            Err(Error::Unsupported(
+                "vamana, ivf, and the disk index support l2 and cosine; use hnsw for dot",
+            ))
+        }
         _ => Ok(()),
     }
 }
@@ -403,7 +411,8 @@ fn validate_index(descriptor: &Descriptor) -> Result<()> {
 // An empty index of the kind the descriptor selects. Batch kinds start unbuilt.
 fn empty_index(descriptor: &Descriptor) -> CollectionIndex {
     match descriptor.index.kind {
-        IndexKind::Vamana | IndexKind::DiskVamana => CollectionIndex::Vamana(None),
+        IndexKind::Vamana => CollectionIndex::Vamana(None),
+        IndexKind::DiskVamana => CollectionIndex::Disk(None),
         IndexKind::Ivf => CollectionIndex::Ivf(None),
         _ => CollectionIndex::Hnsw(Hnsw::new(
             descriptor.dim as usize,
@@ -413,20 +422,43 @@ fn empty_index(descriptor: &Descriptor) -> CollectionIndex {
     }
 }
 
+// A product-quantization subspace count that divides `dim`, targeting roughly
+// eight dimensions per subspace; falls back to one whole-vector codebook.
+fn default_pq_m(dim: usize) -> usize {
+    let target = (dim / 8).max(1);
+    (1..=target)
+        .rev()
+        .find(|&m| dim.is_multiple_of(m))
+        .unwrap_or(1)
+}
+
 // Build the descriptor's index over `ids` (internal 0..n) and their flat vectors.
-fn build_index(descriptor: &Descriptor, ids: &[u64], flat: &[f32]) -> Result<CollectionIndex> {
+// Fixed seed for codebook training, so a collection's disk index is reproducible.
+const PQ_SEED: u64 = 0x5176_5044_5141_5453;
+// The disk index artifact, overwritten in place each rebuild; the caller drops
+// the previous handle (unmapping the file) first.
+const DISK_INDEX_FILE: &str = "vamana.qvx";
+
+fn build_index(
+    store: &Store,
+    cid: CollectionId,
+    descriptor: &Descriptor,
+    ids: &[u64],
+    flat: &[f32],
+) -> Result<CollectionIndex> {
     let dim = descriptor.dim as usize;
     let metric = to_index_metric(descriptor.metric);
     Ok(match descriptor.index.kind {
-        // DiskVamana is gated at creation; until its disk wiring lands it would
-        // build the in-memory Vamana graph (same recall, not yet frugal).
-        IndexKind::Vamana | IndexKind::DiskVamana => CollectionIndex::Vamana(Some(Vamana::build(
+        IndexKind::Vamana => CollectionIndex::Vamana(Some(Vamana::build(
             ids,
             flat,
             dim,
             metric,
             VamanaConfig::default(),
         )?)),
+        IndexKind::DiskVamana => {
+            CollectionIndex::Disk(Some(build_disk_index(store, cid, descriptor, ids, flat)?))
+        }
         IndexKind::Ivf => {
             let cfg = IvfConfig {
                 quantization: descriptor.index.pq_subspaces.map(|m| m as usize),
@@ -444,6 +476,30 @@ fn build_index(descriptor: &Descriptor, ids: &[u64], flat: &[f32]) -> Result<Col
     })
 }
 
+// Build the Vamana graph + PQ codebook, write the encrypted disk artifact under
+// the collection's index dir with the store's codec, and open it for queries.
+fn build_disk_index(
+    store: &Store,
+    cid: CollectionId,
+    descriptor: &Descriptor,
+    ids: &[u64],
+    flat: &[f32],
+) -> Result<DiskVamana> {
+    let dim = descriptor.dim as usize;
+    let metric = to_index_metric(descriptor.metric);
+    let graph = Vamana::build(ids, flat, dim, metric, VamanaConfig::default())?;
+    let m = descriptor
+        .index
+        .pq_subspaces
+        .map_or_else(|| default_pq_m(dim), |x| x as usize);
+    let pq = ProductQuantizer::train(flat, ids.len(), dim, m, metric, PQ_SEED)?;
+    let dir = store.index_dir(cid);
+    std::fs::create_dir_all(&dir).map_err(quiver_index::DiskError::Io)?;
+    let path = dir.join(DISK_INDEX_FILE);
+    quiver_index::disk::write(&path, &graph, &pq, store.codec_ref())?;
+    Ok(DiskVamana::open(&path, store.codec_clone())?)
+}
+
 // Rebuild a collection's index from the store's current live rows.
 fn rebuild_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
     let mut int_to_ext = Vec::new();
@@ -456,7 +512,10 @@ fn rebuild_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
         int_to_ext.push(ext_id);
     }
     let ids: Vec<u64> = (0..int_to_ext.len() as u64).collect();
-    handle.index = build_index(&handle.descriptor, &ids, &flat)?;
+    // Drop the previous index before rebuilding: a disk index `mmap`s a file we
+    // are about to overwrite in place, and the mapping assumes an immutable file.
+    handle.index = empty_index(&handle.descriptor);
+    handle.index = build_index(store, handle.id, &handle.descriptor, &ids, &flat)?;
     handle.int_to_ext = int_to_ext;
     handle.ext_to_int = ext_to_int;
     handle.stale = false;
@@ -693,10 +752,67 @@ mod tests {
             db.create_collection("a", dot_vamana),
             Err(Error::Unsupported(_))
         ));
-        // The disk-resident index is gated until its wiring lands.
+        // ...nor does the disk-resident index.
+        let dot_disk = Descriptor::new(4, Dtype::F32, DistanceMetric::Dot).with_index(IndexSpec {
+            kind: IndexKind::DiskVamana,
+            pq_subspaces: None,
+        });
         assert!(matches!(
-            db.create_collection("b", desc_with(IndexKind::DiskVamana)),
+            db.create_collection("b", dot_disk),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    // Recursively check whether a file named `name` exists under `dir`.
+    fn contains_file(dir: &Path, name: &str) -> bool {
+        std::fs::read_dir(dir).is_ok_and(|rd| {
+            rd.flatten().any(|e| {
+                let p = e.path();
+                if p.is_dir() {
+                    contains_file(&p, name)
+                } else {
+                    p.file_name().is_some_and(|f| f == name)
+                }
+            })
+        })
+    }
+
+    #[test]
+    fn disk_index_collection_searches_persists_and_writes_an_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut db = open(tmp.path());
+            db.create_collection("d", desc_with(IndexKind::DiskVamana))
+                .unwrap();
+            for i in 0..40u32 {
+                db.upsert(
+                    "d",
+                    &format!("p{i}"),
+                    &[i as f32, 0.0, 0.0, 0.0],
+                    &json!({}),
+                )
+                .unwrap();
+            }
+            let res = db
+                .search("d", &[7.0, 0.0, 0.0, 0.0], &SearchParams::default())
+                .unwrap();
+            assert_eq!(res[0].id, "p7");
+            db.checkpoint().unwrap();
+        }
+        // The encrypted disk artifact was written under the collection's index dir.
+        assert!(
+            contains_file(tmp.path(), "vamana.qvx"),
+            "disk index file missing"
+        );
+        // Reopening rebuilds and re-opens the disk index; search still works.
+        let mut db = open(tmp.path());
+        assert_eq!(
+            db.descriptor("d").unwrap().index.kind,
+            IndexKind::DiskVamana
+        );
+        let res = db
+            .search("d", &[7.0, 0.0, 0.0, 0.0], &SearchParams::default())
+            .unwrap();
+        assert_eq!(res[0].id, "p7");
     }
 }

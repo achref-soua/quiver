@@ -228,6 +228,12 @@ pub trait PageCodec: Send + Sync {
     /// [`PageCodec::block_size`] bytes.
     fn open(&self, page_id: u64, block: &[u8], out: &mut [u8; PAGE_SIZE]) -> Result<()>;
 
+    /// Clone this codec into a new boxed instance. A codec holds only key
+    /// material (or nothing), so a clone shares the same keys — this lets a
+    /// component that needs its own handle, such as a disk-resident index sealing
+    /// its own files, reuse the store's codec (ADR-0019).
+    fn clone_box(&self) -> Box<dyn PageCodec>;
+
     /// Seal a variable-length record — a WAL frame payload — into a
     /// self-describing on-disk blob. The default is the identity transform used
     /// by [`PlainCodec`]; an AEAD codec overrides it to return
@@ -274,6 +280,10 @@ impl PageCodec for PlainCodec {
         }
         out.copy_from_slice(block);
         Ok(())
+    }
+
+    fn clone_box(&self) -> Box<dyn PageCodec> {
+        Box::new(*self)
     }
 }
 

@@ -558,6 +558,9 @@ mod tests {
             }
             Ok(())
         }
+        fn clone_box(&self) -> Box<dyn PageCodec> {
+            Box::new(XorCodec(self.0))
+        }
     }
 
     fn build_disk(
