@@ -556,6 +556,14 @@ version = "0.1.0"
 [[package]]
 name = "quiver-embed"
 version = "0.1.0"
+dependencies = [
+ "quiver-core",
+ "quiver-index",
+ "quiver-query",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "quiver-index"
@@ -576,6 +584,10 @@ version = "0.1.0"
 [[package]]
 name = "quiver-query"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "quiver-server"
