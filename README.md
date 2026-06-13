@@ -1,9 +1,78 @@
+<div align="center">
+
 # Quiver
 
-The first security-first vector database — client-side-encrypted, memory-frugal approximate nearest-neighbor search that runs on a laptop, with a retro terminal cockpit.
+**The security-first vector database.** Client-side-encryptable, memory-frugal approximate-nearest-neighbour search that runs on a laptop — with a retro terminal cockpit.
 
-> Under active development. Quickstart, benchmarks, and full documentation land with the first release.
+[![license](https://img.shields.io/github/license/achref-soua/quiver?color=blue)](./LICENSE)
+[![rust](https://img.shields.io/badge/rust-stable-orange)](./rust-toolchain.toml)
+[![CI](https://img.shields.io/badge/CI-manual%20dispatch-informational)](.github/workflows)
+[![status](https://img.shields.io/badge/status-alpha%20·%20phase%201-red)](./docs/roadmap.md)
+[![stars](https://img.shields.io/github/stars/achref-soua/quiver?style=flat)](https://github.com/achref-soua/quiver/stargazers)
 
-## License
+</div>
 
-[AGPL-3.0](./LICENSE)
+> **Status: alpha — Phase 1 in progress.** The design is complete and reviewed (see [`docs/`](./docs)); the engine is being implemented. The TUI cast and benchmark table land with `v0.1.0`. Every performance/memory claim in this README will be backed by a reproducible benchmark — until then, this section stays empty rather than guess.
+
+## Why Quiver
+
+Native-Rust vector databases already exist; Quiver is not trying to out-scale Milvus or out-feature Qdrant. Its defensible edge is the **combination** of three things, executed well:
+
+- **Security-first, by default** — encryption-at-rest is on out of the box; payloads can be client-side-encrypted so the server never sees them; API-key scopes, RBAC, tenant isolation, audit, and crypto-shredding. Only audited cryptography (`rustls`, RustCrypto/`ring`) — never a home-grown primitive.
+- **Memory frugality** — a disk-resident graph index (DiskANN/Vamana) plus quantization (product / scalar / binary) serve large datasets from a laptop's RAM budget. The headline metric is **memory at a fixed recall**.
+- **Developer experience** — a single static binary; embeddable *and* server modes; a `ratatui` cockpit; idiomatic Python/TypeScript SDKs; an MCP server so agents can drive it.
+
+We say plainly what we do **not** do: client-side encryption protects *payloads, not vectors*; billion-scale needs a server, while a laptop comfortably serves tens-to-hundreds of millions; there is no homomorphic search in core. See the honest [threat model](./docs/security/threat-model.md).
+
+## Architecture
+
+A Cargo workspace: a from-scratch storage engine, index structures, SIMD distance kernels, and query planner, with a thin gRPC/REST shell and a TUI client. One binary runs the server, the cockpit, and the MCP server.
+
+→ [System context](./docs/architecture/c4-context.md) · [Container view](./docs/architecture/c4-container.md) · [Overview & crate map](./docs/architecture/overview.md) · [ADRs](./docs/adr)
+
+## Quickstart
+
+Published binaries and images arrive with `v0.1.0`. Today, build from source:
+
+```bash
+# prerequisites: rustup (stable) and just  (cargo install just)
+git clone https://github.com/achref-soua/quiver
+cd quiver
+just build            # compile the workspace
+just verify           # the full local quality gate
+cargo run -p quiver-cli -- --help
+```
+
+```bash
+# coming with v0.1.0:
+cargo install quiver-cli       # or: docker run ghcr.io/achref-soua/quiver
+quiver serve                   # gRPC + REST, encrypted by default
+quiver tui                     # the cockpit
+```
+
+## Command reference
+
+All developer tasks run through [`just`](./justfile):
+
+| Command | What it does |
+|---|---|
+| `just build` | build the workspace (all targets) |
+| `just test` | run the test suite |
+| `just lint` | `cargo fmt --check` + `clippy -D warnings` |
+| `just verify` | **the gate** — lint · test · doc · deny · audit |
+| `just run` / `just tui` | run the server / the cockpit |
+| `just coverage` | HTML coverage report |
+| `just docker` | build the container image |
+
+CI workflows exist under [`.github/workflows`](.github/workflows) but are **manual-only** (`workflow_dispatch`) by design — the authoritative gate is local `just verify` ([ADR-0015](./docs/adr/0015-ci-policy.md)).
+
+## Configuration
+
+Every option is an environment variable with a secure default; see [`.env.example`](./.env.example) and [ADR-0013](./docs/adr/0013-config-and-secure-defaults.md). Encryption-at-rest is on by default and TLS is required for any non-loopback bind.
+
+## Project
+
+- **Roadmap & Definitions of Done** — [`docs/roadmap.md`](./docs/roadmap.md)
+- **Security policy** — [`SECURITY.md`](./SECURITY.md) · **Threat model** — [`docs/security/threat-model.md`](./docs/security/threat-model.md)
+- **Contributing** — [`CONTRIBUTING.md`](./CONTRIBUTING.md)
+- **License** — [AGPL-3.0-only](./LICENSE)
