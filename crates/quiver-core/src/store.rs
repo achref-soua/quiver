@@ -512,12 +512,12 @@ impl Store {
         self.manifest_version = new_version;
         self.last_checkpointed_lsn = last_lsn;
         for &cid in &cids {
-            if let Some(seg) = new_segments.remove(&cid) {
-                if let Some(state) = self.collections.get_mut(&cid) {
-                    state.segments.push(seg);
-                    state.dirty.clear();
-                    state.deleted.clear();
-                }
+            if let Some(seg) = new_segments.remove(&cid)
+                && let Some(state) = self.collections.get_mut(&cid)
+            {
+                state.segments.push(seg);
+                state.dirty.clear();
+                state.deleted.clear();
             }
         }
         self.rotate_wal()?;

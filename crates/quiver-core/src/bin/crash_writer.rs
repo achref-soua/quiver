@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ack.flush()?;
         ack.sync_data()?;
 
-        if checkpoint_every > 0 && (next + 1) % checkpoint_every == 0 {
+        if checkpoint_every > 0 && (next + 1).is_multiple_of(checkpoint_every) {
             store.checkpoint()?;
         }
         next += 1;

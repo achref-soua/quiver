@@ -3,18 +3,11 @@
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-    # `time` is pulled only by `rcgen`, a dev-dependency used to generate
-    # self-signed certificates in the TLS tests. It is never compiled into the
-    # `quiver` binary or any library artifact, the stack-exhaustion path (parsing
-    # adversarial format descriptions) is not exercised by deterministic cert
-    # generation, and no `time` release that fixes it supports our MSRV (1.85).
-    { id = "RUSTSEC-2026-0009", reason = "dev-only (rcgen test certs); no MSRV-1.85-compatible fix; vulnerable path unused" },
-    # `paste` is an *unmaintained* (not vulnerable) compile-time proc-macro pulled
-    # transitively by `ratatui` (the cockpit's renderer). It never ships in the
-    # binary; there is no maintained drop-in at ratatui's pinned version yet.
-    { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro via ratatui; compile-time only, not in any artifact" },
-]
+# No suppressions: the dependency tree is advisory-clean. (Updating ratatui to
+# 0.30 resolved the earlier transitive advisories — it pulls a patched `lru`
+# >= 0.16.3 for RUSTSEC-2026-0002 and no longer depends on the unmaintained
+# `paste` of RUSTSEC-2024-0436; the dev-only `time` advisory cleared too.)
+ignore = []
 
 [licenses]
 version = 2

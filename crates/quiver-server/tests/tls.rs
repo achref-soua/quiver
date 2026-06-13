@@ -75,17 +75,15 @@ async fn rest_tls_healthz(port: u16, ca_pem: &str) -> String {
     let server_name = ServerName::try_from("localhost").unwrap();
 
     for _ in 0..200 {
-        if let Ok(tcp) = TcpStream::connect(("127.0.0.1", port)).await {
-            if let Ok(mut tls) = connector.connect(server_name.clone(), tcp).await {
-                tls.write_all(
-                    b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-                )
+        if let Ok(tcp) = TcpStream::connect(("127.0.0.1", port)).await
+            && let Ok(mut tls) = connector.connect(server_name.clone(), tcp).await
+        {
+            tls.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
                 .await
                 .unwrap();
-                let mut buf = Vec::new();
-                tls.read_to_end(&mut buf).await.unwrap();
-                return String::from_utf8_lossy(&buf).into_owned();
-            }
+            let mut buf = Vec::new();
+            tls.read_to_end(&mut buf).await.unwrap();
+            return String::from_utf8_lossy(&buf).into_owned();
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
