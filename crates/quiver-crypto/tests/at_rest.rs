@@ -22,11 +22,7 @@ use quiver_crypto::AeadCodec;
 const NEEDLE: &str = "TOPSECRET_NEEDLE_7f3a9c2b";
 
 fn desc() -> Descriptor {
-    Descriptor {
-        dim: 4,
-        dtype: Dtype::F32,
-        metric: DistanceMetric::L2,
-    }
+    Descriptor::new(4, Dtype::F32, DistanceMetric::L2)
 }
 
 fn key(b: u8) -> [u8; 32] {

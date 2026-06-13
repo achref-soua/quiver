@@ -219,11 +219,7 @@ impl AppState {
         dim: u32,
         metric: DistanceMetric,
     ) -> Result<CollectionInfo, Error> {
-        let descriptor = Descriptor {
-            dim,
-            dtype: Dtype::F32,
-            metric,
-        };
+        let descriptor = Descriptor::new(dim, Dtype::F32, metric);
         let owned = name.clone();
         self.run_blocking(move |db| db.create_collection(&owned, descriptor))
             .await?;

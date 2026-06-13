@@ -29,7 +29,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub use quiver_core::page::PageCodec;
-pub use quiver_core::{Descriptor, DistanceMetric, Dtype};
+pub use quiver_core::{Descriptor, DistanceMetric, Dtype, IndexKind, IndexSpec};
 pub use quiver_query::Filter;
 
 /// Errors returned by the embeddable database.
@@ -384,11 +384,7 @@ mod tests {
     use serde_json::json;
 
     fn desc() -> Descriptor {
-        Descriptor {
-            dim: 4,
-            dtype: Dtype::F32,
-            metric: DistanceMetric::L2,
-        }
+        Descriptor::new(4, Dtype::F32, DistanceMetric::L2)
     }
 
     fn open(dir: &Path) -> Database {

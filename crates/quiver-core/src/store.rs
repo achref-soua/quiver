@@ -125,7 +125,7 @@ impl Store {
         let mut collections: HashMap<CollectionId, CollectionState> = HashMap::new();
         let mut name_index: HashMap<String, CollectionId> = HashMap::new();
         for entry in &mfst.collections {
-            let descriptor: Descriptor = postcard::from_bytes(&entry.descriptor)?;
+            let descriptor = Descriptor::decode(&entry.descriptor)?;
             let mut state = CollectionState::new(entry.id, entry.name.clone(), descriptor);
             state.segments = entry.segments.clone();
             for seg in &entry.segments {
@@ -558,7 +558,7 @@ fn apply_wal_entry(
             name,
             descriptor,
         } => {
-            let descriptor: Descriptor = postcard::from_bytes(descriptor)?;
+            let descriptor = Descriptor::decode(descriptor)?;
             name_index.insert(name.clone(), *collection_id);
             collections.insert(
                 *collection_id,
@@ -728,11 +728,7 @@ mod tests {
     use crate::descriptor::{DistanceMetric, Dtype};
 
     fn desc() -> Descriptor {
-        Descriptor {
-            dim: 4,
-            dtype: Dtype::F32,
-            metric: DistanceMetric::L2,
-        }
+        Descriptor::new(4, Dtype::F32, DistanceMetric::L2)
     }
 
     fn open(dir: &Path) -> Store {

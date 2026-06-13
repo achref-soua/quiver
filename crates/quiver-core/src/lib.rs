@@ -30,7 +30,7 @@ mod segment;
 pub mod store;
 pub mod wal;
 
-pub use descriptor::{Descriptor, DistanceMetric, Dtype};
+pub use descriptor::{Descriptor, DistanceMetric, Dtype, IndexKind, IndexSpec};
 pub use error::{CoreError, Result};
 pub use ids::{CollectionId, Lsn};
 pub use store::{Record, Store};
