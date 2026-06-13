@@ -1,0 +1,12 @@
+[package]
+name = "quiver-index"
+description = "Vector indexes for Quiver: HNSW now; DiskANN/Vamana and IVF later."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true

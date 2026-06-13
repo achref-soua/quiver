@@ -1,0 +1,11 @@
+.git/
+.scratch/
+target/
+**/target/
+bench/datasets/
+bench/results/
+**/node_modules/
+sdks/python/.venv/
+docs/
+*.md
+!README.md

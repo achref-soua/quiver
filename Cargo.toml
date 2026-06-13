@@ -1,0 +1,37 @@
+# Quiver — Cargo workspace.
+# Crate responsibilities and the dependency DAG: docs/architecture/overview.md
+# Scaffold rationale: docs/repo-scaffold-plan.md
+
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-only"
+repository = "https://github.com/achref-soua/quiver"
+authors = ["Achref Soua <achref.soua@outlook.com>"]
+
+# Shared lint policy applied by every crate via `[lints] workspace = true`.
+# See ADR-0017 (error handling) and ADR-0009 (unsafe discipline).
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+todo = "warn"
+
+# External dependencies are pinned once here and referenced from crates with
+# `dep = { workspace = true }`. Added as features land; clap is used by the CLI.
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
