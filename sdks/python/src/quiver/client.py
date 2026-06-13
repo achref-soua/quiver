@@ -58,6 +58,8 @@ class CollectionInfo:
     dim: int
     metric: str
     count: int
+    index: str = "hnsw"
+    pq_subspaces: Optional[int] = None
 
 
 PointInput = Union[Point, Mapping[str, Any]]
@@ -102,9 +104,25 @@ class Client:
 
     # --- collections ---
 
-    def create_collection(self, name: str, dim: int, metric: str = "l2") -> CollectionInfo:
-        """Create a collection. Raises [`QuiverError`] if the name is taken."""
-        body = {"name": name, "dim": dim, "metric": metric}
+    def create_collection(
+        self,
+        name: str,
+        dim: int,
+        metric: str = "l2",
+        *,
+        index: Optional[str] = None,
+        pq_subspaces: Optional[int] = None,
+    ) -> CollectionInfo:
+        """Create a collection. Raises [`QuiverError`] if the name is taken.
+
+        ``index`` picks the structure (``hnsw`` | ``vamana`` | ``disk_vamana`` |
+        ``ivf``, default ``hnsw``); ``pq_subspaces`` tunes the quantized kinds.
+        """
+        body: dict[str, Any] = {"name": name, "dim": dim, "metric": metric}
+        if index is not None:
+            body["index"] = index
+        if pq_subspaces is not None:
+            body["pq_subspaces"] = pq_subspaces
         return _collection(self._send("POST", "/v1/collections", body).json())
 
     def list_collections(self) -> list[CollectionInfo]:
@@ -196,11 +214,14 @@ class Client:
 
 
 def _collection(body: Mapping[str, Any]) -> CollectionInfo:
+    pq = body.get("pq_subspaces")
     return CollectionInfo(
         name=body["name"],
         dim=int(body["dim"]),
         metric=str(body["metric"]),
         count=int(body.get("count", 0)),
+        index=str(body.get("index", "hnsw")),
+        pq_subspaces=int(pq) if pq is not None else None,
     )
 
 
