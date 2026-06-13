@@ -28,11 +28,11 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0007](0007-index-roadmap.md) | Index roadmap (HNSW → Vamana/IVF) | Accepted | 0 |
 | [0008](0008-quantization.md) | Quantization strategy | Accepted | 0 |
 | [0009](0009-simd-kernels.md) | SIMD distance kernels | Accepted | 0 |
-| 0010 | Crypto: envelope encryption & AEAD | Proposed (PR-D) | 0 |
-| 0011 | AuthN/Z & tenant isolation | Proposed (PR-D) | 0 |
-| 0012 | Client-side encryption & trust boundary | Proposed (PR-D) | 0 |
-| 0013 | Configuration & secure defaults | Proposed (PR-D) | 0 |
-| 0014 | Observability | Proposed (PR-D) | 0 |
+| [0010](0010-crypto-envelope-aead.md) | Crypto: envelope encryption & AEAD | Accepted | 0 |
+| [0011](0011-authn-authz-tenancy.md) | AuthN/Z & tenant isolation | Accepted | 0 |
+| [0012](0012-client-side-encryption.md) | Client-side encryption & trust boundary | Accepted | 0 |
+| [0013](0013-config-and-secure-defaults.md) | Configuration & secure defaults | Accepted | 0 |
+| [0014](0014-observability.md) | Observability | Accepted | 0 |
 | [0015](0015-ci-policy.md) | CI policy — manual-only + local verify gate | Accepted | 0 |
 | [0016](0016-license-agpl.md) | License — AGPL-3.0 | Accepted | 0 |
 | [0017](0017-error-handling.md) | Error handling | Accepted | 0 |
