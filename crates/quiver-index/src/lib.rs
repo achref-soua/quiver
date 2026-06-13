@@ -11,10 +11,12 @@
 mod hnsw;
 mod quant;
 mod rng;
+mod vamana;
 
 pub use hnsw::{Hnsw, HnswConfig};
 pub use quant::{BinaryQuantizer, CodeScorer, ProductQuantizer, Quantizer, ScalarQuantizer};
 pub use quiver_simd::Metric;
+pub use vamana::{Vamana, VamanaConfig};
 
 use thiserror::Error;
 
