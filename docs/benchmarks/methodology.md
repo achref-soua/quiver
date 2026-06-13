@@ -45,7 +45,7 @@ Ground truth is the provided exact neighbors, or brute-forced with the SIMD kern
 ## Reproducibility & honesty
 
 - Pinned dataset versions + checksums; fixed RNG seeds; pinned Quiver + competitor versions.
-- **Reference hardware is documented** with each result set: CPU model + core count, RAM, SSD model, OS/kernel, Rust version. Official numbers come from this documented reference hardware — the day-to-day dev box is resource-shared, so it is **not** the source of published numbers, and CI runs only small smoke datasets (correctness/regression gates), never the headline benchmarks.
+- **Reference hardware is documented** with each result set: CPU model + core count, RAM, SSD model, OS/kernel, Rust version. Official numbers come from this documented reference hardware — the day-to-day dev box is resource-shared, so it is **not** the source of published numbers, and CI runs only small smoke datasets (correctness/regression gates), never the headline benchmarks. The step-by-step procedure to produce the published numbers (Quiver + Qdrant + LanceDB) is the [reference-hardware runbook](./reference-hardware-runbook.md).
 - **Regression gates:** a fixed small dataset guards recall@10 and p95 in CI; a drop beyond a threshold fails the build.
 - Results live in `docs/benchmarks/results/` (CSV + a short write-up) and are summarized as a table in the README with a link here.
 
