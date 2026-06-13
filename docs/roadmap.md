@@ -1,0 +1,55 @@
+# Quiver — Roadmap & Definitions of Done
+
+Quiver is built phase by phase. A phase is not "done" until its Definition of Done (DoD) is met, tested, documented, and merged. Each phase boundary opens a release PR `develop` → `main` and tags a SemVer release.
+
+## Gates
+
+- **Plan gate** — the owner approves the build plan before any work. *(passed)*
+- **Design gate (end of Phase 0)** — the owner approves this design package (PR-A…D) **before any implementation code is written.**
+- Thereafter, each phase ships behind its DoD and a tagged release.
+
+## Phase 0 — Design (no code) → docs only
+
+**Goal:** a complete, reviewed technical design so implementation is de-risked on paper.
+
+**Deliverables:** architecture + C4; on-disk format spec; index design (HNSW/Vamana/IVF + quantization) with cited papers; concurrency model; security threat model + crypto choices; API & wire-protocol spec; benchmark methodology; risk register; this roadmap; the repo-scaffold plan; ADRs for every major decision.
+
+**DoD:** the owner has reviewed and approved the design package; the riskiest unknown — disk-resident index memory/recall behavior — has an evidence-based plan (analytical budget + a spike plan). No SemVer tag (design only).
+
+## Phase 1 — Single-node core (usable) → `v0.1.0`
+
+**Goal:** one binary, end-to-end: encrypted collection → upsert → filtered k-NN → live TUI.
+
+**Scope:** Cargo workspace scaffold + `justfile` + manual CI + Dockerfile + README/CONTRIBUTING/SECURITY; storage engine (segments + WAL + crash recovery + checksums); HNSW; SIMD kernels (f32 + int8 with feature detection); REST + gRPC; basic payload filtering; encryption-at-rest secure-by-default; TLS via `rustls`; TUI MVP (live metrics + collection browser); benchmark harness + first SIFT1M numbers; Python SDK (uv); seeded demo.
+
+**DoD (testable):**
+- `quiver serve` + `quiver tui` run from one binary; `just demo` seeds an encrypted collection.
+- Over **both** REST and gRPC and the Python SDK: create collection, upsert vectors with payloads, run top-k with a metadata filter, get correct results.
+- Encryption-at-rest is on by default; data files are ciphertext on disk (verified by a test).
+- A process **kill mid-write** recovers with no corruption and no lost acknowledged writes (crash-recovery test passes).
+- Recall@10 on SIFT1M ≥ a documented threshold at a documented `ef`; numbers recorded in `docs/benchmarks/`.
+- Coverage gate ≥ 70%; `just verify` green.
+
+## Phase 2 — Memory frugality → `v0.2.0`
+
+**Goal:** large datasets served from a small RAM budget, proven against competitors.
+
+**Scope:** disk-resident graph (DiskANN/Vamana) + IVF; quantization (PQ/scalar/binary + hamming pre-filter + exact re-rank); recall/latency/memory knobs per collection; hybrid search (vector + filter + optional BM25); 10M+ disk-path benchmarks vs Qdrant + LanceDB; TypeScript SDK; MCP server; LangChain/LlamaIndex adapters.
+
+**DoD:** on a 10M+ dataset, Quiver serves a documented recall@10 using a **fraction of the RAM** of Qdrant/LanceDB on identical hardware, with a reproducible methodology and raw numbers published. Quantization knobs documented with a tradeoff table. Coverage ≥ 75%.
+
+## Phase 3 — Security depth + cockpit polish → `v0.3.0`
+
+**Scope:** client-side payload encryption with a documented trust boundary; RBAC + scoped API keys + optional mTLS; audit logging; crypto-shredding; secret/KMS handling; the TUI **constellation view** (2D projection + nearest-neighbor highlight + interactive query); security testing (fuzz the protocol + on-disk format, `cargo audit`/`deny`, threat-model verification).
+
+**DoD:** a payload upserted with client-side encryption is provably unreadable by the server (test); RBAC denies cross-tenant/over-scope access (tests); fuzz targets run clean for a documented duration; the cockpit demo (asciinema cast) is recorded. Coverage ≥ 80%.
+
+## Phase 4 — Advanced / stretch + launch → `v1.0.0`
+
+**Scope:** incremental in-place updates (SpFresh-style); optional multi-vector / late-interaction scoring; optional leader-follower replication (clearly labeled); the **experimental** DCPE feature flag (published scheme, honest caveats); migration importers (Qdrant/Chroma/pgvector); docs-site + benchmark polish; regenerated TUI cast; load-test results.
+
+**DoD:** the README benchmark table is complete and reproducible; the quickstart works from a clean clone in minutes; all tests/property-tests/fuzzers green; history clean and entirely the owner's. Tag **`v1.0.0`** on `main`.
+
+## Testing posture (every phase)
+
+Unit; `proptest` for index/storage invariants; `cargo-fuzz` for wire-protocol + on-disk parsers; crash-recovery tests; `loom` for index concurrency; recall/latency regression gates on a fixed dataset; full server+SDK integration round-trip; `criterion` microbenchmarks for SIMD. Coverage gate starts at 70% and rises to 80%+.
