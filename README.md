@@ -92,7 +92,13 @@ with Client("http://127.0.0.1:6333", api_key="…") as q:
     hits = q.search("items", [0.1, 0.2, 0.3], k=5)
 ```
 
-An `ann-benchmarks`-style harness lives in [`bench/`](./bench), measuring recall@10, latency, and QPS against SIFT1M and friends. **Headline numbers are reference-hardware-pending**: per the [methodology](./docs/benchmarks/methodology.md), official figures come only from documented reference hardware (not this shared dev box) and are never fabricated — so the benchmark table is published once those runs are recorded, not before.
+An `ann-benchmarks`-style harness lives in [`bench/`](./bench). On **SIFT1M** (1M × 128, L2), in-memory HNSW (`M=16`, `efC=200`), recall@10 vs exact ground truth:
+
+| `ef_search` | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|
+| **recall@10** | 0.794 | 0.898 | 0.960 | 0.987 | 0.996 |
+
+Recall is a property of the index and the data (host-independent), so these figures stand; reproduce with `cargo run --release --example sift_recall` ([details](./docs/benchmarks/results/sift1m.md)). **Throughput, memory (RSS — the headline metric), and the head-to-head vs Qdrant/LanceDB are reference-hardware-pending**: per the [methodology](./docs/benchmarks/methodology.md) those require identical dedicated hardware, this shared dev box is not a source for them, and we never fabricate.
 
 ## Configuration
 
