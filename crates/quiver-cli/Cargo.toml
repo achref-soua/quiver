@@ -13,6 +13,7 @@ name = "quiver"
 path = "src/main.rs"
 
 [dependencies]
+quiver-mcp = { workspace = true }
 quiver-server = { workspace = true }
 quiver-tui = { workspace = true }
 

@@ -5,6 +5,8 @@
 //! tools, and benchmarks. `serve` is live; the others land with their Phase 1
 //! features.
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -31,8 +33,18 @@ enum Command {
         #[arg(long, env = "QUIVER_API_KEY")]
         api_key: Option<String>,
     },
-    /// Run the MCP server for AI agents.
-    Mcp,
+    /// Run the MCP server for AI agents (JSON-RPC over stdio).
+    Mcp {
+        /// Data directory for the embedded database.
+        #[arg(long, env = "QUIVER_DATA_DIR", default_value = "./data")]
+        data_dir: PathBuf,
+        /// 64-hex-character key for encryption-at-rest (or set QUIVER_ENCRYPTION_KEY).
+        #[arg(long, env = "QUIVER_ENCRYPTION_KEY")]
+        encryption_key: Option<String>,
+        /// Run without encryption-at-rest (development only).
+        #[arg(long, env = "QUIVER_INSECURE", default_value_t = false)]
+        insecure: bool,
+    },
     /// Administrative commands (collections, keys).
     Admin,
     /// Run benchmarks.
@@ -55,7 +67,13 @@ async fn main() -> anyhow::Result<()> {
             })
             .await?;
         }
-        Command::Mcp => println!("quiver mcp: not yet implemented"),
+        Command::Mcp {
+            data_dir,
+            encryption_key,
+            insecure,
+        } => {
+            quiver_mcp::run(&data_dir, encryption_key.as_deref(), insecure)?;
+        }
         Command::Admin => println!("quiver admin: not yet implemented"),
         Command::Bench => println!("quiver bench: not yet implemented"),
     }
