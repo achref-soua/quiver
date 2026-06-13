@@ -21,10 +21,10 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 |---|---|---|---|
 | [0001](0001-language-and-workspace.md) | Language and workspace layout | Accepted | 0 |
 | [0002](0002-async-runtime.md) | Async runtime — Tokio | Accepted | 0 |
-| 0003 | Serialization formats | Proposed (PR-B) | 0 |
-| 0004 | On-disk format | Proposed (PR-B) | 0 |
-| 0005 | Durability & crash recovery | Proposed (PR-B) | 0 |
-| 0006 | Concurrency model | Proposed (PR-B) | 0 |
+| [0003](0003-serialization.md) | Serialization formats | Accepted | 0 |
+| [0004](0004-on-disk-format.md) | On-disk format | Accepted | 0 |
+| [0005](0005-durability-and-recovery.md) | Durability & crash recovery | Accepted | 0 |
+| [0006](0006-concurrency-model.md) | Concurrency model | Accepted | 0 |
 | 0007 | Index roadmap (HNSW → Vamana/IVF) | Proposed (PR-C) | 0 |
 | 0008 | Quantization strategy | Proposed (PR-C) | 0 |
 | 0009 | SIMD distance kernels | Proposed (PR-C) | 0 |
