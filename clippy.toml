@@ -1,0 +1,8 @@
+# Clippy configuration.
+#
+# `unwrap_used` / `expect_used` are denied workspace-wide (see Cargo.toml lints
+# and ADR-0017) on production paths. ADR-0017 scopes that rule to code *outside*
+# `#[cfg(test)]`; these toggles realize that intent so test code can use
+# `unwrap`/`expect`, where a panic is the desired failure signal.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
