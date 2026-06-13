@@ -25,9 +25,9 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0004](0004-on-disk-format.md) | On-disk format | Accepted | 0 |
 | [0005](0005-durability-and-recovery.md) | Durability & crash recovery | Accepted | 0 |
 | [0006](0006-concurrency-model.md) | Concurrency model | Accepted | 0 |
-| 0007 | Index roadmap (HNSW → Vamana/IVF) | Proposed (PR-C) | 0 |
-| 0008 | Quantization strategy | Proposed (PR-C) | 0 |
-| 0009 | SIMD distance kernels | Proposed (PR-C) | 0 |
+| [0007](0007-index-roadmap.md) | Index roadmap (HNSW → Vamana/IVF) | Accepted | 0 |
+| [0008](0008-quantization.md) | Quantization strategy | Accepted | 0 |
+| [0009](0009-simd-kernels.md) | SIMD distance kernels | Accepted | 0 |
 | 0010 | Crypto: envelope encryption & AEAD | Proposed (PR-D) | 0 |
 | 0011 | AuthN/Z & tenant isolation | Proposed (PR-D) | 0 |
 | 0012 | Client-side encryption & trust boundary | Proposed (PR-D) | 0 |
