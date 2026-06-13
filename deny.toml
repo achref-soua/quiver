@@ -3,6 +3,14 @@
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # `time` is pulled only by `rcgen`, a dev-dependency used to generate
+    # self-signed certificates in the TLS tests. It is never compiled into the
+    # `quiver` binary or any library artifact, the stack-exhaustion path (parsing
+    # adversarial format descriptions) is not exercised by deterministic cert
+    # generation, and no `time` release that fixes it supports our MSRV (1.85).
+    { id = "RUSTSEC-2026-0009", reason = "dev-only (rcgen test certs); no MSRV-1.85-compatible fix; vulnerable path unused" },
+]
 
 [licenses]
 version = 2

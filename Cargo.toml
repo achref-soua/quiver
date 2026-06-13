@@ -42,9 +42,31 @@ quiver-simd = { path = "crates/quiver-simd", version = "0.1" }
 
 anyhow = "1"
 axum = "0.8"
-# Audited cryptography (RustCrypto; never `ring`, never a home-grown primitive)
-# for encryption-at-rest: XChaCha20-Poly1305 AEAD, HKDF-SHA256 per-page subkeys,
-# and zeroized key material. See ADR-0010 and docs/security/crypto.md.
+# TLS-in-transit (ADR-0010): rustls with the audited `ring` provider — no
+# OpenSSL, and no `aws-lc-rs` (which needs a C toolchain unavailable on minimal
+# builders). `ring` backs the rustls AEAD/handshake; the at-rest codec below
+# uses RustCrypto. `axum-server` terminates TLS for REST; tonic's `tls-ring`
+# feature does so for gRPC.
+axum-server = { version = "0.8", default-features = false, features = [
+    "tls-rustls-no-provider",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+# Maintained PEM parsing (the `PemObject` trait), replacing the now-unmaintained
+# `rustls-pemfile`. Already in the tree via rustls.
+rustls-pki-types = { version = "1", features = ["std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
+# Audited cryptography (RustCrypto) for encryption-at-rest: XChaCha20-Poly1305
+# AEAD, HKDF-SHA256 per-page subkeys, and zeroized key material. See ADR-0010
+# and docs/security/crypto.md.
 chacha20poly1305 = { version = "0.10", features = ["getrandom"] }
 clap = { version = "4.5", features = ["derive"] }
 crc32c = "0.6"
@@ -62,7 +84,7 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -74,6 +96,8 @@ protoc-bin-vendored = "3"
 
 # Dev-only dependencies (tests, property tests, fixtures).
 proptest = "1"
+# Self-signed certificate generation for TLS tests, ring-backed (no aws-lc-rs).
+rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 tempfile = "3"
 

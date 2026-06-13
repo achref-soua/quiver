@@ -54,6 +54,10 @@ async fn rest_and_grpc_round_trip() {
         encryption_key: Some(
             "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_owned(),
         ),
+        // This loopback test exercises the plaintext transport path; TLS has its
+        // own end-to-end test in tls.rs.
+        tls_cert: None,
+        tls_key: None,
         insecure: false,
     };
     let server = tokio::spawn(async move {

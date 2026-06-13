@@ -12,23 +12,29 @@
 //! metadata), default-deny, with a fail-fast secure config (ADR-0011/0013).
 //! Encryption-at-rest is on by default (ADR-0010): unless `insecure` is set, an
 //! `encryption_key` is required and the engine is opened through
-//! `quiver-crypto`'s AEAD codec. TLS, RBAC scopes, multi-tenancy, audit logging,
-//! and rate limiting are later phases. Design: `docs/api/rest-grpc.md`.
+//! `quiver-crypto`'s AEAD codec. TLS-in-transit uses `rustls` over the audited
+//! `ring` provider — REST via `axum-server`, gRPC via tonic's `tls-ring` — and a
+//! non-loopback bind requires it. RBAC scopes, multi-tenancy, audit logging, and
+//! rate limiting are later phases. Design: `docs/api/rest-grpc.md`.
 
 mod error;
 mod grpc;
 mod rest;
 
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use axum_server::tls_rustls::RustlsConfig;
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::{Identity, ServerTlsConfig};
 
 use quiver_crypto::AeadCodec;
 use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, SearchParams};
@@ -54,6 +60,12 @@ pub struct Config {
     /// secret store, never the committed config. `None` ⇒ data is stored
     /// unencrypted (only valid in `insecure` mode).
     pub encryption_key: Option<String>,
+    /// Path to the PEM-encoded TLS certificate chain. Must be set together with
+    /// `tls_key`. Required for a non-loopback bind unless `insecure = true`.
+    pub tls_cert: Option<PathBuf>,
+    /// Path to the PEM-encoded TLS private key. Must be set together with
+    /// `tls_cert`.
+    pub tls_key: Option<PathBuf>,
     /// Opt out of the secure defaults (no auth, no encryption-at-rest, allow a
     /// non-loopback bind without TLS). For local development only; never the
     /// default.
@@ -68,6 +80,8 @@ impl Default for Config {
             grpc_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6334),
             api_keys: Vec::new(),
             encryption_key: None,
+            tls_cert: None,
+            tls_key: None,
             insecure: false,
         }
     }
@@ -108,11 +122,18 @@ impl Config {
             AeadCodec::from_hex(key)
                 .map_err(|e| Error::Config(format!("invalid encryption_key: {e}")))?;
         }
-        let non_loopback = !self.rest_addr.ip().is_loopback() || !self.grpc_addr.ip().is_loopback();
-        if non_loopback && !self.insecure {
+        // TLS certificate and key are set together or not at all.
+        if self.tls_cert.is_some() != self.tls_key.is_some() {
             return Err(Error::Config(
-                "non-loopback bind requires insecure=true until TLS lands with \
-                 encryption-at-rest"
+                "tls_cert and tls_key must be set together".to_owned(),
+            ));
+        }
+        let tls_enabled = self.tls_cert.is_some() && self.tls_key.is_some();
+        let non_loopback = !self.rest_addr.ip().is_loopback() || !self.grpc_addr.ip().is_loopback();
+        if non_loopback && !tls_enabled && !self.insecure {
+            return Err(Error::Config(
+                "non-loopback bind requires TLS: set tls_cert and tls_key (PEM files), \
+                 or insecure=true for local development"
                     .to_owned(),
             ));
         }
@@ -376,9 +397,35 @@ pub async fn serve(
     let app = rest::router(state.clone());
     let grpc = grpc::service(state);
 
-    let rest_fut = async move { axum::serve(rest_listener, app).await.map_err(Error::Io) };
+    let tls = load_tls(&config)?;
+
+    // REST: terminate TLS with axum-server when configured, else serve plaintext.
+    let rest_fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> = match &tls {
+        Some(material) => {
+            let rustls_config = RustlsConfig::from_config(Arc::clone(&material.rest_config));
+            let std_listener = rest_listener.into_std().map_err(Error::Io)?;
+            let server =
+                axum_server::from_tcp_rustls(std_listener, rustls_config).map_err(Error::Io)?;
+            Box::pin(async move {
+                server
+                    .serve(app.into_make_service())
+                    .await
+                    .map_err(Error::Io)
+            })
+        }
+        None => Box::pin(async move { axum::serve(rest_listener, app).await.map_err(Error::Io) }),
+    };
+
+    // gRPC: tonic terminates TLS itself (ring provider) when an identity is set.
+    let mut grpc_builder = tonic::transport::Server::builder();
+    if let Some(material) = &tls {
+        let identity = Identity::from_pem(&material.cert_pem, &material.key_pem);
+        grpc_builder = grpc_builder
+            .tls_config(ServerTlsConfig::new().identity(identity))
+            .map_err(|e| Error::Internal(format!("grpc tls config: {e}")))?;
+    }
     let grpc_fut = async move {
-        tonic::transport::Server::builder()
+        grpc_builder
             .add_service(grpc)
             .serve_with_incoming(TcpListenerStream::new(grpc_listener))
             .await
@@ -408,6 +455,61 @@ fn open_database(config: &Config) -> Result<Database, Error> {
         }
         None => Ok(Database::open(&config.data_dir)?),
     }
+}
+
+// TLS material shared by both transports: the raw PEM (for tonic's `Identity`)
+// and a parsed rustls server config (for axum-server's REST acceptor).
+struct TlsMaterial {
+    cert_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+    rest_config: Arc<rustls::ServerConfig>,
+}
+
+// Read the configured certificate and key, returning `None` when TLS is not
+// configured. `Config::validate` already enforces that both are set together and
+// that a non-loopback bind requires them.
+fn load_tls(config: &Config) -> Result<Option<TlsMaterial>, Error> {
+    match (&config.tls_cert, &config.tls_key) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert_pem = std::fs::read(cert_path).map_err(Error::Io)?;
+            let key_pem = std::fs::read(key_path).map_err(Error::Io)?;
+            let rest_config = Arc::new(rustls_server_config(&cert_pem, &key_pem)?);
+            Ok(Some(TlsMaterial {
+                cert_pem,
+                key_pem,
+                rest_config,
+            }))
+        }
+        (None, None) => Ok(None),
+        _ => Err(Error::Config(
+            "tls_cert and tls_key must be set together".to_owned(),
+        )),
+    }
+}
+
+// Build a rustls server config from PEM bytes over the audited `ring` provider
+// (no OpenSSL, no aws-lc-rs C toolchain). TLS 1.3 and 1.2 are offered.
+fn rustls_server_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<rustls::ServerConfig, Error> {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+    let certs = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::Config(format!("parsing tls_cert: {e}")))?;
+    if certs.is_empty() {
+        return Err(Error::Config(
+            "tls_cert contains no certificates".to_owned(),
+        ));
+    }
+    let key = PrivateKeyDer::from_pem_slice(key_pem)
+        .map_err(|e| Error::Config(format!("parsing tls_key: {e}")))?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Internal(format!("tls protocol versions: {e}")))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| Error::Config(format!("tls certificate/key: {e}")))
 }
 
 /// Initialize structured logging from `RUST_LOG` (defaulting to `info`). Safe to
@@ -479,6 +581,34 @@ mod tests {
         // Auth and encryption are satisfied, so the only failure is the bind rule.
         assert!(config.validate().is_err());
         config.insecure = true;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_public_bind_allowed_with_tls() {
+        let config = Config {
+            api_keys: vec!["secret".to_owned()],
+            encryption_key: Some(TEST_KEY.to_owned()),
+            tls_cert: Some(PathBuf::from("cert.pem")),
+            tls_key: Some(PathBuf::from("key.pem")),
+            rest_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 6333),
+            ..Config::default()
+        };
+        // TLS configured ⇒ a non-loopback bind is allowed without insecure.
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_tls_cert_and_key_must_pair() {
+        let mut config = Config {
+            api_keys: vec!["secret".to_owned()],
+            encryption_key: Some(TEST_KEY.to_owned()),
+            tls_cert: Some(PathBuf::from("cert.pem")),
+            ..Config::default()
+        };
+        // Cert without key ⇒ rejected.
+        assert!(config.validate().is_err());
+        config.tls_key = Some(PathBuf::from("key.pem"));
         assert!(config.validate().is_ok());
     }
 
