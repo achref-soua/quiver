@@ -38,4 +38,4 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0017](0017-error-handling.md) | Error handling | Accepted | 0 |
 | [0018](0018-sdk-and-integration-strategy.md) | SDK & integration strategy | Accepted | 0 |
 
-Rows marked *Proposed (PR-X)* are reserved numbers whose records land with the matching Phase-0 design PR.
+All Phase-0 ADRs (0001–0018) are Accepted. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.
