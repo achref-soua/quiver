@@ -13,7 +13,11 @@ name = "quiver"
 path = "src/main.rs"
 
 [dependencies]
+quiver-server = { workspace = true }
+
+anyhow = { workspace = true }
 clap = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

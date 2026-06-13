@@ -2,8 +2,8 @@
 //! Quiver — single-binary entrypoint.
 //!
 //! Subcommands wire together the server, terminal cockpit, MCP server, admin
-//! tools, and benchmarks. Status: scaffolding — subcommands are stubs until the
-//! corresponding Phase 1 features land.
+//! tools, and benchmarks. `serve` is live; the others land with their Phase 1
+//! features.
 
 use clap::{Parser, Subcommand};
 
@@ -32,14 +32,19 @@ enum Command {
     Bench,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let subcommand = match cli.command {
-        Command::Serve => "serve",
-        Command::Tui => "tui",
-        Command::Mcp => "mcp",
-        Command::Admin => "admin",
-        Command::Bench => "bench",
-    };
-    println!("quiver {subcommand}: not yet implemented");
+    match cli.command {
+        Command::Serve => {
+            quiver_server::init_tracing();
+            let config = quiver_server::Config::load()?;
+            quiver_server::run(config).await?;
+        }
+        Command::Tui => println!("quiver tui: not yet implemented"),
+        Command::Mcp => println!("quiver mcp: not yet implemented"),
+        Command::Admin => println!("quiver admin: not yet implemented"),
+        Command::Bench => println!("quiver bench: not yet implemented"),
+    }
+    Ok(())
 }

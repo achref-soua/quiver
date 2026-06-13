@@ -8,5 +8,27 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dependencies]
+quiver-core = { workspace = true }
+quiver-embed = { workspace = true }
+quiver-proto = { workspace = true }
+quiver-query = { workspace = true }
+
+axum = { workspace = true }
+figment = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+
 [lints]
 workspace = true
