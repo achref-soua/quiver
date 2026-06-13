@@ -23,7 +23,14 @@ enum Command {
     /// Run the server (gRPC + REST).
     Serve,
     /// Launch the terminal cockpit.
-    Tui,
+    Tui {
+        /// REST base URL of the server to inspect.
+        #[arg(long, env = "QUIVER_TUI_URL", default_value = "http://127.0.0.1:6333")]
+        url: String,
+        /// API key presented as a bearer token, if the server requires one.
+        #[arg(long, env = "QUIVER_API_KEY")]
+        api_key: Option<String>,
+    },
     /// Run the MCP server for AI agents.
     Mcp,
     /// Administrative commands (collections, keys).
@@ -41,7 +48,13 @@ async fn main() -> anyhow::Result<()> {
             let config = quiver_server::Config::load()?;
             quiver_server::run(config).await?;
         }
-        Command::Tui => println!("quiver tui: not yet implemented"),
+        Command::Tui { url, api_key } => {
+            quiver_tui::run(quiver_tui::TuiOptions {
+                base_url: url,
+                api_key,
+            })
+            .await?;
+        }
         Command::Mcp => println!("quiver mcp: not yet implemented"),
         Command::Admin => println!("quiver admin: not yet implemented"),
         Command::Bench => println!("quiver bench: not yet implemented"),
