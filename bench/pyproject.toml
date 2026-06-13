@@ -1,0 +1,25 @@
+[project]
+name = "quiver-bench"
+version = "0.1.0"
+description = "ann-benchmarks-style harness for Quiver (SIFT1M and friends)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "AGPL-3.0-only"
+authors = [{ name = "Achref Soua", email = "achref.soua@outlook.com" }]
+dependencies = ["quiver-client", "numpy>=1.26"]
+
+[tool.uv.sources]
+quiver-client = { path = "../sdks/python" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["quiver_bench"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -52,6 +52,16 @@ run *ARGS:
 tui:
     cargo run -p quiver-cli -- tui
 
+# One-command demo: build, start an encrypted server, seed a collection, and
+# print how to open the cockpit (Ctrl-C to stop). Requires uv, curl, openssl.
+demo:
+    bash scripts/demo.sh
+
+# Run the benchmark harness against a running server (requires uv). Args pass
+# through, e.g. `just bench --synthetic` or `just bench --dataset PATH`.
+bench *ARGS:
+    uv run --project bench python -m quiver_bench.run {{ ARGS }}
+
 # Coverage report (HTML).
 coverage:
     cargo llvm-cov --workspace --html

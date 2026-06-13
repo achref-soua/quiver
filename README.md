@@ -35,11 +35,21 @@ A Cargo workspace: a from-scratch storage engine, index structures, SIMD distanc
 Published binaries and images arrive with `v0.1.0`. Today, build from source:
 
 ```bash
-# prerequisites: rustup (stable) and just  (cargo install just)
+# prerequisites: rustup (stable), just (cargo install just), and uv
 git clone https://github.com/achref-soua/quiver
 cd quiver
+just demo             # build, start an encrypted server, seed a demo collection
+# then, in another terminal:
+quiver tui --api-key quiver-demo-key   # the retro cockpit
+```
+
+`just demo` brings up a server with **encryption-at-rest on**, seeds a small
+collection through the Python SDK, and prints how to open the cockpit. To build
+and exercise the workspace directly:
+
+```bash
 just build            # compile the workspace
-just verify           # the full local quality gate
+just verify           # the full local quality gate (lint · test · doc · deny · audit)
 cargo run -p quiver-cli -- --help
 ```
 
@@ -60,11 +70,29 @@ All developer tasks run through [`just`](./justfile):
 | `just test` | run the test suite |
 | `just lint` | `cargo fmt --check` + `clippy -D warnings` |
 | `just verify` | **the gate** — lint · test · doc · deny · audit |
+| `just test-py` | Python SDK test suite (via `uv`) |
 | `just run` / `just tui` | run the server / the cockpit |
+| `just demo` | encrypted server + seeded demo collection |
+| `just bench *ARGS` | run the benchmark harness (e.g. `just bench --synthetic`) |
 | `just coverage` | HTML coverage report |
 | `just docker` | build the container image |
 
 CI workflows exist under [`.github/workflows`](.github/workflows) but are **manual-only** (`workflow_dispatch`) by design — the authoritative gate is local `just verify` ([ADR-0015](./docs/adr/0015-ci-policy.md)).
+
+## SDK & benchmarks
+
+The **Python SDK** lives in [`sdks/python`](./sdks/python) (`uv add quiver-client`):
+
+```python
+from quiver import Client, Point
+
+with Client("http://127.0.0.1:6333", api_key="…") as q:
+    q.create_collection("items", dim=3, metric="cosine")
+    q.upsert("items", [Point("a", [0.1, 0.2, 0.3], {"tag": "x"})])
+    hits = q.search("items", [0.1, 0.2, 0.3], k=5)
+```
+
+An `ann-benchmarks`-style harness lives in [`bench/`](./bench), measuring recall@10, latency, and QPS against SIFT1M and friends. **Headline numbers are reference-hardware-pending**: per the [methodology](./docs/benchmarks/methodology.md), official figures come only from documented reference hardware (not this shared dev box) and are never fabricated — so the benchmark table is published once those runs are recorded, not before.
 
 ## Configuration
 
