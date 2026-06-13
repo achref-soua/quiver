@@ -19,7 +19,9 @@ use serde_json::{Value, json};
 
 use quiver_core::page::{PageCodec, PlainCodec};
 use quiver_crypto::AeadCodec;
-use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, Filter, SearchParams};
+use quiver_embed::{
+    Database, Descriptor, DistanceMetric, Dtype, Filter, IndexKind, IndexSpec, SearchParams,
+};
 
 /// The MCP protocol revision this server implements.
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -134,7 +136,9 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
             let collection = want_str(args, "name")?;
             let dim = want_u64(args, "dim")? as u32;
             let metric = want_metric(args)?;
-            db.create_collection(collection, Descriptor::new(dim, Dtype::F32, metric))
+            let index = want_index_spec(args)?;
+            let descriptor = Descriptor::new(dim, Dtype::F32, metric).with_index(index);
+            db.create_collection(collection, descriptor)
                 .map_err(|e| e.to_string())?;
             Ok(format!("created collection '{collection}' (dim {dim})"))
         }
@@ -209,13 +213,23 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "create_collection",
-            "description": "Create a collection with a vector dimensionality and distance metric.",
+            "description": "Create a collection with a vector dimensionality, distance metric, and index.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": collection_arg,
                     "dim": { "type": "integer", "description": "Vector dimensionality" },
-                    "metric": { "type": "string", "enum": ["l2", "cosine", "dot"], "default": "l2" }
+                    "metric": { "type": "string", "enum": ["l2", "cosine", "dot"], "default": "l2" },
+                    "index": {
+                        "type": "string",
+                        "enum": ["hnsw", "vamana", "disk_vamana", "ivf"],
+                        "default": "hnsw",
+                        "description": "Index structure; disk_vamana is the memory-frugal disk path (l2/cosine only)"
+                    },
+                    "pq_subspaces": {
+                        "type": "integer",
+                        "description": "Product-quantization subspaces for disk_vamana / ivf (must divide dim)"
+                    }
                 },
                 "required": ["name", "dim"]
             }
@@ -326,6 +340,25 @@ fn want_metric(args: &Value) -> Result<DistanceMetric, String> {
         "dot" | "Dot" => Ok(DistanceMetric::Dot),
         other => Err(format!("unknown metric '{other}' (use l2, cosine, or dot)")),
     }
+}
+
+fn want_index_spec(args: &Value) -> Result<IndexSpec, String> {
+    let kind = match args.get("index").and_then(Value::as_str).unwrap_or("hnsw") {
+        "hnsw" => IndexKind::Hnsw,
+        "vamana" => IndexKind::Vamana,
+        "disk_vamana" | "disk" => IndexKind::DiskVamana,
+        "ivf" => IndexKind::Ivf,
+        other => {
+            return Err(format!(
+                "unknown index '{other}' (use hnsw, vamana, disk_vamana, or ivf)"
+            ));
+        }
+    };
+    let pq_subspaces = args
+        .get("pq_subspaces")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32);
+    Ok(IndexSpec { kind, pq_subspaces })
 }
 
 #[cfg(test)]
@@ -493,5 +526,43 @@ mod tests {
         let first: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(first["id"], 1);
         assert_eq!(first["result"]["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn agent_can_create_a_disk_index_collection_and_query_it() {
+        let (_t, mut db) = db();
+        let r = call(
+            &mut db,
+            "create_collection",
+            json!({"name":"d","dim":4,"metric":"l2","index":"disk_vamana"}),
+        );
+        assert_eq!(r["result"]["isError"], false, "{}", result_text(&r));
+        for i in 0..30u32 {
+            let r = call(
+                &mut db,
+                "upsert",
+                json!({"collection":"d","id":format!("p{i}"),"vector":[i as f32,0.0,0.0,0.0]}),
+            );
+            assert_eq!(r["result"]["isError"], false);
+        }
+        let r = call(
+            &mut db,
+            "search",
+            json!({"collection":"d","vector":[7.0,0.0,0.0,0.0],"k":1}),
+        );
+        let parsed: Value = serde_json::from_str(&result_text(&r)).unwrap();
+        assert_eq!(parsed["matches"][0]["id"], "p7");
+    }
+
+    #[test]
+    fn unknown_index_kind_is_an_iserror_result() {
+        let (_t, mut db) = db();
+        let r = call(
+            &mut db,
+            "create_collection",
+            json!({"name":"x","dim":4,"index":"bogus"}),
+        );
+        assert_eq!(r["result"]["isError"], true);
+        assert!(result_text(&r).contains("unknown index"));
     }
 }

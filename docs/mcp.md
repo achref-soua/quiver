@@ -24,7 +24,7 @@ launched by an MCP-capable client (e.g. an agent runtime) as a subprocess.
 | Tool | Arguments | Purpose |
 |---|---|---|
 | `list_collections` | — | List collections |
-| `create_collection` | `name`, `dim`, `metric` (`l2`\|`cosine`\|`dot`) | Create a collection |
+| `create_collection` | `name`, `dim`, `metric` (`l2`\|`cosine`\|`dot`), `index` (`hnsw`\|`vamana`\|`disk_vamana`\|`ivf`), `pq_subspaces?` | Create a collection (pick the index, incl. the memory-frugal `disk_vamana`) |
 | `upsert` | `collection`, `id`, `vector`, `payload?` | Insert/replace a point |
 | `search` | `collection`, `vector`, `k?`, `filter?` | k-NN with an optional payload filter |
 | `get` | `collection`, `id` | Fetch one point |
