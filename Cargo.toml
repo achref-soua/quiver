@@ -32,10 +32,15 @@ todo = "warn"
 # Internal crates (path deps with a version so `cargo deny` sees no wildcard),
 # referenced as `quiver-x = { workspace = true }`.
 quiver-core = { path = "crates/quiver-core", version = "0.1" }
+quiver-embed = { path = "crates/quiver-embed", version = "0.1" }
 quiver-index = { path = "crates/quiver-index", version = "0.1" }
+quiver-proto = { path = "crates/quiver-proto", version = "0.1" }
 quiver-query = { path = "crates/quiver-query", version = "0.1" }
+quiver-server = { path = "crates/quiver-server", version = "0.1" }
 quiver-simd = { path = "crates/quiver-simd", version = "0.1" }
 
+anyhow = "1"
+axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
 crc32c = "0.6"
 criterion = { version = "0.5", default-features = false, features = [
@@ -43,11 +48,16 @@ criterion = { version = "0.5", default-features = false, features = [
 ] }
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 prost = "0.14"
+figment = { version = "0.10", features = ["env", "toml"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14"
 tonic-prost = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Build-time codegen for the gRPC contract. protoc is vendored so a clean clone
 # builds with no system protobuf compiler installed.
@@ -56,6 +66,7 @@ protoc-bin-vendored = "3"
 
 # Dev-only dependencies (tests, property tests, fixtures).
 proptest = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 tempfile = "3"
 
 [profile.release]

@@ -1,12 +1,426 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The Quiver daemon: gRPC and REST APIs over the embeddable handle, with
-//! authentication, RBAC, rate limiting, auditing, and observability.
+//! The Quiver daemon: gRPC and REST over the embeddable [`Database`], with
+//! API-key auth and secure-by-default configuration.
 //!
-//! Status: scaffolding — the server lands in Phase 1. Design:
-//! `docs/api/rest-grpc.md`, ADR-0011 (authn/z), ADR-0013 (config), ADR-0014.
+//! Both transports are thin shells over the same shared engine operations; the
+//! engine is synchronous and CPU/`fsync`-bound, so every
+//! call is offloaded with `spawn_blocking` and serialized behind a single mutex
+//! (ADR-0002, single-writer per ADR-0006). The lock-free MVCC read path is
+//! Phase 2.
+//!
+//! Phase 1 auth is a configured API key (Bearer / gRPC `authorization`
+//! metadata), default-deny, with a fail-fast secure config (ADR-0011/0013). TLS,
+//! RBAC scopes, multi-tenancy, audit logging, and rate limiting are later
+//! phases. Design: `docs/api/rest-grpc.md`.
+
+mod error;
+mod grpc;
+mod rest;
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use figment::Figment;
+use figment::providers::{Env, Format, Serialized, Toml};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
+
+use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, SearchParams};
+use quiver_query::Filter;
+
+pub use error::Error;
+
+/// Server configuration, layered defaults → `quiver.toml` → `QUIVER_*` env and
+/// validated at startup (ADR-0013).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    /// Data directory for the storage engine.
+    pub data_dir: PathBuf,
+    /// REST (HTTP/1.1) bind address.
+    pub rest_addr: SocketAddr,
+    /// gRPC (HTTP/2) bind address.
+    pub grpc_addr: SocketAddr,
+    /// Accepted API keys. Empty is allowed only with `insecure = true`.
+    pub api_keys: Vec<String>,
+    /// Opt out of the secure defaults (no auth, allow non-loopback bind without
+    /// TLS). For local development only; never the default.
+    pub insecure: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            data_dir: PathBuf::from("./quiver-data"),
+            rest_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6333),
+            grpc_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6334),
+            api_keys: Vec::new(),
+            insecure: false,
+        }
+    }
+}
+
+impl Config {
+    /// Load configuration from defaults, an optional `quiver.toml`, and
+    /// `QUIVER_*` environment variables.
+    pub fn load() -> Result<Self, Error> {
+        Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::file("quiver.toml"))
+            .merge(Env::prefixed("QUIVER_"))
+            .extract()
+            .map_err(|e| Error::Config(e.to_string()))
+    }
+
+    /// Reject insecure configurations unless explicitly opted out (ADR-0013):
+    /// no anonymous access, and no non-loopback bind without TLS (TLS lands with
+    /// encryption-at-rest).
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.api_keys.is_empty() && !self.insecure {
+            return Err(Error::Config(
+                "no api_keys configured: set QUIVER_API_KEYS (comma-separated) or \
+                 set insecure=true for local development"
+                    .to_owned(),
+            ));
+        }
+        let non_loopback = !self.rest_addr.ip().is_loopback() || !self.grpc_addr.ip().is_loopback();
+        if non_loopback && !self.insecure {
+            return Err(Error::Config(
+                "non-loopback bind requires insecure=true until TLS lands with \
+                 encryption-at-rest"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Shared server state: the engine behind a single-writer lock, plus the
+/// accepted API keys.
+#[derive(Clone)]
+pub(crate) struct AppState {
+    db: Arc<Mutex<Database>>,
+    api_keys: Arc<Vec<String>>,
+}
+
+/// A collection's metadata.
+pub(crate) struct CollectionInfo {
+    pub name: String,
+    pub dim: u32,
+    pub metric: DistanceMetric,
+    pub count: u64,
+}
+
+/// A point to upsert.
+pub(crate) struct PointIn {
+    pub id: String,
+    pub vector: Vec<f32>,
+    pub payload: Value,
+}
+
+/// A fetched point.
+pub(crate) struct PointOut {
+    pub id: String,
+    pub vector: Option<Vec<f32>>,
+    pub payload: Value,
+}
+
+/// A search hit.
+pub(crate) struct MatchOut {
+    pub id: String,
+    pub score: f32,
+    pub payload: Option<Value>,
+    pub vector: Option<Vec<f32>>,
+}
+
+impl AppState {
+    /// Whether a presented bearer token is accepted. An empty key set means
+    /// `insecure` mode (validated at startup), which accepts any caller.
+    pub(crate) fn authorized(&self, presented: Option<&str>) -> bool {
+        if self.api_keys.is_empty() {
+            return true;
+        }
+        match presented {
+            Some(token) => self
+                .api_keys
+                .iter()
+                .any(|key| constant_time_eq(key.as_bytes(), token.as_bytes())),
+            None => false,
+        }
+    }
+
+    async fn run_blocking<T, F>(&self, f: F) -> Result<T, Error>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Database) -> quiver_embed::Result<T> + Send + 'static,
+    {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> Result<T, Error> {
+            let mut guard = db
+                .lock()
+                .map_err(|_| Error::Internal("database lock poisoned".to_owned()))?;
+            f(&mut guard).map_err(Error::Engine)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))?
+    }
+
+    pub(crate) async fn create_collection(
+        &self,
+        name: String,
+        dim: u32,
+        metric: DistanceMetric,
+    ) -> Result<CollectionInfo, Error> {
+        let descriptor = Descriptor {
+            dim,
+            dtype: Dtype::F32,
+            metric,
+        };
+        let owned = name.clone();
+        self.run_blocking(move |db| db.create_collection(&owned, descriptor))
+            .await?;
+        Ok(CollectionInfo {
+            name,
+            dim,
+            metric,
+            count: 0,
+        })
+    }
+
+    pub(crate) async fn get_collection(&self, name: String) -> Result<CollectionInfo, Error> {
+        self.run_blocking(move |db| {
+            let descriptor = db
+                .descriptor(&name)
+                .cloned()
+                .ok_or_else(|| quiver_embed::Error::CollectionNotFound(name.clone()))?;
+            let count = db.len(&name)? as u64;
+            Ok(CollectionInfo {
+                name,
+                dim: descriptor.dim,
+                metric: descriptor.metric,
+                count,
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn list_collections(&self) -> Result<Vec<CollectionInfo>, Error> {
+        self.run_blocking(|db| {
+            let mut out = Vec::new();
+            for name in db.collection_names() {
+                if let Some(descriptor) = db.descriptor(&name).cloned() {
+                    let count = db.len(&name)? as u64;
+                    out.push(CollectionInfo {
+                        name,
+                        dim: descriptor.dim,
+                        metric: descriptor.metric,
+                        count,
+                    });
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    pub(crate) async fn delete_collection(&self, name: String) -> Result<bool, Error> {
+        self.run_blocking(move |db| db.drop_collection(&name)).await
+    }
+
+    pub(crate) async fn upsert(
+        &self,
+        collection: String,
+        points: Vec<PointIn>,
+    ) -> Result<u64, Error> {
+        self.run_blocking(move |db| {
+            let mut count = 0u64;
+            for point in &points {
+                db.upsert(&collection, &point.id, &point.vector, &point.payload)?;
+                count += 1;
+            }
+            Ok(count)
+        })
+        .await
+    }
+
+    pub(crate) async fn delete_points(
+        &self,
+        collection: String,
+        ids: Vec<String>,
+    ) -> Result<u64, Error> {
+        self.run_blocking(move |db| {
+            let mut count = 0u64;
+            for id in &ids {
+                if db.delete(&collection, id)? {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        })
+        .await
+    }
+
+    pub(crate) async fn get_points(
+        &self,
+        collection: String,
+        ids: Vec<String>,
+        with_vector: bool,
+    ) -> Result<Vec<PointOut>, Error> {
+        self.run_blocking(move |db| {
+            let mut out = Vec::new();
+            for id in &ids {
+                if let Some(m) = db.get(&collection, id)? {
+                    out.push(PointOut {
+                        id: m.id,
+                        vector: if with_vector { m.vector } else { None },
+                        payload: m.payload.unwrap_or(Value::Null),
+                    });
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn search(
+        &self,
+        collection: String,
+        vector: Vec<f32>,
+        k: usize,
+        filter: Option<Filter>,
+        ef_search: usize,
+        with_payload: bool,
+        with_vector: bool,
+    ) -> Result<Vec<MatchOut>, Error> {
+        self.run_blocking(move |db| {
+            let params = SearchParams {
+                k,
+                filter,
+                ef_search,
+                with_payload,
+                with_vector,
+            };
+            let matches = db.search(&collection, &vector, &params)?;
+            Ok(matches
+                .into_iter()
+                .map(|m| MatchOut {
+                    id: m.id,
+                    score: m.score,
+                    payload: m.payload,
+                    vector: m.vector,
+                })
+                .collect())
+        })
+        .await
+    }
+}
+
+/// Run the server from `config` until a shutdown signal (Ctrl-C).
+pub async fn run(config: Config) -> Result<(), Error> {
+    config.validate()?;
+    let rest_listener = TcpListener::bind(config.rest_addr)
+        .await
+        .map_err(Error::Io)?;
+    let grpc_listener = TcpListener::bind(config.grpc_addr)
+        .await
+        .map_err(Error::Io)?;
+    tracing::info!(rest = %config.rest_addr, grpc = %config.grpc_addr, "quiver listening");
+    tokio::select! {
+        result = serve(config, rest_listener, grpc_listener) => result,
+        () = shutdown_signal() => {
+            tracing::info!("shutdown signal received");
+            Ok(())
+        }
+    }
+}
+
+/// Serve REST and gRPC on the given (already-bound) listeners until a transport
+/// error. Exposed so tests can bind ephemeral ports.
+pub async fn serve(
+    config: Config,
+    rest_listener: TcpListener,
+    grpc_listener: TcpListener,
+) -> Result<(), Error> {
+    let db = Database::open(&config.data_dir)?;
+    let state = AppState {
+        db: Arc::new(Mutex::new(db)),
+        api_keys: Arc::new(config.api_keys.clone()),
+    };
+
+    let app = rest::router(state.clone());
+    let grpc = grpc::service(state);
+
+    let rest_fut = async move { axum::serve(rest_listener, app).await.map_err(Error::Io) };
+    let grpc_fut = async move {
+        tonic::transport::Server::builder()
+            .add_service(grpc)
+            .serve_with_incoming(TcpListenerStream::new(grpc_listener))
+            .await
+            .map_err(|e| Error::Internal(format!("grpc server: {e}")))
+    };
+
+    tokio::try_join!(rest_fut, grpc_fut)?;
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Initialize structured logging from `RUST_LOG` (defaulting to `info`). Safe to
+/// call once at startup; a second call is ignored.
+pub fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+// Length-checked constant-time byte comparison for API keys.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn crate_builds() {}
+    fn config_rejects_missing_keys_unless_insecure() {
+        let mut config = Config::default();
+        assert!(config.validate().is_err());
+        config.insecure = true;
+        assert!(config.validate().is_ok());
+        config.insecure = false;
+        config.api_keys = vec!["secret".to_owned()];
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_rejects_public_bind_without_optout() {
+        let mut config = Config {
+            api_keys: vec!["secret".to_owned()],
+            ..Config::default()
+        };
+        config.rest_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 6333);
+        assert!(config.validate().is_err());
+        config.insecure = true;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_equal() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+    }
 }
