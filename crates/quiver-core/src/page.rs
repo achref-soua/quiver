@@ -197,14 +197,21 @@ pub fn parse_page(page: &[u8; PAGE_SIZE], expected: PageType) -> Result<(PageHea
     ))
 }
 
-/// Transforms a plaintext page to and from its on-disk representation.
+/// Transforms Quiver's durable bytes — fixed-size pages and variable-length
+/// records — to and from their on-disk representation.
 ///
 /// The plaintext codec ([`PlainCodec`]) is the identity transform; integrity
-/// then comes from the page's inner CRC. The encryption-at-rest codec (added
-/// with `quiver-crypto`) seals each page with an AEAD into a
-/// `[nonce][ciphertext][tag]` block of [`PageCodec::block_size`] bytes, deriving
-/// a unique nonce per page so reuse is impossible by construction; the inner CRC
-/// still protects the plaintext.
+/// then comes from the page's inner CRC (and, for records, the WAL frame CRC).
+/// The encryption-at-rest codec (added with `quiver-crypto`) seals each page with
+/// an AEAD into a `[nonce][ciphertext][tag]` block of [`PageCodec::block_size`]
+/// bytes, deriving a unique nonce per page so reuse is impossible by
+/// construction; the inner CRC still protects the plaintext.
+///
+/// The WAL is record-framed rather than paged, so the AEAD codec must also seal
+/// each WAL record via [`PageCodec::seal_record`]; otherwise an
+/// encrypted-at-rest store would still leak its log in plaintext. The default
+/// record methods are the identity transform, so [`PlainCodec`] needs no change
+/// and a non-encrypting codec writes records verbatim.
 pub trait PageCodec: Send + Sync {
     /// On-disk size, in bytes, of one sealed page.
     fn block_size(&self) -> usize;
@@ -217,6 +224,21 @@ pub trait PageCodec: Send + Sync {
     /// Open an on-disk block back into a plaintext page. `block` must be exactly
     /// [`PageCodec::block_size`] bytes.
     fn open(&self, page_id: u64, block: &[u8], out: &mut [u8; PAGE_SIZE]) -> Result<()>;
+
+    /// Seal a variable-length record — a WAL frame payload — into a
+    /// self-describing on-disk blob. The default is the identity transform used
+    /// by [`PlainCodec`]; an AEAD codec overrides it to return
+    /// `[nonce][ciphertext+tag]`, so no plaintext record ever reaches the disk.
+    fn seal_record(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        Ok(plaintext.to_vec())
+    }
+
+    /// Open a record produced by [`PageCodec::seal_record`]. The default is the
+    /// identity transform; an AEAD codec authenticates and decrypts, returning an
+    /// error on a wrong key or any tampering.
+    fn open_record(&self, sealed: &[u8]) -> Result<Vec<u8>> {
+        Ok(sealed.to_vec())
+    }
 }
 
 /// The identity codec used when encryption-at-rest is disabled. On-disk bytes

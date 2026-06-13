@@ -49,6 +49,11 @@ async fn rest_and_grpc_round_trip() {
         rest_addr,
         grpc_addr,
         api_keys: vec![key.to_owned()],
+        // Exercise the full encrypted path (server → engine → AEAD codec) over
+        // both transports, not just plaintext storage.
+        encryption_key: Some(
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_owned(),
+        ),
         insecure: false,
     };
     let server = tokio::spawn(async move {

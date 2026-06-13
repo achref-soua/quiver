@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 quiver-core = { workspace = true }
+quiver-crypto = { workspace = true }
 quiver-embed = { workspace = true }
 quiver-proto = { workspace = true }
 quiver-query = { workspace = true }

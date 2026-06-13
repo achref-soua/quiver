@@ -156,7 +156,7 @@ impl Store {
         let mut keep_seqs: HashSet<u64> = HashSet::new();
         for (seq, path) in &wal_files {
             max_seq = (*seq).max(max_seq);
-            let replay = wal::read_all(path)?;
+            let replay = wal::read_all(path, codec.as_ref())?;
             let mut had_live = false;
             for entry in replay.entries {
                 if entry.lsn.value() <= floor.value() {
@@ -222,14 +222,17 @@ impl Store {
         let id = CollectionId(self.next_collection_id);
         let descriptor_bytes = postcard::to_allocvec(&descriptor)?;
         let lsn = self.next_lsn;
-        self.wal.append_sync(&WalEntry {
-            lsn,
-            op: WalOp::CreateCollection {
-                collection_id: id,
-                name: name.to_owned(),
-                descriptor: descriptor_bytes,
+        self.wal.append_sync(
+            self.codec.as_ref(),
+            &WalEntry {
+                lsn,
+                op: WalOp::CreateCollection {
+                    collection_id: id,
+                    name: name.to_owned(),
+                    descriptor: descriptor_bytes,
+                },
             },
-        })?;
+        )?;
         self.next_lsn = lsn.next();
         self.next_collection_id += 1;
         self.collections
@@ -245,10 +248,13 @@ impl Store {
             return Ok(false);
         };
         let lsn = self.next_lsn;
-        self.wal.append_sync(&WalEntry {
-            lsn,
-            op: WalOp::DropCollection { collection_id: id },
-        })?;
+        self.wal.append_sync(
+            self.codec.as_ref(),
+            &WalEntry {
+                lsn,
+                op: WalOp::DropCollection { collection_id: id },
+            },
+        )?;
         self.next_lsn = lsn.next();
         self.collections.remove(&id);
         self.name_index.remove(name);
@@ -279,15 +285,18 @@ impl Store {
         }
         let vector_bytes = f32_to_le_bytes(vector);
         let lsn = self.next_lsn;
-        self.wal.append_sync(&WalEntry {
-            lsn,
-            op: WalOp::Upsert {
-                collection_id: collection,
-                external_id: external_id.to_owned(),
-                vector: vector_bytes.clone(),
-                payload: payload.to_vec(),
+        self.wal.append_sync(
+            self.codec.as_ref(),
+            &WalEntry {
+                lsn,
+                op: WalOp::Upsert {
+                    collection_id: collection,
+                    external_id: external_id.to_owned(),
+                    vector: vector_bytes.clone(),
+                    payload: payload.to_vec(),
+                },
             },
-        })?;
+        )?;
         self.next_lsn = lsn.next();
         let state = self
             .collections
@@ -317,13 +326,16 @@ impl Store {
             return Ok(false);
         }
         let lsn = self.next_lsn;
-        self.wal.append_sync(&WalEntry {
-            lsn,
-            op: WalOp::Delete {
-                collection_id: collection,
-                external_id: external_id.to_owned(),
+        self.wal.append_sync(
+            self.codec.as_ref(),
+            &WalEntry {
+                lsn,
+                op: WalOp::Delete {
+                    collection_id: collection,
+                    external_id: external_id.to_owned(),
+                },
             },
-        })?;
+        )?;
         self.next_lsn = lsn.next();
         let state = self
             .collections

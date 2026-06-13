@@ -1,6 +1,8 @@
 # Cryptography
 
-**Non-negotiable: Quiver implements no cryptographic primitives or protocols of its own.** Every primitive comes from an audited library — `rustls` for TLS, and RustCrypto crates / `ring` for AEAD, hashing, KDF, and key wrapping. Rolling our own crypto would disqualify a security-first project. Any experimental scheme uses a *published, peer-reviewed* construction and is clearly labelled. Decisions: [ADR-0010](../adr/0010-crypto-envelope-aead.md), [ADR-0012](../adr/0012-client-side-encryption.md).
+**Non-negotiable: Quiver implements no cryptographic primitives or protocols of its own.** Every primitive comes from an audited library — `rustls` for TLS, and RustCrypto crates for AEAD, hashing, KDF, and key wrapping. Rolling our own crypto would disqualify a security-first project. Any experimental scheme uses a *published, peer-reviewed* construction and is clearly labelled. Decisions: [ADR-0010](../adr/0010-crypto-envelope-aead.md), [ADR-0012](../adr/0012-client-side-encryption.md).
+
+> **Implementation status (Phase 1).** Encryption-at-rest is shipped and on by default. The `quiver-crypto` crate provides an `AeadCodec` (XChaCha20-Poly1305 with per-page/per-record HKDF-SHA256 subkeys and a fresh random 192-bit nonce per seal, from the RustCrypto crates — no `ring`, no home-grown code). It is wired into the storage engine through the `PageCodec` seam so it seals **all** durable data: the paged manifest and segment files *and* the record-framed write-ahead log (the WAL is sealed per record, since a page-only codec would otherwise leave it in plaintext). Phase 1 uses a single operator-supplied 256-bit root key (`QUIVER_ENCRYPTION_KEY`); the full envelope hierarchy below (master key → per-collection DEK → KMS, and crypto-shredding) is Phase 3 "security depth". TLS-in-transit follows in the next Phase 1 slice.
 
 ## Key hierarchy (envelope encryption)
 
