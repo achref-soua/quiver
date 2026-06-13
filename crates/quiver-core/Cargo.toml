@@ -12,6 +12,7 @@ authors.workspace = true
 crc32c = { workspace = true }
 memmap2 = { workspace = true }
 postcard = { workspace = true }
+roaring = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 

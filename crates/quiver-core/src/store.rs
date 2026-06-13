@@ -18,27 +18,30 @@
 //! ## Write path
 //! `upsert`/`delete`/`create_collection`/`drop_collection` append a WAL record,
 //! `fsync` it (acknowledgement), then update in-memory state. `checkpoint` seals
-//! the active buffer (and the window's deletes, as tombstones) into a new
-//! immutable segment per collection, atomically swaps in a manifest that
-//! references them, rotates the WAL, and garbage-collects superseded files.
+//! the active buffer into a new immutable segment per collection, persists the
+//! window's deletes and shadowed rows into the affected segments' `.del`
+//! tombstone bitmaps, atomically swaps in a manifest, rotates the WAL, and
+//! garbage-collects superseded files.
 //!
 //! ## Recovery (on open)
 //! Read `CURRENT` → load the manifest → for each referenced segment, read its
-//! row directory and rebuild the primary index (a later segment shadows an
-//! earlier one for the same id; a segment's tombstones remove ids) → replay every
-//! WAL record with `lsn > last_checkpointed_lsn` idempotently into the active
-//! buffer → garbage-collect orphan segment files a crash left between a flush and
-//! the manifest swap. A torn trailing WAL record fails its frame check and is
-//! dropped; it was never acknowledged.
+//! row directory and tombstone bitmap and rebuild the primary index (a row marked
+//! dead in its segment is skipped, so each id is live in exactly one segment) →
+//! replay every WAL record with `lsn > last_checkpointed_lsn` idempotently into
+//! the active buffer → garbage-collect orphan segment files a crash left between a
+//! flush and the manifest swap. A torn trailing WAL record fails its frame check
+//! and is dropped; it was never acknowledged.
 //!
 //! ## Concurrency
 //! Phase 1/2 is a single-writer engine: mutations take `&mut self`, reads take
 //! `&self`. The lock-free MVCC snapshot model (ADR-0006) arrives with the
 //! server integration; until then a server wraps the store in a lock.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use roaring::RoaringBitmap;
 
 use crate::descriptor::Descriptor;
 use crate::error::{CoreError, Result};
@@ -48,6 +51,10 @@ use crate::page::{PageCodec, PlainCodec};
 use crate::paged::fsync_dir;
 use crate::segment::{self, SealRow, SealedSegment};
 use crate::wal::{self, WalEntry, WalOp, WalWriter};
+
+/// Number of sealed segments at which a checkpoint auto-compacts a collection,
+/// merging them to keep reads and recovery from fanning out across many files.
+const COMPACT_MIN_SEGMENTS: usize = 8;
 
 /// A stored record returned by reads: the decoded vector and opaque payload.
 #[derive(Debug, Clone, PartialEq)]
@@ -92,8 +99,9 @@ struct CollectionState {
     active: Vec<ActiveRow>,
     // Live external id → its latest active row, for sealing at the next checkpoint.
     active_index: BTreeMap<String, u32>,
-    // Ids deleted since the last checkpoint, sealed as tombstones next checkpoint.
-    deleted: BTreeSet<String>,
+    // Sealed-segment rows that died this window (deleted or shadowed), keyed by
+    // segment index; merged into each segment's `.del` at the next checkpoint.
+    dead_this_window: BTreeMap<u32, RoaringBitmap>,
 }
 
 impl CollectionState {
@@ -109,12 +117,44 @@ impl CollectionState {
             segments_meta: Vec::new(),
             active: Vec::new(),
             active_index: BTreeMap::new(),
-            deleted: BTreeSet::new(),
+            dead_this_window: BTreeMap::new(),
         }
     }
 
     fn has_pending(&self) -> bool {
-        !self.active_index.is_empty() || !self.deleted.is_empty()
+        !self.active_index.is_empty() || !self.dead_this_window.is_empty()
+    }
+
+    // Apply an upsert to in-memory state (shared by the write path and WAL
+    // replay). If the id currently lives in a sealed segment, that row is now
+    // shadowed and recorded for tombstoning at the next checkpoint.
+    fn apply_upsert(&mut self, external_id: &str, vector: Vec<u8>, payload: Vec<u8>) {
+        if let Some(Loc::Sealed { seg, row }) = self.primary.get(external_id).copied() {
+            self.dead_this_window.entry(seg).or_default().insert(row);
+        }
+        let row = self.active.len() as u32;
+        self.active.push(ActiveRow { vector, payload });
+        self.active_index.insert(external_id.to_owned(), row);
+        self.primary
+            .insert(external_id.to_owned(), Loc::Active(row));
+    }
+
+    // Apply a delete to in-memory state (shared by the write path and WAL
+    // replay). Returns whether the id existed. A deleted sealed row is recorded
+    // for tombstoning; a deleted active row is simply dropped from the buffer.
+    fn apply_delete(&mut self, external_id: &str) -> bool {
+        match self.primary.remove(external_id) {
+            Some(Loc::Sealed { seg, row }) => {
+                self.dead_this_window.entry(seg).or_default().insert(row);
+                self.active_index.remove(external_id);
+                true
+            }
+            Some(Loc::Active(_)) => {
+                self.active_index.remove(external_id);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -162,8 +202,8 @@ impl Store {
         let mfst = manifest::read_current(dir, codec.as_ref())?.unwrap_or_default();
 
         // 2. Rebuild the primary index from the sealed segments the manifest
-        //    references. Segments are applied oldest-to-newest: a later row
-        //    shadows an earlier one for the same id, and tombstones remove ids.
+        //    references. A row tombstoned in its segment's `.del` is skipped, so
+        //    each external id is added from the single segment in which it is live.
         let mut collections: HashMap<CollectionId, CollectionState> = HashMap::new();
         let mut name_index: HashMap<String, CollectionId> = HashMap::new();
         for entry in &mfst.collections {
@@ -172,20 +212,15 @@ impl Store {
             state.segments_meta = entry.segments.clone();
             let seg_dir = segments_dir(dir, entry.id);
             for seg in &entry.segments {
-                let (sealed, ext_ids, tombstones) =
-                    segment::open_segment(&seg_dir, seg.id, codec.as_ref())?;
+                let (sealed, ext_ids) = segment::open_segment(&seg_dir, seg.id, codec.as_ref())?;
                 let seg_idx = state.sealed.len() as u32;
                 for (row, ext_id) in ext_ids.into_iter().enumerate() {
-                    state.primary.insert(
-                        ext_id,
-                        Loc::Sealed {
-                            seg: seg_idx,
-                            row: row as u32,
-                        },
-                    );
-                }
-                for t in &tombstones {
-                    state.primary.remove(t);
+                    let row = row as u32;
+                    if !sealed.is_dead(row) {
+                        state
+                            .primary
+                            .insert(ext_id, Loc::Sealed { seg: seg_idx, row });
+                    }
                 }
                 state.sealed.push(sealed);
             }
@@ -347,16 +382,7 @@ impl Store {
             .collections
             .get_mut(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
-        let row = state.active.len() as u32;
-        state.active.push(ActiveRow {
-            vector: vector_bytes,
-            payload: payload.to_vec(),
-        });
-        state.active_index.insert(external_id.to_owned(), row);
-        state
-            .primary
-            .insert(external_id.to_owned(), Loc::Active(row));
-        state.deleted.remove(external_id);
+        state.apply_upsert(external_id, vector_bytes, payload.to_vec());
         Ok(lsn)
     }
 
@@ -387,9 +413,7 @@ impl Store {
             .collections
             .get_mut(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
-        state.primary.remove(external_id);
-        state.active_index.remove(external_id);
-        state.deleted.insert(external_id.to_owned());
+        state.apply_delete(external_id);
         Ok(true)
     }
 
@@ -516,41 +540,53 @@ impl Store {
         cids.sort();
         let segment_lsn_low = self.last_checkpointed_lsn.next();
 
-        // Phase A: write a new segment file set for each collection with pending
-        // changes, then re-open it (mmap) ready to install after the swap.
+        // Phase A: for each collection with pending changes, persist the window's
+        // dead rows into the affected segments' `.del` bitmaps, seal the active
+        // buffer into a new segment (if any), and re-open it ready to install.
         let mut pending: HashMap<CollectionId, PendingSegment> = HashMap::new();
         for &cid in &cids {
             if !self.collections[&cid].has_pending() {
                 continue;
             }
-            let seg_id = self.next_segment_id;
-            self.next_segment_id += 1;
             let seg_dir = segments_dir(&self.dir, cid);
             fs::create_dir_all(&seg_dir).map_err(|e| CoreError::io(&seg_dir, e))?;
 
-            // Seal the active rows (in deterministic id order) and the window's
-            // deletes (as tombstones). The borrow of `self.collections` ends with
-            // this block, before the commit phase mutates it.
-            let row_count = {
+            // Merge the window's dead rows into each affected segment's tombstone
+            // bitmap and rewrite it atomically (temp + rename).
+            {
                 let state = &self.collections[&cid];
-                let seal_rows: Vec<SealRow<'_>> = state
-                    .active_index
-                    .iter()
-                    .map(|(id, &row)| SealRow {
-                        external_id: id,
-                        vector: &state.active[row as usize].vector,
-                        payload: &state.active[row as usize].payload,
-                    })
-                    .collect();
-                let tombstones: Vec<String> = state.deleted.iter().cloned().collect();
-                segment::write_segment(
-                    &seg_dir,
-                    seg_id,
-                    self.codec.as_ref(),
-                    &seal_rows,
-                    &tombstones,
-                )?;
-                seal_rows.len() as u64
+                for (&seg_idx, newly_dead) in &state.dead_this_window {
+                    if let Some(seg) = state.sealed.get(seg_idx as usize) {
+                        let mut merged = seg.dead_bitmap();
+                        merged |= newly_dead;
+                        segment::write_del(&seg_dir, seg.seg_id, self.codec.as_ref(), &merged)?;
+                    }
+                }
+            }
+
+            // Seal the active buffer (in deterministic id order) into a new
+            // segment, if there is anything to seal. The borrow of
+            // `self.collections` ends with this block, before the commit phase.
+            let new_seg = if self.collections[&cid].active_index.is_empty() {
+                None
+            } else {
+                let seg_id = self.next_segment_id;
+                self.next_segment_id += 1;
+                let row_count = {
+                    let state = &self.collections[&cid];
+                    let seal_rows: Vec<SealRow<'_>> = state
+                        .active_index
+                        .iter()
+                        .map(|(id, &row)| SealRow {
+                            external_id: id,
+                            vector: &state.active[row as usize].vector,
+                            payload: &state.active[row as usize].payload,
+                        })
+                        .collect();
+                    segment::write_segment(&seg_dir, seg_id, self.codec.as_ref(), &seal_rows)?;
+                    seal_rows.len() as u64
+                };
+                Some((seg_id, row_count))
             };
 
             // Make the new files and their parent directories durable before the
@@ -560,21 +596,23 @@ impl Store {
             fsync_dir(&self.dir.join("collections"))?;
             fsync_dir(&self.dir)?;
 
-            let (sealed, ext_ids, _tombstones) =
-                segment::open_segment(&seg_dir, seg_id, self.codec.as_ref())?;
-            pending.insert(
-                cid,
-                PendingSegment {
-                    seg_ref: SegmentRef {
-                        id: seg_id,
-                        row_count,
-                        lsn_low: segment_lsn_low,
-                        lsn_high: last_lsn,
+            if let Some((seg_id, row_count)) = new_seg {
+                let (sealed, ext_ids) =
+                    segment::open_segment(&seg_dir, seg_id, self.codec.as_ref())?;
+                pending.insert(
+                    cid,
+                    PendingSegment {
+                        seg_ref: SegmentRef {
+                            id: seg_id,
+                            row_count,
+                            lsn_low: segment_lsn_low,
+                            lsn_high: last_lsn,
+                        },
+                        sealed,
+                        ext_ids,
                     },
-                    sealed,
-                    ext_ids,
-                },
-            );
+                );
+            }
         }
 
         // Phase B: build and atomically install the new manifest.
@@ -607,12 +645,19 @@ impl Store {
         self.manifest_version = new_version;
         self.last_checkpointed_lsn = last_lsn;
         for &cid in &cids {
-            if let Some(p) = pending.remove(&cid)
-                && let Some(state) = self.collections.get_mut(&cid)
-            {
-                // Every active id now lives in the new segment; repoint it. Old
-                // sealed rows for updated ids are left shadowed (compaction
-                // reclaims them, PR 2).
+            let Some(state) = self.collections.get_mut(&cid) else {
+                continue;
+            };
+            // Fold this window's dead rows into the in-memory segment bitmaps
+            // (the `.del` files were already persisted in Phase A).
+            let dead_window = std::mem::take(&mut state.dead_this_window);
+            for (seg_idx, bitmap) in dead_window {
+                if let Some(seg) = state.sealed.get_mut(seg_idx as usize) {
+                    seg.mark_dead(&bitmap);
+                }
+            }
+            // Install the new segment, if any, repointing its now-sealed ids.
+            if let Some(p) = pending.remove(&cid) {
                 let seg_idx = state.sealed.len() as u32;
                 for (row, ext_id) in p.ext_ids.into_iter().enumerate() {
                     state.primary.insert(
@@ -625,12 +670,187 @@ impl Store {
                 }
                 state.sealed.push(p.sealed);
                 state.segments_meta.push(p.seg_ref);
-                state.active.clear();
-                state.active_index.clear();
-                state.deleted.clear();
             }
+            state.active.clear();
+            state.active_index.clear();
         }
         self.rotate_wal()?;
+        gc_orphan_segments(&self.dir, &new_manifest)?;
+        self.auto_compact()?;
+        Ok(())
+    }
+
+    /// Compact every collection with reclaimable space: merge its sealed segments,
+    /// dropping dead (deleted or shadowed) rows, into a single fresh segment. Each
+    /// collection commits via its own atomic manifest swap and is crash-safe like
+    /// a checkpoint — the old segments stay valid until the swap, so a crash
+    /// before it leaves the pre-compaction state intact.
+    pub fn compact(&mut self) -> Result<()> {
+        for cid in self.sorted_cids() {
+            if self.reclaimable(cid) {
+                self.compact_collection(cid)?;
+            }
+        }
+        Ok(())
+    }
+
+    // Compact only collections that have crossed the automatic threshold; run at
+    // the end of a checkpoint.
+    fn auto_compact(&mut self) -> Result<()> {
+        for cid in self.sorted_cids() {
+            if self.needs_compaction(cid) {
+                self.compact_collection(cid)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn sorted_cids(&self) -> Vec<CollectionId> {
+        let mut cids: Vec<CollectionId> = self.collections.keys().copied().collect();
+        cids.sort();
+        cids
+    }
+
+    // Whether a collection has any space to reclaim: more than one segment to
+    // merge, or any dead rows in a segment.
+    fn reclaimable(&self, cid: CollectionId) -> bool {
+        self.collections.get(&cid).is_some_and(|s| {
+            s.sealed.len() > 1
+                || s.sealed
+                    .iter()
+                    .any(|seg| seg.live_count() < u64::from(seg.row_count()))
+        })
+    }
+
+    // Whether a collection has crossed the automatic compaction threshold: many
+    // segments to merge, or at least half of its sealed rows dead.
+    fn needs_compaction(&self, cid: CollectionId) -> bool {
+        let Some(s) = self.collections.get(&cid) else {
+            return false;
+        };
+        if s.sealed.is_empty() {
+            return false;
+        }
+        let total: u64 = s.sealed.iter().map(|seg| u64::from(seg.row_count())).sum();
+        let live: u64 = s.sealed.iter().map(SealedSegment::live_count).sum();
+        s.sealed.len() >= COMPACT_MIN_SEGMENTS || (total > 0 && (total - live) * 2 >= total)
+    }
+
+    // Merge one collection's sealed segments into a single fresh segment holding
+    // only its live rows, install it atomically, and reclaim the old files.
+    fn compact_collection(&mut self, cid: CollectionId) -> Result<()> {
+        // Gather the live sealed rows (active rows are untouched). `primary` is
+        // ordered, so the rewritten segment is deterministic.
+        let live: Vec<(String, Vec<u8>, Vec<u8>)> = {
+            let state = self
+                .collections
+                .get(&cid)
+                .ok_or_else(|| CoreError::NotFound(format!("collection {cid}")))?;
+            let mut out = Vec::with_capacity(state.primary.len());
+            for (ext_id, &loc) in &state.primary {
+                if let Loc::Sealed { seg, row } = loc {
+                    let segment = state.sealed.get(seg as usize).ok_or_else(|| {
+                        CoreError::MalformedPage(format!("dangling segment index {seg}"))
+                    })?;
+                    let vector = segment.read_vector(self.codec.as_ref(), row, state.stride)?;
+                    let payload = segment.read_payload(self.codec.as_ref(), row)?;
+                    out.push((ext_id.clone(), vector, payload));
+                }
+            }
+            out
+        };
+
+        // The merged segment spans the full lsn range of its inputs.
+        let (lsn_low, lsn_high) = {
+            let state = &self.collections[&cid];
+            let low = state
+                .segments_meta
+                .iter()
+                .map(|s| s.lsn_low.value())
+                .min()
+                .map(Lsn)
+                .unwrap_or(Lsn::ZERO);
+            let high = state
+                .segments_meta
+                .iter()
+                .map(|s| s.lsn_high.value())
+                .max()
+                .map(Lsn)
+                .unwrap_or(self.last_checkpointed_lsn);
+            (low, high)
+        };
+
+        let seg_id = self.next_segment_id;
+        self.next_segment_id += 1;
+        let seg_dir = segments_dir(&self.dir, cid);
+        fs::create_dir_all(&seg_dir).map_err(|e| CoreError::io(&seg_dir, e))?;
+        let seal_rows: Vec<SealRow<'_>> = live
+            .iter()
+            .map(|(id, v, p)| SealRow {
+                external_id: id,
+                vector: v,
+                payload: p,
+            })
+            .collect();
+        segment::write_segment(&seg_dir, seg_id, self.codec.as_ref(), &seal_rows)?;
+        fsync_dir(&seg_dir)?;
+        fsync_dir(&collection_dir(&self.dir, cid))?;
+        fsync_dir(&self.dir.join("collections"))?;
+        fsync_dir(&self.dir)?;
+        let new_ref = SegmentRef {
+            id: seg_id,
+            row_count: seal_rows.len() as u64,
+            lsn_low,
+            lsn_high,
+        };
+        let (sealed, ext_ids) = segment::open_segment(&seg_dir, seg_id, self.codec.as_ref())?;
+
+        // New manifest: this collection now has exactly one segment; others are
+        // unchanged. The atomic swap is the commit point.
+        let new_version = self.manifest_version + 1;
+        let mut entries = Vec::with_capacity(self.collections.len());
+        for &other in &self.sorted_cids() {
+            let state = &self.collections[&other];
+            let segs = if other == cid {
+                vec![new_ref.clone()]
+            } else {
+                state.segments_meta.clone()
+            };
+            entries.push(CollectionEntry {
+                id: state.id,
+                name: state.name.clone(),
+                descriptor: postcard::to_allocvec(&state.descriptor)?,
+                segments: segs,
+            });
+        }
+        let new_manifest = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            version: new_version,
+            last_checkpointed_lsn: self.last_checkpointed_lsn,
+            next_collection_id: self.next_collection_id,
+            next_segment_id: self.next_segment_id,
+            collections: entries,
+        };
+        manifest::write_manifest(&self.dir, &new_manifest, self.codec.as_ref())?;
+
+        // Commit: replace the segments (dropping the old mmaps before the files
+        // are reclaimed), repoint the now-merged ids, and drop pending tombstones
+        // (their rows no longer exist).
+        self.manifest_version = new_version;
+        if let Some(state) = self.collections.get_mut(&cid) {
+            state.sealed = vec![sealed];
+            state.segments_meta = vec![new_ref];
+            state.dead_this_window.clear();
+            for (row, ext_id) in ext_ids.into_iter().enumerate() {
+                state.primary.insert(
+                    ext_id,
+                    Loc::Sealed {
+                        seg: 0,
+                        row: row as u32,
+                    },
+                );
+            }
+        }
         gc_orphan_segments(&self.dir, &new_manifest)?;
         Ok(())
     }
@@ -688,14 +908,7 @@ fn apply_wal_entry(
             payload,
         } => {
             if let Some(state) = collections.get_mut(collection_id) {
-                let row = state.active.len() as u32;
-                state.active.push(ActiveRow {
-                    vector: vector.clone(),
-                    payload: payload.clone(),
-                });
-                state.active_index.insert(external_id.clone(), row);
-                state.primary.insert(external_id.clone(), Loc::Active(row));
-                state.deleted.remove(external_id);
+                state.apply_upsert(external_id, vector.clone(), payload.clone());
             }
         }
         WalOp::Delete {
@@ -703,9 +916,7 @@ fn apply_wal_entry(
             external_id,
         } => {
             if let Some(state) = collections.get_mut(collection_id) {
-                state.primary.remove(external_id);
-                state.active_index.remove(external_id);
-                state.deleted.insert(external_id.clone());
+                state.apply_delete(external_id);
             }
         }
         // The manifest is the authoritative checkpoint record; explicit
@@ -754,7 +965,15 @@ fn gc_orphan_segments(dir: &Path, mfst: &Manifest) -> Result<()> {
         for seg in fs::read_dir(&seg_dir).map_err(|e| CoreError::io(&seg_dir, e))? {
             let seg = seg.map_err(|e| CoreError::io(&seg_dir, e))?;
             let path = seg.path();
-            let Some(seg_id) = seg.file_name().to_str().and_then(segment::seg_id_of_file) else {
+            let Some(name) = seg.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            // A crash-leftover temp (an interrupted `.del` rewrite) is always junk.
+            if segment::is_temp_file(&name) {
+                remove_file_if_present(&path)?;
+                continue;
+            }
+            let Some(seg_id) = segment::seg_id_of_file(&name) else {
                 continue;
             };
             if !referenced.contains(&(cid, seg_id)) {
@@ -1120,5 +1339,140 @@ mod tests {
                 "vector k{i} mismatch after straddling read"
             );
         }
+    }
+
+    #[test]
+    fn delete_persists_via_del_bitmap_across_reopen() {
+        // Five rows in one segment; deleting one is 20% dead with a single
+        // segment, so auto-compaction does not fire — the delete must survive
+        // purely via the persisted `.del` tombstone bitmap.
+        let tmp = tempfile::tempdir().unwrap();
+        let cid;
+        {
+            let mut s = open(tmp.path());
+            let c = s.create_collection("c", desc()).unwrap();
+            cid = c;
+            for i in 0..5u32 {
+                s.upsert(c, &format!("k{i}"), &[i as f32; 4], b"{}")
+                    .unwrap();
+            }
+            s.checkpoint().unwrap();
+            s.delete(c, "k2").unwrap();
+            s.checkpoint().unwrap();
+            assert_eq!(
+                s.collections[&c].sealed.len(),
+                1,
+                "no new segment for a delete-only window"
+            );
+        }
+        // The tombstone bitmap was written for segment 0.
+        assert!(
+            segments_dir(tmp.path(), cid)
+                .join("seg-0000000000.del")
+                .exists(),
+            ".del must be persisted for the deleted row"
+        );
+        let s = open(tmp.path());
+        let c = s.collection_id("c").unwrap();
+        assert!(s.get(c, "k2").unwrap().is_none());
+        assert_eq!(s.len(c).unwrap(), 4);
+        for i in [0u32, 1, 3, 4] {
+            assert!(s.get(c, &format!("k{i}")).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn shadowed_row_is_tombstoned_and_latest_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut s = open(tmp.path());
+            let c = s.create_collection("c", desc()).unwrap();
+            for i in 0..5u32 {
+                s.upsert(c, &format!("k{i}"), &[i as f32; 4], b"v1")
+                    .unwrap();
+            }
+            s.checkpoint().unwrap(); // seg 0
+            s.upsert(c, "k2", &[99.0; 4], b"v2").unwrap();
+            s.checkpoint().unwrap(); // seg 1 holds the new k2; seg 0 row tombstoned
+        }
+        let s = open(tmp.path());
+        let c = s.collection_id("c").unwrap();
+        assert_eq!(s.len(c).unwrap(), 5); // k2 counted once
+        let got = s.get(c, "k2").unwrap().unwrap();
+        assert_eq!(got.vector, vec![99.0; 4]);
+        assert_eq!(got.payload, b"v2");
+    }
+
+    #[test]
+    fn compaction_merges_segments_reclaims_and_keeps_active_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cid;
+        {
+            let mut s = open(tmp.path());
+            let c = s.create_collection("c", desc()).unwrap();
+            cid = c;
+            for i in 0..6u32 {
+                s.upsert(c, &format!("k{i}"), &[i as f32; 4], b"{}")
+                    .unwrap();
+            }
+            s.checkpoint().unwrap(); // seg 0: k0..k5
+            for i in 6..12u32 {
+                s.upsert(c, &format!("k{i}"), &[i as f32; 4], b"{}")
+                    .unwrap();
+            }
+            s.checkpoint().unwrap(); // seg 1: k6..k11
+            s.delete(c, "k0").unwrap();
+            s.delete(c, "k6").unwrap();
+            s.checkpoint().unwrap(); // tombstones only; still two segments
+            assert_eq!(s.collections[&c].sealed.len(), 2);
+
+            // An un-checkpointed row must survive the compaction untouched.
+            s.upsert(c, "fresh", &[7.0; 4], b"new").unwrap();
+            s.compact().unwrap();
+            assert_eq!(s.collections[&c].sealed.len(), 1, "segments merged to one");
+            assert!(
+                !segments_dir(tmp.path(), cid)
+                    .join("seg-0000000000.dir")
+                    .exists(),
+                "old segment files reclaimed"
+            );
+            assert_eq!(s.len(c).unwrap(), 11); // 10 live sealed + 1 active
+            assert!(s.get(c, "k0").unwrap().is_none());
+            assert!(s.get(c, "k6").unwrap().is_none());
+            assert_eq!(s.get(c, "k5").unwrap().unwrap().vector, vec![5.0; 4]);
+            assert_eq!(s.get(c, "fresh").unwrap().unwrap().payload, b"new");
+        }
+        // Everything survives a reopen, including the active row via WAL replay.
+        let s = open(tmp.path());
+        let c = s.collection_id("c").unwrap();
+        assert_eq!(s.collections[&c].sealed.len(), 1);
+        assert_eq!(s.len(c).unwrap(), 11);
+        assert!(s.get(c, "k0").unwrap().is_none());
+        assert_eq!(s.get(c, "fresh").unwrap().unwrap().vector, vec![7.0; 4]);
+        assert_eq!(s.get(c, "k11").unwrap().unwrap().vector, vec![11.0; 4]);
+    }
+
+    #[test]
+    fn auto_compaction_merges_many_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = open(tmp.path());
+        let c = s.create_collection("c", desc()).unwrap();
+        // Eight checkpoints create eight segments; the eighth checkpoint's
+        // auto-compaction merges them.
+        for ck in 0..8u32 {
+            for i in 0..3u32 {
+                let n = ck * 3 + i;
+                s.upsert(c, &format!("k{n}"), &[n as f32; 4], b"{}")
+                    .unwrap();
+            }
+            s.checkpoint().unwrap();
+        }
+        assert!(
+            s.collections[&c].sealed.len() < COMPACT_MIN_SEGMENTS,
+            "auto-compaction should have merged the segments"
+        );
+        assert_eq!(s.len(c).unwrap(), 24);
+        assert_eq!(s.get(c, "k0").unwrap().unwrap().vector, vec![0.0; 4]);
+        assert_eq!(s.get(c, "k23").unwrap().unwrap().vector, vec![23.0; 4]);
     }
 }
