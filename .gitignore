@@ -1,0 +1,50 @@
+# --- Rust ---
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# --- Working notes / scratch (never committed) ---
+/.scratch/
+
+# --- Benchmark datasets (large; fetched on demand) ---
+/bench/datasets/
+/bench/results/*.local.*
+
+# --- Node / SDKs ---
+node_modules/
+dist/
+.turbo/
+*.tsbuildinfo
+.pnpm-store/
+
+# --- Python / uv ---
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Secrets / local env ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+!**/testdata/**/*.pem
+!**/testdata/**/*.crt
+
+# --- Local data / runtime ---
+/data/
+*.qvr
+*.wal
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
