@@ -199,6 +199,13 @@ impl PageCodec for AeadCodec {
     fn open_record(&self, sealed: &[u8]) -> Result<Vec<u8>> {
         self.open_bytes(&[WAL_INFO], &[], sealed)
     }
+
+    fn clone_box(&self) -> Box<dyn PageCodec> {
+        // Reconstruct from the root key so the disk-resident index (ADR-0019)
+        // can seal its own files with the same key. The key stays in a
+        // `Zeroizing` buffer in both instances; no plaintext key is exposed.
+        Box::new(Self::new(*self.root_key))
+    }
 }
 
 // Decode a 64-character hex string into a 256-bit key. Rejects a wrong length or
