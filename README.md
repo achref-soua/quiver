@@ -21,7 +21,7 @@ Native-Rust vector databases already exist; Quiver is not trying to out-scale Mi
 
 - **Security-first, by default** — encryption-at-rest is on out of the box, sealing every durable byte (segments, manifest, **and** the write-ahead log) with XChaCha20-Poly1305; payloads can be client-side-encrypted so the server never sees them; API-key scopes, RBAC, tenant isolation, audit, and crypto-shredding. Only audited cryptography (RustCrypto AEAD/KDF + `rustls`) — never a home-grown primitive.
 - **Memory frugality** — a disk-resident graph index (DiskANN/Vamana) plus quantization (product / scalar / binary) serve large datasets from a laptop's RAM budget. The headline metric is **memory at a fixed recall**.
-- **Developer experience** — a single static binary; embeddable *and* server modes; a `ratatui` cockpit; idiomatic Python/TypeScript SDKs; an MCP server so agents can drive it.
+- **Developer experience** — a single static binary; embeddable *and* server modes; a `ratatui` cockpit with a 2-D constellation view of the vector space; idiomatic Python/TypeScript SDKs; an MCP server so agents can drive it.
 
 We say plainly what we do **not** do: client-side encryption protects *payloads, not vectors*; billion-scale needs a server, while a laptop comfortably serves tens-to-hundreds of millions; there is no homomorphic search in core. See the honest [threat model](./docs/security/threat-model.md).
 
@@ -47,8 +47,13 @@ quiver tui --api-key quiver-demo-key   # the retro cockpit
 ```
 
 `just demo` brings up a server with **encryption-at-rest on**, seeds a small
-collection through the Python SDK, and prints how to open the cockpit. To build
-and exercise the workspace directly:
+collection through the Python SDK, and prints how to open the cockpit. In the
+cockpit, press `v` (or `enter`) on a collection to open the **constellation
+view** — a 2-D random-projection scatter of its vector space with the query's
+nearest neighbour highlighted; move the cursor and press `enter` to re-query
+around any point. _(The recorded cockpit cast lands in `docs/assets/`; produce
+it on a real terminal with `scripts/record-cockpit-cast.sh`.)_ To build and
+exercise the workspace directly:
 
 ```bash
 just build            # compile the workspace

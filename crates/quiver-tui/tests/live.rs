@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use quiver_server::{Config, serve};
-use quiver_tui::{TuiOptions, fetch_snapshot};
+use quiver_tui::{TuiOptions, fetch_constellation, fetch_snapshot};
 use tokio::net::TcpListener;
 
 #[tokio::test]
@@ -74,4 +74,47 @@ async fn cockpit_reads_live_server_snapshot() {
     assert_eq!(snapshot.collections[0].name, "items");
     assert_eq!(snapshot.collections[0].dim, 4);
     assert_eq!(snapshot.collections[0].metric, "cosine");
+
+    // Seed a few vectors, then drive the constellation path: the cockpit fetches
+    // points with their vectors and projects them to 2-D, nearest-neighbour first.
+    client
+        .post(format!("{}/v1/collections/items/points", options.base_url))
+        .json(&serde_json::json!({
+            "points": [
+                {"id": "p1", "vector": [1.0, 0.0, 0.0, 0.0], "payload": {}},
+                {"id": "p2", "vector": [0.0, 1.0, 0.0, 0.0], "payload": {}},
+                {"id": "p3", "vector": [0.0, 0.0, 1.0, 0.0], "payload": {}},
+                {"id": "p4", "vector": [0.9, 0.1, 0.0, 0.0], "payload": {}}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let constellation = fetch_constellation(
+        &client,
+        &options,
+        "items",
+        4,
+        Some(vec![1.0, 0.0, 0.0, 0.0]),
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        constellation.points.len(),
+        4,
+        "all four points are projected"
+    );
+    assert_eq!(constellation.points.len(), constellation.vectors.len());
+    assert_eq!(constellation.points[0].rank, 0);
+    assert_eq!(
+        constellation.points[0].id, "p1",
+        "p1 is its own nearest neighbour"
+    );
+    for p in &constellation.points {
+        assert!((0.0..=1.0).contains(&p.x) && (0.0..=1.0).contains(&p.y));
+    }
 }
