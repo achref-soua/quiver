@@ -46,8 +46,9 @@ use roaring::RoaringBitmap;
 use crate::descriptor::Descriptor;
 use crate::error::{CoreError, Result};
 use crate::ids::{CollectionId, Lsn};
+use crate::keyring::{KeyRing, SingleCodecKeyRing};
 use crate::manifest::{self, CollectionEntry, MANIFEST_FORMAT_VERSION, Manifest, SegmentRef};
-use crate::page::{PageCodec, PlainCodec};
+use crate::page::PageCodec;
 use crate::paged::fsync_dir;
 use crate::sec::{self, SecPredicate};
 use crate::segment::{self, SealRow, SealedSegment};
@@ -87,6 +88,11 @@ struct CollectionState {
     id: CollectionId,
     name: String,
     descriptor: Descriptor,
+    // The codec that seals this collection's segments and index artifacts —
+    // its own data-encryption key under an envelope key-ring, or the shared
+    // codec under a single-codec key-ring. Built once from the key-ring at
+    // create/open and held so reads need no per-call key derivation.
+    codec: Box<dyn PageCodec>,
     // Bytes per vector (`dim × dtype size`), cached from the descriptor.
     stride: usize,
     // Live external id → location. The authority for `get`/`len`/`scan`; ordered
@@ -106,12 +112,18 @@ struct CollectionState {
 }
 
 impl CollectionState {
-    fn new(id: CollectionId, name: String, descriptor: Descriptor) -> Self {
+    fn new(
+        id: CollectionId,
+        name: String,
+        descriptor: Descriptor,
+        codec: Box<dyn PageCodec>,
+    ) -> Self {
         let stride = descriptor.stride();
         Self {
             id,
             name,
             descriptor,
+            codec,
             stride,
             primary: BTreeMap::new(),
             sealed: Vec::new(),
@@ -169,7 +181,7 @@ struct PendingSegment {
 /// The durable storage engine for one data directory.
 pub struct Store {
     dir: PathBuf,
-    codec: Box<dyn PageCodec>,
+    keyring: Box<dyn KeyRing>,
     collections: HashMap<CollectionId, CollectionState>,
     name_index: HashMap<String, CollectionId>,
     next_lsn: Lsn,
@@ -183,14 +195,24 @@ pub struct Store {
 
 impl Store {
     /// Open (creating if absent) the store at `dir` with encryption-at-rest
-    /// disabled (the [`PlainCodec`]). Runs full crash recovery.
+    /// disabled (the plaintext codec). Runs full crash recovery.
     pub fn open(dir: &Path) -> Result<Self> {
-        Self::open_with_codec(dir, Box::new(PlainCodec))
+        Self::open_with_keyring(dir, Box::new(SingleCodecKeyRing::plaintext()))
     }
 
-    /// Open the store with a specific [`PageCodec`] — used by `quiver-crypto` to
-    /// enable encryption-at-rest. Runs full crash recovery.
+    /// Open the store sealing every byte — catalog and all collections — with a
+    /// single [`PageCodec`]. Used by `quiver-crypto` to enable encryption-at-rest
+    /// under one root key (no per-collection envelope). Runs full crash recovery.
     pub fn open_with_codec(dir: &Path, codec: Box<dyn PageCodec>) -> Result<Self> {
+        Self::open_with_keyring(dir, Box::new(SingleCodecKeyRing::new(codec)))
+    }
+
+    /// Open the store with a [`KeyRing`] supplying a catalog codec (manifest and
+    /// WAL) and a per-collection codec (segments and index artifacts). This is
+    /// the seam `quiver-crypto`'s envelope key-ring uses to seal each collection
+    /// under its own data-encryption key, enabling crypto-shredding. Runs full
+    /// crash recovery.
+    pub fn open_with_keyring(dir: &Path, keyring: Box<dyn KeyRing>) -> Result<Self> {
         fs::create_dir_all(dir).map_err(|e| CoreError::io(dir, e))?;
         let wal_dir = dir.join("wal");
         fs::create_dir_all(&wal_dir).map_err(|e| CoreError::io(&wal_dir, e))?;
@@ -198,7 +220,7 @@ impl Store {
         fsync_dir(&wal_dir)?;
 
         // 1. Load the manifest (or start empty).
-        let mfst = manifest::read_current(dir, codec.as_ref())?.unwrap_or_default();
+        let mfst = manifest::read_current(dir, keyring.catalog_codec())?.unwrap_or_default();
 
         // 2. Rebuild the primary index from the sealed segments the manifest
         //    references. A row tombstoned in its segment's `.del` is skipped, so
@@ -207,11 +229,12 @@ impl Store {
         let mut name_index: HashMap<String, CollectionId> = HashMap::new();
         for entry in &mfst.collections {
             let descriptor = Descriptor::decode(&entry.descriptor)?;
-            let mut state = CollectionState::new(entry.id, entry.name.clone(), descriptor);
+            let codec = keyring.collection_codec(entry.id)?;
+            let mut state = CollectionState::new(entry.id, entry.name.clone(), descriptor, codec);
             state.segments_meta = entry.segments.clone();
             let seg_dir = segments_dir(dir, entry.id);
             for seg in &entry.segments {
-                let sealed = segment::open_segment(&seg_dir, seg.id, codec.as_ref())?;
+                let sealed = segment::open_segment(&seg_dir, seg.id, state.codec.as_ref())?;
                 let seg_idx = state.sealed.len() as u32;
                 for (row, ext_id) in sealed.row_ids().iter().enumerate() {
                     let row = row as u32;
@@ -235,7 +258,7 @@ impl Store {
         let mut keep_seqs: HashSet<u64> = HashSet::new();
         for (seq, path) in &wal_files {
             max_seq = (*seq).max(max_seq);
-            let replay = wal::read_all(path, codec.as_ref())?;
+            let replay = wal::read_all(path, keyring.catalog_codec())?;
             let mut had_live = false;
             for entry in replay.entries {
                 if entry.lsn.value() <= floor.value() {
@@ -245,7 +268,7 @@ impl Store {
                 if entry.lsn > max_lsn {
                     max_lsn = entry.lsn;
                 }
-                apply_wal_entry(&mut collections, &mut name_index, &entry)?;
+                apply_wal_entry(&mut collections, &mut name_index, &entry, keyring.as_ref())?;
             }
             if had_live {
                 keep_seqs.insert(*seq);
@@ -271,7 +294,7 @@ impl Store {
 
         Ok(Self {
             dir: dir.to_path_buf(),
-            codec,
+            keyring,
             collections,
             name_index,
             next_lsn,
@@ -299,10 +322,13 @@ impl Store {
             ));
         }
         let id = CollectionId(self.next_collection_id);
+        // Provision the collection's key material before its first durable record
+        // references it, so WAL replay on recovery can always open what it needs.
+        self.keyring.provision_collection(id)?;
         let descriptor_bytes = postcard::to_allocvec(&descriptor)?;
         let lsn = self.next_lsn;
         self.wal.append_sync(
-            self.codec.as_ref(),
+            self.keyring.catalog_codec(),
             &WalEntry {
                 lsn,
                 op: WalOp::CreateCollection {
@@ -314,8 +340,11 @@ impl Store {
         )?;
         self.next_lsn = lsn.next();
         self.next_collection_id += 1;
-        self.collections
-            .insert(id, CollectionState::new(id, name.to_owned(), descriptor));
+        let codec = self.keyring.collection_codec(id)?;
+        self.collections.insert(
+            id,
+            CollectionState::new(id, name.to_owned(), descriptor, codec),
+        );
         self.name_index.insert(name.to_owned(), id);
         Ok(id)
     }
@@ -328,7 +357,7 @@ impl Store {
         };
         let lsn = self.next_lsn;
         self.wal.append_sync(
-            self.codec.as_ref(),
+            self.keyring.catalog_codec(),
             &WalEntry {
                 lsn,
                 op: WalOp::DropCollection { collection_id: id },
@@ -365,7 +394,7 @@ impl Store {
         let vector_bytes = f32_to_le_bytes(vector);
         let lsn = self.next_lsn;
         self.wal.append_sync(
-            self.codec.as_ref(),
+            self.keyring.catalog_codec(),
             &WalEntry {
                 lsn,
                 op: WalOp::Upsert {
@@ -398,7 +427,7 @@ impl Store {
         }
         let lsn = self.next_lsn;
         self.wal.append_sync(
-            self.codec.as_ref(),
+            self.keyring.catalog_codec(),
             &WalEntry {
                 lsn,
                 op: WalOp::Delete {
@@ -460,8 +489,8 @@ impl Store {
                 let segment = state.sealed.get(seg as usize).ok_or_else(|| {
                     CoreError::MalformedPage(format!("dangling segment index {seg}"))
                 })?;
-                let vector_bytes = segment.read_vector(self.codec.as_ref(), row, state.stride)?;
-                let payload = segment.read_payload(self.codec.as_ref(), row)?;
+                let vector_bytes = segment.read_vector(state.codec.as_ref(), row, state.stride)?;
+                let payload = segment.read_payload(state.codec.as_ref(), row)?;
                 Ok(Record {
                     vector: le_bytes_to_f32(&vector_bytes),
                     payload,
@@ -482,18 +511,18 @@ impl Store {
         self.collections.get(&collection).map(|s| &s.descriptor)
     }
 
-    /// A borrow of the page codec, for sealing one-off bytes with the store's
-    /// key (e.g. writing a disk-resident index artifact, ADR-0019).
-    #[must_use]
-    pub fn codec_ref(&self) -> &dyn PageCodec {
-        self.codec.as_ref()
-    }
-
-    /// A clone of the page codec, for a component that needs to own its own
-    /// handle (e.g. opening a disk-resident index that `mmap`s its files).
-    #[must_use]
-    pub fn codec_clone(&self) -> Box<dyn PageCodec> {
-        self.codec.clone_box()
+    /// A clone of a collection's page codec, for a component that seals its own
+    /// files with that collection's key — e.g. a disk-resident index artifact
+    /// (ADR-0019). The same owned handle can both write and `mmap`-open the
+    /// artifact, so it shares the collection's data-encryption key.
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`] if the collection is unknown.
+    pub fn collection_codec_clone(&self, collection: CollectionId) -> Result<Box<dyn PageCodec>> {
+        self.collections
+            .get(&collection)
+            .map(|s| s.codec.clone_box())
+            .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))
     }
 
     /// The directory that holds a collection's index artifacts
@@ -613,6 +642,9 @@ impl Store {
             }
             let seg_dir = segments_dir(&self.dir, cid);
             fs::create_dir_all(&seg_dir).map_err(|e| CoreError::io(&seg_dir, e))?;
+            // This collection's own codec (its data-encryption key under an
+            // envelope key-ring) seals its segments and tombstone bitmaps.
+            let codec = self.collections[&cid].codec.clone_box();
 
             // Merge the window's dead rows into each affected segment's tombstone
             // bitmap and rewrite it atomically (temp + rename).
@@ -622,7 +654,7 @@ impl Store {
                     if let Some(seg) = state.sealed.get(seg_idx as usize) {
                         let mut merged = seg.dead_bitmap();
                         merged |= newly_dead;
-                        segment::write_del(&seg_dir, seg.seg_id, self.codec.as_ref(), &merged)?;
+                        segment::write_del(&seg_dir, seg.seg_id, codec.as_ref(), &merged)?;
                     }
                 }
             }
@@ -649,7 +681,7 @@ impl Store {
                     segment::write_segment(
                         &seg_dir,
                         seg_id,
-                        self.codec.as_ref(),
+                        codec.as_ref(),
                         &seal_rows,
                         &state.descriptor.filterable,
                     )?;
@@ -666,7 +698,7 @@ impl Store {
             fsync_dir(&self.dir)?;
 
             if let Some((seg_id, row_count)) = new_seg {
-                let sealed = segment::open_segment(&seg_dir, seg_id, self.codec.as_ref())?;
+                let sealed = segment::open_segment(&seg_dir, seg_id, codec.as_ref())?;
                 pending.insert(
                     cid,
                     PendingSegment {
@@ -706,7 +738,7 @@ impl Store {
             next_segment_id: self.next_segment_id,
             collections: entries,
         };
-        manifest::write_manifest(&self.dir, &new_manifest, self.codec.as_ref())?;
+        manifest::write_manifest(&self.dir, &new_manifest, self.keyring.catalog_codec())?;
 
         // Phase C: commit in-memory state, rotate the WAL, GC superseded files.
         self.manifest_version = new_version;
@@ -806,6 +838,14 @@ impl Store {
     // Merge one collection's sealed segments into a single fresh segment holding
     // only its live rows, install it atomically, and reclaim the old files.
     fn compact_collection(&mut self, cid: CollectionId) -> Result<()> {
+        // This collection's own codec (its DEK under an envelope key-ring) seals
+        // both the rows read from the old segments and the merged one written.
+        let codec = self
+            .collections
+            .get(&cid)
+            .ok_or_else(|| CoreError::NotFound(format!("collection {cid}")))?
+            .codec
+            .clone_box();
         // Gather the live sealed rows (active rows are untouched). `primary` is
         // ordered, so the rewritten segment is deterministic.
         let live: Vec<(String, Vec<u8>, Vec<u8>)> = {
@@ -819,8 +859,8 @@ impl Store {
                     let segment = state.sealed.get(seg as usize).ok_or_else(|| {
                         CoreError::MalformedPage(format!("dangling segment index {seg}"))
                     })?;
-                    let vector = segment.read_vector(self.codec.as_ref(), row, state.stride)?;
-                    let payload = segment.read_payload(self.codec.as_ref(), row)?;
+                    let vector = segment.read_vector(codec.as_ref(), row, state.stride)?;
+                    let payload = segment.read_payload(codec.as_ref(), row)?;
                     out.push((ext_id.clone(), vector, payload));
                 }
             }
@@ -862,7 +902,7 @@ impl Store {
         segment::write_segment(
             &seg_dir,
             seg_id,
-            self.codec.as_ref(),
+            codec.as_ref(),
             &seal_rows,
             &self.collections[&cid].descriptor.filterable,
         )?;
@@ -876,7 +916,7 @@ impl Store {
             lsn_low,
             lsn_high,
         };
-        let sealed = segment::open_segment(&seg_dir, seg_id, self.codec.as_ref())?;
+        let sealed = segment::open_segment(&seg_dir, seg_id, codec.as_ref())?;
 
         // New manifest: this collection now has exactly one segment; others are
         // unchanged. The atomic swap is the commit point.
@@ -904,7 +944,7 @@ impl Store {
             next_segment_id: self.next_segment_id,
             collections: entries,
         };
-        manifest::write_manifest(&self.dir, &new_manifest, self.codec.as_ref())?;
+        manifest::write_manifest(&self.dir, &new_manifest, self.keyring.catalog_codec())?;
 
         // Commit: replace the segments (dropping the old mmaps before the files
         // are reclaimed), repoint the now-merged ids, and drop pending tombstones
@@ -956,6 +996,7 @@ fn apply_wal_entry(
     collections: &mut HashMap<CollectionId, CollectionState>,
     name_index: &mut HashMap<String, CollectionId>,
     entry: &WalEntry,
+    keyring: &dyn KeyRing,
 ) -> Result<()> {
     match &entry.op {
         WalOp::CreateCollection {
@@ -964,10 +1005,13 @@ fn apply_wal_entry(
             descriptor,
         } => {
             let descriptor = Descriptor::decode(descriptor)?;
+            // The key material was provisioned before this record was made
+            // durable, so the collection's codec is available on replay.
+            let codec = keyring.collection_codec(*collection_id)?;
             name_index.insert(name.clone(), *collection_id);
             collections.insert(
                 *collection_id,
-                CollectionState::new(*collection_id, name.clone(), descriptor),
+                CollectionState::new(*collection_id, name.clone(), descriptor, codec),
             );
         }
         WalOp::DropCollection { collection_id } => {
@@ -1206,6 +1250,31 @@ mod tests {
         assert_eq!(s.len(c).unwrap(), 7); // k1..k7
         assert!(s.get(c, "k0").unwrap().is_none());
         assert_eq!(s.get(c, "k6").unwrap().unwrap().vector, vec![6.0; 4]);
+    }
+
+    #[test]
+    fn open_with_keyring_round_trips_through_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut s =
+                Store::open_with_keyring(tmp.path(), Box::new(SingleCodecKeyRing::plaintext()))
+                    .unwrap();
+            let c = s.create_collection("c", desc()).unwrap();
+            s.upsert(c, "a", &[1.0, 2.0, 3.0, 4.0], b"{}").unwrap();
+            s.checkpoint().unwrap();
+            s.upsert(c, "b", &[5.0; 4], b"{}").unwrap();
+        }
+        // Reopen through the same key-ring: data recovers from the sealed segment
+        // and the WAL tail, each opened with the collection's own codec.
+        let s = Store::open_with_keyring(tmp.path(), Box::new(SingleCodecKeyRing::plaintext()))
+            .unwrap();
+        let c = s.collection_id("c").unwrap();
+        assert_eq!(s.len(c).unwrap(), 2);
+        assert_eq!(
+            s.get(c, "a").unwrap().unwrap().vector,
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(s.get(c, "b").unwrap().unwrap().vector, vec![5.0; 4]);
     }
 
     #[test]

@@ -40,6 +40,7 @@ use quiver_index::{
 use serde_json::Value;
 use thiserror::Error;
 
+pub use quiver_core::keyring::{KeyRing, SingleCodecKeyRing};
 pub use quiver_core::page::PageCodec;
 pub use quiver_core::{
     Descriptor, DistanceMetric, Dtype, FieldType, FilterableField, IndexKind, IndexSpec,
@@ -187,6 +188,14 @@ impl Database {
     /// and the WAL, so no plaintext user data reaches the disk.
     pub fn open_with_codec(dir: &Path, codec: Box<dyn PageCodec>) -> Result<Self> {
         Self::from_store(Store::open_with_codec(dir, codec)?)
+    }
+
+    /// Open the database with a [`KeyRing`], the seam that lets `quiver-crypto`'s
+    /// envelope key-ring seal each collection under its own data-encryption key
+    /// (enabling crypto-shredding). Mirrors
+    /// [`quiver_core::Store::open_with_keyring`].
+    pub fn open_with_keyring(dir: &Path, keyring: Box<dyn KeyRing>) -> Result<Self> {
+        Self::from_store(Store::open_with_keyring(dir, keyring)?)
     }
 
     // Build the in-memory handles (and their HNSW indexes) over an opened store.
@@ -587,8 +596,12 @@ fn build_disk_index(
     let dir = store.index_dir(cid);
     std::fs::create_dir_all(&dir).map_err(quiver_index::DiskError::Io)?;
     let path = dir.join(DISK_INDEX_FILE);
-    quiver_index::disk::write(&path, &graph, &pq, store.codec_ref())?;
-    Ok(DiskVamana::open(&path, store.codec_clone())?)
+    // Seal the index artifact with the collection's own codec (its DEK under an
+    // envelope key-ring), so a crypto-shred of the collection also makes its
+    // index unreadable. The same owned handle writes and then mmap-opens it.
+    let codec = store.collection_codec_clone(cid)?;
+    quiver_index::disk::write(&path, &graph, &pq, codec.as_ref())?;
+    Ok(DiskVamana::open(&path, codec)?)
 }
 
 // Rebuild a collection's index from the store's current live rows.

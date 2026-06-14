@@ -24,6 +24,7 @@ mod blockfile;
 pub mod descriptor;
 pub mod error;
 pub mod ids;
+pub mod keyring;
 pub mod manifest;
 pub mod page;
 mod paged;
@@ -37,5 +38,6 @@ pub use descriptor::{
 };
 pub use error::{CoreError, Result};
 pub use ids::{CollectionId, Lsn};
+pub use keyring::{KeyRing, SingleCodecKeyRing};
 pub use sec::{SecPredicate, SecValue};
 pub use store::{Record, Store};
