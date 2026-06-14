@@ -58,9 +58,11 @@ Inverted file: a coarse k-means quantizer partitions space into `nlist` Voronoi 
 
 The planner (in `quiver-embed`) decomposes the `Filter` into the predicates the secondary indexes can answer (`And` intersects, `Or` unions, negation/existence/undeclared fields widen to unconstrained — always a sound superset) and resolves a candidate id set via `Store::matching_ids`. When that set is **selective** (at or below a full-scan threshold) it scans those rows **exactly** — perfect recall, and immune to the filtered-ANN recall cliff that bites when a selective predicate starves an over-fetched candidate list; an empty candidate set short-circuits to no results. When the filter is **broad** (or not indexable) it **post-filters** the ANN candidates instead. Both arms re-check the full `Filter`, so results are exact regardless of path. This is the selectivity-based strategy for v1; constraining graph traversal to an allowed-node bitmap, and specialized filtered-graph search (e.g. Filtered-DiskANN, Gollapudi et al. *WWW* 2023; ACORN, Patel et al. *SIGMOD* 2024), are later enhancements.
 
-## Incremental updates (later)
+## Incremental updates (Phase 4 — ADR-0023)
 
-v1 rebuilds/compacts index segments on flush. In-place incremental update for the disk graph (SpFresh; Xu et al., *SOSP* 2023) is a Phase 4 item; until then, updates land in the in-memory HNSW segment and are folded into the disk index at compaction.
+Through `v0.3.0` the index is a **derived artifact**: HNSW absorbs a brand-new id in place, but an update, a delete, or any write to a batch index (Vamana / IVF / DiskVamana) marks the collection stale and the next search rebuilds it from the store — which is also how every index is reconstructed on open. This is simple and correct (the store is the single source of truth, ADR-0020/0021, so the index never has to be crash-consistent), but the update cost is `O(N)`, which does not suit streaming workloads.
+
+Phase 4 closes the gap with **SpFresh's LIRE** protocol (Lightweight Incremental REbalancing; Xu et al., *SOSP* 2023), applied first to **IVF** — the inverted-list structure LIRE was designed for (SPANN; Chen et al., *NeurIPS* 2021). Inserts append to the nearest centroid's posting list; deletes mark a per-index deletion set; and local **split / merge / reassign** rebalancing keeps posting lists balanced as the distribution drifts, maintaining the invariant that each vector sits in its nearest centroid's list — which is what preserves recall — without a global rebuild. The first increment (`v0.4.0`) keeps the index **in memory and derived**, so the `kill -9` crash gate (ADR-0005) is untouched by construction. A *durable* on-disk incremental index (SPFresh's disk model, which puts the index on the WAL/crash path) and **graph** incremental updates (FreshDiskANN's StreamingMerge; Singh et al., 2021 — a different algorithm) are later increments. The decision and full scope are in [ADR-0023](../adr/0023-incremental-in-place-updates.md).
 
 ## References
 
@@ -70,3 +72,4 @@ v1 rebuilds/compacts index segments on flush. In-place incremental update for th
 4. Jégou, Douze, Schmid. *Product quantization for nearest neighbor search.* IEEE TPAMI, 2011.
 5. Xu et al. *SpFresh: Incremental in-place update for billion-scale vector search.* SOSP, 2023.
 6. Gollapudi et al. *Filtered-DiskANN.* WWW, 2023. · Patel et al. *ACORN.* SIGMOD, 2024.
+7. Singh et al. *FreshDiskANN: A fast and accurate graph-based ANN index for streaming similarity search.* 2021.
