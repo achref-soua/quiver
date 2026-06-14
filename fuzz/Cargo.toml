@@ -1,0 +1,43 @@
+# Fuzz targets (cargo-fuzz / libFuzzer). This is its OWN workspace — the empty
+# [workspace] table below decouples it from the repo's main workspace, so the
+# nightly/libfuzzer toolchain and its dependencies never reach the stable build
+# or `cargo deny`. Run with: cargo +nightly fuzz run <target> (see docs/security/fuzzing.md).
+[package]
+name = "quiver-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+tempfile = "3"
+quiver-core = { path = "../crates/quiver-core" }
+quiver-query = { path = "../crates/quiver-query" }
+
+[[bin]]
+name = "filter_json"
+path = "fuzz_targets/filter_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "page_decode"
+path = "fuzz_targets/page_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_decode"
+path = "fuzz_targets/wal_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
