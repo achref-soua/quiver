@@ -13,6 +13,9 @@ dependencies = ["httpx>=0.27"]
 # The LangChain VectorStore adapter (quiver.langchain). Install with
 # `pip install quiver-client[langchain]`.
 langchain = ["langchain-core>=1.0"]
+# The LlamaIndex VectorStore adapter (quiver.llamaindex). Install with
+# `pip install quiver-client[llamaindex]`.
+llamaindex = ["llama-index-core>=0.11"]
 
 [project.urls]
 Repository = "https://github.com/achref-soua/quiver"
@@ -25,7 +28,7 @@ build-backend = "hatchling.build"
 packages = ["src/quiver"]
 
 [dependency-groups]
-dev = ["pytest>=8", "respx>=0.21", "langchain-core>=1.0"]
+dev = ["pytest>=8", "respx>=0.21", "langchain-core>=1.0", "llama-index-core>=0.11"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
