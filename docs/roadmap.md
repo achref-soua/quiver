@@ -38,6 +38,8 @@ Quiver is built phase by phase. A phase is not "done" until its Definition of Do
 
 **DoD:** on a 10M+ dataset, Quiver serves a documented recall@10 using a **fraction of the RAM** of Qdrant/LanceDB on identical hardware, with a reproducible methodology and raw numbers published. Quantization knobs documented with a tradeoff table. Coverage ≥ 75%.
 
+**Status (on `develop`):** the disk-resident graph + IVF, quantization, per-collection index/quant knobs, the storage-engine rewrite (row-addressed segments, roaring tombstones, compaction, secondary indexes), **hybrid filtered search** (a selectivity planner that pre-filters to an exact scan or post-filters ANN, reachable over REST/gRPC, the MCP server, and the Python/TypeScript SDKs), and the LangChain + LlamaIndex adapters are all in and tested. The quantization/index tradeoff table and the disk-path recall/compression figures are recorded; the remaining DoD item is the published **10M reference-hardware** head-to-head (recall@10 vs RAM, against Qdrant/LanceDB) — its methodology and runbook are written, but the raw RSS/QPS require dedicated hardware and are never produced on the shared dev box or fabricated. `v0.2.0` is gated on those numbers plus owner approval.
+
 ## Phase 3 — Security depth + cockpit polish → `v0.3.0`
 
 **Scope:** client-side payload encryption with a documented trust boundary; RBAC + scoped API keys + optional mTLS; audit logging; crypto-shredding; secret/KMS handling; the TUI **constellation view** (2D projection + nearest-neighbor highlight + interactive query); security testing (fuzz the protocol + on-disk format, `cargo audit`/`deny`, threat-model verification).

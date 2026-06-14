@@ -13,7 +13,7 @@
 
 </div>
 
-> **Status: `v0.1.0` released · Phase 2 (memory frugality) in progress.** Phase 1 shipped the single-node core — an encrypted, crash-safe storage engine, HNSW, SIMD kernels, REST/gRPC, the TUI, and the Python SDK. Phase 2 is building the memory-frugal serve path: the disk-resident DiskANN/Vamana index and quantization are in; the storage engine has been rewritten to the row-addressed on-disk format (stride-addressed vector columns, paged payload heaps, roaring tombstones, compaction, and secondary indexes). Every performance/memory claim in this README is backed by a reproducible benchmark on documented reference hardware — until those numbers are recorded, that table stays empty rather than guess.
+> **Status: `v0.1.0` released · Phase 2 (memory frugality) in progress.** Phase 1 shipped the single-node core — an encrypted, crash-safe storage engine, HNSW, SIMD kernels, REST/gRPC, the TUI, and the Python SDK. Phase 2 is building the memory-frugal serve path: the disk-resident DiskANN/Vamana index and quantization are in; the storage engine has been rewritten to the row-addressed on-disk format (stride-addressed vector columns, paged payload heaps, roaring tombstones, compaction, and secondary indexes). **Hybrid filtered search** plans between an exact pre-filter scan and ANN post-filtering over those secondary indexes — reachable over REST, gRPC, the MCP server, and the Python/TypeScript SDKs, with LangChain and LlamaIndex adapters. Every performance/memory claim in this README is backed by a reproducible benchmark on documented reference hardware — until those numbers are recorded, that table stays empty rather than guess.
 
 ## Why Quiver
 
