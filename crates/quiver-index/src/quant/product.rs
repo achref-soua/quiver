@@ -100,6 +100,26 @@ impl ProductQuantizer {
         self.m
     }
 
+    /// Reconstruct an approximate vector from its `m`-byte PQ `code`, in the
+    /// quantizer's prepared space (unit-normalized for cosine): each subspace
+    /// contributes the centroid its code byte selects. Lossy by construction.
+    /// Used by incremental IVF rebalancing (ADR-0023), which needs vector
+    /// geometry that the frugal PQ mode does not keep at full precision.
+    ///
+    /// # Panics
+    /// Panics if `code.len() != self.subspaces()`.
+    #[must_use]
+    pub fn reconstruct(&self, code: &[u8]) -> Vec<f32> {
+        assert_eq!(code.len(), self.m, "code len");
+        let mut out = vec![0f32; self.dim];
+        for (j, &c) in code.iter().enumerate() {
+            let book = self.subspace_centroids(j);
+            let src = &book[c as usize * self.dsub..(c as usize + 1) * self.dsub];
+            out[j * self.dsub..(j + 1) * self.dsub].copy_from_slice(src);
+        }
+        out
+    }
+
     fn subspace_centroids(&self, j: usize) -> &[f32] {
         &self.centroids[j * KSUB * self.dsub..(j + 1) * KSUB * self.dsub]
     }
