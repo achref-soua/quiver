@@ -8,12 +8,12 @@
 [![rust](https://img.shields.io/badge/rust-stable-orange)](./rust-toolchain.toml)
 [![CI](https://img.shields.io/badge/CI-manual%20dispatch-informational)](.github/workflows)
 [![release](https://img.shields.io/github/v/release/achref-soua/quiver?color=FFB000&label=release)](https://github.com/achref-soua/quiver/releases)
-[![status](https://img.shields.io/badge/status-v0.1.0%20·%20phase%202-FFB000)](./docs/roadmap.md)
+[![status](https://img.shields.io/badge/status-v0.3.0%20·%20phase%204-FFB000)](./docs/roadmap.md)
 [![stars](https://img.shields.io/github/stars/achref-soua/quiver?style=flat)](https://github.com/achref-soua/quiver/stargazers)
 
 </div>
 
-> **Status: `v0.1.0` released · Phase 2 (memory frugality) in progress.** Phase 1 shipped the single-node core — an encrypted, crash-safe storage engine, HNSW, SIMD kernels, REST/gRPC, the TUI, and the Python SDK. Phase 2 is building the memory-frugal serve path: the disk-resident DiskANN/Vamana index and quantization are in; the storage engine has been rewritten to the row-addressed on-disk format (stride-addressed vector columns, paged payload heaps, roaring tombstones, compaction, and secondary indexes). **Hybrid filtered search** plans between an exact pre-filter scan and ANN post-filtering over those secondary indexes — reachable over REST, gRPC, the MCP server, and the Python/TypeScript SDKs, with LangChain and LlamaIndex adapters. Every performance/memory claim in this README is backed by a reproducible benchmark on documented reference hardware — until those numbers are recorded, that table stays empty rather than guess.
+> **Status: `v0.3.0` released · Phase 4 (advanced features) in progress.** Phase 1 (`v0.1.0`) shipped the single-node core — an encrypted, crash-safe storage engine, HNSW, SIMD kernels, REST/gRPC, the TUI, and the Python SDK. Phase 2 (`v0.2.0`) delivered memory frugality: the disk-resident DiskANN/Vamana and IVF indexes with product/scalar/binary quantization, a row-addressed storage engine (stride-addressed vector columns, paged payload heaps, roaring tombstones, compaction, secondary indexes), **hybrid filtered search**, the TypeScript SDK, the MCP server, and LangChain/LlamaIndex adapters. Phase 3 (`v0.3.0`) added security depth and cockpit polish: client-side payload encryption, RBAC with scoped API keys and optional mTLS, an append-only audit log, per-collection-DEK encryption with crypto-shredding, master-key-file secret handling, the 2-D **constellation view**, and `cargo-fuzz` targets. Phase 4 (toward `v0.4.0`) is shipping the advanced backlog — **incremental in-place index updates** (SpFresh/LIRE for IVF) have landed on `develop`. Every performance/memory claim in this README is backed by a reproducible benchmark on documented reference hardware — until those numbers are recorded, that table stays empty rather than guess.
 
 ## Why Quiver
 
