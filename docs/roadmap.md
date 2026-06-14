@@ -50,11 +50,13 @@ Quiver is built phase by phase. A phase is not "done" until its Definition of Do
 
 ## Phase 4 — Advanced / stretch features → `v0.4.0`, `v0.5.0`, … (launch is `v1.0.0`, several releases out)
 
-Unlike the earlier phases, Phase 4 is a **backlog shipped incrementally**: each minor release (`v0.4.0`, `v0.5.0`, …) delivers a coherent, owner-gated subset, and **`v1.0.0` is reserved for the launch release** once the backlog and the launch polish below are complete. The next release is **`v0.4.0`** — we are deliberately far from `v1.0.0`.
+Unlike the earlier phases, Phase 4 is a **backlog shipped incrementally**: each minor release (`v0.4.0`, `v0.5.0`, …) delivers a coherent, owner-gated subset, and **`v1.0.0` is reserved for the launch release** once the backlog and the launch polish below are complete. Releases ship incrementally — **`v0.4.0`** and **`v0.5.0`** are out; we remain deliberately far from `v1.0.0`.
 
 **Backlog (rough priority):** incremental in-place updates (SpFresh-style); migration importers (Qdrant/Chroma/pgvector); optional multi-vector / late-interaction scoring; optional leader-follower replication (clearly labeled); the **experimental** DCPE feature flag (published scheme only, honest caveats); then the launch polish — docs site, benchmark-table fill-in, regenerated TUI cast, published load-test results.
 
 **`v0.4.0` ships two backlog items:** **incremental in-place index updates** — SpFresh/LIRE for **IVF**, maintained in memory so the `kill -9` crash gate is untouched by construction ([ADR-0023](adr/0023-incremental-in-place-updates.md); a durable on-disk incremental index and graph (FreshDiskANN) updates are sequenced as later increments) — and **migration importers**, `quiver admin import` loading Qdrant/Chroma/pgvector exports into Quiver collections with filterable fields ([ADR-0024](adr/0024-migration-importers.md); see [`migration.md`](migration.md)).
+
+**`v0.5.0` ships** **HNSW incremental delete** — O(1) soft-delete with search-time tombstone filtering and an amortized rebuild ([ADR-0026](adr/0026-hnsw-incremental-delete.md)); a **neighbor-bounded IVF reassignment** that brings LIRE rebalancing to its `O(nlist + |list|)` target ([ADR-0023](adr/0023-incremental-in-place-updates.md)); a **unified secure database-open path** shared by the server, the MCP server, and the CLI so a data directory is portable between them; and the **design** for a durable on-disk incremental index ([ADR-0025](adr/0025-durable-incremental-index.md), Proposed). The durable-index implementation, live migration connectors (Qdrant/Chroma/Postgres), and multi-vector / late-interaction scoring are sequenced for `v0.6.0`+.
 
 **Per-release DoD (`v0.4.0`, `v0.5.0`, …):** the release's features are tested and documented (ADR/README/`.env.example`); coverage ≥ 80%; `just verify` and the SDK suites green; an owner-approved tag via the fast-forward release mechanic.
 
