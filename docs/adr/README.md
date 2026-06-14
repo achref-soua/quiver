@@ -41,5 +41,6 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0020](0020-row-addressed-segment-storage.md) | Row-addressed segment storage (`.vec`/`.pay`/`.dir`, mmap) | Accepted | 2 |
 | [0021](0021-tombstones-and-compaction.md) | Tombstones (roaring `.del`) and compaction | Accepted | 2 |
 | [0022](0022-secondary-indexes.md) | Secondary indexes (`.sec`, order-preserving keys) | Accepted | 2 |
+| [0023](0023-incremental-in-place-updates.md) | Incremental in-place index updates (SpFresh / LIRE) | Accepted | 4 |
 
-Phase-0 ADRs (0001–0018) are Accepted; Phase-2 decisions begin at 0019. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.
+Phase-0 ADRs (0001–0018) are Accepted; Phase-2 decisions span 0019–0022; Phase-4 decisions begin at 0023. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.
