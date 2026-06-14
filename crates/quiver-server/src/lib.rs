@@ -8,15 +8,19 @@
 //! (ADR-0002, single-writer per ADR-0006). The lock-free MVCC read path is
 //! Phase 2.
 //!
-//! Phase 1 auth is a configured API key (Bearer / gRPC `authorization`
-//! metadata), default-deny, with a fail-fast secure config (ADR-0011/0013).
-//! Encryption-at-rest is on by default (ADR-0010): unless `insecure` is set, an
-//! `encryption_key` is required and the engine is opened through
-//! `quiver-crypto`'s AEAD codec. TLS-in-transit uses `rustls` over the audited
-//! `ring` provider — REST via `axum-server`, gRPC via tonic's `tls-ring` — and a
-//! non-loopback bind requires it. RBAC scopes, multi-tenancy, audit logging, and
-//! rate limiting are later phases. Design: `docs/api/rest-grpc.md`.
+//! Auth is by scoped API key (Bearer / gRPC `authorization` metadata) with
+//! default-deny RBAC: each key carries a role (read ⊆ write ⊆ admin) and a
+//! collection scope, enforced on every operation at the shared op layer
+//! (ADR-0011/0013, the `auth` module). Encryption-at-rest is on by default
+//! (ADR-0010): unless `insecure` is set, an `encryption_key` is required and the
+//! engine is opened through `quiver-crypto`'s AEAD codec; payloads may also be
+//! client-side-encrypted (ADR-0012). TLS-in-transit uses `rustls` over the
+//! audited `ring` provider — REST via `axum-server`, gRPC via tonic's `tls-ring`
+//! — and a non-loopback bind requires it. mTLS identities, per-tenant engine
+//! partitioning, audit logging, and rate limiting are later phases. Design:
+//! `docs/api/rest-grpc.md`.
 
+mod auth;
 mod error;
 mod grpc;
 mod rest;
@@ -30,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use axum_server::tls_rustls::RustlsConfig;
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -42,7 +46,10 @@ use quiver_embed::{
 };
 use quiver_query::Filter;
 
+pub use auth::{Action, ApiKey, CollectionScope};
 pub use error::Error;
+
+use auth::Principal;
 
 /// Server configuration, layered defaults → `quiver.toml` → `QUIVER_*` env and
 /// validated at startup (ADR-0013).
@@ -55,10 +62,13 @@ pub struct Config {
     pub rest_addr: SocketAddr,
     /// gRPC (HTTP/2) bind address.
     pub grpc_addr: SocketAddr,
-    /// Accepted API keys, from a comma-separated `QUIVER_API_KEYS` (the env
-    /// form) or a TOML sequence. Empty is allowed only with `insecure = true`.
-    #[serde(default, deserialize_with = "de_api_keys")]
-    pub api_keys: Vec<String>,
+    /// Accepted API keys with their RBAC scopes (ADR-0011). A bare secret —
+    /// from a comma-separated `QUIVER_API_KEYS` (the env form) or a plain TOML
+    /// array entry — is an all-collections admin key; a structured
+    /// `{secret, role, collections}` entry pins a narrower scope. Empty is
+    /// allowed only with `insecure = true`.
+    #[serde(default, deserialize_with = "auth::de_api_keys")]
+    pub api_keys: Vec<ApiKey>,
     /// Hex-encoded 256-bit key for encryption-at-rest (64 hex characters).
     /// Required unless `insecure = true`; source it from the environment or a
     /// secret store, never the committed config. `None` ⇒ data is stored
@@ -146,11 +156,11 @@ impl Config {
 }
 
 /// Shared server state: the engine behind a single-writer lock, plus the
-/// accepted API keys.
+/// accepted API keys with their RBAC scopes.
 #[derive(Clone)]
 pub(crate) struct AppState {
     db: Arc<Mutex<Database>>,
-    api_keys: Arc<Vec<String>>,
+    keys: Arc<Vec<ApiKey>>,
 }
 
 /// A collection's metadata.
@@ -186,19 +196,11 @@ pub(crate) struct MatchOut {
 }
 
 impl AppState {
-    /// Whether a presented bearer token is accepted. An empty key set means
-    /// `insecure` mode (validated at startup), which accepts any caller.
-    pub(crate) fn authorized(&self, presented: Option<&str>) -> bool {
-        if self.api_keys.is_empty() {
-            return true;
-        }
-        match presented {
-            Some(token) => self
-                .api_keys
-                .iter()
-                .any(|key| constant_time_eq(key.as_bytes(), token.as_bytes())),
-            None => false,
-        }
+    /// Authenticate a presented bearer token to its [`Principal`], or `None`
+    /// (a 401). An empty key set means `insecure` mode (validated at startup),
+    /// which admits any caller as an all-collections admin.
+    pub(crate) fn authenticate(&self, presented: Option<&str>) -> Option<Principal> {
+        auth::authenticate(&self.keys, presented)
     }
 
     async fn run_blocking<T, F>(&self, f: F) -> Result<T, Error>
@@ -219,12 +221,14 @@ impl AppState {
 
     pub(crate) async fn create_collection(
         &self,
+        principal: &Principal,
         name: String,
         dim: u32,
         metric: DistanceMetric,
         index: IndexSpec,
         filterable: Vec<FilterableField>,
     ) -> Result<CollectionInfo, Error> {
+        principal.require(Action::Admin, Some(&name))?;
         let descriptor = Descriptor::new(dim, Dtype::F32, metric)
             .with_index(index)
             .with_filterable(filterable.clone());
@@ -241,7 +245,12 @@ impl AppState {
         })
     }
 
-    pub(crate) async fn get_collection(&self, name: String) -> Result<CollectionInfo, Error> {
+    pub(crate) async fn get_collection(
+        &self,
+        principal: &Principal,
+        name: String,
+    ) -> Result<CollectionInfo, Error> {
+        principal.require(Action::Read, Some(&name))?;
         self.run_blocking(move |db| {
             let descriptor = db
                 .descriptor(&name)
@@ -260,36 +269,51 @@ impl AppState {
         .await
     }
 
-    pub(crate) async fn list_collections(&self) -> Result<Vec<CollectionInfo>, Error> {
-        self.run_blocking(|db| {
-            let mut out = Vec::new();
-            for name in db.collection_names() {
-                if let Some(descriptor) = db.descriptor(&name).cloned() {
-                    let count = db.len(&name)? as u64;
-                    out.push(CollectionInfo {
-                        name,
-                        dim: descriptor.dim,
-                        metric: descriptor.metric,
-                        count,
-                        index: descriptor.index,
-                        filterable: descriptor.filterable,
-                    });
+    pub(crate) async fn list_collections(
+        &self,
+        principal: &Principal,
+    ) -> Result<Vec<CollectionInfo>, Error> {
+        principal.require(Action::Read, None)?;
+        let mut infos = self
+            .run_blocking(|db| {
+                let mut out = Vec::new();
+                for name in db.collection_names() {
+                    if let Some(descriptor) = db.descriptor(&name).cloned() {
+                        let count = db.len(&name)? as u64;
+                        out.push(CollectionInfo {
+                            name,
+                            dim: descriptor.dim,
+                            metric: descriptor.metric,
+                            count,
+                            index: descriptor.index,
+                            filterable: descriptor.filterable,
+                        });
+                    }
                 }
-            }
-            Ok(out)
-        })
-        .await
+                Ok(out)
+            })
+            .await?;
+        // Never reveal collections outside the caller's scope.
+        infos.retain(|info| principal.can_see(&info.name));
+        Ok(infos)
     }
 
-    pub(crate) async fn delete_collection(&self, name: String) -> Result<bool, Error> {
+    pub(crate) async fn delete_collection(
+        &self,
+        principal: &Principal,
+        name: String,
+    ) -> Result<bool, Error> {
+        principal.require(Action::Admin, Some(&name))?;
         self.run_blocking(move |db| db.drop_collection(&name)).await
     }
 
     pub(crate) async fn upsert(
         &self,
+        principal: &Principal,
         collection: String,
         points: Vec<PointIn>,
     ) -> Result<u64, Error> {
+        principal.require(Action::Write, Some(&collection))?;
         self.run_blocking(move |db| {
             let mut count = 0u64;
             for point in &points {
@@ -303,9 +327,11 @@ impl AppState {
 
     pub(crate) async fn delete_points(
         &self,
+        principal: &Principal,
         collection: String,
         ids: Vec<String>,
     ) -> Result<u64, Error> {
+        principal.require(Action::Write, Some(&collection))?;
         self.run_blocking(move |db| {
             let mut count = 0u64;
             for id in &ids {
@@ -320,10 +346,12 @@ impl AppState {
 
     pub(crate) async fn get_points(
         &self,
+        principal: &Principal,
         collection: String,
         ids: Vec<String>,
         with_vector: bool,
     ) -> Result<Vec<PointOut>, Error> {
+        principal.require(Action::Read, Some(&collection))?;
         self.run_blocking(move |db| {
             let mut out = Vec::new();
             for id in &ids {
@@ -343,6 +371,7 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn search(
         &self,
+        principal: &Principal,
         collection: String,
         vector: Vec<f32>,
         k: usize,
@@ -351,6 +380,7 @@ impl AppState {
         with_payload: bool,
         with_vector: bool,
     ) -> Result<Vec<MatchOut>, Error> {
+        principal.require(Action::Read, Some(&collection))?;
         self.run_blocking(move |db| {
             let params = SearchParams {
                 k,
@@ -403,7 +433,7 @@ pub async fn serve(
     let db = open_database(&config)?;
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
-        api_keys: Arc::new(config.api_keys.clone()),
+        keys: Arc::new(config.api_keys.clone()),
     };
 
     let app = rest::router(state.clone());
@@ -532,40 +562,6 @@ pub fn init_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
-// Accept `api_keys` as a comma-separated string (the `QUIVER_API_KEYS` env form,
-// which figment surfaces as a scalar) or as a sequence (TOML / programmatic).
-fn de_api_keys<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum StringOrSeq {
-        String(String),
-        Seq(Vec<String>),
-    }
-    Ok(match StringOrSeq::deserialize(deserializer)? {
-        StringOrSeq::String(s) => s
-            .split(',')
-            .map(|part| part.trim().to_owned())
-            .filter(|part| !part.is_empty())
-            .collect(),
-        StringOrSeq::Seq(v) => v,
-    })
-}
-
-// Length-checked constant-time byte comparison for API keys.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,7 +576,7 @@ mod tests {
         config.insecure = true;
         assert!(config.validate().is_ok());
         config.insecure = false;
-        config.api_keys = vec!["secret".to_owned()];
+        config.api_keys = vec!["secret".into()];
         config.encryption_key = Some(TEST_KEY.to_owned());
         assert!(config.validate().is_ok());
     }
@@ -588,7 +584,7 @@ mod tests {
     #[test]
     fn config_requires_encryption_key_unless_insecure() {
         let mut config = Config {
-            api_keys: vec!["secret".to_owned()],
+            api_keys: vec!["secret".into()],
             ..Config::default()
         };
         // API key set but no encryption key, not insecure ⇒ rejected.
@@ -607,7 +603,7 @@ mod tests {
     #[test]
     fn config_rejects_public_bind_without_optout() {
         let mut config = Config {
-            api_keys: vec!["secret".to_owned()],
+            api_keys: vec!["secret".into()],
             encryption_key: Some(TEST_KEY.to_owned()),
             ..Config::default()
         };
@@ -621,7 +617,7 @@ mod tests {
     #[test]
     fn config_public_bind_allowed_with_tls() {
         let config = Config {
-            api_keys: vec!["secret".to_owned()],
+            api_keys: vec!["secret".into()],
             encryption_key: Some(TEST_KEY.to_owned()),
             tls_cert: Some(PathBuf::from("cert.pem")),
             tls_key: Some(PathBuf::from("key.pem")),
@@ -635,7 +631,7 @@ mod tests {
     #[test]
     fn config_tls_cert_and_key_must_pair() {
         let mut config = Config {
-            api_keys: vec!["secret".to_owned()],
+            api_keys: vec!["secret".into()],
             encryption_key: Some(TEST_KEY.to_owned()),
             tls_cert: Some(PathBuf::from("cert.pem")),
             ..Config::default()
@@ -644,30 +640,5 @@ mod tests {
         assert!(config.validate().is_err());
         config.tls_key = Some(PathBuf::from("key.pem"));
         assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn constant_time_eq_matches_only_equal() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
-    }
-
-    #[test]
-    fn api_keys_parse_from_csv_or_sequence() {
-        #[derive(Deserialize)]
-        struct Wrap {
-            #[serde(deserialize_with = "de_api_keys")]
-            keys: Vec<String>,
-        }
-        // Comma-separated string (the env form), trimmed and emptied-filtered.
-        let csv: Wrap = serde_json::from_str(r#"{"keys":"a, b ,c"}"#).unwrap();
-        assert_eq!(csv.keys, ["a", "b", "c"]);
-        // A sequence (TOML / programmatic) passes through unchanged.
-        let seq: Wrap = serde_json::from_str(r#"{"keys":["x","y"]}"#).unwrap();
-        assert_eq!(seq.keys, ["x", "y"]);
-        // An empty string yields no keys.
-        let empty: Wrap = serde_json::from_str(r#"{"keys":""}"#).unwrap();
-        assert!(empty.keys.is_empty());
     }
 }

@@ -2,20 +2,20 @@
 //! The REST surface (axum): the JSON mirror of the gRPC contract
 //! (`docs/api/rest-grpc.md`).
 
-use axum::Json;
-use axum::Router;
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use quiver_embed::{DistanceMetric, FieldType, FilterableField, IndexKind, IndexSpec};
 use quiver_query::Filter;
 
+use crate::auth::Principal;
 use crate::{AppState, CollectionInfo, Error, MatchOut, PointIn, PointOut};
 
 /// Build the REST router: open `/healthz`, `/readyz`, `/metrics`; the `/v1` API
@@ -46,8 +46,8 @@ pub(crate) fn router(state: AppState) -> Router {
         .merge(api)
 }
 
-async fn auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    let presented = request
+async fn auth(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
+    let presented: Option<String> = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -55,17 +55,23 @@ async fn auth(State(state): State<AppState>, request: Request, next: Next) -> Re
             value
                 .strip_prefix("Bearer ")
                 .or_else(|| value.strip_prefix("bearer "))
-        });
-    if state.authorized(presented) {
-        next.run(request).await
-    } else {
-        let body = json!({
-            "type": "about:blank",
-            "title": "Unauthorized",
-            "status": 401,
-            "detail": "missing or invalid API key",
-        });
-        (StatusCode::UNAUTHORIZED, Json(body)).into_response()
+        })
+        .map(str::to_owned);
+    match state.authenticate(presented.as_deref()) {
+        // The caller's scope rides the request; each op authorizes against it.
+        Some(principal) => {
+            request.extensions_mut().insert(principal);
+            next.run(request).await
+        }
+        None => {
+            let body = json!({
+                "type": "about:blank",
+                "title": "Unauthorized",
+                "status": 401,
+                "detail": "missing or invalid API key",
+            });
+            (StatusCode::UNAUTHORIZED, Json(body)).into_response()
+        }
     }
 }
 
@@ -239,6 +245,7 @@ struct CreateCollectionBody {
 
 async fn create_collection(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Json(body): Json<CreateCollectionBody>,
 ) -> Result<Json<CollectionDto>, Error> {
     let index = IndexSpec {
@@ -247,23 +254,32 @@ async fn create_collection(
     };
     let filterable = body.filterable.into_iter().map(Into::into).collect();
     let info = state
-        .create_collection(body.name, body.dim, body.metric.into(), index, filterable)
+        .create_collection(
+            &principal,
+            body.name,
+            body.dim,
+            body.metric.into(),
+            index,
+            filterable,
+        )
         .await?;
     Ok(Json(info.into()))
 }
 
 async fn get_collection(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(name): Path<String>,
 ) -> Result<Json<CollectionDto>, Error> {
-    let info = state.get_collection(name).await?;
+    let info = state.get_collection(&principal, name).await?;
     Ok(Json(info.into()))
 }
 
 async fn list_collections(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
 ) -> Result<Json<Vec<CollectionDto>>, Error> {
-    let infos = state.list_collections().await?;
+    let infos = state.list_collections(&principal).await?;
     Ok(Json(infos.into_iter().map(CollectionDto::from).collect()))
 }
 
@@ -274,9 +290,10 @@ struct DeleteCollectionResponse {
 
 async fn delete_collection(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(name): Path<String>,
 ) -> Result<Json<DeleteCollectionResponse>, Error> {
-    let existed = state.delete_collection(name).await?;
+    let existed = state.delete_collection(&principal, name).await?;
     Ok(Json(DeleteCollectionResponse { existed }))
 }
 
@@ -300,6 +317,7 @@ struct UpsertResponse {
 
 async fn upsert(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(name): Path<String>,
     Json(body): Json<UpsertBody>,
 ) -> Result<Json<UpsertResponse>, Error> {
@@ -312,7 +330,7 @@ async fn upsert(
             payload: p.payload,
         })
         .collect();
-    let upserted = state.upsert(name, points).await?;
+    let upserted = state.upsert(&principal, name, points).await?;
     Ok(Json(UpsertResponse { upserted }))
 }
 
@@ -328,10 +346,11 @@ struct DeletePointsResponse {
 
 async fn delete_points(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(name): Path<String>,
     Json(body): Json<DeletePointsBody>,
 ) -> Result<Json<DeletePointsResponse>, Error> {
-    let deleted = state.delete_points(name, body.ids).await?;
+    let deleted = state.delete_points(&principal, name, body.ids).await?;
     Ok(Json(DeletePointsResponse { deleted }))
 }
 
@@ -355,9 +374,10 @@ impl From<PointOut> for PointResponse {
 
 async fn get_point(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Response, Error> {
-    let mut points = state.get_points(name, vec![id], true).await?;
+    let mut points = state.get_points(&principal, name, vec![id], true).await?;
     match points.pop() {
         Some(point) => Ok(Json(PointResponse::from(point)).into_response()),
         None => Ok(StatusCode::NOT_FOUND.into_response()),
@@ -417,11 +437,13 @@ struct SearchResponse {
 
 async fn search(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(name): Path<String>,
     Json(body): Json<SearchBody>,
 ) -> Result<Json<SearchResponse>, Error> {
     let matches = state
         .search(
+            &principal,
             name,
             body.vector,
             body.k,

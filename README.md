@@ -131,6 +131,8 @@ The **disk-resident path** is the memory-frugality wedge. On SIFTSMALL (128-d), 
 
 Every option is an environment variable with a secure default; see [`.env.example`](./.env.example) and [ADR-0013](./docs/adr/0013-config-and-secure-defaults.md). Encryption-at-rest is on by default: the server requires a 256-bit key in `QUIVER_ENCRYPTION_KEY` (generate one with `openssl rand -hex 32`) unless `QUIVER_INSECURE=true`, and seals segments, the manifest, and the WAL alike. TLS is required for any non-loopback bind.
 
+**Access control (ADR-0011):** authentication is by API key and authorization is **default-deny RBAC**. A bare `QUIVER_API_KEYS` secret is an all-collections admin key; for least privilege, define scoped keys in `quiver.toml` with a `role` (`read` ⊆ `write` ⊆ `admin`) and a `collections` scope (exact names or a trailing-`*` prefix, e.g. `acme.*`, for per-namespace isolation). A key may only perform its role's actions within its scope — over-scope and cross-namespace access return `403`, and listing hides collections outside the scope.
+
 ## Project
 
 - **Roadmap & Definitions of Done** — [`docs/roadmap.md`](./docs/roadmap.md)

@@ -48,7 +48,7 @@ async fn rest_and_grpc_round_trip() {
         data_dir: tmp.path().to_path_buf(),
         rest_addr,
         grpc_addr,
-        api_keys: vec![key.to_owned()],
+        api_keys: vec![key.into()],
         // Exercise the full encrypted path (server → engine → AEAD codec) over
         // both transports, not just plaintext storage.
         encryption_key: Some(
