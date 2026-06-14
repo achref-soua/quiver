@@ -34,9 +34,14 @@ mod tests {
             metric: v1::Metric::L2 as i32,
             index: v1::IndexKind::DiskVamana as i32,
             pq_subspaces: Some(4),
+            filterable: vec![v1::FilterableField {
+                path: "city".to_owned(),
+                field_type: v1::FieldType::Keyword as i32,
+            }],
         };
         assert_eq!(req.dim, 8);
         assert_eq!(req.index, v1::IndexKind::DiskVamana as i32);
+        assert_eq!(req.filterable.len(), 1);
         let resp = v1::SearchResponse::default();
         assert!(resp.matches.is_empty());
     }

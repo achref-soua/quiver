@@ -37,7 +37,9 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Identity, ServerTlsConfig};
 
 use quiver_crypto::AeadCodec;
-use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, IndexSpec, SearchParams};
+use quiver_embed::{
+    Database, Descriptor, DistanceMetric, Dtype, FilterableField, IndexSpec, SearchParams,
+};
 use quiver_query::Filter;
 
 pub use error::Error;
@@ -158,6 +160,7 @@ pub(crate) struct CollectionInfo {
     pub metric: DistanceMetric,
     pub count: u64,
     pub index: IndexSpec,
+    pub filterable: Vec<FilterableField>,
 }
 
 /// A point to upsert.
@@ -220,8 +223,11 @@ impl AppState {
         dim: u32,
         metric: DistanceMetric,
         index: IndexSpec,
+        filterable: Vec<FilterableField>,
     ) -> Result<CollectionInfo, Error> {
-        let descriptor = Descriptor::new(dim, Dtype::F32, metric).with_index(index);
+        let descriptor = Descriptor::new(dim, Dtype::F32, metric)
+            .with_index(index)
+            .with_filterable(filterable.clone());
         let owned = name.clone();
         self.run_blocking(move |db| db.create_collection(&owned, descriptor))
             .await?;
@@ -231,6 +237,7 @@ impl AppState {
             metric,
             count: 0,
             index,
+            filterable,
         })
     }
 
@@ -247,6 +254,7 @@ impl AppState {
                 metric: descriptor.metric,
                 count,
                 index: descriptor.index,
+                filterable: descriptor.filterable,
             })
         })
         .await
@@ -264,6 +272,7 @@ impl AppState {
                         metric: descriptor.metric,
                         count,
                         index: descriptor.index,
+                        filterable: descriptor.filterable,
                     });
                 }
             }

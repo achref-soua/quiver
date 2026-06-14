@@ -41,6 +41,22 @@ enum IndexKind {
   INDEX_KIND_IVF = 4;
 }
 
+// The value type of a filterable payload field (ADR-0022), which fixes how it is
+// keyed in the secondary index. UNSPECIFIED is treated as KEYWORD.
+enum FieldType {
+  FIELD_TYPE_UNSPECIFIED = 0;
+  FIELD_TYPE_KEYWORD = 1;
+  FIELD_TYPE_NUMERIC = 2;
+}
+
+// A payload field declared filterable at collection creation, indexed for
+// pre-filtered (hybrid) search.
+message FilterableField {
+  // Dot-path into the JSON payload (e.g. "user.age").
+  string path = 1;
+  FieldType field_type = 2;
+}
+
 message Collection {
   string name = 1;
   uint32 dim = 2;
@@ -49,6 +65,8 @@ message Collection {
   IndexKind index = 5;
   // Product-quantization subspaces for quantized kinds; unset = default.
   optional uint32 pq_subspaces = 6;
+  // Payload fields indexed for filtering.
+  repeated FilterableField filterable = 7;
 }
 
 message CreateCollectionRequest {
@@ -58,6 +76,8 @@ message CreateCollectionRequest {
   IndexKind index = 4;
   // Product-quantization subspaces for the disk graph / IVF+PQ; unset = default.
   optional uint32 pq_subspaces = 5;
+  // Payload fields to index for pre-filtered (hybrid) search.
+  repeated FilterableField filterable = 6;
 }
 
 message GetCollectionRequest {

@@ -13,7 +13,7 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use quiver_embed::{DistanceMetric, IndexKind, IndexSpec};
+use quiver_embed::{DistanceMetric, FieldType, FilterableField, IndexKind, IndexSpec};
 use quiver_query::Filter;
 
 use crate::{AppState, CollectionInfo, Error, MatchOut, PointIn, PointOut};
@@ -145,6 +145,57 @@ impl From<IndexKind> for IndexKindDto {
     }
 }
 
+/// A filterable field's value type, in REST JSON (`keyword` | `numeric`).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FieldTypeDto {
+    Keyword,
+    Numeric,
+}
+
+impl From<FieldTypeDto> for FieldType {
+    fn from(t: FieldTypeDto) -> Self {
+        match t {
+            FieldTypeDto::Keyword => FieldType::Keyword,
+            FieldTypeDto::Numeric => FieldType::Numeric,
+        }
+    }
+}
+
+impl From<FieldType> for FieldTypeDto {
+    fn from(t: FieldType) -> Self {
+        match t {
+            FieldType::Numeric => FieldTypeDto::Numeric,
+            _ => FieldTypeDto::Keyword,
+        }
+    }
+}
+
+/// A payload field declared filterable at creation, in REST JSON.
+#[derive(Serialize, Deserialize, Clone)]
+struct FilterableFieldDto {
+    path: String,
+    field_type: FieldTypeDto,
+}
+
+impl From<FilterableFieldDto> for FilterableField {
+    fn from(f: FilterableFieldDto) -> Self {
+        FilterableField {
+            path: f.path,
+            field_type: f.field_type.into(),
+        }
+    }
+}
+
+impl From<FilterableField> for FilterableFieldDto {
+    fn from(f: FilterableField) -> Self {
+        Self {
+            path: f.path,
+            field_type: f.field_type.into(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct CollectionDto {
     name: String,
@@ -154,6 +205,8 @@ struct CollectionDto {
     index: IndexKindDto,
     #[serde(skip_serializing_if = "Option::is_none")]
     pq_subspaces: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    filterable: Vec<FilterableFieldDto>,
 }
 
 impl From<CollectionInfo> for CollectionDto {
@@ -165,6 +218,7 @@ impl From<CollectionInfo> for CollectionDto {
             count: info.count,
             index: info.index.kind.into(),
             pq_subspaces: info.index.pq_subspaces,
+            filterable: info.filterable.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -179,6 +233,8 @@ struct CreateCollectionBody {
     index: IndexKindDto,
     #[serde(default)]
     pq_subspaces: Option<u32>,
+    #[serde(default)]
+    filterable: Vec<FilterableFieldDto>,
 }
 
 async fn create_collection(
@@ -189,8 +245,9 @@ async fn create_collection(
         kind: body.index.into(),
         pq_subspaces: body.pq_subspaces,
     };
+    let filterable = body.filterable.into_iter().map(Into::into).collect();
     let info = state
-        .create_collection(body.name, body.dim, body.metric.into(), index)
+        .create_collection(body.name, body.dim, body.metric.into(), index, filterable)
         .await?;
     Ok(Json(info.into()))
 }

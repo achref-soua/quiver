@@ -5,7 +5,7 @@
 use serde_json::Value;
 use tonic::{Request, Response, Status};
 
-use quiver_embed::{DistanceMetric, IndexKind, IndexSpec};
+use quiver_embed::{DistanceMetric, FieldType, FilterableField, IndexKind, IndexSpec};
 use quiver_proto::v1::{
     self,
     quiver_server::{Quiver, QuiverServer},
@@ -80,6 +80,42 @@ fn index_kind_to_proto(kind: IndexKind) -> i32 {
     value as i32
 }
 
+fn field_type_from_proto(value: i32) -> FieldType {
+    match v1::FieldType::try_from(value) {
+        Ok(v1::FieldType::Numeric) => FieldType::Numeric,
+        // UNSPECIFIED and KEYWORD both map to keyword.
+        _ => FieldType::Keyword,
+    }
+}
+
+fn field_type_to_proto(field_type: FieldType) -> i32 {
+    let value = match field_type {
+        FieldType::Numeric => v1::FieldType::Numeric,
+        _ => v1::FieldType::Keyword,
+    };
+    value as i32
+}
+
+fn filterable_from_proto(fields: Vec<v1::FilterableField>) -> Vec<FilterableField> {
+    fields
+        .into_iter()
+        .map(|f| FilterableField {
+            path: f.path,
+            field_type: field_type_from_proto(f.field_type),
+        })
+        .collect()
+}
+
+fn filterable_to_proto(fields: Vec<FilterableField>) -> Vec<v1::FilterableField> {
+    fields
+        .into_iter()
+        .map(|f| v1::FilterableField {
+            path: f.path,
+            field_type: field_type_to_proto(f.field_type),
+        })
+        .collect()
+}
+
 fn collection_to_proto(info: CollectionInfo) -> v1::Collection {
     v1::Collection {
         name: info.name,
@@ -88,6 +124,7 @@ fn collection_to_proto(info: CollectionInfo) -> v1::Collection {
         count: info.count,
         index: index_kind_to_proto(info.index.kind),
         pq_subspaces: info.index.pq_subspaces,
+        filterable: filterable_to_proto(info.filterable),
     }
 }
 
@@ -130,9 +167,16 @@ impl Quiver for QuiverService {
         self.check_auth(&request)?;
         let req = request.into_inner();
         let index = index_spec_from_proto(req.index, req.pq_subspaces);
+        let filterable = filterable_from_proto(req.filterable);
         let info = self
             .state
-            .create_collection(req.name, req.dim, metric_from_proto(req.metric), index)
+            .create_collection(
+                req.name,
+                req.dim,
+                metric_from_proto(req.metric),
+                index,
+                filterable,
+            )
             .await
             .map_err(|e| e.to_status())?;
         Ok(Response::new(collection_to_proto(info)))

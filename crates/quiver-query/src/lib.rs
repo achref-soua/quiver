@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Query-side filtering: a typed predicate tree over a point's JSON payload.
 //!
-//! Phase 1 evaluates filters by **post-filtering** candidates returned by the
-//! vector search (`docs/index/design.md`): the planner's pre-filter path (build
-//! an allowed-row roaring bitmap from secondary indexes and constrain traversal)
-//! lands in Phase 2 with hybrid search. The [`Filter`] tree itself is the stable
-//! wire shape either way.
+//! How a filter runs is chosen by the embeddable database's planner: when the
+//! filter is selective on secondary-indexed fields it pre-filters to an exact
+//! candidate scan, and otherwise it post-filters the vector-search candidates
+//! (see `quiver-embed` and `docs/index/design.md`). Either way the [`Filter`]
+//! tree is the stable wire shape and is re-checked on every surviving candidate,
+//! so results are exact.
 //!
 //! Field references are dot-paths into the payload object (`"user.age"`).
 

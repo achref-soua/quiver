@@ -42,10 +42,15 @@ whose own `.sec` reflects the new value) — so an id is counted once, with its
 live payload's membership. Active (un-checkpointed) rows are scanned directly.
 The result is a sorted, de-duplicated id set.
 
-**`matching_ids` is a public primitive; planner integration is separate.** This
-PR ships the index and the query primitive (a `pub` API, fully tested); the query
-planner that decomposes a `Filter` into predicates and chooses pre- vs
-post-filtering by selectivity is the next step (Phase-2 hybrid search).
+**`matching_ids` is a public primitive; the planner builds on it.** This ADR
+shipped the index and the query primitive (a `pub` API, fully tested). The query
+planner now lives in `quiver-embed`: it decomposes a `Filter` into the indexable
+predicates (`And` intersects, `Or` unions, anything unrepresentable widens to
+unconstrained — always a sound superset), resolves the candidate ids through
+`matching_ids`, and when the set is selective (below a full-scan threshold) scans
+those rows exactly instead of post-filtering ANN hits. Both arms re-check the
+full `Filter`, so results are exact. Declaring `filterable` fields is exposed over
+REST/gRPC (and the MCP server), so hybrid search is reachable end to end.
 
 ## Consequences
 
