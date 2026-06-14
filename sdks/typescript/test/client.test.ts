@@ -48,6 +48,27 @@ describe("Quiver TypeScript client", () => {
     expect(info.pqSubspaces).toBe(2);
   });
 
+  it("createCollection sends filterable fields and parses them back", async () => {
+    let captured: Record<string, unknown> | undefined;
+    const fetch = mockFetch(async (_path, _method, init) => {
+      captured = parseBody(init);
+      return json({
+        name: "people",
+        dim: 4,
+        metric: "l2",
+        count: 0,
+        index: "hnsw",
+        filterable: [{ path: "city", field_type: "keyword" }],
+      });
+    });
+    const client = new Client("http://x", { fetch });
+    const info = await client.createCollection("people", 4, {
+      filterable: [{ path: "city", fieldType: "keyword" }],
+    });
+    expect(captured?.["filterable"]).toEqual([{ path: "city", field_type: "keyword" }]);
+    expect(info.filterable).toEqual([{ path: "city", fieldType: "keyword" }]);
+  });
+
   it("defaults the index field out of the body and sends the bearer token", async () => {
     let body: Record<string, unknown> | undefined;
     let auth: string | undefined;

@@ -7,7 +7,7 @@ import httpx
 import pytest
 import respx
 
-from quiver import Client, CollectionInfo, Match, Point, QuiverError
+from quiver import Client, CollectionInfo, FilterableField, Match, Point, QuiverError
 
 BASE = "http://quiver.test"
 
@@ -25,6 +25,29 @@ def test_create_collection_sends_body_and_auth_header():
     request = route.calls.last.request
     assert request.headers["authorization"] == "Bearer secret"
     assert json.loads(request.content) == {"name": "items", "dim": 4, "metric": "l2"}
+
+
+@respx.mock
+def test_create_collection_with_filterable_fields():
+    route = respx.post(f"{BASE}/v1/collections").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "name": "people",
+                "dim": 4,
+                "metric": "l2",
+                "count": 0,
+                "filterable": [{"path": "city", "field_type": "keyword"}],
+            },
+        )
+    )
+    with Client(BASE) as q:
+        info = q.create_collection(
+            "people", 4, filterable=[FilterableField("city", "keyword")]
+        )
+    assert info.filterable == [FilterableField("city", "keyword")]
+    body = json.loads(route.calls.last.request.content)
+    assert body["filterable"] == [{"path": "city", "field_type": "keyword"}]
 
 
 @respx.mock
