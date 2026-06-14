@@ -26,9 +26,11 @@
 //! ```
 
 mod codec;
+pub mod envelope;
 pub mod payload;
 
 pub use codec::{AeadCodec, KEY_LEN};
+pub use envelope::EnvelopeKeyRing;
 pub use payload::{ENVELOPE_KEY, PayloadCipher, PayloadError, is_sealed};
 
 /// Errors from constructing or configuring a [`AeadCodec`].

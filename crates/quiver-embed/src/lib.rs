@@ -249,6 +249,17 @@ impl Database {
         Ok(existed)
     }
 
+    /// Crypto-shred a collection: drop it and destroy its data-encryption key, so
+    /// its sealed data is unrecoverable even with the master key, then reclaim
+    /// its files. Mirrors [`quiver_core::Store::shred_collection`]; with an
+    /// envelope key-ring this is irreversible erasure, with a single-codec
+    /// key-ring it is `drop` plus a checkpoint. Returns whether it existed.
+    pub fn shred_collection(&mut self, name: &str) -> Result<bool> {
+        let existed = self.store.shred_collection(name)?;
+        self.collections.remove(name);
+        Ok(existed)
+    }
+
     /// Names of all collections, sorted.
     #[must_use]
     pub fn collection_names(&self) -> Vec<String> {

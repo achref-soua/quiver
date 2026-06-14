@@ -278,7 +278,7 @@ impl Store {
 
         // 4. GC orphan segment files not referenced by the manifest (a crash
         //    between a segment flush and the manifest swap).
-        gc_orphan_segments(dir, &mfst)?;
+        gc_orphan_segments(dir, &mfst, keyring.as_ref())?;
 
         // 5. Start a fresh WAL segment for new appends, then drop superseded WAL
         //    files (empty or fully below the checkpoint).
@@ -366,6 +366,27 @@ impl Store {
         self.next_lsn = lsn.next();
         self.collections.remove(&id);
         self.name_index.remove(name);
+        Ok(true)
+    }
+
+    /// Crypto-shred a collection: drop it, checkpoint so the manifest no longer
+    /// references it and its files are reclaimed, then destroy its key material.
+    /// After this its sealed segments and index are unrecoverable even to the
+    /// master-key holder (ADR-0010); with a single-codec key-ring there is no
+    /// per-collection key, so this is `drop` plus a checkpoint. Returns whether
+    /// the collection existed.
+    pub fn shred_collection(&mut self, name: &str) -> Result<bool> {
+        let Some(id) = self.collection_id(name) else {
+            return Ok(false);
+        };
+        self.drop_collection(name)?;
+        // Seal any un-checkpointed rows into DEK-protected segments and rotate
+        // the WAL, so no live catalog-keyed copy of the collection survives; the
+        // checkpoint's GC then reclaims its files and shreds its key.
+        self.checkpoint()?;
+        // Destroy the key explicitly too, covering a collection that never
+        // reached a segment directory for GC to find. Idempotent.
+        self.keyring.shred_collection(id)?;
         Ok(true)
     }
 
@@ -774,7 +795,7 @@ impl Store {
             state.active_index.clear();
         }
         self.rotate_wal()?;
-        gc_orphan_segments(&self.dir, &new_manifest)?;
+        gc_orphan_segments(&self.dir, &new_manifest, self.keyring.as_ref())?;
         self.auto_compact()?;
         Ok(())
     }
@@ -965,7 +986,7 @@ impl Store {
                 );
             }
         }
-        gc_orphan_segments(&self.dir, &new_manifest)?;
+        gc_orphan_segments(&self.dir, &new_manifest, self.keyring.as_ref())?;
         Ok(())
     }
 
@@ -1046,7 +1067,7 @@ fn apply_wal_entry(
 
 // Delete superseded segment files (and whole dropped-collection directories)
 // that the manifest no longer references.
-fn gc_orphan_segments(dir: &Path, mfst: &Manifest) -> Result<()> {
+fn gc_orphan_segments(dir: &Path, mfst: &Manifest, keyring: &dyn KeyRing) -> Result<()> {
     let collections_dir = dir.join("collections");
     if !collections_dir.exists() {
         return Ok(());
@@ -1070,7 +1091,10 @@ fn gc_orphan_segments(dir: &Path, mfst: &Manifest) -> Result<()> {
             continue;
         };
         if !live_collections.contains(&cid) {
-            // A dropped collection: reclaim its whole directory.
+            // A dropped collection: crypto-shred its key first (so a crash before
+            // the files are reclaimed still leaves them unrecoverable), then
+            // reclaim its whole directory.
+            keyring.shred_collection(CollectionId(cid))?;
             if cdir.is_dir() {
                 fs::remove_dir_all(&cdir).map_err(|e| CoreError::io(&cdir, e))?;
             }

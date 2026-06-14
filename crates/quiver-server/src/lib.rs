@@ -43,7 +43,7 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
-use quiver_crypto::AeadCodec;
+use quiver_crypto::{AeadCodec, EnvelopeKeyRing};
 use quiver_embed::{
     Database, Descriptor, DistanceMetric, Dtype, FilterableField, IndexSpec, SearchParams,
 };
@@ -570,17 +570,19 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-// Open the engine, enabling encryption-at-rest when a key is configured. With no
-// key (only valid in `insecure` mode, enforced by `Config::validate`) the engine
-// is opened in plaintext.
+// Open the engine, enabling encryption-at-rest when a key is configured. The
+// configured key is the **master key** of an envelope key-ring (ADR-0010): it
+// wraps a per-collection data-encryption key, so dropping a collection
+// crypto-shreds it. With no key (only valid in `insecure` mode, enforced by
+// `Config::validate`) the engine is opened in plaintext.
 fn open_database(config: &Config) -> Result<Database, Error> {
     match &config.encryption_key {
         Some(key) => {
-            let codec = AeadCodec::from_hex(key)
+            let keyring = EnvelopeKeyRing::from_hex(key, &config.data_dir)
                 .map_err(|e| Error::Config(format!("invalid encryption_key: {e}")))?;
-            Ok(Database::open_with_codec(
+            Ok(Database::open_with_keyring(
                 &config.data_dir,
-                Box::new(codec),
+                Box::new(keyring),
             )?)
         }
         None => Ok(Database::open(&config.data_dir)?),
