@@ -17,9 +17,12 @@
 //! client-side-encrypted (ADR-0012). TLS-in-transit uses `rustls` over the
 //! audited `ring` provider — REST via `axum-server`, gRPC via tonic's `tls-ring`
 //! — and a non-loopback bind requires it; setting a client CA additionally
-//! requires mutual TLS. Per-tenant engine partitioning, audit logging, and rate
-//! limiting are later phases. Design: `docs/api/rest-grpc.md`.
+//! requires mutual TLS. Mutating and administrative operations, and every
+//! access-control denial, are recorded to an append-only audit log (ADR-0011,
+//! the `audit` module) when `audit_log` is set. Per-tenant engine partitioning
+//! and rate limiting are later phases. Design: `docs/api/rest-grpc.md`.
 
+mod audit;
 mod auth;
 mod error;
 mod grpc;
@@ -49,6 +52,7 @@ use quiver_query::Filter;
 pub use auth::{Action, ApiKey, CollectionScope};
 pub use error::Error;
 
+use audit::{AuditLog, Outcome};
 use auth::Principal;
 
 /// Server configuration, layered defaults → `quiver.toml` → `QUIVER_*` env and
@@ -85,6 +89,12 @@ pub struct Config {
     /// must present a certificate chaining to this CA to connect (ADR-0011).
     /// Requires `tls_cert`/`tls_key`; bearer API keys still carry the RBAC scope.
     pub tls_client_ca: Option<PathBuf>,
+    /// Path to an append-only audit log file (ADR-0011). When set, every
+    /// mutating and administrative operation and every access-control denial is
+    /// appended as one JSON object per line (JSON Lines); records are always
+    /// also emitted as `tracing` events. Unset ⇒ tracing only. Secrets are never
+    /// written — see `docs/security/audit.md`.
+    pub audit_log: Option<PathBuf>,
     /// Opt out of the secure defaults (no auth, no encryption-at-rest, allow a
     /// non-loopback bind without TLS). For local development only; never the
     /// default.
@@ -102,6 +112,7 @@ impl Default for Config {
             tls_cert: None,
             tls_key: None,
             tls_client_ca: None,
+            audit_log: None,
             insecure: false,
         }
     }
@@ -167,12 +178,13 @@ impl Config {
     }
 }
 
-/// Shared server state: the engine behind a single-writer lock, plus the
-/// accepted API keys with their RBAC scopes.
+/// Shared server state: the engine behind a single-writer lock, the accepted
+/// API keys with their RBAC scopes, and the audit log.
 #[derive(Clone)]
 pub(crate) struct AppState {
     db: Arc<Mutex<Database>>,
     keys: Arc<Vec<ApiKey>>,
+    audit: Arc<AuditLog>,
 }
 
 /// A collection's metadata.
@@ -231,6 +243,33 @@ impl AppState {
         .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))?
     }
 
+    // Authorize `action` on `resource`, recording a denial in the audit log
+    // before propagating it. The shared choke point for both transports.
+    fn authorize(
+        &self,
+        principal: &Principal,
+        action: Action,
+        op: &str,
+        resource: &str,
+    ) -> Result<(), Error> {
+        principal
+            .require(action, Some(resource))
+            .inspect_err(|_| self.audit.deny(principal.actor(), op, resource))
+    }
+
+    // Authorize a collection-agnostic operation (listing): only the role is
+    // checked; a denial is recorded against the `*` resource.
+    fn authorize_global(
+        &self,
+        principal: &Principal,
+        action: Action,
+        op: &str,
+    ) -> Result<(), Error> {
+        principal
+            .require(action, None)
+            .inspect_err(|_| self.audit.deny(principal.actor(), op, "*"))
+    }
+
     pub(crate) async fn create_collection(
         &self,
         principal: &Principal,
@@ -240,13 +279,21 @@ impl AppState {
         index: IndexSpec,
         filterable: Vec<FilterableField>,
     ) -> Result<CollectionInfo, Error> {
-        principal.require(Action::Admin, Some(&name))?;
+        self.authorize(principal, Action::Admin, "create_collection", &name)?;
         let descriptor = Descriptor::new(dim, Dtype::F32, metric)
             .with_index(index)
             .with_filterable(filterable.clone());
         let owned = name.clone();
-        self.run_blocking(move |db| db.create_collection(&owned, descriptor))
-            .await?;
+        let result = self
+            .run_blocking(move |db| db.create_collection(&owned, descriptor))
+            .await;
+        self.audit.record(
+            principal.actor(),
+            "create_collection",
+            &name,
+            Outcome::of(&result),
+        );
+        result?;
         Ok(CollectionInfo {
             name,
             dim,
@@ -262,7 +309,7 @@ impl AppState {
         principal: &Principal,
         name: String,
     ) -> Result<CollectionInfo, Error> {
-        principal.require(Action::Read, Some(&name))?;
+        self.authorize(principal, Action::Read, "get_collection", &name)?;
         self.run_blocking(move |db| {
             let descriptor = db
                 .descriptor(&name)
@@ -285,7 +332,7 @@ impl AppState {
         &self,
         principal: &Principal,
     ) -> Result<Vec<CollectionInfo>, Error> {
-        principal.require(Action::Read, None)?;
+        self.authorize_global(principal, Action::Read, "list_collections")?;
         let mut infos = self
             .run_blocking(|db| {
                 let mut out = Vec::new();
@@ -315,8 +362,16 @@ impl AppState {
         principal: &Principal,
         name: String,
     ) -> Result<bool, Error> {
-        principal.require(Action::Admin, Some(&name))?;
-        self.run_blocking(move |db| db.drop_collection(&name)).await
+        self.authorize(principal, Action::Admin, "delete_collection", &name)?;
+        let resource = name.clone();
+        let result = self.run_blocking(move |db| db.drop_collection(&name)).await;
+        self.audit.record(
+            principal.actor(),
+            "delete_collection",
+            &resource,
+            Outcome::of(&result),
+        );
+        result
     }
 
     pub(crate) async fn upsert(
@@ -325,16 +380,21 @@ impl AppState {
         collection: String,
         points: Vec<PointIn>,
     ) -> Result<u64, Error> {
-        principal.require(Action::Write, Some(&collection))?;
-        self.run_blocking(move |db| {
-            let mut count = 0u64;
-            for point in &points {
-                db.upsert(&collection, &point.id, &point.vector, &point.payload)?;
-                count += 1;
-            }
-            Ok(count)
-        })
-        .await
+        self.authorize(principal, Action::Write, "upsert", &collection)?;
+        let resource = collection.clone();
+        let result = self
+            .run_blocking(move |db| {
+                let mut count = 0u64;
+                for point in &points {
+                    db.upsert(&collection, &point.id, &point.vector, &point.payload)?;
+                    count += 1;
+                }
+                Ok(count)
+            })
+            .await;
+        self.audit
+            .record(principal.actor(), "upsert", &resource, Outcome::of(&result));
+        result
     }
 
     pub(crate) async fn delete_points(
@@ -343,17 +403,26 @@ impl AppState {
         collection: String,
         ids: Vec<String>,
     ) -> Result<u64, Error> {
-        principal.require(Action::Write, Some(&collection))?;
-        self.run_blocking(move |db| {
-            let mut count = 0u64;
-            for id in &ids {
-                if db.delete(&collection, id)? {
-                    count += 1;
+        self.authorize(principal, Action::Write, "delete_points", &collection)?;
+        let resource = collection.clone();
+        let result = self
+            .run_blocking(move |db| {
+                let mut count = 0u64;
+                for id in &ids {
+                    if db.delete(&collection, id)? {
+                        count += 1;
+                    }
                 }
-            }
-            Ok(count)
-        })
-        .await
+                Ok(count)
+            })
+            .await;
+        self.audit.record(
+            principal.actor(),
+            "delete_points",
+            &resource,
+            Outcome::of(&result),
+        );
+        result
     }
 
     pub(crate) async fn get_points(
@@ -363,7 +432,7 @@ impl AppState {
         ids: Vec<String>,
         with_vector: bool,
     ) -> Result<Vec<PointOut>, Error> {
-        principal.require(Action::Read, Some(&collection))?;
+        self.authorize(principal, Action::Read, "get_points", &collection)?;
         self.run_blocking(move |db| {
             let mut out = Vec::new();
             for id in &ids {
@@ -392,7 +461,7 @@ impl AppState {
         with_payload: bool,
         with_vector: bool,
     ) -> Result<Vec<MatchOut>, Error> {
-        principal.require(Action::Read, Some(&collection))?;
+        self.authorize(principal, Action::Read, "search", &collection)?;
         self.run_blocking(move |db| {
             let params = SearchParams {
                 k,
@@ -443,9 +512,11 @@ pub async fn serve(
     grpc_listener: TcpListener,
 ) -> Result<(), Error> {
     let db = open_database(&config)?;
+    let audit = Arc::new(AuditLog::open(config.audit_log.as_deref())?);
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         keys: Arc::new(config.api_keys.clone()),
+        audit,
     };
 
     let app = rest::router(state.clone());

@@ -32,6 +32,7 @@
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::Error;
 
@@ -103,6 +104,12 @@ pub struct ApiKey {
     pub role: Action,
     /// The collections this key may touch.
     pub collections: CollectionScope,
+    /// An optional non-secret label identifying this key in the audit log
+    /// (ADR-0011). When unset, the key is identified by a short, preimage-
+    /// resistant SHA-256 fingerprint of its secret (`key:<hex>`), so audit
+    /// records attribute an action to a key without ever revealing the secret.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 impl ApiKey {
@@ -113,8 +120,29 @@ impl ApiKey {
             secret: secret.into(),
             role: Action::Admin,
             collections: CollectionScope::All,
+            id: None,
         }
     }
+
+    /// This key's actor identity for the audit log: its configured [`id`] when
+    /// set, otherwise `key:<fingerprint>` — a short, one-way SHA-256 of the
+    /// secret that never reveals it.
+    ///
+    /// [`id`]: ApiKey::id
+    pub(crate) fn actor_id(&self) -> String {
+        match &self.id {
+            Some(id) => id.clone(),
+            None => format!("key:{}", secret_fingerprint(&self.secret)),
+        }
+    }
+}
+
+// A short, preimage-resistant fingerprint of a key's secret for the audit log:
+// the first 8 bytes of its SHA-256, hex-encoded. Not reversible to the secret.
+fn secret_fingerprint(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(secret.as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl From<&str> for ApiKey {
@@ -134,6 +162,9 @@ impl From<String> for ApiKey {
 pub(crate) struct Principal {
     role: Action,
     collections: CollectionScope,
+    /// A non-secret identity for the audit log — the key's label or fingerprint,
+    /// or `insecure`. Never the bearer secret.
+    actor: Arc<str>,
 }
 
 impl Principal {
@@ -143,6 +174,7 @@ impl Principal {
         Self {
             role: Action::Admin,
             collections: CollectionScope::All,
+            actor: Arc::from("insecure"),
         }
     }
 
@@ -150,7 +182,13 @@ impl Principal {
         Self {
             role: key.role,
             collections: key.collections.clone(),
+            actor: Arc::from(key.actor_id()),
         }
+    }
+
+    /// This caller's non-secret actor identity, recorded in the audit log.
+    pub(crate) fn actor(&self) -> &str {
+        &self.actor
     }
 
     /// Authorize `action` on an optional `collection`, returning
@@ -238,6 +276,8 @@ struct KeySpec {
     role: Action,
     #[serde(default)]
     collections: CollectionScope,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 // Accept the API key list as a comma-separated string (the `QUIVER_API_KEYS`
@@ -287,6 +327,7 @@ where
                         secret: spec.secret,
                         role: spec.role,
                         collections: spec.collections,
+                        id: spec.id,
                     },
                 });
             }
@@ -326,6 +367,7 @@ mod tests {
         let reader = Principal {
             role: Action::Read,
             collections: CollectionScope::Patterns(vec!["acme.*".to_owned()]),
+            actor: Arc::from("reader"),
         };
         assert!(reader.require(Action::Read, Some("acme.orders")).is_ok());
         // Over-scope on action: a reader cannot write.
@@ -343,6 +385,30 @@ mod tests {
         let p = Principal::insecure();
         assert!(p.require(Action::Admin, Some("anything")).is_ok());
         assert!(p.can_see("anything"));
+        assert_eq!(p.actor(), "insecure");
+    }
+
+    #[test]
+    fn actor_id_uses_a_label_or_a_fingerprint_but_never_the_secret() {
+        // An explicit label identifies the key verbatim.
+        let labeled = ApiKey {
+            id: Some("ci-admin".to_owned()),
+            ..ApiKey::admin("super-secret")
+        };
+        assert_eq!(labeled.actor_id(), "ci-admin");
+        assert_eq!(Principal::from_key(&labeled).actor(), "ci-admin");
+
+        // Without one, the key is a `key:<fingerprint>` that never leaks the
+        // secret and is deterministic and key-specific.
+        let bare = ApiKey::admin("super-secret");
+        let id = bare.actor_id();
+        assert!(id.starts_with("key:"));
+        assert!(
+            !id.contains("super-secret"),
+            "the fingerprint must not contain the secret"
+        );
+        assert_eq!(id, ApiKey::admin("super-secret").actor_id());
+        assert_ne!(id, ApiKey::admin("other-secret").actor_id());
     }
 
     #[test]
@@ -353,6 +419,7 @@ mod tests {
                 secret: "reader-secret".to_owned(),
                 role: Action::Read,
                 collections: CollectionScope::Patterns(vec!["acme.*".to_owned()]),
+                id: None,
             },
         ];
         // No keys ⇒ insecure ⇒ any caller is admin.

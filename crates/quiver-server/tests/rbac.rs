@@ -60,17 +60,20 @@ async fn scoped_keys_deny_over_scope_and_cross_namespace() {
                 secret: "reader-secret".to_owned(),
                 role: Action::Read,
                 collections: acme_only.clone(),
+                id: None,
             },
             ApiKey {
                 secret: "writer-secret".to_owned(),
                 role: Action::Write,
                 collections: acme_only,
+                id: None,
             },
         ],
         encryption_key: Some(ENC_KEY.to_owned()),
         tls_cert: None,
         tls_key: None,
         tls_client_ca: None,
+        audit_log: None,
         insecure: false,
     };
     let server = tokio::spawn(async move {
