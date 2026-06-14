@@ -130,6 +130,8 @@ Recall is a property of the index and the data (host-independent), so these figu
 
 The per-collection **recall ↔ latency ↔ memory** knobs — quantizers (scalar/product/binary), the disk-resident DiskANN path, and IVF — are documented with a tradeoff table in [`docs/benchmarks/quantization-tradeoffs.md`](./docs/benchmarks/quantization-tradeoffs.md).
 
+The **IVF** index also supports **incremental in-place updates**: inserts, in-place updates, and deletes are applied to the live index with SpFresh-style LIRE rebalancing (cell split/merge), so streaming workloads avoid an `O(N)` rebuild ([ADR-0023](./docs/adr/0023-incremental-in-place-updates.md)).
+
 The **disk-resident path** is the memory-frugality wedge. On SIFTSMALL (128-d), it serves recall@10 up to **1.000** while holding only PQ codes in RAM — a **32× smaller RAM-resident footprint** than full-precision vectors (the graph and vectors live in the encrypted on-disk index). That reduction is exact arithmetic and scales (e.g. a 10M × 768-d collection: ~1 GB resident vs ~31 GB). The head-to-head **RSS vs Qdrant/LanceDB** is reference-hardware-pending. Numbers and method: [`docs/benchmarks/results/disk-path.md`](./docs/benchmarks/results/disk-path.md).
 
 ## Configuration

@@ -10,11 +10,13 @@
 //! ## Index lifecycle
 //! The store is the source of truth. Each collection chooses its index via the
 //! descriptor's [`IndexSpec`] (default in-memory HNSW); the index is built from
-//! the store on open. HNSW applies new-id inserts incrementally; an update, a
-//! delete, or any write to a batch index (Vamana / IVF, built over the whole
-//! collection) marks the index stale, and the next search rebuilds it — so batch
-//! indexes suit bulk-load-then-query. In-place incremental update for the disk
-//! graph is Phase 4 (SpFresh).
+//! the store on open. HNSW applies new-id inserts incrementally; once an IVF
+//! index is built it applies inserts, in-place updates, and deletes
+//! incrementally with LIRE rebalancing (ADR-0023). An update to HNSW, or any
+//! write to the Vamana / disk graph (built over the whole collection), marks the
+//! index stale and the next search rebuilds it — so those suit
+//! bulk-load-then-query. In-place incremental update for the disk graph is a
+//! later increment (SpFresh).
 //!
 //! ## Filtered (hybrid) search
 //! A search may carry a [`quiver_query::Filter`] over the payload. The planner
@@ -131,9 +133,10 @@ const FILTER_OVERFETCH: usize = 8;
 // the equivalent knob its full-scan threshold.
 const FULL_SCAN_THRESHOLD: usize = 10_000;
 
-// The vector index backing one collection. HNSW is incremental; Vamana and IVF
-// are batch-built from the store (the `Option` is `None` until first build), so
-// they suit bulk-load-then-query and rebuild lazily after writes.
+// The vector index backing one collection. HNSW and (once built) IVF are
+// maintained incrementally; Vamana and the disk graph are batch-built from the
+// store (the `Option` is `None` until first build) and rebuild lazily after
+// writes, so they suit bulk-load-then-query.
 enum CollectionIndex {
     Hnsw(Hnsw),
     Vamana(Option<Vamana>),
@@ -297,19 +300,39 @@ impl Database {
             .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
         let payload_bytes = serde_json::to_vec(payload)?;
         self.store.upsert(handle.id, id, vector, &payload_bytes)?;
-        // Only an in-memory HNSW can absorb a brand-new id incrementally; an
-        // existing id (no in-place update), a batch index, or an already-stale
-        // index defers to a lazy rebuild on the next search.
-        let new_id = !handle.ext_to_int.contains_key(id);
-        let incremental =
-            !handle.stale && new_id && matches!(handle.index, CollectionIndex::Hnsw(_));
-        if incremental {
+        // Maintain the in-memory index in place where the kind allows it, else
+        // defer to a lazy rebuild on the next search. HNSW absorbs a brand-new id
+        // (it cannot update one in place); a built/trained IVF inserts or
+        // replaces any id (ADR-0023). A batch graph, the disk index, an
+        // unbuilt/empty index, or an already-stale handle rebuilds instead.
+        if handle.stale {
+            return Ok(());
+        }
+        let known = handle.ext_to_int.contains_key(id);
+        let is_hnsw = matches!(handle.index, CollectionIndex::Hnsw(_));
+        let is_live_ivf =
+            matches!(&handle.index, CollectionIndex::Ivf(Some(ivf)) if !ivf.is_empty());
+        if is_hnsw && !known {
             let internal = handle.int_to_ext.len() as u64;
             if let CollectionIndex::Hnsw(h) = &mut handle.index {
                 h.insert(internal, vector)?;
             }
             handle.ext_to_int.insert(id.to_owned(), internal);
             handle.int_to_ext.push(id.to_owned());
+        } else if is_live_ivf {
+            // Reuse the internal id for an in-place update; allocate a fresh,
+            // dense one for a new id (so `int_to_ext` stays index-addressable).
+            let internal = if known {
+                handle.ext_to_int[id]
+            } else {
+                let i = handle.int_to_ext.len() as u64;
+                handle.ext_to_int.insert(id.to_owned(), i);
+                handle.int_to_ext.push(id.to_owned());
+                i
+            };
+            if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
+                ivf.insert(internal, vector)?;
+            }
         } else {
             handle.stale = true;
         }
@@ -323,10 +346,25 @@ impl Database {
             .get_mut(collection)
             .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
         let existed = self.store.delete(handle.id, id)?;
-        if existed {
+        if !existed {
+            return Ok(false);
+        }
+        // A built IVF removes in place (ADR-0023); other kinds defer to a
+        // rebuild. The id->internal mapping is kept so a later re-insert reuses
+        // the slot — a removed internal is simply never returned by the index.
+        let is_live_ivf = !handle.stale && matches!(handle.index, CollectionIndex::Ivf(Some(_)));
+        if is_live_ivf {
+            if let Some(&internal) = handle.ext_to_int.get(id) {
+                if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
+                    ivf.remove(internal);
+                }
+            } else {
+                handle.stale = true;
+            }
+        } else {
             handle.stale = true;
         }
-        Ok(existed)
+        Ok(true)
     }
 
     /// Fetch a single point by id, with its payload and vector.
@@ -982,6 +1020,130 @@ mod tests {
             .search("v", &[7.0, 1.0, 2.0, 3.0], &SearchParams::default())
             .unwrap();
         assert_eq!(res[0].id, "p7");
+    }
+
+    #[test]
+    fn ivf_upserts_and_deletes_incrementally_without_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("c", desc_with(IndexKind::Ivf))
+            .unwrap();
+        for i in 0..50u32 {
+            db.upsert(
+                "c",
+                &format!("p{i}"),
+                &[i as f32, 0.0, 0.0, 0.0],
+                &json!({}),
+            )
+            .unwrap();
+        }
+        // The first search builds (and trains) the IVF from the store.
+        let _ = db
+            .search("c", &[1.0, 0.0, 0.0, 0.0], &SearchParams::default())
+            .unwrap();
+        assert!(!db.collections["c"].stale, "the search built the index");
+
+        // Incremental insert: a new outlier is found, with no rebuild scheduled.
+        db.upsert("c", "far", &[500.0, 0.0, 0.0, 0.0], &json!({}))
+            .unwrap();
+        assert!(!db.collections["c"].stale, "ivf insert stayed incremental");
+        let res = db
+            .search("c", &[500.0, 0.0, 0.0, 0.0], &SearchParams::default())
+            .unwrap();
+        assert_eq!(res[0].id, "far");
+
+        // Incremental delete: the point disappears, still with no rebuild.
+        assert!(db.delete("c", "far").unwrap());
+        assert!(!db.collections["c"].stale, "ivf delete stayed incremental");
+        let res = db
+            .search("c", &[500.0, 0.0, 0.0, 0.0], &SearchParams::default())
+            .unwrap();
+        assert!(res.iter().all(|m| m.id != "far"), "deleted point is gone");
+    }
+
+    #[test]
+    fn ivf_incremental_update_replaces_the_vector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("c", desc_with(IndexKind::Ivf))
+            .unwrap();
+        for i in 0..30u32 {
+            db.upsert(
+                "c",
+                &format!("p{i}"),
+                &[i as f32, 0.0, 0.0, 0.0],
+                &json!({}),
+            )
+            .unwrap();
+        }
+        let _ = db.search("c", &[0.0; 4], &SearchParams::default()).unwrap();
+        // Move p5 far away in place.
+        db.upsert("c", "p5", &[900.0, 0.0, 0.0, 0.0], &json!({}))
+            .unwrap();
+        assert!(!db.collections["c"].stale);
+        let at_new = db
+            .search("c", &[900.0, 0.0, 0.0, 0.0], &SearchParams::default())
+            .unwrap();
+        assert_eq!(at_new[0].id, "p5", "p5 found at its new location");
+        let at_old = db
+            .search("c", &[5.0, 0.0, 0.0, 0.0], &SearchParams::default())
+            .unwrap();
+        assert!(at_old.iter().all(|m| m.id != "p5"), "stale vector is gone");
+    }
+
+    #[test]
+    fn ivf_reinsert_after_incremental_delete_is_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("c", desc_with(IndexKind::Ivf))
+            .unwrap();
+        for i in 0..20u32 {
+            db.upsert(
+                "c",
+                &format!("p{i}"),
+                &[i as f32, 0.0, 0.0, 0.0],
+                &json!({}),
+            )
+            .unwrap();
+        }
+        let _ = db.search("c", &[0.0; 4], &SearchParams::default()).unwrap();
+        assert!(db.delete("c", "p3").unwrap());
+        assert!(!db.collections["c"].stale);
+        // Re-insert the same id; it must be searchable again (the slot is reused).
+        db.upsert("c", "p3", &[3.0, 0.0, 0.0, 0.0], &json!({}))
+            .unwrap();
+        assert!(!db.collections["c"].stale);
+        let res = db
+            .search("c", &[3.0, 0.0, 0.0, 0.0], &SearchParams::default())
+            .unwrap();
+        assert_eq!(res[0].id, "p3");
+    }
+
+    #[test]
+    fn hnsw_in_place_update_falls_back_to_rebuild() {
+        // HNSW cannot update an id in place, so an update marks the index stale.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("c", desc()).unwrap();
+        for i in 0..10u32 {
+            db.upsert(
+                "c",
+                &format!("p{i}"),
+                &[i as f32, 0.0, 0.0, 0.0],
+                &json!({}),
+            )
+            .unwrap();
+        }
+        let _ = db.search("c", &[0.0; 4], &SearchParams::default()).unwrap();
+        assert!(!db.collections["c"].stale);
+        db.upsert("c", "p2", &[42.0, 0.0, 0.0, 0.0], &json!({}))
+            .unwrap();
+        assert!(db.collections["c"].stale, "hnsw update schedules a rebuild");
+        // The rebuild on the next search reflects the new vector.
+        let res = db
+            .search("c", &[42.0, 0.0, 0.0, 0.0], &SearchParams::default())
+            .unwrap();
+        assert_eq!(res[0].id, "p2");
     }
 
     #[test]
