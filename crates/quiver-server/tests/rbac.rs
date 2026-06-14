@@ -70,6 +70,7 @@ async fn scoped_keys_deny_over_scope_and_cross_namespace() {
         encryption_key: Some(ENC_KEY.to_owned()),
         tls_cert: None,
         tls_key: None,
+        tls_client_ca: None,
         insecure: false,
     };
     let server = tokio::spawn(async move {

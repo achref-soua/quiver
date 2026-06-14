@@ -30,6 +30,7 @@ async fn cockpit_reads_live_server_snapshot() {
         encryption_key: None,
         tls_cert: None,
         tls_key: None,
+        tls_client_ca: None,
         insecure: true,
     };
     tokio::spawn(async move {

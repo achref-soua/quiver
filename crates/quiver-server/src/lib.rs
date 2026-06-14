@@ -16,9 +16,9 @@
 //! engine is opened through `quiver-crypto`'s AEAD codec; payloads may also be
 //! client-side-encrypted (ADR-0012). TLS-in-transit uses `rustls` over the
 //! audited `ring` provider — REST via `axum-server`, gRPC via tonic's `tls-ring`
-//! — and a non-loopback bind requires it. mTLS identities, per-tenant engine
-//! partitioning, audit logging, and rate limiting are later phases. Design:
-//! `docs/api/rest-grpc.md`.
+//! — and a non-loopback bind requires it; setting a client CA additionally
+//! requires mutual TLS. Per-tenant engine partitioning, audit logging, and rate
+//! limiting are later phases. Design: `docs/api/rest-grpc.md`.
 
 mod auth;
 mod error;
@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::{Identity, ServerTlsConfig};
+use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use quiver_crypto::AeadCodec;
 use quiver_embed::{
@@ -80,6 +80,11 @@ pub struct Config {
     /// Path to the PEM-encoded TLS private key. Must be set together with
     /// `tls_cert`.
     pub tls_key: Option<PathBuf>,
+    /// Path to a PEM-encoded CA certificate that signs accepted client
+    /// certificates. When set, both transports require **mutual TLS**: a client
+    /// must present a certificate chaining to this CA to connect (ADR-0011).
+    /// Requires `tls_cert`/`tls_key`; bearer API keys still carry the RBAC scope.
+    pub tls_client_ca: Option<PathBuf>,
     /// Opt out of the secure defaults (no auth, no encryption-at-rest, allow a
     /// non-loopback bind without TLS). For local development only; never the
     /// default.
@@ -96,6 +101,7 @@ impl Default for Config {
             encryption_key: None,
             tls_cert: None,
             tls_key: None,
+            tls_client_ca: None,
             insecure: false,
         }
     }
@@ -114,7 +120,7 @@ impl Config {
 
     /// Reject insecure configurations unless explicitly opted out (ADR-0013):
     /// no anonymous access, encryption-at-rest on by default with a valid key,
-    /// and no non-loopback bind without TLS (TLS lands in the next slice).
+    /// and no non-loopback bind without TLS.
     pub fn validate(&self) -> Result<(), Error> {
         if self.api_keys.is_empty() && !self.insecure {
             return Err(Error::Config(
@@ -140,6 +146,12 @@ impl Config {
         if self.tls_cert.is_some() != self.tls_key.is_some() {
             return Err(Error::Config(
                 "tls_cert and tls_key must be set together".to_owned(),
+            ));
+        }
+        // mTLS layers on top of server TLS: a client CA needs a server cert/key.
+        if self.tls_client_ca.is_some() && !(self.tls_cert.is_some() && self.tls_key.is_some()) {
+            return Err(Error::Config(
+                "tls_client_ca (mutual TLS) requires tls_cert and tls_key".to_owned(),
             ));
         }
         let tls_enabled = self.tls_cert.is_some() && self.tls_key.is_some();
@@ -462,8 +474,13 @@ pub async fn serve(
     let mut grpc_builder = tonic::transport::Server::builder();
     if let Some(material) = &tls {
         let identity = Identity::from_pem(&material.cert_pem, &material.key_pem);
+        let mut tls_config = ServerTlsConfig::new().identity(identity);
+        // Require client certificates chaining to the configured CA (mTLS).
+        if let Some(ca_pem) = &material.client_ca_pem {
+            tls_config = tls_config.client_ca_root(Certificate::from_pem(ca_pem));
+        }
         grpc_builder = grpc_builder
-            .tls_config(ServerTlsConfig::new().identity(identity))
+            .tls_config(tls_config)
             .map_err(|e| Error::Internal(format!("grpc tls config: {e}")))?;
     }
     let grpc_fut = async move {
@@ -499,26 +516,40 @@ fn open_database(config: &Config) -> Result<Database, Error> {
     }
 }
 
-// TLS material shared by both transports: the raw PEM (for tonic's `Identity`)
-// and a parsed rustls server config (for axum-server's REST acceptor).
+// TLS material shared by both transports: the raw PEM (for tonic's `Identity`
+// and `client_ca_root`) and a parsed rustls server config (for axum-server's
+// REST acceptor). `client_ca_pem` is set only when mutual TLS is configured.
 struct TlsMaterial {
     cert_pem: Vec<u8>,
     key_pem: Vec<u8>,
+    client_ca_pem: Option<Vec<u8>>,
     rest_config: Arc<rustls::ServerConfig>,
 }
 
-// Read the configured certificate and key, returning `None` when TLS is not
-// configured. `Config::validate` already enforces that both are set together and
-// that a non-loopback bind requires them.
+// Read the configured certificate, key, and optional client CA, returning `None`
+// when TLS is not configured. `Config::validate` already enforces that the cert
+// and key are set together, that a client CA requires them, and that a
+// non-loopback bind requires TLS.
 fn load_tls(config: &Config) -> Result<Option<TlsMaterial>, Error> {
     match (&config.tls_cert, &config.tls_key) {
         (Some(cert_path), Some(key_path)) => {
             let cert_pem = std::fs::read(cert_path).map_err(Error::Io)?;
             let key_pem = std::fs::read(key_path).map_err(Error::Io)?;
-            let rest_config = Arc::new(rustls_server_config(&cert_pem, &key_pem)?);
+            let client_ca_pem = config
+                .tls_client_ca
+                .as_ref()
+                .map(std::fs::read)
+                .transpose()
+                .map_err(Error::Io)?;
+            let rest_config = Arc::new(rustls_server_config(
+                &cert_pem,
+                &key_pem,
+                client_ca_pem.as_deref(),
+            )?);
             Ok(Some(TlsMaterial {
                 cert_pem,
                 key_pem,
+                client_ca_pem,
                 rest_config,
             }))
         }
@@ -530,8 +561,13 @@ fn load_tls(config: &Config) -> Result<Option<TlsMaterial>, Error> {
 }
 
 // Build a rustls server config from PEM bytes over the audited `ring` provider
-// (no OpenSSL, no aws-lc-rs C toolchain). TLS 1.3 and 1.2 are offered.
-fn rustls_server_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<rustls::ServerConfig, Error> {
+// (no OpenSSL, no aws-lc-rs C toolchain). TLS 1.3 and 1.2 are offered. When a
+// client CA is supplied, client certificates chaining to it are required (mTLS).
+fn rustls_server_config(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    client_ca_pem: Option<&[u8]>,
+) -> Result<rustls::ServerConfig, Error> {
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -546,10 +582,30 @@ fn rustls_server_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<rustls::Serve
     let key = PrivateKeyDer::from_pem_slice(key_pem)
         .map_err(|e| Error::Config(format!("parsing tls_key: {e}")))?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    rustls::ServerConfig::builder_with_provider(provider)
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
-        .map_err(|e| Error::Internal(format!("tls protocol versions: {e}")))?
-        .with_no_client_auth()
+        .map_err(|e| Error::Internal(format!("tls protocol versions: {e}")))?;
+    let builder = match client_ca_pem {
+        Some(ca_pem) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in CertificateDer::pem_slice_iter(ca_pem) {
+                let cert =
+                    cert.map_err(|e| Error::Config(format!("parsing tls_client_ca: {e}")))?;
+                roots
+                    .add(cert)
+                    .map_err(|e| Error::Config(format!("adding tls_client_ca: {e}")))?;
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                provider,
+            )
+            .build()
+            .map_err(|e| Error::Config(format!("client certificate verifier: {e}")))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    builder
         .with_single_cert(certs, key)
         .map_err(|e| Error::Config(format!("tls certificate/key: {e}")))
 }

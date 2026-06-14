@@ -88,6 +88,7 @@ async fn server_cannot_read_client_encrypted_payload() {
         encryption_key: None,
         tls_cert: None,
         tls_key: None,
+        tls_client_ca: None,
         insecure: true,
     };
     let server = tokio::spawn(async move {
