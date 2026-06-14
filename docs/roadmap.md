@@ -54,7 +54,7 @@ Unlike the earlier phases, Phase 4 is a **backlog shipped incrementally**: each 
 
 **Backlog (rough priority):** incremental in-place updates (SpFresh-style); migration importers (Qdrant/Chroma/pgvector); optional multi-vector / late-interaction scoring; optional leader-follower replication (clearly labeled); the **experimental** DCPE feature flag (published scheme only, honest caveats); then the launch polish — docs site, benchmark-table fill-in, regenerated TUI cast, published load-test results.
 
-**`v0.4.0` status (in design):** the incremental-updates design — the backlog's headline — is recorded in [ADR-0023](adr/0023-incremental-in-place-updates.md): SpFresh/LIRE incremental, rebalanced **IVF** maintained in memory, so the `kill -9` crash gate is untouched by construction; a durable on-disk incremental index and graph (FreshDiskANN) incremental updates are sequenced as later increments behind their own ADRs. Implementation follows this design.
+**`v0.4.0` ships two backlog items:** **incremental in-place index updates** — SpFresh/LIRE for **IVF**, maintained in memory so the `kill -9` crash gate is untouched by construction ([ADR-0023](adr/0023-incremental-in-place-updates.md); a durable on-disk incremental index and graph (FreshDiskANN) updates are sequenced as later increments) — and **migration importers**, `quiver admin import` loading Qdrant/Chroma/pgvector exports into Quiver collections with filterable fields ([ADR-0024](adr/0024-migration-importers.md); see [`migration.md`](migration.md)).
 
 **Per-release DoD (`v0.4.0`, `v0.5.0`, …):** the release's features are tested and documented (ADR/README/`.env.example`); coverage ≥ 80%; `just verify` and the SDK suites green; an owner-approved tag via the fast-forward release mechanic.
 
