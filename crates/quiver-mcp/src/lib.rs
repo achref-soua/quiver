@@ -20,7 +20,8 @@ use serde_json::{Value, json};
 use quiver_core::page::{PageCodec, PlainCodec};
 use quiver_crypto::AeadCodec;
 use quiver_embed::{
-    Database, Descriptor, DistanceMetric, Dtype, Filter, IndexKind, IndexSpec, SearchParams,
+    Database, Descriptor, DistanceMetric, Dtype, FieldType, Filter, FilterableField, IndexKind,
+    IndexSpec, SearchParams,
 };
 
 /// The MCP protocol revision this server implements.
@@ -137,7 +138,10 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
             let dim = want_u64(args, "dim")? as u32;
             let metric = want_metric(args)?;
             let index = want_index_spec(args)?;
-            let descriptor = Descriptor::new(dim, Dtype::F32, metric).with_index(index);
+            let filterable = want_filterable(args)?;
+            let descriptor = Descriptor::new(dim, Dtype::F32, metric)
+                .with_index(index)
+                .with_filterable(filterable);
             db.create_collection(collection, descriptor)
                 .map_err(|e| e.to_string())?;
             Ok(format!("created collection '{collection}' (dim {dim})"))
@@ -213,7 +217,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "create_collection",
-            "description": "Create a collection with a vector dimensionality, distance metric, and index.",
+            "description": "Create a collection with a vector dimensionality, distance metric, index, and optional filterable payload fields for hybrid search.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -229,6 +233,18 @@ pub fn tool_definitions() -> Value {
                     "pq_subspaces": {
                         "type": "integer",
                         "description": "Product-quantization subspaces for disk_vamana / ivf (must divide dim)"
+                    },
+                    "filterable": {
+                        "type": "array",
+                        "description": "Payload fields to index for pre-filtered (hybrid) search",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Dot-path into the payload (e.g. user.city)" },
+                                "field_type": { "type": "string", "enum": ["keyword", "numeric"], "default": "keyword" }
+                            },
+                            "required": ["path"]
+                        }
                     }
                 },
                 "required": ["name", "dim"]
@@ -359,6 +375,42 @@ fn want_index_spec(args: &Value) -> Result<IndexSpec, String> {
         .and_then(Value::as_u64)
         .map(|v| v as u32);
     Ok(IndexSpec { kind, pq_subspaces })
+}
+
+// Parse the optional `filterable` argument: an array of {path, field_type}
+// objects declaring which payload fields to index for hybrid search.
+fn want_filterable(args: &Value) -> Result<Vec<FilterableField>, String> {
+    let Some(value) = args.get("filterable") else {
+        return Ok(Vec::new());
+    };
+    let array = value
+        .as_array()
+        .ok_or("filterable must be an array of {path, field_type}")?;
+    let mut fields = Vec::with_capacity(array.len());
+    for field in array {
+        let path = field
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or("each filterable field needs a string 'path'")?;
+        let field_type = match field
+            .get("field_type")
+            .and_then(Value::as_str)
+            .unwrap_or("keyword")
+        {
+            "keyword" => FieldType::Keyword,
+            "numeric" => FieldType::Numeric,
+            other => {
+                return Err(format!(
+                    "unknown field_type '{other}' (use keyword or numeric)"
+                ));
+            }
+        };
+        fields.push(FilterableField {
+            path: path.to_owned(),
+            field_type,
+        });
+    }
+    Ok(fields)
 }
 
 #[cfg(test)]
@@ -564,5 +616,60 @@ mod tests {
         );
         assert_eq!(r["result"]["isError"], true);
         assert!(result_text(&r).contains("unknown index"));
+    }
+
+    #[test]
+    fn agent_can_declare_filterable_fields_and_run_a_hybrid_search() {
+        let (_t, mut db) = db();
+        let r = call(
+            &mut db,
+            "create_collection",
+            json!({
+                "name": "people", "dim": 4, "metric": "l2",
+                "filterable": [{"path": "city", "field_type": "keyword"}]
+            }),
+        );
+        assert_eq!(r["result"]["isError"], false, "{}", result_text(&r));
+        for (id, x, city) in [
+            ("p", 0.0, "paris"),
+            ("l", 1.0, "lyon"),
+            ("p2", 2.0, "paris"),
+        ] {
+            let r = call(
+                &mut db,
+                "upsert",
+                json!({"collection":"people","id":id,"vector":[x,0.0,0.0,0.0],"payload":{"city":city}}),
+            );
+            assert_eq!(r["result"]["isError"], false, "upsert {id}");
+        }
+        let r = call(
+            &mut db,
+            "search",
+            json!({
+                "collection":"people","vector":[0.0,0.0,0.0,0.0],"k":5,
+                "filter":{"eq":{"field":"city","value":"paris"}}
+            }),
+        );
+        let parsed: Value = serde_json::from_str(&result_text(&r)).unwrap();
+        let matches = parsed["matches"].as_array().unwrap();
+        assert_eq!(matches[0]["id"], "p"); // nearest paris, via the pre-filter
+        for m in matches {
+            assert_eq!(m["payload"]["city"], "paris"); // lyon excluded
+        }
+    }
+
+    #[test]
+    fn unknown_field_type_is_an_iserror_result() {
+        let (_t, mut db) = db();
+        let r = call(
+            &mut db,
+            "create_collection",
+            json!({
+                "name": "x", "dim": 4,
+                "filterable": [{"path": "city", "field_type": "bogus"}]
+            }),
+        );
+        assert_eq!(r["result"]["isError"], true);
+        assert!(result_text(&r).contains("unknown field_type"));
     }
 }
