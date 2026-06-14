@@ -113,6 +113,8 @@ const hits = await q.search("items", [0.1, 0.2, 0.3], { k: 5 });
 
 A **LangChain** `VectorStore` adapter ships in `quiver.langchain` (`pip install quiver-client[langchain]`), and a **LlamaIndex** `VectorStore` in `quiver.llamaindex` (`pip install quiver-client[llamaindex]`) — so any Quiver index, including the memory-frugal disk path, backs a LangChain or LlamaIndex retriever. The LlamaIndex adapter maps `MetadataFilters` onto Quiver's hybrid pre-filter.
 
+**Client-side payload encryption** (ADR-0012): seal payload fields with a key the server never sees, so it stores and returns only ciphertext, while cleartext sibling fields stay server-filterable. The `PayloadCipher` helper ships in both SDKs (`quiver.encryption` / `quiver-client/encryption`) and a Rust reference (`quiver_crypto::payload`), sharing one XChaCha20-Poly1305 envelope byte-for-byte. The trust boundary is honest — it protects payloads, not vectors — and proven by a test that runs a server with at-rest encryption off and shows the sealed field never appears in plaintext over the API or on disk.
+
 An `ann-benchmarks`-style harness lives in [`bench/`](./bench). On **SIFT1M** (1M × 128, L2), in-memory HNSW (`M=16`, `efC=200`), recall@10 vs exact ground truth:
 
 | `ef_search` | 16 | 32 | 64 | 128 | 256 |

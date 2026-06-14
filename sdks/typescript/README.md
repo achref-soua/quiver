@@ -48,6 +48,35 @@ Errors from the server (or transport) reject with a `QuiverError` carrying the
 HTTP `status`. A custom `fetch` can be injected via the constructor for testing
 or a bespoke transport.
 
+## Client-side payload encryption
+
+Seal payload fields with a key Quiver never sees; the server stores and returns
+ciphertext it cannot read (ADR-0012). The helper lives at the
+`quiver-client/encryption` subpath, so the core client stays dependency-free —
+install the optional peer dependency to use it:
+
+```bash
+pnpm add @stablelib/xchacha20poly1305
+```
+
+```ts
+import { Client } from "quiver-client";
+import { PayloadCipher } from "quiver-client/encryption";
+
+const cipher = PayloadCipher.fromHex("…64 hex chars…"); // a dedicated key, never the at-rest one
+const q = new Client("http://127.0.0.1:6333", { apiKey: "…" });
+
+// Keep `tier` server-filterable; hide `ssn` from the server.
+const payload = { tier: "gold", ...cipher.seal({ ssn: "078-05-1120" }) };
+await q.upsert("people", [{ id: "p1", vector: embed("…"), payload }]);
+
+const point = await q.getPoint("people", "p1");
+const secret = cipher.open(point!.payload); // -> { ssn: "078-05-1120" }
+```
+
+The envelope (XChaCha20-Poly1305) matches the Rust reference and the Python SDK
+byte-for-byte — see [client-side encryption](https://github.com/achref-soua/quiver/blob/main/docs/security/crypto.md#client-side-payload-encryption-adr-0012).
+
 ## Develop
 
 ```bash
