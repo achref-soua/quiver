@@ -61,4 +61,4 @@ Per-collection DEKs make **cryptographic erasure** a first-class operation: dest
 
 ## Verification
 
-Fuzzing of the wire-protocol and on-disk parsers; `cargo audit`/`deny`; tests asserting (a) data files are ciphertext, (b) a client-side-encrypted payload is unreadable server-side, (c) RBAC denies cross-tenant/over-scope access. Tracked under risks R3/R4/R8 in [`../risk-register.md`](../risk-register.md).
+[**Fuzzing**](./fuzzing.md) of the wire-protocol and on-disk parsers (`cargo-fuzz` targets for the `Filter` JSON parser and the page/WAL decoders — malformed input must reject cleanly, never panic); `cargo audit`/`deny`; tests asserting (a) data files are ciphertext, (b) a client-side-encrypted payload is unreadable server-side, (c) RBAC denies cross-tenant/over-scope access, (d) a crypto-shredded collection is unrecoverable, and (e) the audit log records actor/action/resource without leaking secrets. Tracked under risks R3/R4/R8 in [`../risk-register.md`](../risk-register.md).

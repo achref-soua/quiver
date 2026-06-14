@@ -65,6 +65,12 @@ demo:
 bench *ARGS:
     uv run --project bench python -m quiver_bench.run {{ ARGS }}
 
+# Fuzz a parser target with cargo-fuzz (requires a nightly toolchain +
+# cargo-fuzz; see docs/security/fuzzing.md). Targets: filter_json, page_decode,
+# wal_decode. e.g. `just fuzz filter_json` or `just fuzz page_decode 300`.
+fuzz target="filter_json" secs="60":
+    cargo +nightly fuzz run {{ target }} -- -max_total_time={{ secs }}
+
 # Coverage report (HTML).
 coverage:
     cargo llvm-cov --workspace --html
