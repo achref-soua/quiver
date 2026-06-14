@@ -10,9 +10,16 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./encryption": {
+      "types": "./dist/encryption.d.ts",
+      "import": "./dist/encryption.js"
     }
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "engines": {
     "node": ">=20"
   },
@@ -21,7 +28,16 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run"
   },
+  "peerDependencies": {
+    "@stablelib/xchacha20poly1305": "^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@stablelib/xchacha20poly1305": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@stablelib/xchacha20poly1305": "^2.0.1",
     "@types/node": "^25.0.0",
     "typescript": "^6.0.0",
     "vitest": "^4.1.0"
