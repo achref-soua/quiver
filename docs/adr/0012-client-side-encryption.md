@@ -23,4 +23,9 @@ Some users must keep payloads confidential **even from the server/operator** (th
 
 - **Claiming end-to-end encryption of everything** — rejected as dishonest: plaintext vectors are required for default ANN.
 - **Building homomorphic / fully-oblivious search into core** — rejected for v1: impractical performance and easy to overclaim; only a cited DCPE scheme behind an experimental flag.
+
+## Implementation
+
+- **Payload encryption (shipped):** the reference envelope and `PayloadCipher` live in `quiver_crypto::payload`; the format (XChaCha20-Poly1305 over a `{"__quiver_enc__": {...}}` JSON envelope) is documented in [`../security/crypto.md`](../security/crypto.md) and mirrored by the language SDKs. The trust boundary is verified by an end-to-end test that runs a server with at-rest encryption *off* and proves a client-sealed payload is returned only as ciphertext and never written to disk in plaintext (`quiver-server/tests/client_side_encryption.rs`).
+- **Vector confidentiality (DCPE):** not yet implemented — remains a Phase-4 experimental flag, published scheme only.
 - **Server-side-only encryption (no client option)** — insufficient for users who don't trust the operator.

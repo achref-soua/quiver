@@ -43,6 +43,35 @@ Because each collection has its own DEK, destroying that wrapped DEK renders the
 
 A client may encrypt payloads with a key Quiver never sees; the server stores and returns the ciphertext as an opaque blob and performs no server-side filtering on those fields. This protects payload confidentiality against the server/operator (adversary A4). **It does not encrypt vectors** — see the threat model's honest boundary statement.
 
+### Envelope format (the cross-language contract)
+
+The reference implementation is [`quiver_crypto::payload::PayloadCipher`](https://github.com/achref-soua/quiver/blob/main/crates/quiver-crypto/src/payload.rs); the Python and TypeScript SDKs mirror it byte-for-byte. A sealed value is one JSON object with a single reserved key:
+
+```json
+{ "__quiver_enc__": {
+    "v": 1,
+    "alg": "xchacha20poly1305",
+    "n":  "<base64 24-byte nonce>",
+    "ct": "<base64 ciphertext + 16-byte Poly1305 tag>"
+} }
+```
+
+- **AEAD:** XChaCha20-Poly1305 (the same audited RustCrypto primitive as at-rest), a fresh random 192-bit nonce per seal — nonce reuse is impossible by construction. The associated data `quiver/payload/v1` binds every ciphertext to this format version.
+- **Key:** a dedicated 256-bit key, used directly (no derivation) so the envelope is reproducible in any language. The plaintext is the UTF-8 JSON serialization of the original value.
+
+### Keeping some fields filterable
+
+Encrypted fields cannot be filtered or indexed server-side. To keep a field server-filterable, leave it in cleartext and merge the sealed envelope alongside it — `open` reads only the reserved key and ignores cleartext siblings:
+
+```jsonc
+// stored payload: `tier` stays filterable; `ssn` is opaque to the server
+{ "tier": "gold", "__quiver_enc__": { "v": 1, "alg": "xchacha20poly1305", "n": "…", "ct": "…" } }
+```
+
+### Key management & honest limits
+
+The client owns the key. **Never reuse the `QUIVER_ENCRYPTION_KEY` (at-rest) key** for payloads, and never send the payload key to the server. Losing the key means the data is unrecoverable. The boundary is exact: this hides *only* the sealed fields; cleartext siblings and all vectors remain visible to the server.
+
 ## Experimental: vector confidentiality vs the server (DCPE)
 
 Standard ANN needs plaintext vectors server-side. The only path to *vector* confidentiality against the server is **property-preserving encryption** — specifically a **published distance-comparison-preserving encryption (DCPE)** scheme — implemented **behind an experimental feature flag**, off by default. We will:

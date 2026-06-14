@@ -1954,9 +1954,11 @@ dependencies = [
 name = "quiver-crypto"
 version = "0.2.0"
 dependencies = [
+ "base64",
  "chacha20poly1305",
  "hkdf",
  "quiver-core",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
