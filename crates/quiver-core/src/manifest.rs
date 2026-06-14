@@ -32,8 +32,9 @@ use crate::page::{PageCodec, PageType};
 use crate::paged::{fsync_dir, read_paged, write_paged};
 
 /// On-disk manifest schema version (independent of the product SemVer and of the
-/// page format version).
-pub const MANIFEST_FORMAT_VERSION: u16 = 1;
+/// page format version). v2 (ADR-0025) added the per-collection index snapshot
+/// reference; v1 manifests are read and upgraded transparently.
+pub const MANIFEST_FORMAT_VERSION: u16 = 2;
 
 const CURRENT_FILE: &str = "CURRENT";
 const CURRENT_TMP: &str = "CURRENT.tmp";
@@ -56,6 +57,18 @@ pub struct SegmentRef {
     pub lsn_high: Lsn,
 }
 
+/// A reference to one sealed, immutable index snapshot (ADR-0025).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexSnapshotRef {
+    /// Snapshot file id; also names the file (`index/idx-<id>`). Set to the
+    /// manifest version that first published it, so it is unique per checkpoint.
+    pub id: u64,
+    /// The checkpoint LSN the snapshot reflects — equal to the manifest's
+    /// `last_checkpointed_lsn` when written, so WAL replay above it reconstructs
+    /// exactly the post-snapshot mutations.
+    pub lsn: Lsn,
+}
+
 /// Catalog entry for one collection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionEntry {
@@ -67,6 +80,10 @@ pub struct CollectionEntry {
     pub descriptor: Vec<u8>,
     /// Live sealed segments, in creation order.
     pub segments: Vec<SegmentRef>,
+    /// The current durable index snapshot for this collection, if any (ADR-0025).
+    /// `None` for a collection whose index is rebuilt on open (HNSW, the batch
+    /// graph, or a store written before v2).
+    pub index_snapshot: Option<IndexSnapshotRef>,
 }
 
 /// A complete catalog snapshot. Immutable once written; superseded by writing a
@@ -176,16 +193,72 @@ pub fn read_current(dir: &Path, codec: &dyn PageCodec) -> Result<Option<Manifest
     Ok(Some(manifest))
 }
 
+// Just the leading `format_version`, consumed without committing to a full
+// schema (postcard is not self-describing) so the reader can dispatch on it; the
+// remaining bytes are then decoded with the matching schema.
+#[derive(Deserialize)]
+struct VersionPeek {
+    format_version: u16,
+}
+
+// The v1 manifest body (everything after `format_version`), pre-ADR-0025:
+// collection entries carried no index snapshot reference. Retained read-only so a
+// store written before v2 still opens — its indexes simply rebuild on first load.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct CollectionEntryV1 {
+    id: CollectionId,
+    name: String,
+    descriptor: Vec<u8>,
+    segments: Vec<SegmentRef>,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct ManifestV1Body {
+    version: u64,
+    last_checkpointed_lsn: Lsn,
+    next_collection_id: u64,
+    next_segment_id: u64,
+    collections: Vec<CollectionEntryV1>,
+}
+
+impl From<ManifestV1Body> for Manifest {
+    fn from(m: ManifestV1Body) -> Self {
+        Self {
+            format_version: MANIFEST_FORMAT_VERSION,
+            version: m.version,
+            last_checkpointed_lsn: m.last_checkpointed_lsn,
+            next_collection_id: m.next_collection_id,
+            next_segment_id: m.next_segment_id,
+            collections: m
+                .collections
+                .into_iter()
+                .map(|c| CollectionEntry {
+                    id: c.id,
+                    name: c.name,
+                    descriptor: c.descriptor,
+                    segments: c.segments,
+                    index_snapshot: None,
+                })
+                .collect(),
+        }
+    }
+}
+
 fn read_manifest_file(path: &Path, codec: &dyn PageCodec) -> Result<Manifest> {
     let body = read_paged(path, codec, PageType::Manifest)?;
-    let manifest: Manifest = postcard::from_bytes(&body)?;
-    if manifest.format_version != MANIFEST_FORMAT_VERSION {
-        return Err(CoreError::UnsupportedVersion {
-            found: manifest.format_version,
+    // Dispatch on the schema version (the first field) so an older on-disk
+    // manifest is upgraded rather than rejected (ADR-0025).
+    let (peek, rest) = postcard::take_from_bytes::<VersionPeek>(&body)?;
+    match peek.format_version {
+        1 => Ok(postcard::from_bytes::<ManifestV1Body>(rest)?.into()),
+        v if v == MANIFEST_FORMAT_VERSION => Ok(postcard::from_bytes::<Manifest>(&body)?),
+        other => Err(CoreError::UnsupportedVersion {
+            found: other,
             supported: MANIFEST_FORMAT_VERSION,
-        });
+        }),
     }
-    Ok(manifest)
 }
 
 #[cfg(test)]
@@ -205,6 +278,7 @@ mod tests {
                     lsn_low: Lsn(c as u64),
                     lsn_high: Lsn(c as u64 + 5),
                 }],
+                index_snapshot: None,
             })
             .collect();
         Manifest {
@@ -310,5 +384,76 @@ mod tests {
         );
         assert!(m.collection(CollectionId(99)).is_none());
         assert!(m.collection_by_name("nope").is_none());
+    }
+
+    #[test]
+    fn v2_manifest_round_trips_an_index_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = sample(4, 2, 8);
+        m.collections[0].index_snapshot = Some(IndexSnapshotRef {
+            id: 4,
+            lsn: Lsn(99),
+        });
+        write_manifest(dir.path(), &m, &PlainCodec).unwrap();
+        assert_eq!(read_current(dir.path(), &PlainCodec).unwrap(), Some(m));
+    }
+
+    #[test]
+    fn v1_manifest_without_index_snapshot_opens_and_upgrades() {
+        let dir = tempfile::tempdir().unwrap();
+        // A pre-v2 manifest, written in the old layout (no index_snapshot field).
+        let v1 = ManifestV1Body {
+            version: 3,
+            last_checkpointed_lsn: Lsn(42),
+            next_collection_id: 2,
+            next_segment_id: 5,
+            collections: vec![CollectionEntryV1 {
+                id: CollectionId(0),
+                name: "legacy".to_owned(),
+                descriptor: vec![1, 2, 3],
+                segments: vec![SegmentRef {
+                    id: 0,
+                    row_count: 7,
+                    lsn_low: Lsn(1),
+                    lsn_high: Lsn(9),
+                }],
+            }],
+        };
+        // The on-disk v1 layout is `format_version` (= 1) followed by the body.
+        let mut body = postcard::to_allocvec(&1u16).unwrap();
+        body.extend_from_slice(&postcard::to_allocvec(&v1).unwrap());
+        write_paged(
+            &dir.path().join(manifest_file_name(3)),
+            &PlainCodec,
+            PageType::Manifest,
+            3,
+            &body,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(CURRENT_FILE),
+            format!("{}\n", manifest_file_name(3)),
+        )
+        .unwrap();
+
+        let got = read_current(dir.path(), &PlainCodec).unwrap().unwrap();
+        assert_eq!(got.format_version, MANIFEST_FORMAT_VERSION);
+        assert_eq!(got.version, 3);
+        assert_eq!(got.last_checkpointed_lsn, Lsn(42));
+        assert_eq!(got.collections.len(), 1);
+        assert_eq!(got.collections[0].name, "legacy");
+        assert_eq!(got.collections[0].index_snapshot, None);
+    }
+
+    #[test]
+    fn future_manifest_version_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = sample(1, 1, 8);
+        m.format_version = 999;
+        write_manifest(dir.path(), &m, &PlainCodec).unwrap();
+        assert!(matches!(
+            read_current(dir.path(), &PlainCodec),
+            Err(CoreError::UnsupportedVersion { found: 999, .. })
+        ));
     }
 }
