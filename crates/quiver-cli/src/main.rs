@@ -49,8 +49,10 @@ enum Command {
     },
     /// Administrative commands (imports, collections, keys).
     Admin {
+        // Boxed to keep this large, rarely-built subcommand from bloating every
+        // `Command` value (clippy::large_enum_variant); the enum is parsed once.
         #[command(subcommand)]
-        command: AdminCommand,
+        command: Box<AdminCommand>,
     },
     /// Run benchmarks.
     Bench,
@@ -123,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             quiver_mcp::run(&data_dir, encryption_key.as_deref(), insecure)?;
         }
-        Command::Admin { command } => match command {
+        Command::Admin { command } => match *command {
             AdminCommand::Import {
                 source,
                 input,
