@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./docs/assets/logo.svg" alt="Quiver" width="540">
+# Quiver
 
 **The security-first vector database.** Client-side-encryptable, memory-frugal approximate-nearest-neighbour search that runs on a laptop — with a retro terminal cockpit.
 
