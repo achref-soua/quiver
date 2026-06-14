@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+mod admin;
+
 #[derive(Parser)]
 #[command(
     name = "quiver",
@@ -45,10 +47,57 @@ enum Command {
         #[arg(long, env = "QUIVER_INSECURE", default_value_t = false)]
         insecure: bool,
     },
-    /// Administrative commands (collections, keys).
-    Admin,
+    /// Administrative commands (imports, collections, keys).
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
     /// Run benchmarks.
     Bench,
+}
+
+#[derive(Subcommand)]
+enum AdminCommand {
+    /// Import an export from another vector database into a collection (ADR-0024).
+    Import {
+        /// Source tool: qdrant, chroma, or pgvector.
+        #[arg(long)]
+        source: String,
+        /// Export file: JSON Lines for qdrant/pgvector; a single
+        /// `collection.get(...)` JSON object for chroma.
+        #[arg(long)]
+        input: PathBuf,
+        /// Target collection name (created if absent, appended to otherwise).
+        #[arg(long)]
+        collection: String,
+        /// Data directory for the embedded database.
+        #[arg(long, env = "QUIVER_DATA_DIR", default_value = "./data")]
+        data_dir: PathBuf,
+        /// Distance metric for a newly created collection (l2, cosine, or dot).
+        #[arg(long, default_value = "cosine")]
+        metric: String,
+        /// Vector dimensionality (inferred from the export when omitted).
+        #[arg(long)]
+        dim: Option<usize>,
+        /// Filterable payload field as `path:type` (type = keyword|numeric); repeatable.
+        #[arg(long = "filterable", value_name = "PATH:TYPE")]
+        filterable: Vec<String>,
+        /// Id column name (pgvector; defaults to `id`).
+        #[arg(long)]
+        id_field: Option<String>,
+        /// Vector column name (defaults: qdrant `vector`, pgvector `embedding`).
+        #[arg(long)]
+        vector_field: Option<String>,
+        /// Named vector to import (for qdrant collections with named vectors).
+        #[arg(long)]
+        vector_name: Option<String>,
+        /// 64-hex-character master key for encryption-at-rest (or QUIVER_ENCRYPTION_KEY).
+        #[arg(long, env = "QUIVER_ENCRYPTION_KEY")]
+        encryption_key: Option<String>,
+        /// Import into an unencrypted database (development only).
+        #[arg(long, env = "QUIVER_INSECURE", default_value_t = false)]
+        insecure: bool,
+    },
 }
 
 #[tokio::main]
@@ -74,7 +123,39 @@ async fn main() -> anyhow::Result<()> {
         } => {
             quiver_mcp::run(&data_dir, encryption_key.as_deref(), insecure)?;
         }
-        Command::Admin => println!("quiver admin: not yet implemented"),
+        Command::Admin { command } => match command {
+            AdminCommand::Import {
+                source,
+                input,
+                collection,
+                data_dir,
+                metric,
+                dim,
+                filterable,
+                id_field,
+                vector_field,
+                vector_name,
+                encryption_key,
+                insecure,
+            } => {
+                let args = admin::ImportArgs {
+                    source: source.parse().map_err(|e: String| anyhow::anyhow!(e))?,
+                    input,
+                    collection: collection.clone(),
+                    data_dir,
+                    metric: admin::parse_metric(&metric)?,
+                    dim,
+                    filterable: admin::parse_filterable(&filterable)?,
+                    id_field,
+                    vector_field,
+                    vector_name,
+                    encryption_key,
+                    insecure,
+                };
+                let n = admin::import(args)?;
+                println!("imported {n} points into collection '{collection}'");
+            }
+        },
         Command::Bench => println!("quiver bench: not yet implemented"),
     }
     Ok(())
