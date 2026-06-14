@@ -89,6 +89,7 @@ async fn server_cannot_read_client_encrypted_payload() {
         tls_cert: None,
         tls_key: None,
         tls_client_ca: None,
+        master_key_file: None,
         audit_log: None,
         insecure: true,
     };
