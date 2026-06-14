@@ -48,11 +48,15 @@ Quiver is built phase by phase. A phase is not "done" until its Definition of Do
 
 **Status (shipped on `develop` for the `v0.3.0` tag):** all five slices are in and tested — client-side payload encryption (cross-language KATs); RBAC + scoped keys + optional mTLS; an append-only audit log; per-collection-DEK envelope encryption with **crypto-shredding**; `QUIVER_MASTER_KEY_FILE` secret handling; the cockpit **constellation view** (random-projection scatter + nearest-neighbour highlight + interactive re-query); and `cargo-fuzz` targets for the wire and on-disk parsers (clean over a bounded run). Core-engine coverage is **93% line**. The only artifact produced off the shared dev box is the cockpit's asciinema cast — `scripts/record-cockpit-cast.sh` records it on a real terminal. Note: the per-collection envelope is a pre-1.0 at-rest format change, so a `v0.2.0` encrypted store must be re-created.
 
-## Phase 4 — Advanced / stretch + launch → `v1.0.0`
+## Phase 4 — Advanced / stretch features → `v0.4.0`, `v0.5.0`, … (launch is `v1.0.0`, several releases out)
 
-**Scope:** incremental in-place updates (SpFresh-style); optional multi-vector / late-interaction scoring; optional leader-follower replication (clearly labeled); the **experimental** DCPE feature flag (published scheme, honest caveats); migration importers (Qdrant/Chroma/pgvector); docs-site + benchmark polish; regenerated TUI cast; load-test results.
+Unlike the earlier phases, Phase 4 is a **backlog shipped incrementally**: each minor release (`v0.4.0`, `v0.5.0`, …) delivers a coherent, owner-gated subset, and **`v1.0.0` is reserved for the launch release** once the backlog and the launch polish below are complete. The next release is **`v0.4.0`** — we are deliberately far from `v1.0.0`.
 
-**DoD:** the README benchmark table is complete and reproducible; the quickstart works from a clean clone in minutes; all tests/property-tests/fuzzers green; history clean and entirely the owner's. Tag **`v1.0.0`** on `main`.
+**Backlog (rough priority):** incremental in-place updates (SpFresh-style); migration importers (Qdrant/Chroma/pgvector); optional multi-vector / late-interaction scoring; optional leader-follower replication (clearly labeled); the **experimental** DCPE feature flag (published scheme only, honest caveats); then the launch polish — docs site, benchmark-table fill-in, regenerated TUI cast, published load-test results.
+
+**Per-release DoD (`v0.4.0`, `v0.5.0`, …):** the release's features are tested and documented (ADR/README/`.env.example`); coverage ≥ 80%; `just verify` and the SDK suites green; an owner-approved tag via the fast-forward release mechanic.
+
+**Launch DoD (`v1.0.0`, several releases out):** the README benchmark table is complete and reproducible (on documented reference hardware, never fabricated); the quickstart works from a clean clone in minutes; the docs site is live; the cockpit cast is recorded; all tests/property-tests/fuzzers green; history clean and entirely the owner's. Tag **`v1.0.0`** on `main`.
 
 ## Testing posture (every phase)
 
