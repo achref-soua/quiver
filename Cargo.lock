@@ -1929,9 +1929,13 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
+ "quiver-crypto",
+ "quiver-embed",
+ "quiver-import",
  "quiver-mcp",
  "quiver-server",
  "quiver-tui",
+ "tempfile",
  "tokio",
 ]
 

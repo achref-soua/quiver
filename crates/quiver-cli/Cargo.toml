@@ -13,6 +13,9 @@ name = "quiver"
 path = "src/main.rs"
 
 [dependencies]
+quiver-crypto = { workspace = true }
+quiver-embed = { workspace = true }
+quiver-import = { workspace = true }
 quiver-mcp = { workspace = true }
 quiver-server = { workspace = true }
 quiver-tui = { workspace = true }
@@ -20,6 +23,9 @@ quiver-tui = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
