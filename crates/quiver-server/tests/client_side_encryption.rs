@@ -82,7 +82,7 @@ async fn server_cannot_read_client_encrypted_payload() {
         data_dir: tmp.path().to_path_buf(),
         rest_addr,
         grpc_addr,
-        api_keys: vec![key.to_owned()],
+        api_keys: vec![key.into()],
         // At-rest encryption OFF on purpose: isolate the client-side envelope as
         // the only thing protecting the secret. `insecure` permits this.
         encryption_key: None,

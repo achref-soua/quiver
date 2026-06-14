@@ -12,6 +12,7 @@ use quiver_proto::v1::{
 };
 use quiver_query::Filter;
 
+use crate::auth::Principal;
 use crate::{AppState, CollectionInfo, MatchOut, PointIn, PointOut};
 
 /// Build the gRPC service over the shared state.
@@ -24,7 +25,7 @@ pub(crate) struct QuiverService {
 }
 
 impl QuiverService {
-    fn check_auth<T>(&self, request: &Request<T>) -> Result<(), Status> {
+    fn authenticate<T>(&self, request: &Request<T>) -> Result<Principal, Status> {
         let presented = request
             .metadata()
             .get("authorization")
@@ -35,11 +36,9 @@ impl QuiverService {
                     .or_else(|| value.strip_prefix("bearer "))
                     .unwrap_or(value)
             });
-        if self.state.authorized(presented) {
-            Ok(())
-        } else {
-            Err(Status::unauthenticated("missing or invalid API key"))
-        }
+        self.state
+            .authenticate(presented)
+            .ok_or_else(|| Status::unauthenticated("missing or invalid API key"))
     }
 }
 
@@ -164,13 +163,14 @@ impl Quiver for QuiverService {
         &self,
         request: Request<v1::CreateCollectionRequest>,
     ) -> Result<Response<v1::Collection>, Status> {
-        self.check_auth(&request)?;
+        let principal = self.authenticate(&request)?;
         let req = request.into_inner();
         let index = index_spec_from_proto(req.index, req.pq_subspaces);
         let filterable = filterable_from_proto(req.filterable);
         let info = self
             .state
             .create_collection(
+                &principal,
                 req.name,
                 req.dim,
                 metric_from_proto(req.metric),
@@ -186,11 +186,11 @@ impl Quiver for QuiverService {
         &self,
         request: Request<v1::GetCollectionRequest>,
     ) -> Result<Response<v1::Collection>, Status> {
-        self.check_auth(&request)?;
+        let principal = self.authenticate(&request)?;
         let req = request.into_inner();
         let info = self
             .state
-            .get_collection(req.name)
+            .get_collection(&principal, req.name)
             .await
             .map_err(|e| e.to_status())?;
         Ok(Response::new(collection_to_proto(info)))
@@ -200,10 +200,10 @@ impl Quiver for QuiverService {
         &self,
         request: Request<v1::ListCollectionsRequest>,
     ) -> Result<Response<v1::ListCollectionsResponse>, Status> {
-        self.check_auth(&request)?;
+        let principal = self.authenticate(&request)?;
         let infos = self
             .state
-            .list_collections()
+            .list_collections(&principal)
             .await
             .map_err(|e| e.to_status())?;
         Ok(Response::new(v1::ListCollectionsResponse {
@@ -215,11 +215,11 @@ impl Quiver for QuiverService {
         &self,
         request: Request<v1::DeleteCollectionRequest>,
     ) -> Result<Response<v1::DeleteCollectionResponse>, Status> {
-        self.check_auth(&request)?;
+        let principal = self.authenticate(&request)?;
         let req = request.into_inner();
         let existed = self
             .state
-            .delete_collection(req.name)
+            .delete_collection(&principal, req.name)
             .await
             .map_err(|e| e.to_status())?;
         Ok(Response::new(v1::DeleteCollectionResponse { existed }))
@@ -229,7 +229,7 @@ impl Quiver for QuiverService {
         &self,
         request: Request<v1::UpsertRequest>,
     ) -> Result<Response<v1::UpsertResponse>, Status> {
-        self.check_auth(&request)?;
+        let principal = self.authenticate(&request)?;
         let req = request.into_inner();
         let mut points = Vec::with_capacity(req.points.len());
         for point in req.points {
@@ -241,7 +241,7 @@ impl Quiver for QuiverService {
         }
         let upserted = self
             .state
-            .upsert(req.collection, points)
+            .upsert(&principal, req.collection, points)
             .await
             .map_err(|e| e.to_status())?;
         Ok(Response::new(v1::UpsertResponse { upserted }))
@@ -251,11 +251,11 @@ impl Quiver for QuiverService {
         &self,
         request: Request<v1::DeletePointsRequest>,
     ) -> Result<Response<v1::DeletePointsResponse>, Status> {
-        self.check_auth(&request)?;
+        let principal = self.authenticate(&request)?;
         let req = request.into_inner();
         let deleted = self
             .state
-            .delete_points(req.collection, req.ids)
+            .delete_points(&principal, req.collection, req.ids)
             .await
             .map_err(|e| e.to_status())?;
         Ok(Response::new(v1::DeletePointsResponse { deleted }))
@@ -265,11 +265,11 @@ impl Quiver for QuiverService {
         &self,
         request: Request<v1::GetPointsRequest>,
     ) -> Result<Response<v1::GetPointsResponse>, Status> {
-        self.check_auth(&request)?;
+        let principal = self.authenticate(&request)?;
         let req = request.into_inner();
         let points = self
             .state
-            .get_points(req.collection, req.ids, req.with_vector)
+            .get_points(&principal, req.collection, req.ids, req.with_vector)
             .await
             .map_err(|e| e.to_status())?;
         Ok(Response::new(v1::GetPointsResponse {
@@ -281,7 +281,7 @@ impl Quiver for QuiverService {
         &self,
         request: Request<v1::SearchRequest>,
     ) -> Result<Response<v1::SearchResponse>, Status> {
-        self.check_auth(&request)?;
+        let principal = self.authenticate(&request)?;
         let req = request.into_inner();
         let filter: Option<Filter> = if req.filter.is_empty() {
             None
@@ -300,6 +300,7 @@ impl Quiver for QuiverService {
         let matches = self
             .state
             .search(
+                &principal,
                 req.collection,
                 req.vector,
                 k,

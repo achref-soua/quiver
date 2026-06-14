@@ -19,6 +19,10 @@ pub enum Error {
     /// An error from the embeddable engine.
     #[error(transparent)]
     Engine(#[from] EngineError),
+    /// The authenticated caller's API-key scope does not permit the operation
+    /// (RBAC, ADR-0011). The message is generic so it leaks no resource names.
+    #[error("{0}")]
+    Forbidden(String),
     /// Invalid or insecure configuration.
     #[error("configuration error: {0}")]
     Config(String),
@@ -41,6 +45,7 @@ impl Error {
             Error::Engine(EngineError::Core(CoreError::AlreadyExists(_))) => {
                 (StatusCode::CONFLICT, tonic::Code::AlreadyExists)
             }
+            Error::Forbidden(_) => (StatusCode::FORBIDDEN, tonic::Code::PermissionDenied),
             Error::Engine(EngineError::Core(CoreError::InvalidArgument(_)))
             | Error::Engine(EngineError::Index(_))
             | Error::Engine(EngineError::Unsupported(_))

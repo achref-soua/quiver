@@ -108,7 +108,7 @@ async fn tls_secures_both_rest_and_grpc() {
         data_dir: tmp.path().join("data"),
         rest_addr: rest_listener.local_addr().unwrap(),
         grpc_addr: grpc_listener.local_addr().unwrap(),
-        api_keys: vec![TEST_KEY.to_owned()],
+        api_keys: vec![TEST_KEY.into()],
         encryption_key: Some(TEST_KEY.to_owned()),
         tls_cert: Some(cert_path),
         tls_key: Some(key_path),
