@@ -210,7 +210,7 @@ impl PageCodec for AeadCodec {
 
 // Decode a 64-character hex string into a 256-bit key. Rejects a wrong length or
 // any non-hex character; never panics.
-fn decode_key_hex(hex: &str) -> std::result::Result<[u8; KEY_LEN], CryptoError> {
+pub(crate) fn decode_key_hex(hex: &str) -> std::result::Result<[u8; KEY_LEN], CryptoError> {
     let hex = hex.trim();
     if hex.len() != KEY_LEN * 2 {
         return Err(CryptoError::InvalidKey(format!(
