@@ -1925,7 +1925,7 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quiver-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "quiver-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32c",
  "memmap2",
@@ -1952,7 +1952,7 @@ dependencies = [
 
 [[package]]
 name = "quiver-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "hkdf",
@@ -1965,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "quiver-embed"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "quiver-core",
  "quiver-index",
@@ -1977,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "quiver-index"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "memmap2",
  "postcard",
@@ -1991,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "quiver-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "quiver-core",
@@ -2006,7 +2006,7 @@ dependencies = [
 
 [[package]]
 name = "quiver-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "quiver-query"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2025,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "quiver-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -2053,7 +2053,7 @@ dependencies = [
 
 [[package]]
 name = "quiver-simd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "serde",
@@ -2061,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "quiver-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossterm",
