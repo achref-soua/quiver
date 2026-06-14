@@ -49,6 +49,7 @@ use crate::ids::{CollectionId, Lsn};
 use crate::manifest::{self, CollectionEntry, MANIFEST_FORMAT_VERSION, Manifest, SegmentRef};
 use crate::page::{PageCodec, PlainCodec};
 use crate::paged::fsync_dir;
+use crate::sec::{self, SecPredicate};
 use crate::segment::{self, SealRow, SealedSegment};
 use crate::wal::{self, WalEntry, WalOp, WalWriter};
 
@@ -159,12 +160,10 @@ impl CollectionState {
 }
 
 // A segment written during a checkpoint, opened and ready to install after the
-// manifest swap commits.
+// manifest swap commits. The repointing ids come from `sealed.row_ids()`.
 struct PendingSegment {
     seg_ref: SegmentRef,
     sealed: SealedSegment,
-    // External ids in row order, used to repoint the primary index.
-    ext_ids: Vec<String>,
 }
 
 /// The durable storage engine for one data directory.
@@ -212,14 +211,14 @@ impl Store {
             state.segments_meta = entry.segments.clone();
             let seg_dir = segments_dir(dir, entry.id);
             for seg in &entry.segments {
-                let (sealed, ext_ids) = segment::open_segment(&seg_dir, seg.id, codec.as_ref())?;
+                let sealed = segment::open_segment(&seg_dir, seg.id, codec.as_ref())?;
                 let seg_idx = state.sealed.len() as u32;
-                for (row, ext_id) in ext_ids.into_iter().enumerate() {
+                for (row, ext_id) in sealed.row_ids().iter().enumerate() {
                     let row = row as u32;
                     if !sealed.is_dead(row) {
                         state
                             .primary
-                            .insert(ext_id, Loc::Sealed { seg: seg_idx, row });
+                            .insert(ext_id.clone(), Loc::Sealed { seg: seg_idx, row });
                     }
                 }
                 state.sealed.push(sealed);
@@ -527,6 +526,70 @@ impl Store {
         names
     }
 
+    /// The live external ids whose payload satisfies an indexable `predicate`,
+    /// resolved through the sealed segments' secondary indexes (`.sec`) plus a
+    /// scan of the active buffer. The result is sorted and de-duplicated. This is
+    /// the pre-filter primitive the query planner builds hybrid search on.
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`] if the collection is unknown, or
+    /// [`CoreError::InvalidArgument`] if the predicate's field is not declared
+    /// filterable in the collection schema.
+    pub fn matching_ids(
+        &self,
+        collection: CollectionId,
+        predicate: &SecPredicate,
+    ) -> Result<Vec<String>> {
+        let state = self
+            .collections
+            .get(&collection)
+            .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
+        let field_type = state
+            .descriptor
+            .filterable
+            .iter()
+            .find(|f| f.path == predicate.field())
+            .map(|f| f.field_type)
+            .ok_or_else(|| {
+                CoreError::InvalidArgument(format!("field {} is not filterable", predicate.field()))
+            })?;
+
+        let mut out: Vec<String> = Vec::new();
+        // Sealed segments: query each `.sec`, keeping rows still live here (a row
+        // dead or shadowed no longer has the primary index pointing at it).
+        for (seg_idx, segment) in state.sealed.iter().enumerate() {
+            let seg_idx = seg_idx as u32;
+            let Some(rows) = segment.sec_query(predicate)? else {
+                continue;
+            };
+            for row in rows {
+                if segment.is_dead(row) {
+                    continue;
+                }
+                let Some(ext_id) = segment.row_ids().get(row as usize) else {
+                    continue;
+                };
+                if matches!(
+                    state.primary.get(ext_id),
+                    Some(Loc::Sealed { seg: s, row: r }) if *s == seg_idx && *r == row
+                ) {
+                    out.push(ext_id.clone());
+                }
+            }
+        }
+        // Active (un-checkpointed) rows: evaluate the predicate directly.
+        for (ext_id, &row) in &state.active_index {
+            if let Some(active) = state.active.get(row as usize)
+                && sec::payload_matches(predicate, field_type, &active.payload)
+            {
+                out.push(ext_id.clone());
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     /// Seal everything changed since the last checkpoint into new immutable
     /// segments, install a new manifest atomically, rotate the WAL, and reclaim
     /// superseded files. A no-op if nothing has changed since the last
@@ -583,7 +646,13 @@ impl Store {
                             payload: &state.active[row as usize].payload,
                         })
                         .collect();
-                    segment::write_segment(&seg_dir, seg_id, self.codec.as_ref(), &seal_rows)?;
+                    segment::write_segment(
+                        &seg_dir,
+                        seg_id,
+                        self.codec.as_ref(),
+                        &seal_rows,
+                        &state.descriptor.filterable,
+                    )?;
                     seal_rows.len() as u64
                 };
                 Some((seg_id, row_count))
@@ -597,8 +666,7 @@ impl Store {
             fsync_dir(&self.dir)?;
 
             if let Some((seg_id, row_count)) = new_seg {
-                let (sealed, ext_ids) =
-                    segment::open_segment(&seg_dir, seg_id, self.codec.as_ref())?;
+                let sealed = segment::open_segment(&seg_dir, seg_id, self.codec.as_ref())?;
                 pending.insert(
                     cid,
                     PendingSegment {
@@ -609,7 +677,6 @@ impl Store {
                             lsn_high: last_lsn,
                         },
                         sealed,
-                        ext_ids,
                     },
                 );
             }
@@ -659,9 +726,9 @@ impl Store {
             // Install the new segment, if any, repointing its now-sealed ids.
             if let Some(p) = pending.remove(&cid) {
                 let seg_idx = state.sealed.len() as u32;
-                for (row, ext_id) in p.ext_ids.into_iter().enumerate() {
+                for (row, ext_id) in p.sealed.row_ids().iter().enumerate() {
                     state.primary.insert(
-                        ext_id,
+                        ext_id.clone(),
                         Loc::Sealed {
                             seg: seg_idx,
                             row: row as u32,
@@ -792,7 +859,13 @@ impl Store {
                 payload: p,
             })
             .collect();
-        segment::write_segment(&seg_dir, seg_id, self.codec.as_ref(), &seal_rows)?;
+        segment::write_segment(
+            &seg_dir,
+            seg_id,
+            self.codec.as_ref(),
+            &seal_rows,
+            &self.collections[&cid].descriptor.filterable,
+        )?;
         fsync_dir(&seg_dir)?;
         fsync_dir(&collection_dir(&self.dir, cid))?;
         fsync_dir(&self.dir.join("collections"))?;
@@ -803,7 +876,7 @@ impl Store {
             lsn_low,
             lsn_high,
         };
-        let (sealed, ext_ids) = segment::open_segment(&seg_dir, seg_id, self.codec.as_ref())?;
+        let sealed = segment::open_segment(&seg_dir, seg_id, self.codec.as_ref())?;
 
         // New manifest: this collection now has exactly one segment; others are
         // unchanged. The atomic swap is the commit point.
@@ -837,11 +910,12 @@ impl Store {
         // are reclaimed), repoint the now-merged ids, and drop pending tombstones
         // (their rows no longer exist).
         self.manifest_version = new_version;
+        let row_ids: Vec<String> = sealed.row_ids().to_vec();
         if let Some(state) = self.collections.get_mut(&cid) {
             state.sealed = vec![sealed];
             state.segments_meta = vec![new_ref];
             state.dead_this_window.clear();
-            for (row, ext_id) in ext_ids.into_iter().enumerate() {
+            for (row, ext_id) in row_ids.into_iter().enumerate() {
                 state.primary.insert(
                     ext_id,
                     Loc::Sealed {
@@ -1474,5 +1548,73 @@ mod tests {
         assert_eq!(s.len(c).unwrap(), 24);
         assert_eq!(s.get(c, "k0").unwrap().unwrap().vector, vec![0.0; 4]);
         assert_eq!(s.get(c, "k23").unwrap().unwrap().vector, vec![23.0; 4]);
+    }
+
+    #[test]
+    fn matching_ids_spans_secondary_index_and_active_buffer() {
+        use crate::descriptor::FilterableField;
+        use crate::sec::SecValue;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = open(tmp.path());
+        let descriptor = Descriptor::new(4, Dtype::F32, DistanceMetric::L2).with_filterable(vec![
+            FilterableField::keyword("city"),
+            FilterableField::numeric("age"),
+        ]);
+        let c = s.create_collection("c", descriptor).unwrap();
+        s.upsert(c, "a", &[0.0; 4], br#"{"city":"paris","age":30}"#)
+            .unwrap();
+        s.upsert(c, "b", &[0.0; 4], br#"{"city":"lyon","age":25}"#)
+            .unwrap();
+        s.upsert(c, "d", &[0.0; 4], br#"{"city":"paris","age":40}"#)
+            .unwrap();
+        s.checkpoint().unwrap();
+        // An active (un-checkpointed) row, matched by scanning the buffer.
+        s.upsert(c, "e", &[0.0; 4], br#"{"city":"paris","age":22}"#)
+            .unwrap();
+
+        let paris = || SecPredicate::Eq {
+            field: "city".into(),
+            value: SecValue::Keyword("paris".into()),
+        };
+        assert_eq!(s.matching_ids(c, &paris()).unwrap(), ["a", "d", "e"]);
+
+        // Numeric range [25, 35]: 30 (a, sealed) and 25 (b, sealed); not 40 or 22.
+        assert_eq!(
+            s.matching_ids(
+                c,
+                &SecPredicate::Range {
+                    field: "age".into(),
+                    lo: Some(SecValue::Numeric(25.0)),
+                    hi: Some(SecValue::Numeric(35.0)),
+                    lo_inclusive: true,
+                    hi_inclusive: true,
+                }
+            )
+            .unwrap(),
+            ["a", "b"]
+        );
+
+        // Deleting a sealed row drops it via the primary-consistency check.
+        s.delete(c, "a").unwrap();
+        assert_eq!(s.matching_ids(c, &paris()).unwrap(), ["d", "e"]);
+
+        // A non-filterable field is rejected (the planner must post-filter it).
+        assert!(matches!(
+            s.matching_ids(
+                c,
+                &SecPredicate::Eq {
+                    field: "country".into(),
+                    value: SecValue::Keyword("fr".into()),
+                }
+            ),
+            Err(CoreError::InvalidArgument(_))
+        ));
+
+        // Checkpoint seals the active row and the deletion; results survive reopen.
+        s.checkpoint().unwrap();
+        let s = open(tmp.path());
+        let c = s.collection_id("c").unwrap();
+        assert_eq!(s.matching_ids(c, &paris()).unwrap(), ["d", "e"]);
     }
 }
