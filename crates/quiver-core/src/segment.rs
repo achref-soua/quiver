@@ -31,8 +31,10 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::blockfile::{BlockFile, write_blocks};
+use crate::descriptor::FilterableField;
 use crate::error::{CoreError, Result};
 use crate::page::{PageCodec, PageType};
+use crate::sec::{SecIndex, SecPredicate};
 
 /// Current segment schema version. (v1 was the Phase-1 snapshot-delta `postcard`
 /// blob; v2 the row-addressed layout with string tombstones; v3 moves tombstones
@@ -82,18 +84,35 @@ pub(crate) struct PayLoc {
 }
 
 /// A sealed segment opened for reads: `mmap` handles for the vector column and
-/// payload heap, the row → payload-location directory, and the tombstone bitmap.
+/// payload heap, the row → payload-location directory, the row → external-id map,
+/// the tombstone bitmap, and the secondary index.
 pub(crate) struct SealedSegment {
     /// Segment id; names the files and matches the manifest.
     pub seg_id: u64,
     vec: BlockFile,
     pay: BlockFile,
     paylocs: Vec<PayLoc>,
+    // External id of each row (row order); reverses the primary index, e.g. to
+    // resolve a secondary-index hit back to an id.
+    row_ids: Vec<String>,
     // Rows of this segment that are no longer live.
     dead: RoaringBitmap,
+    // Secondary index over the collection's filterable fields (empty if none).
+    sec: SecIndex,
 }
 
 impl SealedSegment {
+    /// The external ids of this segment's rows, in row order.
+    pub(crate) fn row_ids(&self) -> &[String] {
+        &self.row_ids
+    }
+
+    /// The rows matching a secondary-index predicate, or `None` if the field is
+    /// not indexed in this segment.
+    pub(crate) fn sec_query(&self, predicate: &SecPredicate) -> Result<Option<RoaringBitmap>> {
+        self.sec.query(predicate)
+    }
+
     /// Read row `row`'s raw little-endian vector bytes (`stride` bytes).
     pub(crate) fn read_vector(
         &self,
@@ -144,17 +163,19 @@ impl SealedSegment {
     }
 }
 
-/// Write a new sealed segment's `.vec`, `.pay`, and `.dir` files into `seg_dir`
-/// and `fsync` each. A new segment has no tombstones, so no `.del` is written.
+/// Write a new sealed segment's `.vec`, `.pay`, `.dir`, and (if the collection
+/// has `filterable` fields) `.sec` files into `seg_dir` and `fsync` each. A new
+/// segment has no tombstones, so no `.del` is written.
 ///
-/// `rows` are sealed in the given order (row `i` → `.vec` slot `i`). The directory
-/// is *not* `fsync`'d here — the engine sequences directory `fsync`s against the
-/// manifest swap.
+/// `rows` are sealed in the given order (row `i` → `.vec` slot `i`). The files are
+/// *not* directory-`fsync`'d here — the engine sequences directory `fsync`s
+/// against the manifest swap.
 pub(crate) fn write_segment(
     seg_dir: &Path,
     segment_id: u64,
     codec: &dyn PageCodec,
     rows: &[SealRow<'_>],
+    filterable: &[FilterableField],
 ) -> Result<()> {
     let mut vec_blob = Vec::new();
     let mut pay_blob = Vec::new();
@@ -197,6 +218,17 @@ pub(crate) fn write_segment(
         segment_id,
         &dir_blob,
     )?;
+    if !filterable.is_empty() {
+        let payloads: Vec<&[u8]> = rows.iter().map(|r| r.payload).collect();
+        let sec = SecIndex::build(filterable, &payloads)?;
+        crate::paged::write_paged(
+            &sec_path(seg_dir, segment_id),
+            codec,
+            PageType::Segment,
+            segment_id,
+            &sec.encode()?,
+        )?;
+    }
     Ok(())
 }
 
@@ -232,14 +264,25 @@ fn read_del(seg_dir: &Path, segment_id: u64, codec: &dyn PageCodec) -> Result<Ro
     Ok(RoaringBitmap::deserialize_from(&blob[..])?)
 }
 
-/// Open a sealed segment for reads, returning the `mmap`-backed handle together
-/// with the external ids in row order — the engine uses them, minus the segment's
-/// dead rows, to (re)build the primary index.
+/// Read a segment's secondary index, or an empty one if no `.sec` exists (the
+/// collection has no filterable fields).
+fn read_sec(seg_dir: &Path, segment_id: u64, codec: &dyn PageCodec) -> Result<SecIndex> {
+    let path = sec_path(seg_dir, segment_id);
+    if !path.exists() {
+        return Ok(SecIndex::default());
+    }
+    let blob = crate::paged::read_paged(&path, codec, PageType::Segment)?;
+    SecIndex::decode(&blob)
+}
+
+/// Open a sealed segment for reads. The returned handle carries the row →
+/// external-id map (used to rebuild the primary index, minus the segment's dead
+/// rows) and the secondary index.
 pub(crate) fn open_segment(
     seg_dir: &Path,
     segment_id: u64,
     codec: &dyn PageCodec,
-) -> Result<(SealedSegment, Vec<String>)> {
+) -> Result<SealedSegment> {
     let dir_blob =
         crate::paged::read_paged(&dir_path(seg_dir, segment_id), codec, PageType::Segment)?;
     let dir: SegmentDir = postcard::from_bytes(&dir_blob)?;
@@ -252,26 +295,26 @@ pub(crate) fn open_segment(
     let vec = BlockFile::open(&vec_path(seg_dir, segment_id), codec, PageType::Segment)?;
     let pay = BlockFile::open(&pay_path(seg_dir, segment_id), codec, PageType::Segment)?;
     let dead = read_del(seg_dir, segment_id, codec)?;
+    let sec = read_sec(seg_dir, segment_id, codec)?;
 
-    let mut ext_ids = Vec::with_capacity(dir.rows.len());
+    let mut row_ids = Vec::with_capacity(dir.rows.len());
     let mut paylocs = Vec::with_capacity(dir.rows.len());
     for r in dir.rows {
-        ext_ids.push(r.external_id);
+        row_ids.push(r.external_id);
         paylocs.push(PayLoc {
             off: r.pay_off,
             len: r.pay_len,
         });
     }
-    Ok((
-        SealedSegment {
-            seg_id: segment_id,
-            vec,
-            pay,
-            paylocs,
-            dead,
-        },
-        ext_ids,
-    ))
+    Ok(SealedSegment {
+        seg_id: segment_id,
+        vec,
+        pay,
+        paylocs,
+        row_ids,
+        dead,
+        sec,
+    })
 }
 
 /// File name of a segment's vector column.
@@ -287,6 +330,11 @@ fn pay_path(seg_dir: &Path, seg_id: u64) -> PathBuf {
 /// File name of a segment's row directory.
 fn dir_path(seg_dir: &Path, seg_id: u64) -> PathBuf {
     seg_dir.join(format!("seg-{seg_id:010}.dir"))
+}
+
+/// File name of a segment's secondary index.
+fn sec_path(seg_dir: &Path, seg_id: u64) -> PathBuf {
+    seg_dir.join(format!("seg-{seg_id:010}.sec"))
 }
 
 /// File name of a segment's tombstone bitmap.
@@ -337,9 +385,9 @@ mod tests {
     fn segment_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path();
-        write_segment(seg_dir, 1, &PlainCodec, &rows()).unwrap();
-        let (seg, ext_ids) = open_segment(seg_dir, 1, &PlainCodec).unwrap();
-        assert_eq!(ext_ids, vec!["a".to_owned(), "b".to_owned()]);
+        write_segment(seg_dir, 1, &PlainCodec, &rows(), &[]).unwrap();
+        let seg = open_segment(seg_dir, 1, &PlainCodec).unwrap();
+        assert_eq!(seg.row_ids(), &["a".to_owned(), "b".to_owned()]);
         assert_eq!(seg.row_count(), 2);
         assert_eq!(seg.live_count(), 2);
         assert!(!seg.is_dead(0));
@@ -353,15 +401,17 @@ mod tests {
         );
         assert_eq!(seg.read_payload(&PlainCodec, 0).unwrap(), b"{}");
         assert_eq!(seg.read_payload(&PlainCodec, 1).unwrap(), b"[1,2,3]");
+        // No `.sec` is written when there are no filterable fields.
+        assert!(!sec_path(seg_dir, 1).exists());
     }
 
     #[test]
     fn tombstone_bitmap_roundtrips_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let seg_dir = dir.path();
-        write_segment(seg_dir, 1, &PlainCodec, &rows()).unwrap();
+        write_segment(seg_dir, 1, &PlainCodec, &rows(), &[]).unwrap();
         // Absent .del => no dead rows.
-        let (seg, _) = open_segment(seg_dir, 1, &PlainCodec).unwrap();
+        let seg = open_segment(seg_dir, 1, &PlainCodec).unwrap();
         assert_eq!(seg.live_count(), 2);
 
         // Persist a tombstone for row 0, then reopen.
@@ -373,18 +423,49 @@ mod tests {
             "temp must be renamed away"
         );
 
-        let (seg, _) = open_segment(seg_dir, 1, &PlainCodec).unwrap();
+        let seg = open_segment(seg_dir, 1, &PlainCodec).unwrap();
         assert!(seg.is_dead(0));
         assert!(!seg.is_dead(1));
         assert_eq!(seg.live_count(), 1);
     }
 
     #[test]
+    fn secondary_index_is_written_and_queryable() {
+        use crate::descriptor::FilterableField;
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path();
+        let rows = vec![
+            SealRow {
+                external_id: "a",
+                vector: &[0, 0, 0, 0],
+                payload: br#"{"city":"paris"}"#,
+            },
+            SealRow {
+                external_id: "b",
+                vector: &[0, 0, 0, 0],
+                payload: br#"{"city":"lyon"}"#,
+            },
+        ];
+        let filterable = [FilterableField::keyword("city")];
+        write_segment(seg_dir, 2, &PlainCodec, &rows, &filterable).unwrap();
+        assert!(sec_path(seg_dir, 2).exists(), ".sec must be written");
+        let seg = open_segment(seg_dir, 2, &PlainCodec).unwrap();
+        let hit = seg
+            .sec_query(&SecPredicate::Eq {
+                field: "city".into(),
+                value: crate::sec::SecValue::Keyword("paris".into()),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.iter().collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
     fn empty_segment_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
-        write_segment(dir.path(), 5, &PlainCodec, &[]).unwrap();
-        let (seg, ext_ids) = open_segment(dir.path(), 5, &PlainCodec).unwrap();
-        assert!(ext_ids.is_empty());
+        write_segment(dir.path(), 5, &PlainCodec, &[], &[]).unwrap();
+        let seg = open_segment(dir.path(), 5, &PlainCodec).unwrap();
+        assert!(seg.row_ids().is_empty());
         assert_eq!(seg.row_count(), 0);
         assert!(seg.read_payload(&PlainCodec, 0).is_err());
     }
@@ -395,6 +476,7 @@ mod tests {
         assert_eq!(seg_id_of_file("seg-0000000042.pay"), Some(42));
         assert_eq!(seg_id_of_file("seg-0000000003.dir"), Some(3));
         assert_eq!(seg_id_of_file("seg-0000000009.del"), Some(9));
+        assert_eq!(seg_id_of_file("seg-0000000005.sec"), Some(5));
         assert_eq!(seg_id_of_file("CURRENT"), None);
         assert_eq!(seg_id_of_file("seg-bogus.vec"), None);
         assert!(is_temp_file("seg-0000000001.del.tmp"));

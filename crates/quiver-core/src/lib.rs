@@ -27,11 +27,15 @@ pub mod ids;
 pub mod manifest;
 pub mod page;
 mod paged;
+pub mod sec;
 mod segment;
 pub mod store;
 pub mod wal;
 
-pub use descriptor::{Descriptor, DistanceMetric, Dtype, IndexKind, IndexSpec};
+pub use descriptor::{
+    Descriptor, DistanceMetric, Dtype, FieldType, FilterableField, IndexKind, IndexSpec,
+};
 pub use error::{CoreError, Result};
 pub use ids::{CollectionId, Lsn};
+pub use sec::{SecPredicate, SecValue};
 pub use store::{Record, Store};

@@ -71,13 +71,13 @@ Variable-length payloads (validated JSON, see ADR-0003) live in a paged heap (`s
 
 ## Secondary indexes (`.sec`)
 
-Per filterable field, value → **roaring bitmap** of matching rows:
+Per filterable field (declared in the collection schema), value → **roaring bitmap** of the rows that hold it, stored as sorted `(key → bitmap)` entries with **order-preserving keys** — UTF-8 for keyword fields, a sign-flipped big-endian encoding for numeric fields (so negatives sort correctly):
 
-- **equality**: hashed value → bitmap;
-- **range**: order-preserving keys → bitmap (sorted runs), for `<,>,between`;
+- **equality / `in`**: binary-search the key(s);
+- **range** (`<`, `>`, `between`): a contiguous scan of the sorted keys;
 - (geo and full-text are later phases).
 
-Indexes are built per-segment and merged across segments at query time; the planner uses their selectivity to choose pre- vs post-filtering (see [`../index/design.md`](../index/design.md)). Phase 1 ships equality + range; richer types follow with hybrid search.
+Indexes are built per filterable field **at flush** (parsing each row's JSON payload) and rebuilt at compaction; a collection with no filterable fields writes no `.sec`. They are immutable like `.vec`/`.pay`/`.dir` — deletes and updates are reflected through the `.del` bitmap and the primary index, never by rewriting `.sec`. At query time the per-segment results are unioned and a hit is kept only if the primary index still points at that `(segment, row)`, so each id is counted once with its live value; un-checkpointed (active-buffer) rows are evaluated directly. The planner uses selectivity to choose pre- vs post-filtering (see [`../index/design.md`](../index/design.md)). Full decisions: [ADR-0022](../adr/0022-secondary-indexes.md).
 
 ## Write path, sealing, and compaction
 
