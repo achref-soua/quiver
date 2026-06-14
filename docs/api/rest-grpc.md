@@ -64,6 +64,15 @@ default `hnsw`) and an optional `pq_subspaces` for the quantized kinds. `Collect
 responses echo both, so a client can confirm the memory-frugal `disk_vamana` path
 was selected. Inner-product (`dot`) is rejected for the graph/IVF kinds (400).
 
+The request also carries `filterable` — payload fields to index for pre-filtered
+(hybrid) search (ADR-0022), each a `{ "path": "user.city", "field_type":
+"keyword" | "numeric" }`. Declared fields are extracted into the secondary index
+at flush time; a `Search` whose `filter` is selective on them is then answered by
+an exact scan of the narrowed rows instead of post-filtering ANN hits (perfect
+recall, no filtered-search cliff). `Collection` responses echo the declared
+fields. Fields left undeclared still filter correctly — they fall back to
+post-filtering — they just do not get the pre-filter speed-up.
+
 REST bodies are JSON; vectors are JSON arrays (or base64 for `int8`/`binary`). Errors are RFC-9457 `application/problem+json`; gRPC uses the mapped `Status` (ADR-0017).
 
 ## Auth, idempotency, limits (applied uniformly)

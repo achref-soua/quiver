@@ -56,7 +56,7 @@ Inverted file: a coarse k-means quantizer partitions space into `nlist` Voronoi 
 
 ## Filtered search
 
-The planner chooses **pre-filter** (build the allowed-row roaring bitmap from secondary indexes, constrain traversal to allowed nodes) when the predicate is selective, vs **post-filter** (search, then drop) when it is broad — because aggressive pre-filtering can disconnect a proximity graph. v1 uses this selectivity-based strategy; specialized filtered-graph search (e.g. Filtered-DiskANN, Gollapudi et al. *WWW* 2023; ACORN, Patel et al. *SIGMOD* 2024) is a later enhancement. Details in the query design.
+The planner (in `quiver-embed`) decomposes the `Filter` into the predicates the secondary indexes can answer (`And` intersects, `Or` unions, negation/existence/undeclared fields widen to unconstrained — always a sound superset) and resolves a candidate id set via `Store::matching_ids`. When that set is **selective** (at or below a full-scan threshold) it scans those rows **exactly** — perfect recall, and immune to the filtered-ANN recall cliff that bites when a selective predicate starves an over-fetched candidate list; an empty candidate set short-circuits to no results. When the filter is **broad** (or not indexable) it **post-filters** the ANN candidates instead. Both arms re-check the full `Filter`, so results are exact regardless of path. This is the selectivity-based strategy for v1; constraining graph traversal to an allowed-node bitmap, and specialized filtered-graph search (e.g. Filtered-DiskANN, Gollapudi et al. *WWW* 2023; ACORN, Patel et al. *SIGMOD* 2024), are later enhancements.
 
 ## Incremental updates (later)
 

@@ -150,6 +150,56 @@ async fn rest_and_grpc_round_trip() {
         assert_eq!(m["payload"]["color"], "red"); // blue point filtered out
     }
 
+    // --- REST: filterable fields are declared, echoed back, and drive the
+    // hybrid pre-filter path end to end ---
+    let resp = http
+        .post(format!("{base}/v1/collections"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({
+            "name": "people", "dim": 4, "metric": "l2",
+            "filterable": [{"path": "city", "field_type": "keyword"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["filterable"][0]["path"], "city");
+    assert_eq!(body["filterable"][0]["field_type"], "keyword");
+
+    let resp = http
+        .post(format!("{base}/v1/collections/people/points"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({"points": [
+            {"id": "p", "vector": [0.0, 0.0, 0.0, 0.0], "payload": {"city": "paris"}},
+            {"id": "l", "vector": [1.0, 0.0, 0.0, 0.0], "payload": {"city": "lyon"}},
+            {"id": "p2", "vector": [2.0, 0.0, 0.0, 0.0], "payload": {"city": "paris"}}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let resp = http
+        .post(format!("{base}/v1/collections/people/query"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({
+            "vector": [0.0, 0.0, 0.0, 0.0],
+            "k": 5,
+            "filter": {"eq": {"field": "city", "value": "paris"}},
+            "with_payload": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let matches = body["matches"].as_array().unwrap();
+    assert_eq!(matches[0]["id"], "p"); // nearest paris point via the pre-filter
+    for m in matches {
+        assert_eq!(m["payload"]["city"], "paris"); // lyon filtered out
+    }
+
     // --- gRPC: connect and exercise the same collection ---
     let mut client = QuiverClient::connect(format!("http://{grpc_addr}"))
         .await

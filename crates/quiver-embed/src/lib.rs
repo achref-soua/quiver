@@ -32,7 +32,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
-use quiver_core::{CollectionId, FieldType, FilterableField, SecPredicate, SecValue, Store};
+use quiver_core::{CollectionId, SecPredicate, SecValue, Store};
 use quiver_index::{
     DiskSearchParams, DiskVamana, Hnsw, HnswConfig, Index, Ivf, IvfConfig, Metric, Neighbor,
     ProductQuantizer, Vamana, VamanaConfig, ordering_distance, report_metric,
@@ -41,7 +41,9 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub use quiver_core::page::PageCodec;
-pub use quiver_core::{Descriptor, DistanceMetric, Dtype, IndexKind, IndexSpec};
+pub use quiver_core::{
+    Descriptor, DistanceMetric, Dtype, FieldType, FilterableField, IndexKind, IndexSpec,
+};
 pub use quiver_query::Filter;
 
 /// Errors returned by the embeddable database.
