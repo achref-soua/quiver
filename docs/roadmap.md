@@ -46,6 +46,8 @@ Quiver is built phase by phase. A phase is not "done" until its Definition of Do
 
 **DoD:** a payload upserted with client-side encryption is provably unreadable by the server (test); RBAC denies cross-tenant/over-scope access (tests); fuzz targets run clean for a documented duration; the cockpit demo (asciinema cast) is recorded. Coverage ≥ 80%.
 
+**Status (shipped on `develop` for the `v0.3.0` tag):** all five slices are in and tested — client-side payload encryption (cross-language KATs); RBAC + scoped keys + optional mTLS; an append-only audit log; per-collection-DEK envelope encryption with **crypto-shredding**; `QUIVER_MASTER_KEY_FILE` secret handling; the cockpit **constellation view** (random-projection scatter + nearest-neighbour highlight + interactive re-query); and `cargo-fuzz` targets for the wire and on-disk parsers (clean over a bounded run). Core-engine coverage is **93% line**. The only artifact produced off the shared dev box is the cockpit's asciinema cast — `scripts/record-cockpit-cast.sh` records it on a real terminal. Note: the per-collection envelope is a pre-1.0 at-rest format change, so a `v0.2.0` encrypted store must be re-created.
+
 ## Phase 4 — Advanced / stretch + launch → `v1.0.0`
 
 **Scope:** incremental in-place updates (SpFresh-style); optional multi-vector / late-interaction scoring; optional leader-follower replication (clearly labeled); the **experimental** DCPE feature flag (published scheme, honest caveats); migration importers (Qdrant/Chroma/pgvector); docs-site + benchmark polish; regenerated TUI cast; load-test results.
