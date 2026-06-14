@@ -68,13 +68,10 @@ impl PartialOrd for Candidate {
 }
 
 // Distance with "smaller is closer" semantics for every metric, so the search
-// heaps order consistently. Similarities are negated.
+// heaps order consistently. Shared with the embeddable pre-filter scan via
+// `crate::ordering_distance` so the two never diverge.
 fn dist(metric: Metric, a: &[f32], b: &[f32]) -> f32 {
-    match metric {
-        Metric::L2 => quiver_simd::l2_sq_f32(a, b),
-        Metric::Dot => -quiver_simd::dot_f32(a, b),
-        Metric::Cosine => -quiver_simd::cosine_f32(a, b),
-    }
+    crate::ordering_distance(metric, a, b)
 }
 
 fn vec_of(vectors: &[f32], dim: usize, node: u32) -> &[f32] {
@@ -370,10 +367,7 @@ impl Index for Hnsw {
             .map(|c| Neighbor {
                 id: self.ids[c.node as usize],
                 // Un-negate similarities so the reported value is the true metric.
-                distance: match self.metric {
-                    Metric::L2 => c.dist,
-                    Metric::Dot | Metric::Cosine => -c.dist,
-                },
+                distance: crate::report_metric(self.metric, c.dist),
             })
             .collect())
     }
