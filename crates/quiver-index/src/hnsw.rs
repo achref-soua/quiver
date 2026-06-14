@@ -147,6 +147,9 @@ pub struct Hnsw {
     conns: Vec<Vec<Vec<u32>>>,
     entry_point: Option<u32>,
     max_level: usize,
+    // Soft-deleted nodes (ADR-0026): excluded from results but kept in the graph
+    // as connectivity waypoints until a rebuild reclaims them.
+    deleted: HashSet<u32>,
 }
 
 impl Hnsw {
@@ -170,6 +173,7 @@ impl Hnsw {
             conns: Vec::new(),
             entry_point: None,
             max_level: 0,
+            deleted: HashSet::new(),
         }
     }
 
@@ -183,6 +187,25 @@ impl Hnsw {
     #[must_use]
     pub fn metric(&self) -> Metric {
         self.metric
+    }
+
+    /// Soft-delete the node with internal id `node` (ADR-0026): it stays in the
+    /// graph as a connectivity waypoint but is never returned by
+    /// [`Index::search`]. Returns whether it was a live, in-range node
+    /// (idempotent — re-deleting returns `false`).
+    pub fn mark_deleted(&mut self, node: u32) -> bool {
+        (node as usize) < self.ids.len() && self.deleted.insert(node)
+    }
+
+    /// The fraction of nodes that are soft-deleted, in `[0, 1]`. A caller uses it
+    /// to decide when a rebuild is worth the reclaimed graph space.
+    #[must_use]
+    pub fn deleted_fraction(&self) -> f64 {
+        if self.ids.is_empty() {
+            0.0
+        } else {
+            self.deleted.len() as f64 / self.ids.len() as f64
+        }
     }
 
     fn random_level(&mut self) -> usize {
@@ -361,8 +384,18 @@ impl Index for Hnsw {
             cur -= 1;
         }
         let ef = ef_search.max(k);
-        let w = self.search_layer(query, &[ep], ef, 0);
+        // With soft-deletes present, widen the base-layer search so roughly `ef`
+        // *live* candidates survive the filter (the graph is still traversed
+        // through deleted nodes), then drop the tombstones (ADR-0026).
+        let ef_eff = if self.deleted.is_empty() {
+            ef
+        } else {
+            let live = (self.ids.len() - self.deleted.len()).max(1);
+            (ef.saturating_mul(self.ids.len()) / live).min(self.ids.len())
+        };
+        let w = self.search_layer(query, &[ep], ef_eff, 0);
         Ok(w.into_iter()
+            .filter(|c| !self.deleted.contains(&c.node))
             .take(k)
             .map(|c| Neighbor {
                 id: self.ids[c.node as usize],
@@ -373,7 +406,7 @@ impl Index for Hnsw {
     }
 
     fn len(&self) -> usize {
-        self.ids.len()
+        self.ids.len() - self.deleted.len()
     }
 }
 
@@ -514,5 +547,64 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(build(), build());
+    }
+
+    #[test]
+    fn marked_deleted_points_are_not_returned() {
+        let dim = 8;
+        let mut rng = SplitMix64::new(0x0DE1);
+        let mut h = Hnsw::new(dim, Metric::L2, HnswConfig::default());
+        let data: Vec<Vec<f32>> = (0..200).map(|_| rand_vec(&mut rng, dim)).collect();
+        for (i, v) in data.iter().enumerate() {
+            h.insert(i as u64, v).unwrap();
+        }
+        assert_eq!(h.len(), 200);
+
+        // Node 0 is its own nearest neighbor; after deletion it must vanish while
+        // the search still returns k live neighbors.
+        let before = h.search(&data[0], 5, 64).unwrap();
+        assert_eq!(before[0].id, 0);
+        assert!(h.mark_deleted(0));
+        assert!(!h.mark_deleted(0), "re-deleting is idempotent");
+        assert_eq!(h.len(), 199);
+        let after = h.search(&data[0], 5, 64).unwrap();
+        assert!(
+            after.iter().all(|n| n.id != 0),
+            "a deleted node was returned"
+        );
+        assert_eq!(after.len(), 5, "still returns k live neighbors");
+    }
+
+    #[test]
+    fn search_finds_live_points_after_many_deletes() {
+        // Delete a third of the points; every survivor must still be found as its
+        // own nearest neighbor (ef is widened to compensate for the tombstones it
+        // traverses, ADR-0026), and no deleted id is ever returned.
+        let dim = 12;
+        let mut rng = SplitMix64::new(0x0DE2);
+        let mut h = Hnsw::new(dim, Metric::L2, HnswConfig::default());
+        let data: Vec<Vec<f32>> = (0..600).map(|_| rand_vec(&mut rng, dim)).collect();
+        for (i, v) in data.iter().enumerate() {
+            h.insert(i as u64, v).unwrap();
+        }
+        for i in (0..600u32).step_by(3) {
+            assert!(h.mark_deleted(i));
+        }
+        assert_eq!(h.len(), 400);
+
+        let (mut hits, mut trials) = (0usize, 0usize);
+        for i in (1..600usize).step_by(3) {
+            trials += 1;
+            let got = h.search(&data[i], 1, 96).unwrap();
+            assert!(
+                got.iter().all(|n| n.id % 3 != 0),
+                "a deleted id was returned"
+            );
+            if got.first().is_some_and(|n| n.id == i as u64) {
+                hits += 1;
+            }
+        }
+        let recall = hits as f64 / trials as f64;
+        assert!(recall >= 0.90, "self-recall after deletes was {recall:.3}");
     }
 }

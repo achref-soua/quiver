@@ -133,6 +133,11 @@ const FILTER_OVERFETCH: usize = 8;
 // the equivalent knob its full-scan threshold.
 const FULL_SCAN_THRESHOLD: usize = 10_000;
 
+// Soft-deleted fraction at which a built HNSW is rebuilt from the store to
+// reclaim its tombstoned graph nodes (ADR-0026). Below it, a delete is an O(1)
+// soft-delete; at it, the next access rebuilds.
+const HNSW_REBUILD_DELETED_FRACTION: f64 = 0.2;
+
 // The vector index backing one collection. HNSW and (once built) IVF are
 // maintained incrementally; Vamana and the disk graph are batch-built from the
 // store (the `Option` is `None` until first build) and rebuild lazily after
@@ -349,20 +354,30 @@ impl Database {
         if !existed {
             return Ok(false);
         }
-        // A built IVF removes in place (ADR-0023); other kinds defer to a
-        // rebuild. The id->internal mapping is kept so a later re-insert reuses
-        // the slot — a removed internal is simply never returned by the index.
-        let is_live_ivf = !handle.stale && matches!(handle.index, CollectionIndex::Ivf(Some(_)));
-        if is_live_ivf {
-            if let Some(&internal) = handle.ext_to_int.get(id) {
+        // A built IVF removes in place (ADR-0023) and a built HNSW soft-deletes
+        // (ADR-0026); other kinds defer to a rebuild. The id->internal mapping is
+        // kept so a later re-insert reuses the slot — a removed or soft-deleted
+        // internal is simply never returned by the index.
+        let internal = handle.ext_to_int.get(id).copied();
+        let live_ivf = !handle.stale && matches!(handle.index, CollectionIndex::Ivf(Some(_)));
+        let live_hnsw = !handle.stale && matches!(handle.index, CollectionIndex::Hnsw(_));
+        match internal {
+            Some(internal) if live_ivf => {
                 if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
                     ivf.remove(internal);
                 }
-            } else {
-                handle.stale = true;
             }
-        } else {
-            handle.stale = true;
+            Some(internal) if live_hnsw => {
+                let mut crowded = false;
+                if let CollectionIndex::Hnsw(h) = &mut handle.index {
+                    h.mark_deleted(internal as u32);
+                    crowded = h.deleted_fraction() >= HNSW_REBUILD_DELETED_FRACTION;
+                }
+                if crowded {
+                    handle.stale = true;
+                }
+            }
+            _ => handle.stale = true,
         }
         Ok(true)
     }
