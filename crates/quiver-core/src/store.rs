@@ -47,9 +47,11 @@ use crate::descriptor::Descriptor;
 use crate::error::{CoreError, Result};
 use crate::ids::{CollectionId, Lsn};
 use crate::keyring::{KeyRing, SingleCodecKeyRing};
-use crate::manifest::{self, CollectionEntry, MANIFEST_FORMAT_VERSION, Manifest, SegmentRef};
-use crate::page::PageCodec;
-use crate::paged::fsync_dir;
+use crate::manifest::{
+    self, CollectionEntry, IndexSnapshotRef, MANIFEST_FORMAT_VERSION, Manifest, SegmentRef,
+};
+use crate::page::{PageCodec, PageType};
+use crate::paged::{fsync_dir, read_paged, write_paged};
 use crate::sec::{self, SecPredicate};
 use crate::segment::{self, SealRow, SealedSegment};
 use crate::wal::{self, WalEntry, WalOp, WalWriter};
@@ -109,6 +111,9 @@ struct CollectionState {
     // Sealed-segment rows that died this window (deleted or shadowed), keyed by
     // segment index; merged into each segment's `.del` at the next checkpoint.
     dead_this_window: BTreeMap<u32, RoaringBitmap>,
+    // The durable index snapshot reference (ADR-0025): loaded from the manifest on
+    // open, refreshed at each checkpoint; `None` if the index is rebuilt on open.
+    index_snapshot: Option<IndexSnapshotRef>,
 }
 
 impl CollectionState {
@@ -131,6 +136,7 @@ impl CollectionState {
             active: Vec::new(),
             active_index: BTreeMap::new(),
             dead_this_window: BTreeMap::new(),
+            index_snapshot: None,
         }
     }
 
@@ -232,6 +238,7 @@ impl Store {
             let codec = keyring.collection_codec(entry.id)?;
             let mut state = CollectionState::new(entry.id, entry.name.clone(), descriptor, codec);
             state.segments_meta = entry.segments.clone();
+            state.index_snapshot = entry.index_snapshot.clone();
             let seg_dir = segments_dir(dir, entry.id);
             for seg in &entry.segments {
                 let sealed = segment::open_segment(&seg_dir, seg.id, state.codec.as_ref())?;
@@ -277,8 +284,10 @@ impl Store {
         let next_lsn = max_lsn.next();
 
         // 4. GC orphan segment files not referenced by the manifest (a crash
-        //    between a segment flush and the manifest swap).
+        //    between a segment flush and the manifest swap), then the analogous
+        //    orphan/superseded index snapshots (ADR-0025).
         gc_orphan_segments(dir, &mfst, keyring.as_ref())?;
+        gc_orphan_index_snapshots(dir, &mfst)?;
 
         // 5. Start a fresh WAL segment for new appends, then drop superseded WAL
         //    files (empty or fully below the checkpoint).
@@ -553,6 +562,29 @@ impl Store {
         collection_dir(&self.dir, collection).join("index")
     }
 
+    /// Read and decrypt the current durable index snapshot for a collection, if
+    /// one is referenced by the manifest (ADR-0025). Returns the opaque blob the
+    /// index layer wrote at the last checkpoint, or `None` if the index must be
+    /// rebuilt (no snapshot, or a store written before v2).
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`] if the collection is unknown, or an I/O / decrypt /
+    /// page-integrity error reading the snapshot file.
+    pub fn read_index_snapshot(&self, collection: CollectionId) -> Result<Option<Vec<u8>>> {
+        let state = self
+            .collections
+            .get(&collection)
+            .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
+        let Some(snap) = &state.index_snapshot else {
+            return Ok(None);
+        };
+        let path = self
+            .index_dir(collection)
+            .join(index_snapshot_file_name(snap.id));
+        let body = read_paged(&path, state.codec.as_ref(), PageType::IndexBlock)?;
+        Ok(Some(body))
+    }
+
     /// The number of live rows in a collection.
     pub fn len(&self, collection: CollectionId) -> Result<usize> {
         Ok(self
@@ -644,7 +676,24 @@ impl Store {
     /// segments, install a new manifest atomically, rotate the WAL, and reclaim
     /// superseded files. A no-op if nothing has changed since the last
     /// checkpoint. Crash-safe at every step (see the module docs).
+    ///
+    /// Equivalent to [`Store::checkpoint_with_index_snapshots`] with no index
+    /// snapshots (any existing snapshot references are cleared).
     pub fn checkpoint(&mut self) -> Result<()> {
+        self.checkpoint_with_index_snapshots(&HashMap::new())
+    }
+
+    /// Like [`Store::checkpoint`], but also durably captures the supplied
+    /// per-collection index snapshots (ADR-0025): each opaque blob is sealed with
+    /// its collection's codec, fsync'd, and referenced by the same atomic manifest
+    /// swap that publishes the segments — so the `(segments, index)` pair is
+    /// consistent at one LSN. The map is the *complete* set for this checkpoint; a
+    /// collection absent from it has any existing snapshot cleared, so a
+    /// referenced snapshot's LSN always equals the new checkpoint's LSN.
+    pub fn checkpoint_with_index_snapshots(
+        &mut self,
+        index_snapshots: &HashMap<CollectionId, Vec<u8>>,
+    ) -> Result<()> {
         let last_lsn = Lsn(self.next_lsn.value().saturating_sub(1));
         if last_lsn.value() <= self.last_checkpointed_lsn.value() {
             return Ok(()); // nothing new since the last checkpoint
@@ -652,6 +701,7 @@ impl Store {
         let mut cids: Vec<CollectionId> = self.collections.keys().copied().collect();
         cids.sort();
         let segment_lsn_low = self.last_checkpointed_lsn.next();
+        let new_version = self.manifest_version + 1;
 
         // Phase A: for each collection with pending changes, persist the window's
         // dead rows into the affected segments' `.del` bitmaps, seal the active
@@ -735,8 +785,38 @@ impl Store {
             }
         }
 
+        // Phase A2: persist the supplied index snapshots (ADR-0025), each sealed
+        // with its collection's codec and fsync'd, so the manifest swap can
+        // reference a durable file. The snapshot file id is the new manifest
+        // version, unique per checkpoint.
+        let mut new_index_refs: HashMap<CollectionId, IndexSnapshotRef> = HashMap::new();
+        for &cid in &cids {
+            let Some(blob) = index_snapshots.get(&cid) else {
+                continue;
+            };
+            let index_dir = self.index_dir(cid);
+            fs::create_dir_all(&index_dir).map_err(|e| CoreError::io(&index_dir, e))?;
+            let codec = self.collections[&cid].codec.clone_box();
+            let path = index_dir.join(index_snapshot_file_name(new_version));
+            write_paged(
+                &path,
+                codec.as_ref(),
+                PageType::IndexBlock,
+                new_version,
+                blob,
+            )?;
+            fsync_dir(&index_dir)?;
+            fsync_dir(&collection_dir(&self.dir, cid))?;
+            new_index_refs.insert(
+                cid,
+                IndexSnapshotRef {
+                    id: new_version,
+                    lsn: last_lsn,
+                },
+            );
+        }
+
         // Phase B: build and atomically install the new manifest.
-        let new_version = self.manifest_version + 1;
         let mut entries = Vec::with_capacity(cids.len());
         for &cid in &cids {
             let state = &self.collections[&cid];
@@ -749,6 +829,7 @@ impl Store {
                 name: state.name.clone(),
                 descriptor: postcard::to_allocvec(&state.descriptor)?,
                 segments: segs,
+                index_snapshot: new_index_refs.get(&cid).cloned(),
             });
         }
         let new_manifest = Manifest {
@@ -793,9 +874,11 @@ impl Store {
             }
             state.active.clear();
             state.active_index.clear();
+            state.index_snapshot = new_index_refs.get(&cid).cloned();
         }
         self.rotate_wal()?;
         gc_orphan_segments(&self.dir, &new_manifest, self.keyring.as_ref())?;
+        gc_orphan_index_snapshots(&self.dir, &new_manifest)?;
         self.auto_compact()?;
         Ok(())
     }
@@ -955,6 +1038,7 @@ impl Store {
                 name: state.name.clone(),
                 descriptor: postcard::to_allocvec(&state.descriptor)?,
                 segments: segs,
+                index_snapshot: state.index_snapshot.clone(),
             });
         }
         let new_manifest = Manifest {
@@ -987,6 +1071,7 @@ impl Store {
             }
         }
         gc_orphan_segments(&self.dir, &new_manifest, self.keyring.as_ref())?;
+        gc_orphan_index_snapshots(&self.dir, &new_manifest)?;
         Ok(())
     }
 
@@ -1126,6 +1211,34 @@ fn gc_orphan_segments(dir: &Path, mfst: &Manifest, keyring: &dyn KeyRing) -> Res
     Ok(())
 }
 
+// Delete stale or orphaned index snapshot files (`idx-*`) that a live
+// collection's manifest entry no longer references — a superseded snapshot, or
+// one written by a checkpoint that crashed before its manifest swap (ADR-0025).
+// Non-snapshot index artifacts (e.g. the disk graph) are left untouched; dropped
+// collections are reclaimed wholesale by `gc_orphan_segments`.
+fn gc_orphan_index_snapshots(dir: &Path, mfst: &Manifest) -> Result<()> {
+    for c in &mfst.collections {
+        let index_dir = collection_dir(dir, c.id).join("index");
+        if !index_dir.is_dir() {
+            continue;
+        }
+        let keep = c.index_snapshot.as_ref().map(|r| r.id);
+        for entry in fs::read_dir(&index_dir).map_err(|e| CoreError::io(&index_dir, e))? {
+            let entry = entry.map_err(|e| CoreError::io(&index_dir, e))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(id) = index_snapshot_id_of_file(&name) else {
+                continue; // not a snapshot file
+            };
+            if Some(id) != keep {
+                remove_file_if_present(&entry.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn remove_file_if_present(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -1140,6 +1253,19 @@ fn collection_dir(dir: &Path, cid: CollectionId) -> PathBuf {
 
 fn segments_dir(dir: &Path, cid: CollectionId) -> PathBuf {
     collection_dir(dir, cid).join("segments")
+}
+
+// Name of a collection's index snapshot file for snapshot id `id` (ADR-0025);
+// zero-padded so lexical order matches numeric order.
+fn index_snapshot_file_name(id: u64) -> String {
+    format!("idx-{id:010}")
+}
+
+// Parse a snapshot id from an `idx-NNNNNNNNNN` file name, or `None` for any other
+// file (so non-snapshot index artifacts are ignored by snapshot GC).
+fn index_snapshot_id_of_file(name: &str) -> Option<u64> {
+    name.strip_prefix("idx-")
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 fn wal_file_path(wal_dir: &Path, seq: u64) -> PathBuf {
@@ -1709,5 +1835,119 @@ mod tests {
         let s = open(tmp.path());
         let c = s.collection_id("c").unwrap();
         assert_eq!(s.matching_ids(c, &paris()).unwrap(), ["d", "e"]);
+    }
+
+    // ----- durable index snapshots (ADR-0025) -----
+
+    // The `idx-*` snapshot files currently on disk for a collection, sorted.
+    fn index_snapshot_files(dir: &Path, cid: CollectionId) -> Vec<String> {
+        let idx = collection_dir(dir, cid).join("index");
+        let mut names: Vec<String> = fs::read_dir(&idx)
+            .map(|rd| {
+                rd.filter_map(std::result::Result::ok)
+                    .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+                    .filter(|n| n.starts_with("idx-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn index_snapshot_round_trips_through_checkpoint_and_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob = b"opaque-index-bytes".to_vec();
+        let cid = {
+            let mut s = open(tmp.path());
+            let c = s.create_collection("c", desc()).unwrap();
+            s.upsert(c, "a", &[1.0, 2.0, 3.0, 4.0], b"{}").unwrap();
+            s.checkpoint_with_index_snapshots(&HashMap::from([(c, blob.clone())]))
+                .unwrap();
+            // Available immediately, exactly one snapshot file on disk.
+            assert_eq!(s.read_index_snapshot(c).unwrap(), Some(blob.clone()));
+            assert_eq!(index_snapshot_files(tmp.path(), c).len(), 1);
+            c
+        };
+        // Survives reopen, loaded via the manifest reference.
+        let s = open(tmp.path());
+        assert_eq!(s.read_index_snapshot(cid).unwrap(), Some(blob));
+    }
+
+    #[test]
+    fn checkpoint_without_a_snapshot_clears_and_reclaims_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = open(tmp.path());
+        let c = s.create_collection("c", desc()).unwrap();
+        s.upsert(c, "a", &[1.0, 2.0, 3.0, 4.0], b"{}").unwrap();
+        s.checkpoint_with_index_snapshots(&HashMap::from([(c, b"blob".to_vec())]))
+            .unwrap();
+        assert!(s.read_index_snapshot(c).unwrap().is_some());
+
+        // A later plain checkpoint (with new data) carries no snapshot → cleared.
+        s.upsert(c, "b", &[5.0, 6.0, 7.0, 8.0], b"{}").unwrap();
+        s.checkpoint().unwrap();
+        assert_eq!(s.read_index_snapshot(c).unwrap(), None);
+        assert!(index_snapshot_files(tmp.path(), c).is_empty());
+
+        let s = open(tmp.path());
+        assert_eq!(s.read_index_snapshot(c).unwrap(), None);
+    }
+
+    #[test]
+    fn a_new_snapshot_supersedes_and_reclaims_the_old_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = open(tmp.path());
+        let c = s.create_collection("c", desc()).unwrap();
+        s.upsert(c, "a", &[1.0, 2.0, 3.0, 4.0], b"{}").unwrap();
+        s.checkpoint_with_index_snapshots(&HashMap::from([(c, b"first".to_vec())]))
+            .unwrap();
+        s.upsert(c, "b", &[5.0, 6.0, 7.0, 8.0], b"{}").unwrap();
+        s.checkpoint_with_index_snapshots(&HashMap::from([(c, b"second".to_vec())]))
+            .unwrap();
+
+        assert_eq!(s.read_index_snapshot(c).unwrap(), Some(b"second".to_vec()));
+        assert_eq!(index_snapshot_files(tmp.path(), c).len(), 1);
+    }
+
+    #[test]
+    fn compaction_preserves_the_index_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = open(tmp.path());
+        let c = s.create_collection("c", desc()).unwrap();
+        s.upsert(c, "a", &[1.0, 2.0, 3.0, 4.0], b"{}").unwrap();
+        s.checkpoint_with_index_snapshots(&HashMap::from([(c, b"keep".to_vec())]))
+            .unwrap();
+        // More changes, then re-snapshot at the new floor and compact.
+        s.upsert(c, "b", &[5.0, 6.0, 7.0, 8.0], b"{}").unwrap();
+        s.delete(c, "a").unwrap();
+        s.checkpoint_with_index_snapshots(&HashMap::from([(c, b"keep".to_vec())]))
+            .unwrap();
+        s.compact().unwrap();
+        assert_eq!(s.read_index_snapshot(c).unwrap(), Some(b"keep".to_vec()));
+
+        let s = open(tmp.path());
+        assert_eq!(s.read_index_snapshot(c).unwrap(), Some(b"keep".to_vec()));
+    }
+
+    #[test]
+    fn orphan_index_snapshot_is_reclaimed_on_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cid = {
+            let mut s = open(tmp.path());
+            let c = s.create_collection("c", desc()).unwrap();
+            s.upsert(c, "a", &[1.0, 2.0, 3.0, 4.0], b"{}").unwrap();
+            s.checkpoint_with_index_snapshots(&HashMap::from([(c, b"live".to_vec())]))
+                .unwrap();
+            // Simulate a checkpoint that wrote a snapshot file but crashed before
+            // the manifest swap: an unreferenced idx-* in the index dir.
+            let stray = s.index_dir(c).join("idx-9999999999");
+            fs::write(&stray, b"orphan").unwrap();
+            c
+        };
+        let s = open(tmp.path());
+        // Recovery reclaims the orphan but keeps the referenced snapshot.
+        assert!(!s.index_dir(cid).join("idx-9999999999").exists());
+        assert_eq!(s.read_index_snapshot(cid).unwrap(), Some(b"live".to_vec()));
     }
 }
