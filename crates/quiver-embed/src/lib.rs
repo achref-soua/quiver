@@ -16,18 +16,26 @@
 //! indexes suit bulk-load-then-query. In-place incremental update for the disk
 //! graph is Phase 4 (SpFresh).
 //!
+//! ## Filtered (hybrid) search
+//! A search may carry a [`quiver_query::Filter`] over the payload. The planner
+//! decomposes it into the predicates the collection's secondary indexes can
+//! answer; when those narrow the query to a small candidate set it scans that
+//! set exactly (perfect recall, no filtered-ANN cliff), and otherwise it
+//! over-fetches from the ANN index and post-filters. Both arms re-check the full
+//! filter, so results are exact regardless of which path runs.
+//!
 //! ## Concurrency (Phase 1)
 //! Single-writer: every operation takes `&mut self` (a search may rebuild a
 //! stale index). A server serializes access behind a lock; the lock-free MVCC
 //! snapshot model (ADR-0006) arrives with Phase 2.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
-use quiver_core::{CollectionId, Store};
+use quiver_core::{CollectionId, FieldType, FilterableField, SecPredicate, SecValue, Store};
 use quiver_index::{
     DiskSearchParams, DiskVamana, Hnsw, HnswConfig, Index, Ivf, IvfConfig, Metric, Neighbor,
-    ProductQuantizer, Vamana, VamanaConfig,
+    ProductQuantizer, Vamana, VamanaConfig, ordering_distance, report_metric,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -82,7 +90,10 @@ pub struct Match {
 pub struct SearchParams {
     /// Number of results to return.
     pub k: usize,
-    /// Optional payload predicate (post-filtered in Phase 1).
+    /// Optional payload predicate. The planner pre-filters through the
+    /// collection's secondary indexes when the filter is selective enough, and
+    /// otherwise post-filters the ANN candidates; either way the full predicate
+    /// is re-checked, so results are exact.
     pub filter: Option<Filter>,
     /// Search beam width (recall/latency knob), clamped up to at least `k`.
     pub ef_search: usize,
@@ -107,6 +118,15 @@ impl Default for SearchParams {
 // How many extra candidates to pull before post-filtering, so a filtered query
 // still has enough survivors to fill `k`.
 const FILTER_OVERFETCH: usize = 8;
+
+// Selectivity threshold for the hybrid planner. When a payload filter decomposes
+// into secondary-index predicates that narrow a query to at most this many live
+// candidate rows, those rows are scanned exactly (brute force) instead of going
+// through the ANN index. Below this size an exact scan is both cheaper and
+// higher-recall than filtered ANN, which can return too few results when the
+// filter is very selective (the "filtered-search recall cliff"). Qdrant calls
+// the equivalent knob its full-scan threshold.
+const FULL_SCAN_THRESHOLD: usize = 10_000;
 
 // The vector index backing one collection. HNSW is incremental; Vamana and IVF
 // are batch-built from the store (the `Option` is `None` until first build), so
@@ -320,6 +340,29 @@ impl Database {
         }
 
         let handle = self.handle(collection)?;
+
+        // Hybrid planning: if the filter narrows to a small, secondary-indexed
+        // candidate set, scan those rows exactly instead of post-filtering ANN
+        // hits — exact, and immune to the filtered-ANN recall cliff.
+        if let Some(filter) = &params.filter
+            && let Some(candidates) = candidate_ids(
+                &self.store,
+                handle.id,
+                filter,
+                &handle.descriptor.filterable,
+            )?
+            && candidates.len() <= FULL_SCAN_THRESHOLD
+        {
+            return self.exact_filtered_search(
+                handle.id,
+                &handle.descriptor,
+                query,
+                params,
+                filter,
+                &candidates,
+            );
+        }
+
         let fetch = if params.filter.is_some() {
             params
                 .k
@@ -372,6 +415,45 @@ impl Database {
             });
         }
         Ok(out)
+    }
+
+    // Exactly score `candidates` (a superset of the filter's matches that the
+    // secondary indexes produced) against the query, re-check the full filter
+    // for correctness, and return the top `k`. The pre-filter arm of the hybrid
+    // planner: perfect recall over an already-narrowed set.
+    fn exact_filtered_search(
+        &self,
+        cid: CollectionId,
+        descriptor: &Descriptor,
+        query: &[f32],
+        params: &SearchParams,
+        filter: &Filter,
+        candidates: &BTreeSet<String>,
+    ) -> Result<Vec<Match>> {
+        let metric = to_index_metric(descriptor.metric);
+        let mut scored: Vec<(f32, String, Value, Vec<f32>)> = Vec::new();
+        for ext_id in candidates {
+            let Some(record) = self.store.get(cid, ext_id)? else {
+                continue;
+            };
+            let payload: Value = serde_json::from_slice(&record.payload)?;
+            if !filter.matches(&payload) {
+                continue;
+            }
+            let ordering = ordering_distance(metric, query, &record.vector);
+            scored.push((ordering, ext_id.clone(), payload, record.vector));
+        }
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        scored.truncate(params.k);
+        Ok(scored
+            .into_iter()
+            .map(|(ordering, id, payload, vector)| Match {
+                id,
+                score: report_metric(metric, ordering),
+                payload: params.with_payload.then_some(payload),
+                vector: params.with_vector.then_some(vector),
+            })
+            .collect())
     }
 
     /// Flush a durable checkpoint of all collections.
@@ -527,6 +609,137 @@ fn rebuild_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
     handle.ext_to_int = ext_to_int;
     handle.stale = false;
     Ok(())
+}
+
+// The set of live external ids guaranteed to contain every row the `filter`
+// accepts (a sound superset), resolved through the collection's secondary
+// indexes. `None` means the filter cannot be narrowed with the available indexes
+// and the caller should post-filter instead; `Some(set)` is a candidate
+// superset, and an empty set proves no row can match.
+//
+// Only indexable leaves — equality, `in`, and range comparisons on declared
+// filterable fields of a matching type — constrain the set. Everything else
+// (negation, existence, `ne`, non-indexed fields, type mismatches) is treated as
+// unconstrained, which keeps the result a superset; exactness is restored when
+// the caller re-checks the full `Filter` on each surviving candidate.
+fn candidate_ids(
+    store: &Store,
+    cid: CollectionId,
+    filter: &Filter,
+    filterable: &[FilterableField],
+) -> Result<Option<BTreeSet<String>>> {
+    match filter {
+        Filter::And(subs) => {
+            // Intersect the constrained children; an unconstrained child (None)
+            // is dropped, which only widens the set — still a superset.
+            let mut acc: Option<BTreeSet<String>> = None;
+            for sub in subs {
+                if let Some(set) = candidate_ids(store, cid, sub, filterable)? {
+                    acc = Some(match acc {
+                        Some(existing) => existing.intersection(&set).cloned().collect(),
+                        None => set,
+                    });
+                }
+            }
+            Ok(acc)
+        }
+        Filter::Or(subs) => {
+            // The union of the children — but one unconstrained child makes the
+            // whole disjunction unconstrained (its rows could be anything).
+            let mut acc = BTreeSet::new();
+            for sub in subs {
+                match candidate_ids(store, cid, sub, filterable)? {
+                    Some(set) => acc.extend(set),
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(acc))
+        }
+        // A negation cannot be narrowed to a superset with these indexes.
+        Filter::Not(_) => Ok(None),
+        // A leaf: indexable ⇒ its matching ids; otherwise unconstrained.
+        leaf => match leaf_predicate(leaf, filterable) {
+            Some(pred) => Ok(Some(store.matching_ids(cid, &pred)?.into_iter().collect())),
+            None => Ok(None),
+        },
+    }
+}
+
+// Map a single filter leaf to an indexable secondary-index predicate, if its
+// field is declared filterable and the value types line up. Boolean nodes and
+// predicates the secondary index cannot answer (`Ne`, `Exists`) return `None`.
+fn leaf_predicate(filter: &Filter, filterable: &[FilterableField]) -> Option<SecPredicate> {
+    let field_type = |field: &str| {
+        filterable
+            .iter()
+            .find(|f| f.path == field)
+            .map(|f| f.field_type)
+    };
+    match filter {
+        Filter::Eq { field, value } => Some(SecPredicate::Eq {
+            field: field.clone(),
+            value: sec_value(field_type(field)?, value)?,
+        }),
+        Filter::In { field, values } => {
+            let ft = field_type(field)?;
+            // Every value must encode, or the `in` set would be understated and
+            // the candidate superset unsound.
+            let values: Option<Vec<SecValue>> = values.iter().map(|v| sec_value(ft, v)).collect();
+            Some(SecPredicate::In {
+                field: field.clone(),
+                values: values?,
+            })
+        }
+        Filter::Lt { field, value } => {
+            one_sided_range(field, field_type(field)?, value, false, false)
+        }
+        Filter::Lte { field, value } => {
+            one_sided_range(field, field_type(field)?, value, false, true)
+        }
+        Filter::Gt { field, value } => {
+            one_sided_range(field, field_type(field)?, value, true, false)
+        }
+        Filter::Gte { field, value } => {
+            one_sided_range(field, field_type(field)?, value, true, true)
+        }
+        _ => None,
+    }
+}
+
+// Build a one-sided range predicate from a comparison leaf. `is_lower` selects
+// whether `value` is the lower (`Gt`/`Gte`) or upper (`Lt`/`Lte`) bound;
+// `inclusive` is that bound's inclusivity. `None` on a type mismatch.
+fn one_sided_range(
+    field: &str,
+    field_type: FieldType,
+    value: &Value,
+    is_lower: bool,
+    inclusive: bool,
+) -> Option<SecPredicate> {
+    let v = sec_value(field_type, value)?;
+    let (lo, hi, lo_inclusive, hi_inclusive) = if is_lower {
+        (Some(v), None, inclusive, false)
+    } else {
+        (None, Some(v), false, inclusive)
+    };
+    Some(SecPredicate::Range {
+        field: field.to_owned(),
+        lo,
+        hi,
+        lo_inclusive,
+        hi_inclusive,
+    })
+}
+
+// Encode a filter value as a typed secondary-index value, or `None` when the
+// JSON type does not match the field's declared type (so it cannot be
+// pre-filtered and the planner falls back to post-filtering).
+fn sec_value(field_type: FieldType, value: &Value) -> Option<SecValue> {
+    match (field_type, value) {
+        (FieldType::Keyword, Value::String(s)) => Some(SecValue::Keyword(s.clone())),
+        (FieldType::Numeric, Value::Number(n)) => n.as_f64().map(SecValue::Numeric),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -821,5 +1034,253 @@ mod tests {
             .search("d", &[7.0, 0.0, 0.0, 0.0], &SearchParams::default())
             .unwrap();
         assert_eq!(res[0].id, "p7");
+    }
+
+    // ---- hybrid (pre-filtered) search ----
+
+    // A collection whose `city` (keyword) and `n` (numeric) payload fields are
+    // declared filterable, so the planner can pre-filter on them.
+    fn desc_filterable() -> Descriptor {
+        Descriptor::new(4, Dtype::F32, DistanceMetric::L2).with_filterable(vec![
+            FilterableField::keyword("city"),
+            FilterableField::numeric("n"),
+        ])
+    }
+
+    // 30 points on the x-axis (distance to the origin grows with i), cycling
+    // through three cities, each carrying its index as a numeric `n`.
+    // Checkpointed so the rows live in a sealed segment's secondary index — the
+    // pre-filter primitive — not only the active buffer.
+    fn seed_cities(db: &mut Database) {
+        const CITIES: [&str; 3] = ["paris", "lyon", "rome"];
+        db.create_collection("c", desc_filterable()).unwrap();
+        for i in 0..30u32 {
+            db.upsert(
+                "c",
+                &format!("p{i}"),
+                &[i as f32, 0.0, 0.0, 0.0],
+                &json!({"city": CITIES[i as usize % 3], "n": i}),
+            )
+            .unwrap();
+        }
+        db.checkpoint().unwrap();
+    }
+
+    #[test]
+    fn hybrid_equality_prefilter_is_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        seed_cities(&mut db);
+        let params = SearchParams {
+            k: 5,
+            filter: Some(Filter::Eq {
+                field: "city".into(),
+                value: json!("lyon"),
+            }),
+            ..SearchParams::default()
+        };
+        let res = db.search("c", &[0.0; 4], &params).unwrap();
+        assert!(!res.is_empty());
+        // lyon is i % 3 == 1 → p1, p4, p7, …; nearest the origin is p1.
+        assert_eq!(res[0].id, "p1");
+        for m in &res {
+            assert_eq!(m.payload.as_ref().unwrap()["city"], json!("lyon"));
+        }
+    }
+
+    #[test]
+    fn hybrid_numeric_range_prefilter_is_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        seed_cities(&mut db);
+        let params = SearchParams {
+            k: 4,
+            filter: Some(Filter::Gte {
+                field: "n".into(),
+                value: json!(10),
+            }),
+            ..SearchParams::default()
+        };
+        let res = db.search("c", &[0.0; 4], &params).unwrap();
+        // Among n >= 10, the nearest the origin is n == 10 (p10).
+        assert_eq!(res[0].id, "p10");
+        for m in &res {
+            assert!(m.payload.as_ref().unwrap()["n"].as_u64().unwrap() >= 10);
+        }
+    }
+
+    #[test]
+    fn hybrid_unsatisfiable_filter_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        seed_cities(&mut db);
+        // No row holds this city, so the pre-filter proves the result empty
+        // without touching the vector index.
+        let params = SearchParams {
+            filter: Some(Filter::Eq {
+                field: "city".into(),
+                value: json!("atlantis"),
+            }),
+            ..SearchParams::default()
+        };
+        assert!(db.search("c", &[0.0; 4], &params).unwrap().is_empty());
+    }
+
+    #[test]
+    fn hybrid_and_or_composition_is_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        seed_cities(&mut db);
+        // (city in {paris, rome}) AND (n < 12): a keyword `in` intersected with a
+        // numeric range, both pre-filterable.
+        let params = SearchParams {
+            k: 10,
+            filter: Some(Filter::And(vec![
+                Filter::In {
+                    field: "city".into(),
+                    values: vec![json!("paris"), json!("rome")],
+                },
+                Filter::Lt {
+                    field: "n".into(),
+                    value: json!(12),
+                },
+            ])),
+            ..SearchParams::default()
+        };
+        let res = db.search("c", &[0.0; 4], &params).unwrap();
+        // paris is i % 3 == 0 → the nearest qualifying point is p0.
+        assert_eq!(res[0].id, "p0");
+        for m in &res {
+            let payload = m.payload.as_ref().unwrap();
+            let city = payload["city"].as_str().unwrap();
+            assert!(city == "paris" || city == "rome");
+            assert!(payload["n"].as_u64().unwrap() < 12);
+        }
+    }
+
+    #[test]
+    fn hybrid_rechecks_non_indexable_clause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        seed_cities(&mut db);
+        // city is pre-filterable; the Not(…) clause is not, so it is re-checked
+        // exactly on the narrowed candidates — paris rows excluding p0.
+        let params = SearchParams {
+            k: 10,
+            filter: Some(Filter::And(vec![
+                Filter::Eq {
+                    field: "city".into(),
+                    value: json!("paris"),
+                },
+                Filter::Not(Box::new(Filter::Eq {
+                    field: "n".into(),
+                    value: json!(0),
+                })),
+            ])),
+            ..SearchParams::default()
+        };
+        let res = db.search("c", &[0.0; 4], &params).unwrap();
+        assert!(res.iter().all(|m| m.id != "p0"));
+        // The nearest paris point after p0 is p3.
+        assert_eq!(res[0].id, "p3");
+        for m in &res {
+            assert_eq!(m.payload.as_ref().unwrap()["city"], json!("paris"));
+        }
+    }
+
+    #[test]
+    fn post_filter_fallback_on_undeclared_field_is_correct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        // Only `city` is filterable; a filter on the undeclared `tier` cannot
+        // pre-filter and falls back to ANN post-filtering — still exact.
+        db.create_collection(
+            "c",
+            Descriptor::new(4, Dtype::F32, DistanceMetric::L2)
+                .with_filterable(vec![FilterableField::keyword("city")]),
+        )
+        .unwrap();
+        for i in 0..20u32 {
+            let tier = if i % 2 == 0 { "gold" } else { "silver" };
+            db.upsert(
+                "c",
+                &format!("p{i}"),
+                &[i as f32, 0.0, 0.0, 0.0],
+                &json!({"city": "paris", "tier": tier}),
+            )
+            .unwrap();
+        }
+        let params = SearchParams {
+            k: 5,
+            filter: Some(Filter::Eq {
+                field: "tier".into(),
+                value: json!("gold"),
+            }),
+            ..SearchParams::default()
+        };
+        let res = db.search("c", &[0.0; 4], &params).unwrap();
+        assert!(!res.is_empty());
+        for m in &res {
+            assert_eq!(m.payload.as_ref().unwrap()["tier"], json!("gold"));
+        }
+    }
+
+    #[test]
+    fn leaf_predicate_maps_only_indexable_filterable_leaves() {
+        let fields = vec![
+            FilterableField::keyword("city"),
+            FilterableField::numeric("n"),
+        ];
+        // Keyword equality on a filterable field maps.
+        assert_eq!(
+            leaf_predicate(
+                &Filter::Eq {
+                    field: "city".into(),
+                    value: json!("paris")
+                },
+                &fields
+            ),
+            Some(SecPredicate::Eq {
+                field: "city".into(),
+                value: SecValue::Keyword("paris".into())
+            })
+        );
+        // A numeric comparison maps to a one-sided range.
+        assert_eq!(
+            leaf_predicate(
+                &Filter::Gte {
+                    field: "n".into(),
+                    value: json!(3)
+                },
+                &fields
+            ),
+            Some(SecPredicate::Range {
+                field: "n".into(),
+                lo: Some(SecValue::Numeric(3.0)),
+                hi: None,
+                lo_inclusive: true,
+                hi_inclusive: false,
+            })
+        );
+        // Undeclared field, type mismatch, `ne`, and `exists` do not map.
+        let undeclared = Filter::Eq {
+            field: "tier".into(),
+            value: json!("gold"),
+        };
+        let mismatch = Filter::Eq {
+            field: "city".into(),
+            value: json!(5),
+        };
+        let ne = Filter::Ne {
+            field: "city".into(),
+            value: json!("x"),
+        };
+        let exists = Filter::Exists {
+            field: "city".into(),
+        };
+        assert!(leaf_predicate(&undeclared, &fields).is_none());
+        assert!(leaf_predicate(&mismatch, &fields).is_none());
+        assert!(leaf_predicate(&ne, &fields).is_none());
+        assert!(leaf_predicate(&exists, &fields).is_none());
     }
 }
