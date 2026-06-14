@@ -35,6 +35,27 @@ with Client("http://127.0.0.1:6333", api_key="your-api-key") as q:
 `create_collection` also takes `index` (`hnsw` | `vamana` | `disk_vamana` | `ivf`)
 and `pq_subspaces` to select the memory-frugal disk-resident path.
 
+## Client-side payload encryption
+
+Seal payload fields with a key Quiver never sees (install
+`quiver-client[encryption]`). The server stores and returns ciphertext it
+cannot read; keep fields server-filterable by leaving them in cleartext:
+
+```python
+from quiver import Client, Point
+from quiver.encryption import PayloadCipher
+
+cipher = PayloadCipher.from_hex("…64 hex chars…")   # a dedicated key, never the at-rest one
+with Client("http://127.0.0.1:6333", api_key="…") as q:
+    payload = {"tier": "gold", **cipher.seal({"ssn": "078-05-1120"})}  # tier stays filterable
+    q.upsert("people", [Point("p1", [0.1, 0.2, 0.3], payload)])
+    hit = q.get("people", "p1")
+    secret = cipher.open(hit.payload)               # -> {"ssn": "078-05-1120"}
+```
+
+The envelope (XChaCha20-Poly1305) matches the Rust reference and the TypeScript
+SDK byte-for-byte — see [client-side encryption](https://github.com/achref-soua/quiver/blob/main/docs/security/crypto.md#client-side-payload-encryption-adr-0012).
+
 ## LangChain
 
 A LangChain `VectorStore` adapter ships in `quiver.langchain` (install
