@@ -37,6 +37,7 @@ todo = "warn"
 quiver-core = { path = "crates/quiver-core", version = "0.3" }
 quiver-crypto = { path = "crates/quiver-crypto", version = "0.3" }
 quiver-embed = { path = "crates/quiver-embed", version = "0.3" }
+quiver-import = { path = "crates/quiver-import", version = "0.3" }
 quiver-index = { path = "crates/quiver-index", version = "0.3" }
 quiver-mcp = { path = "crates/quiver-mcp", version = "0.3" }
 quiver-proto = { path = "crates/quiver-proto", version = "0.3" }

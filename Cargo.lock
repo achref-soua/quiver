@@ -1979,6 +1979,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "quiver-import"
+version = "0.3.0"
+dependencies = [
+ "quiver-embed",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "quiver-index"
 version = "0.3.0"
 dependencies = [
