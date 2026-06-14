@@ -12,6 +12,7 @@ Example::
 """
 
 from .client import Client, CollectionInfo, FilterableField, Match, Point, QuiverError
+from .encryption import ENVELOPE_KEY, PayloadCipher, PayloadError, is_sealed
 
 __all__ = [
     "Client",
@@ -20,5 +21,9 @@ __all__ = [
     "CollectionInfo",
     "FilterableField",
     "QuiverError",
+    "PayloadCipher",
+    "PayloadError",
+    "is_sealed",
+    "ENVELOPE_KEY",
 ]
 __version__ = "0.2.0"
