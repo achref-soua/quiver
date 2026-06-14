@@ -1,18 +1,19 @@
 <div align="center">
 
-# Quiver
+<img src="./docs/assets/logo.svg" alt="Quiver" width="540">
 
 **The security-first vector database.** Client-side-encryptable, memory-frugal approximate-nearest-neighbour search that runs on a laptop — with a retro terminal cockpit.
 
 [![license](https://img.shields.io/github/license/achref-soua/quiver?color=blue)](./LICENSE)
 [![rust](https://img.shields.io/badge/rust-stable-orange)](./rust-toolchain.toml)
 [![CI](https://img.shields.io/badge/CI-manual%20dispatch-informational)](.github/workflows)
-[![status](https://img.shields.io/badge/status-alpha%20·%20phase%201-red)](./docs/roadmap.md)
+[![release](https://img.shields.io/github/v/release/achref-soua/quiver?color=FFB000&label=release)](https://github.com/achref-soua/quiver/releases)
+[![status](https://img.shields.io/badge/status-v0.1.0%20·%20phase%202-FFB000)](./docs/roadmap.md)
 [![stars](https://img.shields.io/github/stars/achref-soua/quiver?style=flat)](https://github.com/achref-soua/quiver/stargazers)
 
 </div>
 
-> **Status: alpha — Phase 1 in progress.** The design is complete and reviewed (see [`docs/`](./docs)); the engine is being implemented. The TUI cast and benchmark table land with `v0.1.0`. Every performance/memory claim in this README will be backed by a reproducible benchmark — until then, this section stays empty rather than guess.
+> **Status: `v0.1.0` released · Phase 2 (memory frugality) in progress.** Phase 1 shipped the single-node core — an encrypted, crash-safe storage engine, HNSW, SIMD kernels, REST/gRPC, the TUI, and the Python SDK. Phase 2 is building the memory-frugal serve path: the disk-resident DiskANN/Vamana index and quantization are in; the storage engine has been rewritten to the row-addressed on-disk format (stride-addressed vector columns, paged payload heaps, roaring tombstones, compaction, and secondary indexes). Every performance/memory claim in this README is backed by a reproducible benchmark on documented reference hardware — until those numbers are recorded, that table stays empty rather than guess.
 
 ## Why Quiver
 
@@ -24,6 +25,8 @@ Native-Rust vector databases already exist; Quiver is not trying to out-scale Mi
 
 We say plainly what we do **not** do: client-side encryption protects *payloads, not vectors*; billion-scale needs a server, while a laptop comfortably serves tens-to-hundreds of millions; there is no homomorphic search in core. See the honest [threat model](./docs/security/threat-model.md).
 
+> *The name.* A quiver holds arrows, and an arrow is a vector — apt for a database of them. And in mathematics a *quiver* is a directed graph, which is exactly what an HNSW or Vamana index is. The cockpit wears that identity in amber phosphor.
+
 ## Architecture
 
 A Cargo workspace: a from-scratch storage engine, index structures, SIMD distance kernels, and query planner, with a thin gRPC/REST shell and a TUI client. One binary runs the server, the cockpit, and the MCP server.
@@ -32,7 +35,7 @@ A Cargo workspace: a from-scratch storage engine, index structures, SIMD distanc
 
 ## Quickstart
 
-Published binaries and images arrive with `v0.1.0`. Today, build from source:
+Pre-built binaries and container images are on the roadmap; today, build from source:
 
 ```bash
 # prerequisites: rustup (stable), just (cargo install just), and uv
@@ -54,7 +57,7 @@ cargo run -p quiver-cli -- --help
 ```
 
 ```bash
-# coming with v0.1.0:
+# planned (build from source today):
 cargo install quiver-cli       # or: docker run ghcr.io/achref-soua/quiver
 quiver serve                   # gRPC + REST, encrypted by default
 quiver tui                     # the cockpit
