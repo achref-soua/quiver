@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="Quiver">
+  <title>Quiver</title>
+  <defs>
+    <!-- phosphor bloom -->
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2.1" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <!-- one arrow (a vector): shaft, head, and fletching, pointing up from the base -->
+    <g id="qa" stroke="#FFB000" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <line x1="0" y1="2" x2="0" y2="-60"/>
+      <path d="M -10 -47 L 0 -62 L 10 -47"/>
+      <path d="M -8 -2 L 0 -11 L 8 -2"/>
+    </g>
+  </defs>
+
+  <!-- a fan of three vectors rising from one origin: the quiver, and a k-NN spray -->
+  <g filter="url(#glow)">
+    <use href="#qa" transform="translate(60 92) rotate(-25) scale(0.92)" opacity="0.78"/>
+    <use href="#qa" transform="translate(60 92) rotate(22) scale(0.86)" opacity="0.78"/>
+    <use href="#qa" transform="translate(60 92) rotate(-2) scale(1.06)"/>
+    <!-- the quiver's rim / origin point -->
+    <ellipse cx="60" cy="93" rx="15" ry="4.6" fill="none" stroke="#FFB000" stroke-width="5"/>
+    <circle cx="60" cy="93" r="3.4" fill="#FFD166"/>
+  </g>
+</svg>
