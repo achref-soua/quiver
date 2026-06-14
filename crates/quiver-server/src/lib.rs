@@ -73,11 +73,22 @@ pub struct Config {
     /// allowed only with `insecure = true`.
     #[serde(default, deserialize_with = "auth::de_api_keys")]
     pub api_keys: Vec<ApiKey>,
-    /// Hex-encoded 256-bit key for encryption-at-rest (64 hex characters).
-    /// Required unless `insecure = true`; source it from the environment or a
-    /// secret store, never the committed config. `None` ⇒ data is stored
-    /// unencrypted (only valid in `insecure` mode).
+    /// Hex-encoded 256-bit **master key** for encryption-at-rest (64 hex
+    /// characters). It wraps per-collection data-encryption keys (ADR-0010).
+    /// Required unless `insecure = true` or [`master_key_file`] is set; source it
+    /// from the environment or a secret store, never the committed config. `None`
+    /// ⇒ data is stored unencrypted (only valid in `insecure` mode).
+    ///
+    /// [`master_key_file`]: Config::master_key_file
     pub encryption_key: Option<String>,
+    /// Path to a file holding the hex master key, as an alternative to
+    /// [`encryption_key`] (set exactly one). Lets the key arrive as a mounted
+    /// secret (Docker/Kubernetes) or a KMS-decrypted file rather than an
+    /// environment variable. It should be mode `0600`; a group/world-accessible
+    /// file is warned about at startup.
+    ///
+    /// [`encryption_key`]: Config::encryption_key
+    pub master_key_file: Option<PathBuf>,
     /// Path to the PEM-encoded TLS certificate chain. Must be set together with
     /// `tls_key`. Required for a non-loopback bind unless `insecure = true`.
     pub tls_cert: Option<PathBuf>,
@@ -109,6 +120,7 @@ impl Default for Config {
             grpc_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6334),
             api_keys: Vec::new(),
             encryption_key: None,
+            master_key_file: None,
             tls_cert: None,
             tls_key: None,
             tls_client_ca: None,
@@ -140,18 +152,21 @@ impl Config {
                     .to_owned(),
             ));
         }
-        if self.encryption_key.is_none() && !self.insecure {
+        // Resolve the master key from the env var or a key file (exactly one).
+        let master_key = self.master_key_hex()?;
+        if master_key.is_none() && !self.insecure {
             return Err(Error::Config(
-                "no encryption_key configured: encryption-at-rest is on by default — \
-                 set QUIVER_ENCRYPTION_KEY to a 64-hex-character (256-bit) key, or set \
-                 insecure=true to store data unencrypted (development only)"
+                "no encryption key configured: encryption-at-rest is on by default — \
+                 set QUIVER_ENCRYPTION_KEY to a 64-hex-character (256-bit) key (or \
+                 QUIVER_MASTER_KEY_FILE to a file holding it), or set insecure=true to \
+                 store data unencrypted (development only)"
                     .to_owned(),
             ));
         }
         // Fail fast on a malformed key rather than at first write.
-        if let Some(key) = &self.encryption_key {
+        if let Some(key) = &master_key {
             AeadCodec::from_hex(key)
-                .map_err(|e| Error::Config(format!("invalid encryption_key: {e}")))?;
+                .map_err(|e| Error::Config(format!("invalid master key: {e}")))?;
         }
         // TLS certificate and key are set together or not at all.
         if self.tls_cert.is_some() != self.tls_key.is_some() {
@@ -176,7 +191,59 @@ impl Config {
         }
         Ok(())
     }
+
+    /// The effective hex master key: from [`master_key_file`] when set (read and
+    /// trimmed), otherwise [`encryption_key`]. `None` means no key is configured
+    /// (only valid with `insecure`).
+    ///
+    /// # Errors
+    /// [`Error::Config`] if both sources are set, or the key file cannot be read.
+    ///
+    /// [`master_key_file`]: Config::master_key_file
+    /// [`encryption_key`]: Config::encryption_key
+    pub(crate) fn master_key_hex(&self) -> Result<Option<String>, Error> {
+        let env_key = self
+            .encryption_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty());
+        match (&self.master_key_file, env_key) {
+            (Some(_), Some(_)) => Err(Error::Config(
+                "set either encryption_key (QUIVER_ENCRYPTION_KEY) or master_key_file \
+                 (QUIVER_MASTER_KEY_FILE), not both"
+                    .to_owned(),
+            )),
+            (Some(path), None) => {
+                warn_if_world_readable(path);
+                let hex = std::fs::read_to_string(path).map_err(|e| {
+                    Error::Config(format!("reading master_key_file {}: {e}", path.display()))
+                })?;
+                Ok(Some(hex.trim().to_owned()))
+            }
+            (None, Some(key)) => Ok(Some(key.to_owned())),
+            (None, None) => Ok(None),
+        }
+    }
 }
+
+// Warn (don't fail — Docker/Kubernetes secrets often mount group/world-readable)
+// when a master-key file is more permissive than `0600`.
+#[cfg(unix)]
+fn warn_if_world_readable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.permissions().mode() & 0o077 != 0
+    {
+        tracing::warn!(
+            path = %path.display(),
+            mode = format!("{:o}", meta.permissions().mode() & 0o777),
+            "master key file is group/world-accessible; restrict it to 0600"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_world_readable(_path: &std::path::Path) {}
 
 /// Shared server state: the engine behind a single-writer lock, the accepted
 /// API keys with their RBAC scopes, and the audit log.
@@ -576,10 +643,10 @@ async fn shutdown_signal() {
 // crypto-shreds it. With no key (only valid in `insecure` mode, enforced by
 // `Config::validate`) the engine is opened in plaintext.
 fn open_database(config: &Config) -> Result<Database, Error> {
-    match &config.encryption_key {
+    match config.master_key_hex()? {
         Some(key) => {
-            let keyring = EnvelopeKeyRing::from_hex(key, &config.data_dir)
-                .map_err(|e| Error::Config(format!("invalid encryption_key: {e}")))?;
+            let keyring = EnvelopeKeyRing::from_hex(&key, &config.data_dir)
+                .map_err(|e| Error::Config(format!("invalid master key: {e}")))?;
             Ok(Database::open_with_keyring(
                 &config.data_dir,
                 Box::new(keyring),
@@ -727,6 +794,32 @@ mod tests {
         config.insecure = true;
         config.encryption_key = None;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn master_key_file_is_an_alternative_to_the_env_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("master.key");
+        // A trailing newline (as editors and `echo` add) is trimmed off.
+        std::fs::write(&path, format!("{TEST_KEY}\n")).unwrap();
+
+        let mut config = Config {
+            api_keys: vec!["secret".into()],
+            master_key_file: Some(path.clone()),
+            ..Config::default()
+        };
+        // The file alone satisfies encryption-at-rest and resolves to the key.
+        assert!(config.validate().is_ok());
+        assert_eq!(config.master_key_hex().unwrap().as_deref(), Some(TEST_KEY));
+
+        // Setting both the env key and a file is rejected as ambiguous.
+        config.encryption_key = Some(TEST_KEY.to_owned());
+        assert!(config.validate().is_err());
+
+        // A file holding malformed hex is rejected up front.
+        config.encryption_key = None;
+        std::fs::write(&path, "not-a-valid-key").unwrap();
+        assert!(config.validate().is_err());
     }
 
     #[test]

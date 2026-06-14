@@ -35,6 +35,7 @@ The selection is automatic by default and overridable by config/compliance polic
 ## Secrets handling
 
 - Secrets (MK, KMS creds, TLS keys) come from env/KMS/files with strict modes — **never** committed, **never** logged, **never** in the config file in plaintext (the config references a secret *source*).
+- **Master key source (shipped):** the MK is `QUIVER_ENCRYPTION_KEY` (hex) **or** `QUIVER_MASTER_KEY_FILE` (a `0600` file holding the hex), exactly one of the two. The file form suits a mounted Docker/Kubernetes secret or a KMS-decrypted file; a group/world-readable key file is warned about at startup. A built-in KMS client is a future decrypt-to-file step in front of this. The MK never touches disk via Quiver, and plaintext DEKs in memory are wrapped in `zeroize`-ing types.
 - `gitleaks` runs pre-commit and in CI; `.env.example` documents every variable; key material in memory is wrapped in `zeroize`-ing types.
 
 ## Crypto-shredding

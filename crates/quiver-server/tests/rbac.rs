@@ -73,6 +73,7 @@ async fn scoped_keys_deny_over_scope_and_cross_namespace() {
         tls_cert: None,
         tls_key: None,
         tls_client_ca: None,
+        master_key_file: None,
         audit_log: None,
         insecure: false,
     };

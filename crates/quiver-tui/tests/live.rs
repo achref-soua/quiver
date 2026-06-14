@@ -31,6 +31,7 @@ async fn cockpit_reads_live_server_snapshot() {
         tls_cert: None,
         tls_key: None,
         tls_client_ca: None,
+        master_key_file: None,
         audit_log: None,
         insecure: true,
     };
