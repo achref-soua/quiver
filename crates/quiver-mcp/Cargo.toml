@@ -9,7 +9,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-quiver-core = { workspace = true }
 quiver-crypto = { workspace = true }
 quiver-embed = { workspace = true }
 

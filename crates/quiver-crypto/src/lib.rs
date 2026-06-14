@@ -25,6 +25,10 @@
 //! # }
 //! ```
 
+use std::path::Path;
+
+use quiver_core::KeyRing;
+
 mod codec;
 pub mod envelope;
 pub mod payload;
@@ -45,4 +49,83 @@ pub enum CryptoError {
     /// non-hex character). The message never echoes the key material.
     #[error("invalid encryption key: {0}")]
     InvalidKey(String),
+
+    /// Encryption-at-rest is required (the process is not running insecure) but
+    /// no master key was supplied.
+    #[error(
+        "no encryption key set: encryption-at-rest is on by default — set \
+         QUIVER_ENCRYPTION_KEY (or QUIVER_MASTER_KEY_FILE), or run insecure"
+    )]
+    KeyRequired,
+}
+
+/// Resolve the at-rest key-ring for a database at `data_dir` from an optional
+/// hex master key, applying Quiver's secure-by-default posture (ADR-0010,
+/// ADR-0013) uniformly across the network server, the MCP server, and the CLI:
+///
+/// - `Some(key)` ⇒ an [`EnvelopeKeyRing`] master key — each collection gets its
+///   own wrapped data-encryption key;
+/// - `None` with `insecure` ⇒ `Ok(None)`: the caller opens the store in
+///   plaintext;
+/// - `None` without `insecure` ⇒ [`CryptoError::KeyRequired`].
+///
+/// Every Quiver entrypoint opens through this one function, so a data directory
+/// written by one is byte-for-byte readable by another.
+///
+/// # Errors
+/// [`CryptoError::InvalidKey`] if `master_key` is malformed or the keys
+/// directory cannot be prepared; [`CryptoError::KeyRequired`] if no key is
+/// supplied outside insecure mode.
+pub fn open_keyring(
+    data_dir: &Path,
+    master_key: Option<&str>,
+    insecure: bool,
+) -> Result<Option<Box<dyn KeyRing>>, CryptoError> {
+    match master_key {
+        Some(key) => {
+            let keyring: Box<dyn KeyRing> = Box::new(EnvelopeKeyRing::from_hex(key, data_dir)?);
+            Ok(Some(keyring))
+        }
+        None if insecure => Ok(None),
+        None => Err(CryptoError::KeyRequired),
+    }
+}
+
+#[cfg(test)]
+mod open_keyring_tests {
+    use super::*;
+
+    const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    #[test]
+    fn a_master_key_yields_a_keyring() {
+        let dir = tempfile::tempdir().unwrap();
+        let kr = open_keyring(dir.path(), Some(KEY), false).unwrap();
+        assert!(kr.is_some(), "a key should produce a key-ring");
+    }
+
+    #[test]
+    fn no_key_in_insecure_mode_is_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let kr = open_keyring(dir.path(), None, true).unwrap();
+        assert!(kr.is_none(), "insecure + no key should open in plaintext");
+    }
+
+    #[test]
+    fn no_key_outside_insecure_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            open_keyring(dir.path(), None, false),
+            Err(CryptoError::KeyRequired)
+        ));
+    }
+
+    #[test]
+    fn a_malformed_key_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            open_keyring(dir.path(), Some("not-hex"), false),
+            Err(CryptoError::InvalidKey(_))
+        ));
+    }
 }
