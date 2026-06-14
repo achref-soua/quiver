@@ -19,7 +19,7 @@ mod vamana;
 
 pub use disk::{DiskError, DiskSearchParams, DiskVamana};
 pub use hnsw::{Hnsw, HnswConfig};
-pub use ivf::{Ivf, IvfConfig};
+pub use ivf::{Ivf, IvfConfig, SnapshotError};
 pub use quant::{BinaryQuantizer, CodeScorer, ProductQuantizer, Quantizer, ScalarQuantizer};
 pub use quiver_simd::Metric;
 pub use score::{ordering_distance, report_metric};
