@@ -20,7 +20,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use tonic::transport::{Certificate, Channel, ClientTlsConfig};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 
 const TEST_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
@@ -37,6 +37,35 @@ fn auth_request<T>(key: &str, message: T) -> tonic::Request<T> {
 fn self_signed() -> (String, String) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     (cert.cert.pem(), cert.signing_key.serialize_pem())
+}
+
+// A CA plus a CA-signed server certificate (for localhost) and a CA-signed
+// client certificate, for exercising mutual TLS. Returns
+// (ca_pem, server_cert_pem, server_key_pem, client_cert_pem, client_key_pem).
+fn ca_signed_chain() -> (String, String, String, String, String) {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let server_key = KeyPair::generate().unwrap();
+    let server_params = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+    let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+
+    let client_key = KeyPair::generate().unwrap();
+    let client_params = CertificateParams::new(vec!["quiver-client".to_owned()]).unwrap();
+    let client_cert = client_params.signed_by(&client_key, &issuer).unwrap();
+
+    (
+        ca_cert.pem(),
+        server_cert.pem(),
+        server_key.serialize_pem(),
+        client_cert.pem(),
+        client_key.serialize_pem(),
+    )
 }
 
 // Connect a TLS gRPC channel, retrying until the spawned server is ready.
@@ -112,6 +141,7 @@ async fn tls_secures_both_rest_and_grpc() {
         encryption_key: Some(TEST_KEY.to_owned()),
         tls_cert: Some(cert_path),
         tls_key: Some(key_path),
+        tls_client_ca: None,
         insecure: false,
     };
     tokio::spawn(async move {
@@ -162,5 +192,85 @@ async fn tls_secures_both_rest_and_grpc() {
     assert!(
         plaintext.is_err(),
         "plaintext HTTP must be refused on the TLS port"
+    );
+}
+
+#[tokio::test]
+async fn mtls_requires_a_client_certificate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ca_pem, server_cert_pem, server_key_pem, client_cert_pem, client_key_pem) =
+        ca_signed_chain();
+    let cert_path = tmp.path().join("server-cert.pem");
+    let key_path = tmp.path().join("server-key.pem");
+    let ca_path = tmp.path().join("ca.pem");
+    std::fs::write(&cert_path, &server_cert_pem).unwrap();
+    std::fs::write(&key_path, &server_key_pem).unwrap();
+    std::fs::write(&ca_path, &ca_pem).unwrap();
+
+    let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_port = grpc_listener.local_addr().unwrap().port();
+
+    // mTLS on: the server requires client certs chaining to `ca_path`.
+    let config = Config {
+        data_dir: tmp.path().join("data"),
+        rest_addr: rest_listener.local_addr().unwrap(),
+        grpc_addr: grpc_listener.local_addr().unwrap(),
+        api_keys: vec![TEST_KEY.into()],
+        encryption_key: Some(TEST_KEY.to_owned()),
+        tls_cert: Some(cert_path),
+        tls_key: Some(key_path),
+        tls_client_ca: Some(ca_path),
+        insecure: false,
+    };
+    tokio::spawn(async move {
+        let _ = serve(config, rest_listener, grpc_listener).await;
+    });
+
+    // A client presenting a CA-signed certificate completes the handshake and,
+    // with a valid bearer key, is served.
+    let identity = Identity::from_pem(client_cert_pem.as_bytes(), client_key_pem.as_bytes());
+    let mut authed = None;
+    for _ in 0..200 {
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(ca_pem.clone()))
+            .identity(identity.clone())
+            .domain_name("localhost");
+        if let Ok(endpoint) = Channel::from_shared(format!("https://127.0.0.1:{grpc_port}"))
+            .unwrap()
+            .tls_config(tls)
+            && let Ok(channel) = endpoint.connect().await
+        {
+            authed = Some(QuiverClient::new(channel));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut authed = authed.expect("a client with a CA-signed certificate should connect");
+    authed
+        .list_collections(auth_request(TEST_KEY, v1::ListCollectionsRequest {}))
+        .await
+        .expect("an mTLS + bearer request should be served");
+
+    // A client WITHOUT a certificate cannot perform an operation: mandatory
+    // client auth fails the TLS handshake, which tonic surfaces either at
+    // connect or on the first request. The server is already proven up above.
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(ca_pem.clone()))
+        .domain_name("localhost");
+    let endpoint = Channel::from_shared(format!("https://127.0.0.1:{grpc_port}"))
+        .unwrap()
+        .tls_config(tls)
+        .unwrap();
+    let refused = match endpoint.connect().await {
+        Err(_) => true,
+        Ok(channel) => QuiverClient::new(channel)
+            .list_collections(auth_request(TEST_KEY, v1::ListCollectionsRequest {}))
+            .await
+            .is_err(),
+    };
+    assert!(
+        refused,
+        "a client presenting no certificate must be refused by mTLS"
     );
 }
