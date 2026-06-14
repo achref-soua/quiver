@@ -10,15 +10,14 @@
 //!
 //! Tools: `list_collections`, `create_collection`, `upsert`, `search`, `get`,
 //! `delete`. The database is opened secure-by-default (encryption-at-rest on
-//! unless explicitly insecure), the same posture as the network server.
+//! unless explicitly insecure) through the same envelope key-ring as the network
+//! server and `quiver admin`, so a data directory is interchangeable between them.
 
 use std::io::{BufRead, Write};
 use std::path::Path;
 
 use serde_json::{Value, json};
 
-use quiver_core::page::{PageCodec, PlainCodec};
-use quiver_crypto::AeadCodec;
 use quiver_embed::{
     Database, Descriptor, DistanceMetric, Dtype, FieldType, Filter, FilterableField, IndexKind,
     IndexSpec, SearchParams,
@@ -27,26 +26,35 @@ use quiver_embed::{
 /// The MCP protocol revision this server implements.
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// Open the embedded database at `data_dir`, encrypted at rest unless `insecure`.
+///
+/// Opens through [`quiver_crypto::open_keyring`], the same envelope key-ring the
+/// network server and `quiver admin` use, so a data directory is interchangeable
+/// between `quiver serve`, `quiver mcp`, and `quiver admin`.
+///
+/// # Errors
+/// Returns an error if no encryption key is provided and `insecure` is false, if
+/// the key is invalid, or if the database cannot be opened.
+pub fn open(
+    data_dir: &Path,
+    encryption_key: Option<&str>,
+    insecure: bool,
+) -> anyhow::Result<Database> {
+    let db = match quiver_crypto::open_keyring(data_dir, encryption_key, insecure)? {
+        Some(keyring) => Database::open_with_keyring(data_dir, keyring)?,
+        None => Database::open(data_dir)?,
+    };
+    Ok(db)
+}
+
 /// Open the database at `data_dir` (encrypted at rest unless `insecure`) and
 /// serve MCP over stdin/stdout until the input stream closes.
 ///
 /// # Errors
-/// Returns an error if no encryption key is provided and `insecure` is false, if
-/// the key is invalid, if the database cannot be opened, or on an I/O failure.
+/// Returns an error if the database cannot be opened (see [`open`]) or on an I/O
+/// failure.
 pub fn run(data_dir: &Path, encryption_key: Option<&str>, insecure: bool) -> anyhow::Result<()> {
-    let codec: Box<dyn PageCodec> = match encryption_key {
-        Some(key) => Box::new(
-            AeadCodec::from_hex(key).map_err(|e| anyhow::anyhow!("invalid encryption key: {e}"))?,
-        ),
-        None => {
-            anyhow::ensure!(
-                insecure,
-                "no encryption key set: encryption-at-rest is on by default — set QUIVER_ENCRYPTION_KEY or pass --insecure"
-            );
-            Box::new(PlainCodec)
-        }
-    };
-    let mut db = Database::open_with_codec(data_dir, codec)?;
+    let mut db = open(data_dir, encryption_key, insecure)?;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     serve(&mut db, stdin.lock(), stdout.lock())?;
@@ -517,6 +525,57 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result_text(&r)).unwrap();
         let matches = parsed["matches"].as_array().unwrap();
         assert!(matches.iter().all(|m| m["payload"]["color"] == "blue"));
+    }
+
+    const ENC_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    // Open the same directory through the `serve`/admin path (an envelope
+    // key-ring from the master key), independent of MCP's `open` helper.
+    fn open_via_serve(dir: &std::path::Path) -> Database {
+        let keyring = quiver_crypto::open_keyring(dir, Some(ENC_KEY), false)
+            .unwrap()
+            .unwrap();
+        Database::open_with_keyring(dir, keyring).unwrap()
+    }
+
+    // A directory written through MCP's encrypted `open` must be readable through
+    // the `serve`/admin opener, and vice versa — they share one on-disk crypto
+    // format. Before unifying on `quiver_crypto::open_keyring`, MCP wrote
+    // single-key `AeadCodec` pages the envelope key-ring could not open.
+    #[test]
+    fn a_directory_written_by_mcp_opens_under_serve() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut db = open(tmp.path(), Some(ENC_KEY), false).unwrap();
+            call_tool(&mut db, "create_collection", &json!({"name":"c","dim":2})).unwrap();
+            call_tool(
+                &mut db,
+                "upsert",
+                &json!({"collection":"c","id":"1","vector":[1.0,2.0]}),
+            )
+            .unwrap();
+        }
+        let db = open_via_serve(tmp.path());
+        assert_eq!(db.len("c").unwrap(), 1);
+        assert!(db.get("c", "1").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_directory_written_by_serve_opens_under_mcp() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut db = open_via_serve(tmp.path());
+            call_tool(&mut db, "create_collection", &json!({"name":"c","dim":2})).unwrap();
+            call_tool(
+                &mut db,
+                "upsert",
+                &json!({"collection":"c","id":"9","vector":[3.0,4.0]}),
+            )
+            .unwrap();
+        }
+        let db = open(tmp.path(), Some(ENC_KEY), false).unwrap();
+        assert_eq!(db.len("c").unwrap(), 1);
+        assert!(db.get("c", "9").unwrap().is_some());
     }
 
     #[test]

@@ -10,7 +10,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
-use quiver_crypto::EnvelopeKeyRing;
 use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, FieldType, FilterableField};
 use quiver_import::{ParseOptions, Source, import_into, infer_dim, parse};
 
@@ -98,22 +97,13 @@ pub(crate) fn parse_filterable(specs: &[String]) -> anyhow::Result<Vec<Filterabl
 
 // Open the target database the same way the server does (ADR-0010): an envelope
 // key-ring derived from the master key, or plaintext only in insecure mode.
+// Shares `quiver serve`'s opener so imported data is immediately serveable.
 fn open_database(data_dir: &Path, key: Option<&str>, insecure: bool) -> anyhow::Result<Database> {
-    match key {
-        Some(key) => {
-            let keyring = EnvelopeKeyRing::from_hex(key, data_dir)
-                .map_err(|e| anyhow!("invalid master key: {e}"))?;
-            Ok(Database::open_with_keyring(data_dir, Box::new(keyring))?)
-        }
-        None => {
-            if !insecure {
-                bail!(
-                    "no encryption key set: encryption-at-rest is on by default — set QUIVER_ENCRYPTION_KEY or pass --insecure"
-                );
-            }
-            Ok(Database::open(data_dir)?)
-        }
-    }
+    let db = match quiver_crypto::open_keyring(data_dir, key, insecure)? {
+        Some(keyring) => Database::open_with_keyring(data_dir, keyring)?,
+        None => Database::open(data_dir)?,
+    };
+    Ok(db)
 }
 
 #[cfg(test)]
@@ -212,9 +202,8 @@ mod tests {
         };
         assert_eq!(import(args).unwrap(), 1);
 
-        // Reopen with the same envelope key-ring `serve` uses.
-        let keyring = EnvelopeKeyRing::from_hex(key, &data_dir).unwrap();
-        let db = Database::open_with_keyring(&data_dir, Box::new(keyring)).unwrap();
+        // Reopen through the shared opener `serve` uses.
+        let db = open_database(&data_dir, Some(key), false).unwrap();
         assert_eq!(db.len("c").unwrap(), 1);
     }
 

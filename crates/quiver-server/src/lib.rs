@@ -43,7 +43,7 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
-use quiver_crypto::{AeadCodec, EnvelopeKeyRing};
+use quiver_crypto::AeadCodec;
 use quiver_embed::{
     Database, Descriptor, DistanceMetric, Dtype, FilterableField, IndexSpec, SearchParams,
 };
@@ -643,17 +643,15 @@ async fn shutdown_signal() {
 // crypto-shreds it. With no key (only valid in `insecure` mode, enforced by
 // `Config::validate`) the engine is opened in plaintext.
 fn open_database(config: &Config) -> Result<Database, Error> {
-    match config.master_key_hex()? {
-        Some(key) => {
-            let keyring = EnvelopeKeyRing::from_hex(&key, &config.data_dir)
-                .map_err(|e| Error::Config(format!("invalid master key: {e}")))?;
-            Ok(Database::open_with_keyring(
-                &config.data_dir,
-                Box::new(keyring),
-            )?)
-        }
-        None => Ok(Database::open(&config.data_dir)?),
-    }
+    let master_key = config.master_key_hex()?;
+    let keyring =
+        quiver_crypto::open_keyring(&config.data_dir, master_key.as_deref(), config.insecure)
+            .map_err(|e| Error::Config(e.to_string()))?;
+    let db = match keyring {
+        Some(keyring) => Database::open_with_keyring(&config.data_dir, keyring)?,
+        None => Database::open(&config.data_dir)?,
+    };
+    Ok(db)
 }
 
 // TLS material shared by both transports: the raw PEM (for tonic's `Identity`
