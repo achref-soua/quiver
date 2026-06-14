@@ -2,7 +2,9 @@
 
 **Non-negotiable: Quiver implements no cryptographic primitives or protocols of its own.** Every primitive comes from an audited library — `rustls` for TLS, and RustCrypto crates for AEAD, hashing, KDF, and key wrapping. Rolling our own crypto would disqualify a security-first project. Any experimental scheme uses a *published, peer-reviewed* construction and is clearly labelled. Decisions: [ADR-0010](../adr/0010-crypto-envelope-aead.md), [ADR-0012](../adr/0012-client-side-encryption.md).
 
-> **Implementation status (Phase 1).** Encryption-at-rest is shipped and on by default. The `quiver-crypto` crate provides an `AeadCodec` (XChaCha20-Poly1305 with per-page/per-record HKDF-SHA256 subkeys and a fresh random 192-bit nonce per seal, from the RustCrypto crates — no `ring`, no home-grown code). It is wired into the storage engine through the `PageCodec` seam so it seals **all** durable data: the paged manifest and segment files *and* the record-framed write-ahead log (the WAL is sealed per record, since a page-only codec would otherwise leave it in plaintext). Phase 1 uses a single operator-supplied 256-bit root key (`QUIVER_ENCRYPTION_KEY`); the full envelope hierarchy below (master key → per-collection DEK → KMS, and crypto-shredding) is Phase 3 "security depth". TLS-in-transit is shipped too: `rustls` over the audited `ring` provider (no OpenSSL, no `aws-lc-rs` C toolchain) terminates TLS for REST (via `axum-server`) and gRPC (via tonic's `tls-ring`), and a non-loopback bind requires it.
+> **Implementation status (Phase 1).** Encryption-at-rest is shipped and on by default. The `quiver-crypto` crate provides an `AeadCodec` (XChaCha20-Poly1305 with per-page/per-record HKDF-SHA256 subkeys and a fresh random 192-bit nonce per seal, from the RustCrypto crates — no `ring`, no home-grown code). It is wired into the storage engine through the `PageCodec` seam so it seals **all** durable data: the paged manifest and segment files *and* the record-framed write-ahead log (the WAL is sealed per record, since a page-only codec would otherwise leave it in plaintext). TLS-in-transit is shipped too: `rustls` over the audited `ring` provider (no OpenSSL, no `aws-lc-rs` C toolchain) terminates TLS for REST (via `axum-server`) and gRPC (via tonic's `tls-ring`), and a non-loopback bind requires it.
+>
+> **Update (Phase 3).** The **envelope hierarchy below is now shipped.** `quiver-crypto`'s `EnvelopeKeyRing` makes `QUIVER_ENCRYPTION_KEY` a **master key** that wraps a random per-collection **DEK** (stored wrapped under `<data_dir>/keys/<id>.dek`); each collection's segments and index are sealed under its own DEK, and the catalog (manifest + WAL) under a master-key-derived catalog key. This makes **crypto-shredding** real (below). Sourcing the master key from a `0600` file or a KMS is the remaining slice; the AEAD throughout is XChaCha20-Poly1305 (AES-256-GCM auto-select remains a future option). **Format note:** this changes the at-rest key hierarchy from v0.2.0's single root key — pre-1.0 there is no migrator, so re-create encrypted collections under v0.3.0.
 
 ## Key hierarchy (envelope encryption)
 
@@ -37,7 +39,11 @@ The selection is automatic by default and overridable by config/compliance polic
 
 ## Crypto-shredding
 
-Because each collection has its own DEK, destroying that wrapped DEK renders the collection's at-rest data (and backups) cryptographically unrecoverable — instant, verifiable erasure.
+Because each collection has its own DEK, destroying that wrapped DEK renders the collection's at-rest data cryptographically unrecoverable — even to the master-key holder, and even if the ciphertext survives in a backup. This is instant, verifiable erasure without overwriting every byte (the GDPR "right to erasure" pattern).
+
+`Store::shred_collection` / `Database::shred_collection` drops the collection, checkpoints (so any un-checkpointed rows are sealed into DEK-protected segments and the catalog-keyed WAL is rotated away), then deletes `<data_dir>/keys/<id>.dek`. A plain `drop_collection` also reclaims the DEK at the next checkpoint's garbage collection. After a shred, opening the collection's codec fails — the DEK is gone — so its segments and index are permanently undecryptable (`quiver-crypto/tests/envelope_shred.rs` proves this end-to-end).
+
+**Scope:** erasure covers the durable **segments and index** (the bulk store). A WAL *backup* captured before the shred would still be master-key-decryptable until rotation — the inherent caveat of erasing data that was already copied elsewhere.
 
 ## Client-side payload encryption (ADR-0012)
 
