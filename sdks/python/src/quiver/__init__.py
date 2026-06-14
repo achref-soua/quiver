@@ -11,7 +11,14 @@ Example::
         hits = q.search("items", [0.1, 0.2, 0.3], k=5)
 """
 
-from .client import Client, CollectionInfo, Match, Point, QuiverError
+from .client import Client, CollectionInfo, FilterableField, Match, Point, QuiverError
 
-__all__ = ["Client", "Point", "Match", "CollectionInfo", "QuiverError"]
+__all__ = [
+    "Client",
+    "Point",
+    "Match",
+    "CollectionInfo",
+    "FilterableField",
+    "QuiverError",
+]
 __version__ = "0.1.0"

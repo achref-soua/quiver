@@ -8,12 +8,19 @@ are produced by the caller — Quiver is model-agnostic.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, Sequence, Union
 
 import httpx
 
-__all__ = ["Client", "Point", "Match", "CollectionInfo", "QuiverError"]
+__all__ = [
+    "Client",
+    "Point",
+    "Match",
+    "CollectionInfo",
+    "FilterableField",
+    "QuiverError",
+]
 
 DEFAULT_BASE_URL = "http://127.0.0.1:6333"
 DEFAULT_TIMEOUT = 30.0
@@ -51,6 +58,14 @@ class Match:
 
 
 @dataclass
+class FilterableField:
+    """A payload field declared filterable for hybrid (pre-filtered) search."""
+
+    path: str
+    field_type: str = "keyword"  # "keyword" | "numeric"
+
+
+@dataclass
 class CollectionInfo:
     """Metadata about a collection."""
 
@@ -60,6 +75,7 @@ class CollectionInfo:
     count: int
     index: str = "hnsw"
     pq_subspaces: Optional[int] = None
+    filterable: list[FilterableField] = field(default_factory=list)
 
 
 PointInput = Union[Point, Mapping[str, Any]]
@@ -112,17 +128,24 @@ class Client:
         *,
         index: Optional[str] = None,
         pq_subspaces: Optional[int] = None,
+        filterable: Optional[Sequence[FilterableField]] = None,
     ) -> CollectionInfo:
         """Create a collection. Raises [`QuiverError`] if the name is taken.
 
         ``index`` picks the structure (``hnsw`` | ``vamana`` | ``disk_vamana`` |
         ``ivf``, default ``hnsw``); ``pq_subspaces`` tunes the quantized kinds.
+        ``filterable`` declares payload fields to index for hybrid (pre-filtered)
+        search, each a :class:`FilterableField` of ``keyword`` or ``numeric`` type.
         """
         body: dict[str, Any] = {"name": name, "dim": dim, "metric": metric}
         if index is not None:
             body["index"] = index
         if pq_subspaces is not None:
             body["pq_subspaces"] = pq_subspaces
+        if filterable:
+            body["filterable"] = [
+                {"path": f.path, "field_type": f.field_type} for f in filterable
+            ]
         return _collection(self._send("POST", "/v1/collections", body).json())
 
     def list_collections(self) -> list[CollectionInfo]:
@@ -222,6 +245,13 @@ def _collection(body: Mapping[str, Any]) -> CollectionInfo:
         count=int(body.get("count", 0)),
         index=str(body.get("index", "hnsw")),
         pq_subspaces=int(pq) if pq is not None else None,
+        filterable=[
+            FilterableField(
+                path=str(f["path"]),
+                field_type=str(f.get("field_type", "keyword")),
+            )
+            for f in body.get("filterable", [])
+        ],
     )
 
 

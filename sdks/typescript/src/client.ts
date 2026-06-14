@@ -42,6 +42,15 @@ export type IndexKind = "hnsw" | "vamana" | "disk_vamana" | "ivf";
 /** A distance metric. */
 export type Metric = "l2" | "cosine" | "dot";
 
+/** The value type of a filterable payload field (ADR-0022). */
+export type FieldType = "keyword" | "numeric";
+
+/** A payload field declared filterable for hybrid (pre-filtered) search. */
+export interface FilterableField {
+  path: string;
+  fieldType?: FieldType;
+}
+
 /** Metadata about a collection. */
 export interface CollectionInfo {
   name: string;
@@ -50,6 +59,7 @@ export interface CollectionInfo {
   count: number;
   index: IndexKind;
   pqSubspaces?: number;
+  filterable: FilterableField[];
 }
 
 /** Options for constructing a {@link Client}. */
@@ -67,6 +77,8 @@ export interface CreateCollectionOptions {
   index?: IndexKind;
   /** Product-quantization subspaces for `disk_vamana` / `ivf` (must divide dim). */
   pqSubspaces?: number;
+  /** Payload fields to index for hybrid (pre-filtered) search. */
+  filterable?: FilterableField[];
 }
 
 /** Options for {@link Client.search}. */
@@ -108,6 +120,12 @@ export class Client {
     const body: Record<string, unknown> = { name, dim, metric: opts.metric ?? "l2" };
     if (opts.index) body["index"] = opts.index;
     if (opts.pqSubspaces !== undefined) body["pq_subspaces"] = opts.pqSubspaces;
+    if (opts.filterable && opts.filterable.length > 0) {
+      body["filterable"] = opts.filterable.map((f) => ({
+        path: f.path,
+        field_type: f.fieldType ?? "keyword",
+      }));
+    }
     return toCollection(await this.#json("POST", "/v1/collections", body));
   }
 
@@ -233,6 +251,12 @@ function toCollection(body: unknown): CollectionInfo {
     count: Number(b["count"] ?? 0),
     index: (b["index"] as IndexKind) ?? "hnsw",
     pqSubspaces: b["pq_subspaces"] === undefined ? undefined : Number(b["pq_subspaces"]),
+    filterable: Array.isArray(b["filterable"])
+      ? (b["filterable"] as Record<string, unknown>[]).map((f) => ({
+          path: String(f["path"]),
+          fieldType: (f["field_type"] as FieldType) ?? "keyword",
+        }))
+      : [],
   };
 }
 
