@@ -69,6 +69,19 @@ pub struct Record {
     pub payload: Vec<u8>,
 }
 
+/// The post-checkpoint mutations a restored index snapshot must replay to reach
+/// the current state — the WAL tail `open` already applied to the store
+/// (ADR-0025). Both lists are bounded by the checkpoint cadence, not the
+/// collection size.
+#[derive(Debug, Default)]
+pub struct RecoveryTail {
+    /// Live rows upserted since the last checkpoint (the active buffer).
+    pub upserts: Vec<(String, Record)>,
+    /// External ids whose pre-checkpoint row died this window (deleted, or
+    /// shadowed by a re-upsert) and so must be removed from a restored index.
+    pub deleted: Vec<String>,
+}
+
 // Where a live row's bytes are: in the in-RAM active buffer, or in a sealed
 // segment at `(segment index, row)`.
 #[derive(Debug, Clone, Copy)]
@@ -583,6 +596,43 @@ impl Store {
             .join(index_snapshot_file_name(snap.id));
         let body = read_paged(&path, state.codec.as_ref(), PageType::IndexBlock)?;
         Ok(Some(body))
+    }
+
+    /// The post-checkpoint mutations a restored index snapshot must replay to
+    /// catch up to the current state (ADR-0025): the active-buffer upserts and the
+    /// external ids whose checkpointed row died this window. Both are bounded by
+    /// the checkpoint cadence, not the collection size.
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`] if the collection is unknown.
+    pub fn recovery_tail(&self, collection: CollectionId) -> Result<RecoveryTail> {
+        let state = self
+            .collections
+            .get(&collection)
+            .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
+        let mut upserts = Vec::with_capacity(state.active_index.len());
+        for (ext_id, &row) in &state.active_index {
+            let ar = &state.active[row as usize];
+            upserts.push((
+                ext_id.clone(),
+                Record {
+                    vector: le_bytes_to_f32(&ar.vector),
+                    payload: ar.payload.clone(),
+                },
+            ));
+        }
+        let mut deleted = Vec::new();
+        for (&seg_idx, bitmap) in &state.dead_this_window {
+            if let Some(seg) = state.sealed.get(seg_idx as usize) {
+                let row_ids = seg.row_ids();
+                for row in bitmap.iter() {
+                    if let Some(ext) = row_ids.get(row as usize) {
+                        deleted.push(ext.clone());
+                    }
+                }
+            }
+        }
+        Ok(RecoveryTail { upserts, deleted })
     }
 
     /// The number of live rows in a collection.

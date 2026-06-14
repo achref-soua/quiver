@@ -12,6 +12,8 @@ authors.workspace = true
 quiver-core = { workspace = true }
 quiver-index = { workspace = true }
 quiver-query = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 

@@ -39,6 +39,7 @@ use quiver_index::{
     DiskSearchParams, DiskVamana, Hnsw, HnswConfig, Index, Ivf, IvfConfig, Metric, Neighbor,
     ProductQuantizer, Vamana, VamanaConfig, ordering_distance, report_metric,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -72,6 +73,13 @@ pub enum Error {
     /// The requested index / metric combination is not supported.
     #[error("unsupported configuration: {0}")]
     Unsupported(&'static str),
+    /// A durable index snapshot could not be restored (ADR-0025); the caller
+    /// falls back to rebuilding from the store, so this does not surface to users.
+    #[error(transparent)]
+    IndexSnapshot(#[from] quiver_index::SnapshotError),
+    /// An index snapshot envelope could not be (de)serialized.
+    #[error("index snapshot envelope: {0}")]
+    Envelope(#[from] postcard::Error),
 }
 
 /// Result alias for database operations.
@@ -168,6 +176,22 @@ impl CollectionIndex {
     }
 }
 
+/// On-disk envelope (ADR-0025) for a durable IVF snapshot: the `Ivf` bytes plus
+/// the internal->external id mapping they are addressed by, postcard-encoded and
+/// handed to the store as one opaque blob. On open the envelope is decoded, the
+/// `Ivf` restored, and the post-checkpoint WAL tail replayed. A decode/version
+/// error means "rebuild from the store" — the snapshot is only ever a fast path.
+#[derive(Serialize, Deserialize)]
+struct IndexEnvelope {
+    version: u16,
+    int_to_ext: Vec<String>,
+    ivf: Vec<u8>,
+}
+
+// Envelope format version, independent of the product SemVer (and of the inner
+// `Ivf` snapshot version); a mismatch falls back to a rebuild.
+const INDEX_ENVELOPE_VERSION: u16 = 1;
+
 struct CollectionHandle {
     id: CollectionId,
     descriptor: Descriptor,
@@ -224,7 +248,7 @@ impl Database {
                 ext_to_int: HashMap::new(),
                 stale: true,
             };
-            rebuild_index(&store, &mut handle)?;
+            load_index(&store, &mut handle)?;
             collections.insert(name, handle);
         }
         Ok(Self { store, collections })
@@ -531,9 +555,30 @@ impl Database {
             .collect())
     }
 
-    /// Flush a durable checkpoint of all collections.
+    /// Flush a durable checkpoint of all collections, capturing a durable
+    /// snapshot of each built, up-to-date IVF index (ADR-0025) so it reloads on
+    /// open instead of rebuilding. Other index kinds, and a stale or unbuilt IVF,
+    /// are rebuilt on open.
     pub fn checkpoint(&mut self) -> Result<()> {
-        Ok(self.store.checkpoint()?)
+        let mut snapshots: HashMap<CollectionId, Vec<u8>> = HashMap::new();
+        for handle in self.collections.values() {
+            if handle.stale {
+                continue;
+            }
+            if let CollectionIndex::Ivf(Some(ivf)) = &handle.index {
+                if ivf.is_empty() {
+                    continue;
+                }
+                let envelope = IndexEnvelope {
+                    version: INDEX_ENVELOPE_VERSION,
+                    int_to_ext: handle.int_to_ext.clone(),
+                    ivf: ivf.snapshot()?,
+                };
+                snapshots.insert(handle.id, postcard::to_allocvec(&envelope)?);
+            }
+        }
+        self.store.checkpoint_with_index_snapshots(&snapshots)?;
+        Ok(())
     }
 
     /// Compact every collection with reclaimable space, merging its sealed
@@ -666,6 +711,68 @@ fn build_disk_index(
     let codec = store.collection_codec_clone(cid)?;
     quiver_index::disk::write(&path, &graph, &pq, codec.as_ref())?;
     Ok(DiskVamana::open(&path, codec)?)
+}
+
+// Load a collection's index on open: restore the durable IVF snapshot and replay
+// the post-checkpoint tail (ADR-0025) when one is present and intact, otherwise
+// rebuild from the store. The snapshot is only a fast path — any problem reading
+// or restoring it falls back to the authoritative rebuild.
+fn load_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
+    if handle.descriptor.index.kind == IndexKind::Ivf
+        && let Ok(Some(blob)) = store.read_index_snapshot(handle.id)
+        && restore_ivf_snapshot(store, handle, &blob).is_ok()
+    {
+        return Ok(());
+    }
+    rebuild_index(store, handle)
+}
+
+// Restore an IVF from its snapshot envelope and catch it up to the store's
+// current state by replaying the post-checkpoint tail (ADR-0025). Tombstoned ids
+// are removed before the active upserts are applied, so a row shadowed this
+// window (present in both) ends with its new vector.
+fn restore_ivf_snapshot(store: &Store, handle: &mut CollectionHandle, blob: &[u8]) -> Result<()> {
+    let envelope: IndexEnvelope = postcard::from_bytes(blob)?;
+    if envelope.version != INDEX_ENVELOPE_VERSION {
+        return Err(Error::Unsupported(
+            "unsupported index snapshot envelope version",
+        ));
+    }
+    let ivf = Ivf::restore(&envelope.ivf)?;
+    handle.ext_to_int = envelope
+        .int_to_ext
+        .iter()
+        .enumerate()
+        .map(|(i, ext)| (ext.clone(), i as u64))
+        .collect();
+    handle.int_to_ext = envelope.int_to_ext;
+    handle.index = CollectionIndex::Ivf(Some(ivf));
+    handle.stale = false;
+
+    let tail = store.recovery_tail(handle.id)?;
+    for ext in &tail.deleted {
+        let Some(&internal) = handle.ext_to_int.get(ext) else {
+            continue;
+        };
+        if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
+            ivf.remove(internal);
+        }
+    }
+    for (ext, record) in tail.upserts {
+        let internal = match handle.ext_to_int.get(&ext) {
+            Some(&i) => i,
+            None => {
+                let i = handle.int_to_ext.len() as u64;
+                handle.ext_to_int.insert(ext.clone(), i);
+                handle.int_to_ext.push(ext);
+                i
+            }
+        };
+        if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
+            ivf.insert(internal, &record.vector)?;
+        }
+    }
+    Ok(())
 }
 
 // Rebuild a collection's index from the store's current live rows.
@@ -1485,5 +1592,161 @@ mod tests {
         assert!(leaf_predicate(&mismatch, &fields).is_none());
         assert!(leaf_predicate(&ne, &fields).is_none());
         assert!(leaf_predicate(&exists, &fields).is_none());
+    }
+
+    // ----- durable IVF index recovery (ADR-0025) -----
+
+    // The first collection created in a fresh store has id 0.
+    fn ivf_index_dir(root: &Path) -> std::path::PathBuf {
+        root.join("collections").join("0000000000").join("index")
+    }
+
+    fn idx_snapshot_files(root: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(ivf_index_dir(root))
+            .map(|rd| {
+                rd.filter_map(std::result::Result::ok)
+                    .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+                    .filter(|n| n.starts_with("idx-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    fn nearest(db: &mut Database, q: &[f32]) -> Vec<String> {
+        db.search("c", q, &SearchParams::default())
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect()
+    }
+
+    fn seed_ivf(db: &mut Database, n: u32) {
+        db.create_collection("c", desc_with(IndexKind::Ivf))
+            .unwrap();
+        for i in 0..n {
+            db.upsert(
+                "c",
+                &format!("p{i}"),
+                &[i as f32, 0.0, 0.0, 0.0],
+                &json!({}),
+            )
+            .unwrap();
+        }
+        // The first search builds (and trains) the IVF from the store.
+        let _ = nearest(db, &[1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn ivf_snapshot_is_written_at_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        seed_ivf(&mut db, 40);
+        db.checkpoint().unwrap();
+        assert_eq!(idx_snapshot_files(tmp.path()).len(), 1);
+    }
+
+    #[test]
+    fn ivf_loads_from_snapshot_rather_than_rebuilding() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut db = open(tmp.path());
+            db.create_collection("c", desc_with(IndexKind::Ivf))
+                .unwrap();
+            db.upsert("c", "a", &[0.0, 0.0, 0.0, 0.0], &json!({}))
+                .unwrap();
+            db.upsert("c", "m", &[1.0, 0.0, 0.0, 0.0], &json!({}))
+                .unwrap();
+            // First search builds the IVF — int_to_ext is the sorted scan order.
+            let _ = nearest(&mut db, &[0.0, 0.0, 0.0, 0.0]);
+            // Incremental upserts append in insertion order, diverging from sort.
+            db.upsert("c", "z", &[2.0, 0.0, 0.0, 0.0], &json!({}))
+                .unwrap();
+            db.upsert("c", "b", &[3.0, 0.0, 0.0, 0.0], &json!({}))
+                .unwrap();
+            db.checkpoint().unwrap();
+            assert_eq!(db.collections["c"].int_to_ext, ["a", "m", "z", "b"]);
+        }
+        let db = open(tmp.path());
+        // Loaded from the snapshot: the insertion-order mapping is preserved. A
+        // rebuild would have produced the sorted order ["a", "b", "m", "z"].
+        assert_eq!(
+            db.collections["c"].int_to_ext,
+            ["a", "m", "z", "b"],
+            "index was rebuilt, not loaded from the snapshot"
+        );
+    }
+
+    #[test]
+    fn ivf_recovery_replays_post_checkpoint_upserts() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut db = open(tmp.path());
+            seed_ivf(&mut db, 30);
+            db.checkpoint().unwrap();
+            // Post-checkpoint upsert, no further checkpoint.
+            db.upsert("c", "far", &[500.0, 0.0, 0.0, 0.0], &json!({}))
+                .unwrap();
+        }
+        let mut db = open(tmp.path());
+        assert_eq!(nearest(&mut db, &[500.0, 0.0, 0.0, 0.0])[0], "far");
+        assert_eq!(nearest(&mut db, &[1.0, 0.0, 0.0, 0.0])[0], "p1");
+    }
+
+    #[test]
+    fn ivf_recovery_replays_post_checkpoint_deletes() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut db = open(tmp.path());
+            seed_ivf(&mut db, 30);
+            db.checkpoint().unwrap();
+            assert!(db.delete("c", "p7").unwrap());
+        }
+        let mut db = open(tmp.path());
+        assert!(
+            nearest(&mut db, &[7.0, 0.0, 0.0, 0.0])
+                .iter()
+                .all(|id| id != "p7")
+        );
+        assert!(db.get("c", "p7").unwrap().is_none());
+        assert!(db.get("c", "p6").unwrap().is_some());
+    }
+
+    #[test]
+    fn ivf_recovery_replays_post_checkpoint_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut db = open(tmp.path());
+            seed_ivf(&mut db, 30);
+            db.checkpoint().unwrap();
+            // Move p0 far away — an in-place update shadowing its sealed row.
+            db.upsert("c", "p0", &[999.0, 0.0, 0.0, 0.0], &json!({}))
+                .unwrap();
+        }
+        let mut db = open(tmp.path());
+        assert_eq!(nearest(&mut db, &[999.0, 0.0, 0.0, 0.0])[0], "p0");
+        assert_ne!(
+            nearest(&mut db, &[0.0, 0.0, 0.0, 0.0])[0],
+            "p0",
+            "the stale p0 vector survived the update"
+        );
+    }
+
+    #[test]
+    fn corrupt_ivf_snapshot_falls_back_to_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut db = open(tmp.path());
+            seed_ivf(&mut db, 30);
+            db.checkpoint().unwrap();
+        }
+        // Corrupt the snapshot file; recovery must fall back to a rebuild.
+        let files = idx_snapshot_files(tmp.path());
+        assert_eq!(files.len(), 1);
+        std::fs::write(ivf_index_dir(tmp.path()).join(&files[0]), b"corrupt").unwrap();
+
+        let mut db = open(tmp.path());
+        assert_eq!(nearest(&mut db, &[7.0, 0.0, 0.0, 0.0])[0], "p7");
     }
 }

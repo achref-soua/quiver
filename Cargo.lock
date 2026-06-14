@@ -1974,9 +1974,11 @@ dependencies = [
 name = "quiver-embed"
 version = "0.5.0"
 dependencies = [
+ "postcard",
  "quiver-core",
  "quiver-index",
  "quiver-query",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
