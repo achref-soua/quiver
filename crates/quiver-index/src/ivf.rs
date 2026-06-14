@@ -23,11 +23,20 @@
 
 use std::collections::HashMap;
 
-use quiver_simd::Metric;
+use quiver_simd::{Metric, l2_sq_f32};
 
 use crate::kmeans::{kmeans, nearest_centroid};
 use crate::quant::Quantizer;
 use crate::{IndexError, Neighbor, ProductQuantizer};
+
+/// Reassignment fanout (SpFresh LIRE): after a split or merge, affected points
+/// are re-evaluated only against this many of the affected cell's nearest live
+/// neighbors (plus, for a split, the two new centroids) instead of every
+/// centroid. This keeps a rebalance `O(nlist + |list|)` rather than
+/// `O(|list| × nlist)`, and is large enough that the true nearest centroid is
+/// virtually always in the set for points drawn from the affected cell's
+/// locality.
+const REASSIGN_NEIGHBORS: usize = 32;
 
 /// Build parameters for [`Ivf`].
 #[derive(Debug, Clone, Copy)]
@@ -359,14 +368,20 @@ impl Ivf {
     }
 
     // Split an over-full cell into two via local 2-means, then reassign the
-    // affected points to their nearest centroid over the full set so the
-    // nearest-centroid invariant is preserved (SpFresh LIRE, ADR-0023).
+    // affected points to their nearest centroid within the local neighborhood —
+    // the two new centroids plus the old cell's nearest live neighbors — rather
+    // than over the full centroid set (SpFresh LIRE, ADR-0023). Bounding the
+    // candidates keeps a split `O(nlist + |list|)` while preserving recall: a
+    // point drawn from the old cell's region has its nearest centroid there.
     fn split(&mut self, cell: usize) {
         let members = std::mem::take(&mut self.postings[cell]);
         if members.len() < 2 {
             self.postings[cell] = members;
             return;
         }
+        // Capture the old cell's nearest live neighbors before its centroid is
+        // overwritten; these plus the two new cells are the reassign candidates.
+        let neighbors = self.neighbor_cells(cell, REASSIGN_NEIGHBORS);
         // Gather member vectors (reconstructed for PQ) into a flat buffer.
         let mut data = vec![0f32; members.len() * self.dim];
         for (row, &node) in members.iter().enumerate() {
@@ -389,11 +404,15 @@ impl Ivf {
         // Centroid 0 replaces `cell`; centroid 1 takes a fresh/recycled cell.
         self.centroids[cell * self.dim..(cell + 1) * self.dim].copy_from_slice(&two[0..self.dim]);
         let new = self.take_cell(&two[self.dim..2 * self.dim]);
-        // Reassign every affected point to its now-nearest centroid (over all
-        // live cells — tombstoned ones carry a sentinel and are never chosen).
+        // Reassign each affected point to its nearest centroid in the local
+        // neighborhood: the two new cells first, then the old neighbors.
+        let mut candidates = Vec::with_capacity(neighbors.len() + 2);
+        candidates.push(cell);
+        candidates.push(new);
+        candidates.extend_from_slice(&neighbors);
         for &node in &members {
             let v = self.reconstruct_node(node);
-            let target = nearest_centroid(&v, &self.centroids, self.dim);
+            let target = self.nearest_among(&v, &candidates);
             self.postings[target].push(node);
             self.node_cell[node as usize] = target as u32;
         }
@@ -404,17 +423,67 @@ impl Ivf {
     }
 
     // Merge an under-full cell: tombstone it, then move its points to their
-    // nearest remaining centroid (SpFresh LIRE, ADR-0023).
+    // nearest remaining centroid among the cell's nearest live neighbors — the
+    // local neighborhood, not the full centroid set (SpFresh LIRE, ADR-0023).
     fn merge(&mut self, cell: usize) {
         let members = std::mem::take(&mut self.postings[cell]);
-        // Tombstone first so members are never reassigned back into this cell.
+        // Capture neighbors before tombstoning removes this cell from the set.
+        let neighbors = self.neighbor_cells(cell, REASSIGN_NEIGHBORS);
         self.tombstone_cell(cell);
         for node in members {
             let v = self.reconstruct_node(node);
-            let target = nearest_centroid(&v, &self.centroids, self.dim);
+            // `merge` only runs while another live cell exists, so `neighbors`
+            // is non-empty; the full-set fallback guards that invariant anyway.
+            let target = if neighbors.is_empty() {
+                nearest_centroid(&v, &self.centroids, self.dim)
+            } else {
+                self.nearest_among(&v, &neighbors)
+            };
             self.postings[target].push(node);
             self.node_cell[node as usize] = target as u32;
         }
+    }
+
+    // Whether cell `c` is tombstoned — it carries the never-selected sentinel
+    // centroid that `tombstone_cell` writes. `O(1)`.
+    fn is_tombstoned(&self, c: usize) -> bool {
+        self.centroids[c * self.dim] == f32::MAX
+    }
+
+    // The up-to-`k` live cells whose centroids are nearest to `cell`'s centroid,
+    // excluding `cell` itself and tombstoned cells. `O(nlist)`, computed once per
+    // rebalance so a split/merge stays `O(nlist + |list|)`.
+    fn neighbor_cells(&self, cell: usize, k: usize) -> Vec<usize> {
+        let dim = self.dim;
+        let center = self.centroids[cell * dim..(cell + 1) * dim].to_vec();
+        let mut ranked: Vec<(f32, usize)> = (0..self.postings.len())
+            .filter(|&c| c != cell && !self.is_tombstoned(c))
+            .map(|c| {
+                (
+                    l2_sq_f32(&center, &self.centroids[c * dim..(c + 1) * dim]),
+                    c,
+                )
+            })
+            .collect();
+        ranked.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        ranked.truncate(k);
+        ranked.into_iter().map(|(_, c)| c).collect()
+    }
+
+    // The candidate cell whose centroid is nearest to `v` by squared L2.
+    // `candidates` must be non-empty (callers always include at least one cell).
+    fn nearest_among(&self, v: &[f32], candidates: &[usize]) -> usize {
+        let dim = self.dim;
+        let mut best = candidates[0];
+        let mut best_d = f32::INFINITY;
+        for &c in candidates {
+            let d = l2_sq_f32(v, &self.centroids[c * dim..(c + 1) * dim]);
+            if d < best_d {
+                best_d = d;
+                best = c;
+            }
+        }
+        best
     }
 
     // Reserve a cell slot for `centroid` (recycling a tombstoned one if any).
@@ -789,6 +858,38 @@ mod tests {
         let live = live_subset(&data, &live_ids);
         let r = recall_over(&idx, &live, Metric::L2, 10, idx.nlist(), 50, &mut rng);
         assert!(r >= 0.90, "recall after splitting was {r:.3}");
+    }
+
+    #[test]
+    fn bounded_reassignment_holds_recall_past_the_fanout() {
+        // Drive the live cell count well past REASSIGN_NEIGHBORS so reassignment
+        // is a strict subset of all cells — the regime the bound targets. Recall
+        // and reachability must still hold (SpFresh LIRE locality, ADR-0023).
+        let dim = 16;
+        let mut rng = SplitMix64::new(0x5AFE);
+        let (mut data, flat, ids) = dataset(&mut rng, 200, dim);
+        let cfg = IvfConfig {
+            nlist: 8,
+            max_postings: 16,
+            ..IvfConfig::default()
+        };
+        let mut idx = Ivf::build(&ids, &flat, dim, Metric::L2, cfg).unwrap();
+        for new_id in 200u64..2000 {
+            let v = rand_vec(&mut rng, dim);
+            idx.insert(new_id, &v).unwrap();
+            data.push(v);
+        }
+        assert_eq!(idx.len(), 2000);
+        assert!(
+            idx.nlist() > REASSIGN_NEIGHBORS,
+            "test must exceed the reassignment fanout ({REASSIGN_NEIGHBORS}) to \
+             exercise bounding; got {} cells",
+            idx.nlist()
+        );
+        let live_ids: Vec<u64> = (0..2000).collect();
+        let live = live_subset(&data, &live_ids);
+        let r = recall_over(&idx, &live, Metric::L2, 10, idx.nlist(), 50, &mut rng);
+        assert!(r >= 0.90, "recall past the fanout was {r:.3}");
     }
 
     #[test]
