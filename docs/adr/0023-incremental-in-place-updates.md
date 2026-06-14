@@ -144,8 +144,8 @@ index remains derived and rebuilt-on-open.
 Shipped for `v0.4.0`. `quiver-index` gained `Ivf::insert` / `Ivf::remove` — a
 reverse id→node map plus a free list that reuses removed node slots, LIRE
 `split` (local 2-means past `max_postings`) and `merge` (tombstone + redistribute
-below `min_postings`, default `1` = reclaim emptied cells), and reassignment over
-the centroid set; `ProductQuantizer::reconstruct` decodes a code so the frugal PQ
+below `min_postings`, default `1` = reclaim emptied cells), and reassignment
+bounded to the local neighborhood; `ProductQuantizer::reconstruct` decodes a code so the frugal PQ
 mode can rebalance, and `IvfConfig` gained `max_postings` / `min_postings`.
 `quiver-embed` now dispatches upserts (insert/replace) and deletes on a *built*
 IVF collection incrementally instead of marking the index stale; a full rebuild
@@ -154,10 +154,12 @@ real data), a structural change, or reopen.
 
 Honest deviations, scoped for this first increment:
 
-- **Reassignment is exact over the full centroid set**, not a neighbour subset —
-  correct (it preserves the nearest-centroid invariant) but `O(affected ×
-  ncells)` per rebalance; neighbour-bounded reassignment is a performance
-  refinement.
+- **Reassignment is bounded to the local neighborhood** — resolved in v0.5.0:
+  after a split or merge the affected points are re-evaluated against the new
+  centroids and the affected cell's `REASSIGN_NEIGHBORS` nearest live neighbors,
+  not the full centroid set, so a rebalance is `O(nlist + |list|)`. The candidate
+  set reliably holds the true nearest centroid for points drawn from the cell's
+  locality, so recall is preserved (the IVF rebalancing recall tests cover it).
 - One split/merge per triggering operation (no cascading); a still-over-full cell
   is split again on its next insert.
 - The index stays derived and is rebuilt from the store on reopen, as decided —
