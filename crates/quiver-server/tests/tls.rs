@@ -142,6 +142,7 @@ async fn tls_secures_both_rest_and_grpc() {
         tls_cert: Some(cert_path),
         tls_key: Some(key_path),
         tls_client_ca: None,
+        audit_log: None,
         insecure: false,
     };
     tokio::spawn(async move {
@@ -221,6 +222,7 @@ async fn mtls_requires_a_client_certificate() {
         tls_cert: Some(cert_path),
         tls_key: Some(key_path),
         tls_client_ca: Some(ca_path),
+        audit_log: None,
         insecure: false,
     };
     tokio::spawn(async move {

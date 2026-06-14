@@ -59,6 +59,7 @@ async fn rest_and_grpc_round_trip() {
         tls_cert: None,
         tls_key: None,
         tls_client_ca: None,
+        audit_log: None,
         insecure: false,
     };
     let server = tokio::spawn(async move {
