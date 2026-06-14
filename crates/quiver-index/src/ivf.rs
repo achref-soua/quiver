@@ -20,8 +20,15 @@
 //! LIRE rebalancing (cell split/merge, ADR-0023), so a long insert/delete
 //! stream does not force an `O(N)` rebuild. It supports [`Metric::L2`] and
 //! [`Metric::Cosine`] (cosine on the unit sphere); inner product uses HNSW.
+//!
+//! Its state can be snapshotted to a versioned, self-describing blob and
+//! restored ([`Ivf::snapshot`] / [`Ivf::restore`]) — the basis for durable
+//! on-disk index recovery (ADR-0025).
 
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use quiver_simd::{Metric, l2_sq_f32};
 
@@ -39,7 +46,7 @@ use crate::{IndexError, Neighbor, ProductQuantizer};
 const REASSIGN_NEIGHBORS: usize = 32;
 
 /// Build parameters for [`Ivf`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct IvfConfig {
     /// Number of Voronoi cells / coarse centroids (`nlist`).
     pub nlist: usize,
@@ -74,6 +81,7 @@ impl Default for IvfConfig {
 }
 
 // Resident per-vector data: either full vectors (exact) or PQ codes (frugal).
+#[derive(Serialize, Deserialize)]
 enum Storage {
     Flat {
         vectors: Vec<f32>,
@@ -91,6 +99,11 @@ enum Storage {
 /// and unlinks it from its cell, so live points are exactly the keys of
 /// `id_to_node`; merged (emptied) cells are tombstoned (centroid set to a
 /// never-selected sentinel) and recycled by later splits.
+///
+/// [`Ivf::snapshot`] / [`Ivf::restore`] persist and reload this state (ADR-0025);
+/// `id_to_node` and `node_cell` are derivable, so they are skipped in the blob
+/// and rebuilt — with the structural invariants revalidated — on restore.
+#[derive(Serialize, Deserialize)]
 pub struct Ivf {
     dim: usize,
     metric: Metric,
@@ -100,9 +113,13 @@ pub struct Ivf {
     postings: Vec<Vec<u32>>,
     // node id -> external id (stale in a freed slot until the slot is reused).
     ids: Vec<u64>,
-    // Live external id -> node id (its size is the live count).
+    // Live external id -> node id (its size is the live count). Derived from
+    // `ids`/`free`, so it is rebuilt on restore rather than persisted.
+    #[serde(skip)]
     id_to_node: HashMap<u64, u32>,
-    // node id -> its current cell (stale in a freed slot).
+    // node id -> its current cell (stale in a freed slot). Derived from
+    // `postings`, so it is rebuilt on restore rather than persisted.
+    #[serde(skip)]
     node_cell: Vec<u32>,
     // Reusable node slots freed by removals.
     free: Vec<u32>,
@@ -582,6 +599,202 @@ impl Ivf {
     }
 }
 
+/// Magic tag at the head of an [`Ivf`] snapshot blob (ADR-0025).
+const SNAPSHOT_MAGIC: [u8; 4] = *b"QVIS";
+
+/// IVF snapshot format version, independent of the product SemVer. A reader that
+/// does not recognize the version refuses the blob — callers then fall back to a
+/// full rebuild (ADR-0025); bump it on any change to the serialized layout.
+const SNAPSHOT_VERSION: u16 = 1;
+
+/// An error encoding or decoding an [`Ivf`] snapshot (ADR-0025).
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum SnapshotError {
+    /// The blob does not begin with the IVF snapshot magic tag.
+    #[error("not an IVF snapshot (bad magic)")]
+    BadMagic,
+    /// The blob is shorter than the fixed snapshot header.
+    #[error("IVF snapshot is truncated")]
+    Truncated,
+    /// The blob declares a format version this build cannot read.
+    #[error("unsupported IVF snapshot format version {0}")]
+    UnsupportedVersion(u16),
+    /// The snapshot body failed to (de)serialize.
+    #[error("IVF snapshot serialization: {0}")]
+    Serde(#[from] postcard::Error),
+    /// The decoded state violates an IVF structural invariant (a torn or
+    /// tampered snapshot).
+    #[error("IVF snapshot invariant violated: {0}")]
+    Invariant(&'static str),
+}
+
+impl Ivf {
+    /// Serialize the full index state to a versioned, self-describing snapshot
+    /// blob (ADR-0025): `[b"QVIS"][version: u16-le][postcard(state)]`.
+    ///
+    /// The blob captures everything needed to resume incremental maintenance —
+    /// centroids, posting lists, resident vectors / PQ codes, the free lists, and
+    /// the split counter. The id↔node and node→cell maps are *not* written; they
+    /// are rebuilt by [`Ivf::restore`]. The bytes are not guaranteed reproducible
+    /// across restores, only to restore to an equivalent index.
+    ///
+    /// # Errors
+    /// Returns [`SnapshotError::Serde`] if serialization fails.
+    pub fn snapshot(&self) -> Result<Vec<u8>, SnapshotError> {
+        let body = postcard::to_allocvec(self)?;
+        let mut out = Vec::with_capacity(SNAPSHOT_MAGIC.len() + 2 + body.len());
+        out.extend_from_slice(&SNAPSHOT_MAGIC);
+        out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Reconstruct an index from a blob produced by [`Ivf::snapshot`], rebuilding
+    /// the derived maps and revalidating the structural invariants (ADR-0025).
+    /// The restored index is behaviorally equivalent to the original — same
+    /// membership and search results — and ready for further in-place updates.
+    ///
+    /// # Errors
+    /// Returns [`SnapshotError::BadMagic`], [`SnapshotError::Truncated`], or
+    /// [`SnapshotError::UnsupportedVersion`] for a header this build will not
+    /// read; [`SnapshotError::Serde`] for a malformed body; or
+    /// [`SnapshotError::Invariant`] if the decoded state is internally
+    /// inconsistent (a torn or tampered snapshot).
+    pub fn restore(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let header = SNAPSHOT_MAGIC.len() + 2;
+        if bytes.len() < header {
+            return Err(SnapshotError::Truncated);
+        }
+        if bytes[..SNAPSHOT_MAGIC.len()] != SNAPSHOT_MAGIC {
+            return Err(SnapshotError::BadMagic);
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != SNAPSHOT_VERSION {
+            return Err(SnapshotError::UnsupportedVersion(version));
+        }
+        let mut ivf: Ivf = postcard::from_bytes(&bytes[header..])?;
+        ivf.rebuild_derived()?;
+        Ok(ivf)
+    }
+
+    // Rebuild `id_to_node` and `node_cell` from the persisted state, validating
+    // the invariants an `Ivf` relies on so a torn or tampered snapshot is
+    // rejected rather than silently mis-serving (ADR-0025).
+    fn rebuild_derived(&mut self) -> Result<(), SnapshotError> {
+        if self.dim == 0 {
+            return Err(SnapshotError::Invariant("zero dimension"));
+        }
+        if self.metric == Metric::Dot {
+            return Err(SnapshotError::Invariant(
+                "IVF does not support inner product",
+            ));
+        }
+        let ncells = self.postings.len();
+        if self.centroids.len() != ncells * self.dim {
+            return Err(SnapshotError::Invariant("centroids length != ncells * dim"));
+        }
+        let n_slots = self.ids.len();
+        match &self.storage {
+            Storage::Flat { vectors } => {
+                if vectors.len() != n_slots * self.dim {
+                    return Err(SnapshotError::Invariant(
+                        "flat storage length != nslots * dim",
+                    ));
+                }
+            }
+            Storage::Pq { pq, codes } => {
+                if pq.dim() != self.dim || pq.metric() != self.metric {
+                    return Err(SnapshotError::Invariant("PQ dim/metric mismatch"));
+                }
+                if codes.len() != n_slots * pq.code_len() {
+                    return Err(SnapshotError::Invariant(
+                        "PQ codes length != nslots * code_len",
+                    ));
+                }
+            }
+        }
+
+        // Tombstoned (recyclable) cells: in range, listed once, and empty.
+        let mut tomb = vec![false; ncells];
+        for &c in &self.free_cells {
+            if c >= ncells {
+                return Err(SnapshotError::Invariant("free cell out of range"));
+            }
+            if std::mem::replace(&mut tomb[c], true) {
+                return Err(SnapshotError::Invariant("duplicate free cell"));
+            }
+            if !self.postings[c].is_empty() {
+                return Err(SnapshotError::Invariant(
+                    "tombstoned cell has a non-empty posting",
+                ));
+            }
+        }
+
+        // Freed node slots: each in range and listed once.
+        let mut freed = vec![false; n_slots];
+        for &slot in &self.free {
+            let s = slot as usize;
+            if s >= n_slots {
+                return Err(SnapshotError::Invariant("free slot out of range"));
+            }
+            if std::mem::replace(&mut freed[s], true) {
+                return Err(SnapshotError::Invariant("duplicate free slot"));
+            }
+        }
+
+        // node -> cell from the posting lists: every live node appears in exactly
+        // one list and no freed slot appears at all.
+        let mut node_cell = vec![0u32; n_slots];
+        let mut seen = vec![false; n_slots];
+        let mut live = 0usize;
+        for (cell, list) in self.postings.iter().enumerate() {
+            for &node in list {
+                let nd = node as usize;
+                if nd >= n_slots {
+                    return Err(SnapshotError::Invariant(
+                        "posting references out-of-range node",
+                    ));
+                }
+                if freed[nd] {
+                    return Err(SnapshotError::Invariant(
+                        "freed slot appears in a posting list",
+                    ));
+                }
+                if std::mem::replace(&mut seen[nd], true) {
+                    return Err(SnapshotError::Invariant(
+                        "node appears in multiple posting lists",
+                    ));
+                }
+                node_cell[nd] = cell as u32;
+                live += 1;
+            }
+        }
+        if live != n_slots - self.free.len() {
+            return Err(SnapshotError::Invariant(
+                "live node count disagrees with posting membership",
+            ));
+        }
+
+        // external id -> node over the live slots; external ids are unique.
+        let mut id_to_node = HashMap::with_capacity(live);
+        for (node, &is_free) in freed.iter().enumerate() {
+            if is_free {
+                continue;
+            }
+            if id_to_node.insert(self.ids[node], node as u32).is_some() {
+                return Err(SnapshotError::Invariant(
+                    "duplicate external id among live nodes",
+                ));
+            }
+        }
+
+        self.node_cell = node_cell;
+        self.id_to_node = id_to_node;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1225,239 @@ mod tests {
         assert!(matches!(
             l2.insert(7, &[0.0; 3]),
             Err(IndexError::DimensionMismatch { .. })
+        ));
+    }
+
+    // ----- durable snapshot / restore (ADR-0025) -----
+
+    // Assert two indexes return identical results for many random queries —
+    // snapshot/restore must be behavior-preserving, not merely lossless.
+    fn assert_search_equivalent(a: &Ivf, b: &Ivf, dim: usize, nprobe: usize, rng: &mut SplitMix64) {
+        for _ in 0..40 {
+            let q = rand_vec(rng, dim);
+            assert_eq!(
+                a.search(&q, 10, nprobe).unwrap(),
+                b.search(&q, 10, nprobe).unwrap(),
+                "snapshot/restore changed search results"
+            );
+        }
+    }
+
+    enum Op {
+        Insert(u64, Vec<f32>),
+        Remove(u64),
+    }
+
+    // A deterministic insert/delete stream that exercises splits, merges, slot
+    // reuse, and tombstones. Returns the ops, the next free id, and the live set.
+    fn make_ops(
+        rng: &mut SplitMix64,
+        start_id: u64,
+        count: usize,
+        dim: usize,
+        mut live: Vec<u64>,
+    ) -> (Vec<Op>, u64, Vec<u64>) {
+        let mut ops = Vec::with_capacity(count);
+        let mut next = start_id;
+        for _ in 0..count {
+            if rng.next_f64() < 0.45 && !live.is_empty() {
+                let i = ((rng.next_f64() * live.len() as f64) as usize).min(live.len() - 1);
+                ops.push(Op::Remove(live.swap_remove(i)));
+            } else {
+                ops.push(Op::Insert(next, rand_vec(rng, dim)));
+                live.push(next);
+                next += 1;
+            }
+        }
+        (ops, next, live)
+    }
+
+    fn apply(idx: &mut Ivf, ops: &[Op]) {
+        for op in ops {
+            match op {
+                Op::Insert(id, v) => idx.insert(*id, v).unwrap(),
+                Op::Remove(id) => {
+                    idx.remove(*id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_blob_is_self_describing() {
+        let mut rng = SplitMix64::new(1);
+        let (_d, flat, ids) = dataset(&mut rng, 50, 8);
+        let idx = Ivf::build(&ids, &flat, 8, Metric::L2, IvfConfig::default()).unwrap();
+        let blob = idx.snapshot().unwrap();
+        assert_eq!(&blob[0..4], b"QVIS", "snapshot must carry the magic tag");
+        assert_eq!(u16::from_le_bytes([blob[4], blob[5]]), 1, "format version");
+    }
+
+    #[test]
+    fn snapshot_round_trips_flat() {
+        let (dim, n) = (32, 800);
+        let mut rng = SplitMix64::new(0x5004);
+        let (_d, flat, ids) = dataset(&mut rng, n, dim);
+        let cfg = IvfConfig {
+            nlist: 32,
+            ..IvfConfig::default()
+        };
+        let idx = Ivf::build(&ids, &flat, dim, Metric::L2, cfg).unwrap();
+        let restored = Ivf::restore(&idx.snapshot().unwrap()).unwrap();
+        assert_eq!(restored.len(), idx.len());
+        assert_eq!(restored.nlist(), idx.nlist());
+        assert_search_equivalent(&idx, &restored, dim, 16, &mut rng);
+    }
+
+    #[test]
+    fn snapshot_round_trips_pq() {
+        let (dim, n) = (32, 1200);
+        let mut rng = SplitMix64::new(0x5005);
+        let (_d, flat, ids) = dataset(&mut rng, n, dim);
+        let cfg = IvfConfig {
+            nlist: 32,
+            quantization: Some(8),
+            ..IvfConfig::default()
+        };
+        let idx = Ivf::build(&ids, &flat, dim, Metric::L2, cfg).unwrap();
+        let restored = Ivf::restore(&idx.snapshot().unwrap()).unwrap();
+        assert_eq!(restored.len(), idx.len());
+        assert_search_equivalent(&idx, &restored, dim, 32, &mut rng);
+    }
+
+    #[test]
+    fn snapshot_round_trips_cosine() {
+        let (dim, n) = (24, 600);
+        let mut rng = SplitMix64::new(0x5006);
+        let (_d, flat, ids) = dataset(&mut rng, n, dim);
+        let cfg = IvfConfig {
+            nlist: 24,
+            ..IvfConfig::default()
+        };
+        let idx = Ivf::build(&ids, &flat, dim, Metric::Cosine, cfg).unwrap();
+        let restored = Ivf::restore(&idx.snapshot().unwrap()).unwrap();
+        assert_search_equivalent(&idx, &restored, dim, 24, &mut rng);
+    }
+
+    #[test]
+    fn empty_index_snapshot_round_trips() {
+        let idx = Ivf::build(&[], &[], 4, Metric::L2, IvfConfig::default()).unwrap();
+        let restored = Ivf::restore(&idx.snapshot().unwrap()).unwrap();
+        assert!(restored.is_empty());
+        assert_eq!(restored.search(&[0.0; 4], 5, 4).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn snapshot_round_trips_after_churn() {
+        // Splits, merges, freed slots, and tombstoned cells must all survive.
+        let dim = 16;
+        let mut rng = SplitMix64::new(0xC04);
+        let (_d, flat, ids) = dataset(&mut rng, 300, dim);
+        let cfg = IvfConfig {
+            nlist: 8,
+            max_postings: 24,
+            min_postings: 4,
+            ..IvfConfig::default()
+        };
+        let mut idx = Ivf::build(&ids, &flat, dim, Metric::L2, cfg).unwrap();
+        let (ops, _next, _live) = make_ops(&mut rng, 300, 1200, dim, (0..300).collect());
+        apply(&mut idx, &ops);
+        assert!(idx.nlist() > cfg.nlist, "churn should have split cells");
+
+        let restored = Ivf::restore(&idx.snapshot().unwrap()).unwrap();
+        assert_eq!(restored.len(), idx.len());
+        assert_eq!(restored.nlist(), idx.nlist());
+        assert_search_equivalent(&idx, &restored, dim, idx.nlist(), &mut rng);
+    }
+
+    #[test]
+    fn restored_index_supports_identical_further_updates() {
+        // A restored index must be indistinguishable from one that was never
+        // snapshotted — including the split-seed counter and free lists — so
+        // subsequent in-place updates evolve it identically.
+        let dim = 16;
+        let mut build_rng = SplitMix64::new(0x7A1);
+        let (_d, flat, ids) = dataset(&mut build_rng, 200, dim);
+        let cfg = IvfConfig {
+            nlist: 8,
+            max_postings: 20,
+            min_postings: 3,
+            ..IvfConfig::default()
+        };
+        // Two byte-identical indexes (build is deterministic).
+        let mut a = Ivf::build(&ids, &flat, dim, Metric::L2, cfg).unwrap();
+        let mut b = Ivf::build(&ids, &flat, dim, Metric::L2, cfg).unwrap();
+
+        let mut op_rng = SplitMix64::new(0xBEEF);
+        let (ops1, next, live) = make_ops(&mut op_rng, 200, 900, dim, (0..200).collect());
+        apply(&mut a, &ops1);
+        apply(&mut b, &ops1);
+
+        // Snapshot+restore only `b`; `a` stays the never-snapshotted reference.
+        let mut b2 = Ivf::restore(&b.snapshot().unwrap()).unwrap();
+
+        // Continue both with the same further stream; they must stay identical.
+        let (ops2, _n, _l) = make_ops(&mut op_rng, next, 500, dim, live);
+        apply(&mut a, &ops2);
+        apply(&mut b2, &ops2);
+        assert_eq!(a.len(), b2.len());
+        assert_eq!(a.nlist(), b2.nlist());
+        let mut q_rng = SplitMix64::new(0x99);
+        assert_search_equivalent(&a, &b2, dim, a.nlist(), &mut q_rng);
+    }
+
+    #[test]
+    fn restore_rejects_a_truncated_or_mistagged_blob() {
+        assert!(matches!(
+            Ivf::restore(&[1, 2, 3]),
+            Err(SnapshotError::Truncated)
+        ));
+        assert!(matches!(
+            Ivf::restore(b"NOPExxxxxx"),
+            Err(SnapshotError::BadMagic)
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_an_unsupported_version() {
+        let mut rng = SplitMix64::new(2);
+        let ids: Vec<u64> = (0..20).collect();
+        let (_d, flat, _ids) = dataset(&mut rng, 20, 8);
+        let idx = Ivf::build(&ids, &flat, 8, Metric::L2, IvfConfig::default()).unwrap();
+        let mut blob = idx.snapshot().unwrap();
+        blob[4] = 0xFF; // bump the version to 255
+        blob[5] = 0x00;
+        assert!(matches!(
+            Ivf::restore(&blob),
+            Err(SnapshotError::UnsupportedVersion(255))
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_a_truncated_body() {
+        let mut rng = SplitMix64::new(3);
+        let ids: Vec<u64> = (0..60).collect();
+        let (_d, flat, _ids) = dataset(&mut rng, 60, 8);
+        let idx = Ivf::build(&ids, &flat, 8, Metric::L2, IvfConfig::default()).unwrap();
+        let mut blob = idx.snapshot().unwrap();
+        blob.truncate(8); // valid header, but the body is gone
+        // Never a panic, never a silently broken index.
+        assert!(Ivf::restore(&blob).is_err());
+    }
+
+    #[test]
+    fn restore_rejects_inconsistent_state() {
+        // A structurally valid blob whose decoded state is internally
+        // inconsistent must be rejected by the invariant checks, not loaded.
+        let mut rng = SplitMix64::new(4);
+        let ids: Vec<u64> = (0..60).collect();
+        let (_d, flat, _ids) = dataset(&mut rng, 60, 8);
+        let mut idx = Ivf::build(&ids, &flat, 8, Metric::L2, IvfConfig::default()).unwrap();
+        // Corrupt a posting list to reference a node that does not exist.
+        idx.postings[0].push(99_999);
+        assert!(matches!(
+            Ivf::restore(&idx.snapshot().unwrap()),
+            Err(SnapshotError::Invariant(_))
         ));
     }
 }
