@@ -1,6 +1,6 @@
 # ADR-0031: Experimental property-preserving vector encryption (DCPE)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-15
 - **Deciders:** Achref Soua
 
@@ -155,6 +155,39 @@ with its limits, not as a general confidentiality control.
 all DCPE sub-keys; the client owns it and Quiver never sees it. Use a dedicated
 key per deployment (ideally per collection); losing it makes the vectors
 unrecoverable; reusing the at-rest key is forbidden.
+
+## Implementation
+
+Shipped across the crypto crate, the engine, the network surface, and the SDKs
+(v0.10.0):
+
+- **Cipher** (`quiver_crypto::dcpe`): `DcpeCipher` implements Scale-And-Perturb
+  exactly as above — HKDF-SHA256 derives the secret scale `s ∈ [1, 2)`, a ChaCha20
+  CSPRNG key, and an HMAC key from one master secret; the perturbation is a
+  uniform point in the d-ball of radius `(s/4)·β` (a Box-Muller Gaussian direction
+  over the ChaCha20 keystream, normalised and scaled by `radius = (s/4)·β·U^{1/d}`);
+  the ciphertext is `s·m + λ` with an HMAC-SHA256 integrity tag. Only audited
+  RustCrypto primitives (`chacha20`, `hmac`, `hkdf`, `sha2`). The byte-level
+  sampling is fixed and documented so it can be reproduced in another language.
+- **Collection flag**: `Descriptor.encrypted_vectors` (serde-default `false`,
+  decode-fallback-compatible), enforced **L2-only** in the engine, surfaced over
+  REST, gRPC, the MCP `create_collection` tool, and the Python/TypeScript SDKs.
+- **Gate proof**: an end-to-end test boots a server with encryption-at-rest
+  **off**, DCPE-encrypts vectors client-side, and shows an encrypted query returns
+  the right neighbour while the plaintext vector never reaches disk.
+- **SDKs**: a faithful **Python** `quiver.dcpe.DcpeCipher` port, validated by a
+  cross-language known-answer test that decrypts a vector produced by the Rust
+  reference (the tag verifies — an exact HKDF + HMAC match — and the plaintext is
+  recovered — the ChaCha20 + Box-Muller perturbation matches within float ULPs).
+
+Honest deviations and follow-ups: v0.10.0 ships the core scale-and-perturb cipher
+with an integrity tag; the paper's two security-boosting pre-processing steps —
+the secret component **shuffle** and **plaintext-distribution normalisation** —
+are documented as recommended hardening and are noted follow-ups, not yet
+implemented. A native **TypeScript** DCPE cipher is also a follow-up (the TS SDK
+can already create DCPE collections via the flag). Cross-language interop is
+validated within a tolerance, not bit-exactly, because the float-valued
+ciphertext uses transcendental functions (libm ULP differences).
 
 ## Consequences
 
