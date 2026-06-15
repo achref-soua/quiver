@@ -15,6 +15,13 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 ureq = { workspace = true }
 
+# Live Postgres / pgvector connector (ADR-0029). `rustls` + `webpki-roots` build
+# the ring-backed TLS the `postgres` driver uses; see the workspace manifest.
+postgres = { workspace = true }
+rustls = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

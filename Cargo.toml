@@ -117,10 +117,28 @@ tonic-prost-build = "0.14"
 protoc-bin-vendored = "3"
 
 # Live migration connectors (ADR-0027): a blocking HTTP client on rustls over
-# `ring` (matching the transport TLS), with no async runtime — it fits the
-# synchronous, tokio-free `quiver-import` crate, where `reqwest` (async, dev-only
+# `ring` (matching the transport TLS), with no async runtime — it carries the
+# synchronous Qdrant and Chroma connectors, where `reqwest` (async, dev-only
 # here) would not.
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
+# Live Postgres / pgvector connector (ADR-0029): the blocking rust-postgres
+# client (a synchronous wrapper over tokio-postgres) reads each row as
+# `row_to_json`, reusing the offline pgvector mapper. `with-serde_json-1` lets a
+# row column decode straight into a serde_json::Value. tokio is already a
+# workspace dependency (ADR-0002, the server); the embeddable engine
+# (quiver-embed / quiver-core) stays tokio-free — only the import crate gains the
+# driver.
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+# TLS for the Postgres connector over the same rustls/`ring` stack as the rest of
+# Quiver — no OpenSSL and no `aws-lc-rs` C toolchain: default features off so only
+# `ring` is pulled. Whether TLS is used is governed by `sslmode` in the URL.
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = [
+    "ring",
+] }
+# Mozilla CA roots to verify the Postgres TLS peer; pinned to the same 0.26 line
+# `ureq` already uses, so no third webpki-roots major lands in the tree.
+webpki-roots = "0.26"
 
 # Dev-only dependencies (tests, property tests, fixtures).
 proptest = "1"

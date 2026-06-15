@@ -3,14 +3,17 @@
 //! source over HTTP, normalizing each through the same per-source mapper the
 //! offline importers use, so live and offline import share one write path.
 //!
-//! Qdrant (ADR-0027) and Chroma (ADR-0029) are supported. Qdrant uses its stable,
-//! name-addressed `points/scroll` API; Chroma uses its v2 HTTP API, resolving the
-//! collection name to an id by listing collections, then paginating `/get`.
-//! pgvector follows on a blocking Postgres driver (ADR-0029).
+//! Qdrant (ADR-0027), Chroma, and Postgres/pgvector (ADR-0029) are supported.
+//! Qdrant uses its stable `points/scroll` API and Chroma its v2 `get` API, both
+//! over the blocking `ureq` HTTP client; Postgres uses the blocking `postgres`
+//! driver, reading each row as `row_to_json` so it reuses the offline pgvector
+//! mapper.
 
 use serde_json::{Value, json};
 
-use crate::{ImportError, ImportPoint, ParseOptions, Source, chroma_points, qdrant_point};
+use crate::{
+    ImportError, ImportPoint, ParseOptions, Source, chroma_points, pgvector_point, qdrant_point,
+};
 
 /// Connection details for a live Qdrant collection.
 #[derive(Debug, Clone)]
@@ -233,6 +236,94 @@ fn with_token(request: ureq::Request, src: &ChromaSource) -> ureq::Request {
     }
 }
 
+/// Connection details for a live Postgres / pgvector source (ADR-0029).
+#[derive(Debug, Clone)]
+pub struct PgvectorSource {
+    /// libpq connection URL, e.g.
+    /// `postgresql://user:pass@host:5432/db?sslmode=require`.
+    pub url: String,
+    /// Table to read, optionally schema-qualified (`schema.table`).
+    pub table: String,
+}
+
+impl PgvectorSource {
+    /// A source reading `table` from the Postgres database at `url`.
+    #[must_use]
+    pub fn new(url: impl Into<String>, table: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            table: table.into(),
+        }
+    }
+}
+
+/// Pull every row from a live Postgres table holding pgvector embeddings
+/// (ADR-0029). Each row is read as `row_to_json(...)` — the same JSON shape the
+/// offline pgvector path parses, with the id and vector columns named (per
+/// `opts`) and every other column becoming payload — then normalized through the
+/// shared pgvector mapper. TLS is negotiated according to the URL's `sslmode`.
+///
+/// # Errors
+/// [`ImportError::Http`] if the connection or query fails, [`ImportError::Shape`]
+/// for an unreadable row or an empty table name, and the usual per-row mapping
+/// errors ([`ImportError::Vector`], …).
+pub fn fetch_pgvector(
+    src: &PgvectorSource,
+    opts: &ParseOptions,
+) -> Result<Vec<ImportPoint>, ImportError> {
+    let tls = pgvector_tls()?;
+    let mut client = postgres::Client::connect(&src.url, tls)
+        .map_err(|e| ImportError::Http(Source::Pgvector, e.to_string()))?;
+    let query = format!(
+        "SELECT row_to_json(t) FROM (SELECT * FROM {}) t",
+        quote_ident(&src.table)?
+    );
+    let rows = client
+        .query(query.as_str(), &[])
+        .map_err(|e| ImportError::Http(Source::Pgvector, e.to_string()))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let value: Value = row.try_get(0).map_err(|e| {
+            ImportError::Shape(Source::Pgvector, format!("decoding row_to_json: {e}"))
+        })?;
+        out.push(pgvector_point(opts, value)?);
+    }
+    Ok(out)
+}
+
+// Build a rustls TLS connector for Postgres on the same `ring` provider and
+// Mozilla roots the rest of Quiver uses (no OpenSSL, no aws-lc-rs). Whether TLS
+// is actually used is governed by `sslmode` in the connection URL.
+fn pgvector_tls() -> Result<tokio_postgres_rustls::MakeRustlsConnect, ImportError> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| ImportError::Http(Source::Pgvector, format!("tls setup: {e}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(config))
+}
+
+// Quote a possibly schema-qualified SQL identifier (`schema.table`) so the table
+// name is interpolated safely: each dot-separated part is double-quoted with any
+// embedded quote doubled.
+fn quote_ident(ident: &str) -> Result<String, ImportError> {
+    if ident.trim().is_empty() {
+        return Err(ImportError::Shape(
+            Source::Pgvector,
+            "empty table name".to_string(),
+        ));
+    }
+    let quoted = ident
+        .split('.')
+        .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(".");
+    Ok(quoted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +461,45 @@ mod tests {
             fetch_chroma(&src),
             Err(ImportError::Shape(Source::Chroma, _))
         ));
+    }
+
+    #[test]
+    fn quote_ident_quotes_and_rejects_empty() {
+        assert_eq!(quote_ident("items").unwrap(), "\"items\"");
+        assert_eq!(quote_ident("public.items").unwrap(), "\"public\".\"items\"");
+        // An embedded quote is doubled, so a crafted table name cannot break out.
+        assert_eq!(quote_ident("a\"b").unwrap(), "\"a\"\"b\"");
+        assert!(quote_ident("   ").is_err());
+    }
+
+    #[test]
+    fn fetch_pgvector_reports_a_connection_error() {
+        use std::net::TcpListener;
+        // Bind then drop to get a port nothing is listening on, so the connect is
+        // refused promptly — exercising TLS setup and the connection-error path
+        // without a real server.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("postgresql://u@127.0.0.1:{port}/db?connect_timeout=2&sslmode=disable");
+        let src = PgvectorSource::new(url, "items");
+        assert!(matches!(
+            fetch_pgvector(&src, &ParseOptions::new(Source::Pgvector)),
+            Err(ImportError::Http(Source::Pgvector, _))
+        ));
+    }
+
+    // A real-server check: point QUIVER_PG_TEST_URL (and optionally
+    // QUIVER_PG_TEST_TABLE) at a running Postgres with a pgvector table, then run
+    // `cargo test -p quiver-import -- --ignored`. Hermetic CI cannot fake the
+    // Postgres wire protocol, so this is an operator step (ADR-0029).
+    #[test]
+    #[ignore = "needs a real Postgres+pgvector at QUIVER_PG_TEST_URL"]
+    fn live_pgvector_import_against_a_real_server() {
+        let url = std::env::var("QUIVER_PG_TEST_URL").expect("QUIVER_PG_TEST_URL must be set");
+        let table = std::env::var("QUIVER_PG_TEST_TABLE").unwrap_or_else(|_| "items".to_string());
+        let src = PgvectorSource::new(url, table);
+        let points = fetch_pgvector(&src, &ParseOptions::new(Source::Pgvector)).unwrap();
+        assert!(!points.is_empty(), "expected at least one row");
     }
 }
