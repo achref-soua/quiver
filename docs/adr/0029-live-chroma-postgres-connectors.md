@@ -1,6 +1,6 @@
 # ADR-0029: Live Chroma and Postgres migration connectors
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-15
 - **Deciders:** Achref Soua
 
@@ -79,6 +79,29 @@ live and offline routes.
 **4. Keep the dependency tree honest.** Any new license the rust-postgres family
 introduces is allow-listed in `deny.toml`; `cargo deny` and `cargo audit` gate
 every PR.
+
+## Implementation
+
+Shipped across four PRs:
+
+- **Chroma** — `quiver_import::live::fetch_chroma` on the existing `ureq` seam,
+  **no new dependency**. It resolves the collection id by listing collections,
+  paginates `…/collections/{id}/get` with
+  `include:[embeddings,metadatas,documents]`, and reuses the extracted
+  `chroma_points` mapper shared with the offline `parse_chroma`.
+- **Postgres** — `quiver_import::live::fetch_pgvector` on the blocking `postgres`
+  driver with rustls/`ring` TLS (`tokio-postgres-rustls` + `webpki-roots`, no
+  aws-lc-rs). It reads `row_to_json(...)` and reuses the offline `pgvector_point`
+  mapper. `cargo deny` and `cargo audit` are clean on the enlarged tree (single
+  `rustls` 0.23, no aws-lc-rs); the licence allow-list needed no additions.
+- **CLI** — `quiver admin import --chroma-url` (with `--chroma-tenant` /
+  `--chroma-database`) and `--postgres-url` (with `--table`).
+
+Honest deviations: Chroma is validated **hermetically** (an in-process HTTP
+server); the Postgres I/O path has **no** hermetic test (its wire protocol can't
+be faked in-process) — the row mapping is unit-tested and a real instance is
+covered by an `#[ignore]`d test against `QUIVER_PG_TEST_URL`. Real-server
+validation is an operator step for both.
 
 ## Consequences
 
