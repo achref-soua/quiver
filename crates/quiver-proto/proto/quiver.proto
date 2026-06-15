@@ -21,6 +21,11 @@ service Quiver {
   rpc GetPoints(GetPointsRequest) returns (GetPointsResponse);
 
   rpc Search(SearchRequest) returns (SearchResponse);
+
+  // Multi-vector (late-interaction / ColBERT) documents (ADR-0028).
+  rpc UpsertMultiVector(UpsertMultiVectorRequest) returns (UpsertMultiVectorResponse);
+  rpc SearchMultiVector(SearchMultiVectorRequest) returns (SearchMultiVectorResponse);
+  rpc DeleteDocuments(DeleteDocumentsRequest) returns (DeleteDocumentsResponse);
 }
 
 // Distance / similarity metric.
@@ -67,6 +72,8 @@ message Collection {
   optional uint32 pq_subspaces = 6;
   // Payload fields indexed for filtering.
   repeated FilterableField filterable = 7;
+  // Whether this is a multi-vector (late-interaction / ColBERT) collection.
+  bool multivector = 8;
 }
 
 message CreateCollectionRequest {
@@ -78,6 +85,9 @@ message CreateCollectionRequest {
   optional uint32 pq_subspaces = 5;
   // Payload fields to index for pre-filtered (hybrid) search.
   repeated FilterableField filterable = 6;
+  // Create a multi-vector (late-interaction / ColBERT) collection (ADR-0028),
+  // whose documents are token-vector sets searched by MaxSim.
+  bool multivector = 7;
 }
 
 message GetCollectionRequest {
@@ -153,4 +163,59 @@ message Match {
 
 message SearchResponse {
   repeated Match matches = 1;
+}
+
+// A dense f32 vector — one document or query token in multi-vector search.
+message Vector {
+  repeated float values = 1;
+}
+
+// A multi-vector (late-interaction / ColBERT) document: an id, its set of token
+// vectors, and an opaque (JSON) payload.
+message MultiVectorPoint {
+  string id = 1;
+  repeated Vector vectors = 2;
+  bytes payload = 3;
+}
+
+message UpsertMultiVectorRequest {
+  string collection = 1;
+  repeated MultiVectorPoint documents = 2;
+}
+
+message UpsertMultiVectorResponse {
+  uint64 upserted = 1;
+}
+
+message SearchMultiVectorRequest {
+  string collection = 1;
+  repeated Vector query = 2;
+  uint32 k = 3;
+  // JSON-encoded quiver-query Filter; empty = no filter.
+  bytes filter = 4;
+  uint32 ef_search = 5;
+  bool with_payload = 6;
+  bool with_vector = 7;
+}
+
+// A multi-vector document match: id, MaxSim score, payload, and — if requested —
+// the document's token vectors.
+message DocumentMatch {
+  string id = 1;
+  float score = 2;
+  bytes payload = 3;
+  repeated Vector vectors = 4;
+}
+
+message SearchMultiVectorResponse {
+  repeated DocumentMatch matches = 1;
+}
+
+message DeleteDocumentsRequest {
+  string collection = 1;
+  repeated string ids = 2;
+}
+
+message DeleteDocumentsResponse {
+  uint64 deleted = 1;
 }

@@ -16,7 +16,9 @@ use quiver_embed::{DistanceMetric, FieldType, FilterableField, IndexKind, IndexS
 use quiver_query::Filter;
 
 use crate::auth::Principal;
-use crate::{AppState, CollectionInfo, Error, MatchOut, PointIn, PointOut};
+use crate::{
+    AppState, CollectionInfo, DocumentIn, DocumentMatchOut, Error, MatchOut, PointIn, PointOut,
+};
 
 /// Build the REST router: open `/healthz`, `/readyz`, `/metrics`; the `/v1` API
 /// behind API-key auth.
@@ -36,6 +38,14 @@ pub(crate) fn router(state: AppState) -> Router {
         )
         .route("/v1/collections/{name}/points/{id}", get(get_point))
         .route("/v1/collections/{name}/query", post(search))
+        .route(
+            "/v1/collections/{name}/documents",
+            post(upsert_documents).delete(delete_documents),
+        )
+        .route(
+            "/v1/collections/{name}/documents/query",
+            post(search_multi_vector),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state);
 
@@ -213,6 +223,12 @@ struct CollectionDto {
     pq_subspaces: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     filterable: Vec<FilterableFieldDto>,
+    #[serde(skip_serializing_if = "is_false")]
+    multivector: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl From<CollectionInfo> for CollectionDto {
@@ -225,6 +241,7 @@ impl From<CollectionInfo> for CollectionDto {
             index: info.index.kind.into(),
             pq_subspaces: info.index.pq_subspaces,
             filterable: info.filterable.into_iter().map(Into::into).collect(),
+            multivector: info.multivector,
         }
     }
 }
@@ -241,6 +258,8 @@ struct CreateCollectionBody {
     pq_subspaces: Option<u32>,
     #[serde(default)]
     filterable: Vec<FilterableFieldDto>,
+    #[serde(default)]
+    multivector: bool,
 }
 
 async fn create_collection(
@@ -261,6 +280,7 @@ async fn create_collection(
             body.metric.into(),
             index,
             filterable,
+            body.multivector,
         )
         .await?;
     Ok(Json(info.into()))
@@ -455,5 +475,113 @@ async fn search(
         .await?;
     Ok(Json(SearchResponse {
         matches: matches.into_iter().map(MatchDto::from).collect(),
+    }))
+}
+
+// ---- Multi-vector (late-interaction / ColBERT) documents (ADR-0028) ----
+
+#[derive(Deserialize)]
+struct DocumentDto {
+    id: String,
+    vectors: Vec<Vec<f32>>,
+    #[serde(default)]
+    payload: Value,
+}
+
+#[derive(Deserialize)]
+struct UpsertDocumentsBody {
+    documents: Vec<DocumentDto>,
+}
+
+async fn upsert_documents(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(name): Path<String>,
+    Json(body): Json<UpsertDocumentsBody>,
+) -> Result<Json<UpsertResponse>, Error> {
+    let documents = body
+        .documents
+        .into_iter()
+        .map(|d| DocumentIn {
+            id: d.id,
+            vectors: d.vectors,
+            payload: d.payload,
+        })
+        .collect();
+    let upserted = state.upsert_documents(&principal, name, documents).await?;
+    Ok(Json(UpsertResponse { upserted }))
+}
+
+async fn delete_documents(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(name): Path<String>,
+    Json(body): Json<DeletePointsBody>,
+) -> Result<Json<DeletePointsResponse>, Error> {
+    let deleted = state.delete_documents(&principal, name, body.ids).await?;
+    Ok(Json(DeletePointsResponse { deleted }))
+}
+
+#[derive(Deserialize)]
+struct SearchMultiVectorBody {
+    query: Vec<Vec<f32>>,
+    #[serde(default = "default_k")]
+    k: usize,
+    #[serde(default)]
+    filter: Option<Filter>,
+    #[serde(default = "default_ef")]
+    ef_search: usize,
+    #[serde(default = "default_true")]
+    with_payload: bool,
+    #[serde(default)]
+    with_vector: bool,
+}
+
+#[derive(Serialize)]
+struct DocumentMatchDto {
+    id: String,
+    score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vectors: Option<Vec<Vec<f32>>>,
+}
+
+impl From<DocumentMatchOut> for DocumentMatchDto {
+    fn from(m: DocumentMatchOut) -> Self {
+        Self {
+            id: m.id,
+            score: m.score,
+            payload: m.payload,
+            vectors: m.vectors,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SearchMultiVectorResponse {
+    matches: Vec<DocumentMatchDto>,
+}
+
+async fn search_multi_vector(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(name): Path<String>,
+    Json(body): Json<SearchMultiVectorBody>,
+) -> Result<Json<SearchMultiVectorResponse>, Error> {
+    let matches = state
+        .search_multi_vector(
+            &principal,
+            name,
+            body.query,
+            body.k,
+            body.filter,
+            body.ef_search,
+            body.with_payload,
+            body.with_vector,
+        )
+        .await?;
+    Ok(Json(SearchMultiVectorResponse {
+        matches: matches.into_iter().map(DocumentMatchDto::from).collect(),
     }))
 }

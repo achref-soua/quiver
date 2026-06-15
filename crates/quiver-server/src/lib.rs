@@ -262,6 +262,7 @@ pub(crate) struct CollectionInfo {
     pub count: u64,
     pub index: IndexSpec,
     pub filterable: Vec<FilterableField>,
+    pub multivector: bool,
 }
 
 /// A point to upsert.
@@ -284,6 +285,21 @@ pub(crate) struct MatchOut {
     pub score: f32,
     pub payload: Option<Value>,
     pub vector: Option<Vec<f32>>,
+}
+
+/// A multi-vector document to upsert.
+pub(crate) struct DocumentIn {
+    pub id: String,
+    pub vectors: Vec<Vec<f32>>,
+    pub payload: Value,
+}
+
+/// A multi-vector document hit (MaxSim).
+pub(crate) struct DocumentMatchOut {
+    pub id: String,
+    pub score: f32,
+    pub payload: Option<Value>,
+    pub vectors: Option<Vec<Vec<f32>>>,
 }
 
 impl AppState {
@@ -337,6 +353,7 @@ impl AppState {
             .inspect_err(|_| self.audit.deny(principal.actor(), op, "*"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_collection(
         &self,
         principal: &Principal,
@@ -345,11 +362,13 @@ impl AppState {
         metric: DistanceMetric,
         index: IndexSpec,
         filterable: Vec<FilterableField>,
+        multivector: bool,
     ) -> Result<CollectionInfo, Error> {
         self.authorize(principal, Action::Admin, "create_collection", &name)?;
         let descriptor = Descriptor::new(dim, Dtype::F32, metric)
             .with_index(index)
-            .with_filterable(filterable.clone());
+            .with_filterable(filterable.clone())
+            .with_multivector(multivector);
         let owned = name.clone();
         let result = self
             .run_blocking(move |db| db.create_collection(&owned, descriptor))
@@ -368,6 +387,7 @@ impl AppState {
             count: 0,
             index,
             filterable,
+            multivector,
         })
     }
 
@@ -382,7 +402,13 @@ impl AppState {
                 .descriptor(&name)
                 .cloned()
                 .ok_or_else(|| quiver_embed::Error::CollectionNotFound(name.clone()))?;
-            let count = db.len(&name)? as u64;
+            // A multi-vector collection reports its document count, not its
+            // (much larger) token-row count.
+            let count = if descriptor.multivector {
+                db.document_count(&name)? as u64
+            } else {
+                db.len(&name)? as u64
+            };
             Ok(CollectionInfo {
                 name,
                 dim: descriptor.dim,
@@ -390,6 +416,7 @@ impl AppState {
                 count,
                 index: descriptor.index,
                 filterable: descriptor.filterable,
+                multivector: descriptor.multivector,
             })
         })
         .await
@@ -405,7 +432,11 @@ impl AppState {
                 let mut out = Vec::new();
                 for name in db.collection_names() {
                     if let Some(descriptor) = db.descriptor(&name).cloned() {
-                        let count = db.len(&name)? as u64;
+                        let count = if descriptor.multivector {
+                            db.document_count(&name)? as u64
+                        } else {
+                            db.len(&name)? as u64
+                        };
                         out.push(CollectionInfo {
                             name,
                             dim: descriptor.dim,
@@ -413,6 +444,7 @@ impl AppState {
                             count,
                             index: descriptor.index,
                             filterable: descriptor.filterable,
+                            multivector: descriptor.multivector,
                         });
                     }
                 }
@@ -545,6 +577,96 @@ impl AppState {
                     score: m.score,
                     payload: m.payload,
                     vector: m.vector,
+                })
+                .collect())
+        })
+        .await
+    }
+
+    pub(crate) async fn upsert_documents(
+        &self,
+        principal: &Principal,
+        collection: String,
+        documents: Vec<DocumentIn>,
+    ) -> Result<u64, Error> {
+        self.authorize(principal, Action::Write, "upsert_documents", &collection)?;
+        let resource = collection.clone();
+        let result = self
+            .run_blocking(move |db| {
+                let mut count = 0u64;
+                for doc in &documents {
+                    db.upsert_document(&collection, &doc.id, &doc.vectors, &doc.payload)?;
+                    count += 1;
+                }
+                Ok(count)
+            })
+            .await;
+        self.audit.record(
+            principal.actor(),
+            "upsert_documents",
+            &resource,
+            Outcome::of(&result),
+        );
+        result
+    }
+
+    pub(crate) async fn delete_documents(
+        &self,
+        principal: &Principal,
+        collection: String,
+        ids: Vec<String>,
+    ) -> Result<u64, Error> {
+        self.authorize(principal, Action::Write, "delete_documents", &collection)?;
+        let resource = collection.clone();
+        let result = self
+            .run_blocking(move |db| {
+                let mut count = 0u64;
+                for id in &ids {
+                    if db.delete_document(&collection, id)? {
+                        count += 1;
+                    }
+                }
+                Ok(count)
+            })
+            .await;
+        self.audit.record(
+            principal.actor(),
+            "delete_documents",
+            &resource,
+            Outcome::of(&result),
+        );
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn search_multi_vector(
+        &self,
+        principal: &Principal,
+        collection: String,
+        query: Vec<Vec<f32>>,
+        k: usize,
+        filter: Option<Filter>,
+        ef_search: usize,
+        with_payload: bool,
+        with_vector: bool,
+    ) -> Result<Vec<DocumentMatchOut>, Error> {
+        self.authorize(principal, Action::Read, "search_multi_vector", &collection)?;
+        self.run_blocking(move |db| {
+            let params = SearchParams {
+                k,
+                filter,
+                ef_search,
+                with_payload,
+                with_vector,
+            };
+            let matches = db.search_multi_vector(&collection, &query, &params)?;
+            Ok(matches
+                .into_iter()
+                .map(|m| DocumentMatchOut {
+                    id: m.id,
+                    score: m.score,
+                    payload: m.payload,
+                    vectors: m.vectors,
                 })
                 .collect())
         })

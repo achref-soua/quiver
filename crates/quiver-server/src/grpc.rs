@@ -13,7 +13,7 @@ use quiver_proto::v1::{
 use quiver_query::Filter;
 
 use crate::auth::Principal;
-use crate::{AppState, CollectionInfo, MatchOut, PointIn, PointOut};
+use crate::{AppState, CollectionInfo, DocumentIn, DocumentMatchOut, MatchOut, PointIn, PointOut};
 
 /// Build the gRPC service over the shared state.
 pub(crate) fn service(state: AppState) -> QuiverServer<QuiverService> {
@@ -124,6 +124,27 @@ fn collection_to_proto(info: CollectionInfo) -> v1::Collection {
         index: index_kind_to_proto(info.index.kind),
         pq_subspaces: info.index.pq_subspaces,
         filterable: filterable_to_proto(info.filterable),
+        multivector: info.multivector,
+    }
+}
+
+fn vectors_from_proto(vectors: Vec<v1::Vector>) -> Vec<Vec<f32>> {
+    vectors.into_iter().map(|v| v.values).collect()
+}
+
+fn vectors_to_proto(vectors: Vec<Vec<f32>>) -> Vec<v1::Vector> {
+    vectors
+        .into_iter()
+        .map(|values| v1::Vector { values })
+        .collect()
+}
+
+fn document_match_to_proto(m: DocumentMatchOut) -> v1::DocumentMatch {
+    v1::DocumentMatch {
+        id: m.id,
+        score: m.score,
+        payload: m.payload.as_ref().map(payload_to_bytes).unwrap_or_default(),
+        vectors: m.vectors.map(vectors_to_proto).unwrap_or_default(),
     }
 }
 
@@ -176,6 +197,7 @@ impl Quiver for QuiverService {
                 metric_from_proto(req.metric),
                 index,
                 filterable,
+                req.multivector,
             )
             .await
             .map_err(|e| e.to_status())?;
@@ -314,5 +336,81 @@ impl Quiver for QuiverService {
         Ok(Response::new(v1::SearchResponse {
             matches: matches.into_iter().map(match_to_proto).collect(),
         }))
+    }
+
+    async fn upsert_multi_vector(
+        &self,
+        request: Request<v1::UpsertMultiVectorRequest>,
+    ) -> Result<Response<v1::UpsertMultiVectorResponse>, Status> {
+        let principal = self.authenticate(&request)?;
+        let req = request.into_inner();
+        let mut documents = Vec::with_capacity(req.documents.len());
+        for doc in req.documents {
+            documents.push(DocumentIn {
+                id: doc.id,
+                vectors: vectors_from_proto(doc.vectors),
+                payload: parse_payload(&doc.payload)?,
+            });
+        }
+        let upserted = self
+            .state
+            .upsert_documents(&principal, req.collection, documents)
+            .await
+            .map_err(|e| e.to_status())?;
+        Ok(Response::new(v1::UpsertMultiVectorResponse { upserted }))
+    }
+
+    async fn search_multi_vector(
+        &self,
+        request: Request<v1::SearchMultiVectorRequest>,
+    ) -> Result<Response<v1::SearchMultiVectorResponse>, Status> {
+        let principal = self.authenticate(&request)?;
+        let req = request.into_inner();
+        let filter: Option<Filter> = if req.filter.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_slice(&req.filter)
+                    .map_err(|e| Status::invalid_argument(format!("invalid filter json: {e}")))?,
+            )
+        };
+        let k = if req.k == 0 { 10 } else { req.k as usize };
+        let ef_search = if req.ef_search == 0 {
+            64
+        } else {
+            req.ef_search as usize
+        };
+        let query = vectors_from_proto(req.query);
+        let matches = self
+            .state
+            .search_multi_vector(
+                &principal,
+                req.collection,
+                query,
+                k,
+                filter,
+                ef_search,
+                req.with_payload,
+                req.with_vector,
+            )
+            .await
+            .map_err(|e| e.to_status())?;
+        Ok(Response::new(v1::SearchMultiVectorResponse {
+            matches: matches.into_iter().map(document_match_to_proto).collect(),
+        }))
+    }
+
+    async fn delete_documents(
+        &self,
+        request: Request<v1::DeleteDocumentsRequest>,
+    ) -> Result<Response<v1::DeleteDocumentsResponse>, Status> {
+        let principal = self.authenticate(&request)?;
+        let req = request.into_inner();
+        let deleted = self
+            .state
+            .delete_documents(&principal, req.collection, req.ids)
+            .await
+            .map_err(|e| e.to_status())?;
+        Ok(Response::new(v1::DeleteDocumentsResponse { deleted }))
     }
 }
