@@ -147,9 +147,14 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
             let metric = want_metric(args)?;
             let index = want_index_spec(args)?;
             let filterable = want_filterable(args)?;
+            let multivector = args
+                .get("multivector")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let descriptor = Descriptor::new(dim, Dtype::F32, metric)
                 .with_index(index)
-                .with_filterable(filterable);
+                .with_filterable(filterable)
+                .with_multivector(multivector);
             db.create_collection(collection, descriptor)
                 .map_err(|e| e.to_string())?;
             Ok(format!("created collection '{collection}' (dim {dim})"))
@@ -208,6 +213,55 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
                 format!("'{point_id}' was not present in '{collection}'")
             })
         }
+        "upsert_document" => {
+            let collection = want_str(args, "collection")?;
+            let doc_id = want_str(args, "id")?;
+            let vectors = want_vectors(args, "vectors")?;
+            let payload = args.get("payload").cloned().unwrap_or_else(|| json!({}));
+            db.upsert_document(collection, doc_id, &vectors, &payload)
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "upserted document '{doc_id}' ({} tokens) into '{collection}'",
+                vectors.len()
+            ))
+        }
+        "search_multi_vector" => {
+            let collection = want_str(args, "collection")?;
+            let query = want_vectors(args, "query")?;
+            let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+            let filter = match args.get("filter") {
+                Some(f) if !f.is_null() => Some(
+                    serde_json::from_value::<Filter>(f.clone())
+                        .map_err(|e| format!("invalid filter: {e}"))?,
+                ),
+                _ => None,
+            };
+            let params = SearchParams {
+                k,
+                filter,
+                ..SearchParams::default()
+            };
+            let matches = db
+                .search_multi_vector(collection, &query, &params)
+                .map_err(|e| e.to_string())?;
+            let rendered: Vec<Value> = matches
+                .iter()
+                .map(|m| json!({ "id": m.id, "score": m.score, "payload": m.payload }))
+                .collect();
+            to_text(&json!({ "matches": rendered }))
+        }
+        "delete_document" => {
+            let collection = want_str(args, "collection")?;
+            let doc_id = want_str(args, "id")?;
+            let existed = db
+                .delete_document(collection, doc_id)
+                .map_err(|e| e.to_string())?;
+            Ok(if existed {
+                format!("deleted document '{doc_id}' from '{collection}'")
+            } else {
+                format!("document '{doc_id}' was not present in '{collection}'")
+            })
+        }
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -253,6 +307,11 @@ pub fn tool_definitions() -> Value {
                             },
                             "required": ["path"]
                         }
+                    },
+                    "multivector": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Create a multi-vector (late-interaction / ColBERT) collection; documents are token sets searched by MaxSim (cosine/dot only)"
                     }
                 },
                 "required": ["name", "dim"]
@@ -298,6 +357,43 @@ pub fn tool_definitions() -> Value {
         {
             "name": "delete",
             "description": "Delete a point by id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "collection": collection_arg, "id": { "type": "string" } },
+                "required": ["collection", "id"]
+            }
+        },
+        {
+            "name": "upsert_document",
+            "description": "Insert or replace a multi-vector (late-interaction / ColBERT) document: its set of token vectors plus an optional JSON payload.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "collection": collection_arg,
+                    "id": { "type": "string", "description": "External document id" },
+                    "vectors": { "type": "array", "items": { "type": "array", "items": { "type": "number" } }, "description": "The document's token vectors" },
+                    "payload": { "type": "object", "description": "Arbitrary JSON metadata" }
+                },
+                "required": ["collection", "id", "vectors"]
+            }
+        },
+        {
+            "name": "search_multi_vector",
+            "description": "Rank documents in a multi-vector collection by MaxSim late interaction against a set of query token vectors, with an optional payload filter.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "collection": collection_arg,
+                    "query": { "type": "array", "items": { "type": "array", "items": { "type": "number" } }, "description": "The query's token vectors" },
+                    "k": { "type": "integer", "default": 10 },
+                    "filter": { "type": "object", "description": "Quiver payload filter tree" }
+                },
+                "required": ["collection", "query"]
+            }
+        },
+        {
+            "name": "delete_document",
+            "description": "Delete a multi-vector document and all of its token rows.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "collection": collection_arg, "id": { "type": "string" } },
@@ -353,6 +449,29 @@ fn want_vector(args: &Value, key: &str) -> Result<Vec<f32>, String> {
             v.as_f64()
                 .map(|f| f as f32)
                 .ok_or_else(|| format!("'{key}' must be an array of numbers"))
+        })
+        .collect()
+}
+
+// Parse an array-of-arrays argument into the token set of a multi-vector document
+// or query (ADR-0028).
+fn want_vectors(args: &Value, key: &str) -> Result<Vec<Vec<f32>>, String> {
+    let outer = args
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("missing array-of-arrays argument '{key}'"))?;
+    outer
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .ok_or_else(|| format!("'{key}' must be an array of vectors"))?
+                .iter()
+                .map(|v| {
+                    v.as_f64()
+                        .map(|f| f as f32)
+                        .ok_or_else(|| format!("'{key}' vectors must contain numbers"))
+                })
+                .collect()
         })
         .collect()
 }
@@ -730,5 +849,47 @@ mod tests {
         );
         assert_eq!(r["result"]["isError"], true);
         assert!(result_text(&r).contains("unknown field_type"));
+    }
+
+    #[test]
+    fn multivector_tools_create_upsert_search_and_delete() {
+        let (_t, mut db) = db();
+        call_tool(
+            &mut db,
+            "create_collection",
+            &json!({"name": "docs", "dim": 3, "metric": "cosine", "multivector": true}),
+        )
+        .unwrap();
+        call_tool(
+            &mut db,
+            "upsert_document",
+            &json!({"collection": "docs", "id": "a",
+                    "vectors": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], "payload": {"lang": "en"}}),
+        )
+        .unwrap();
+        call_tool(
+            &mut db,
+            "upsert_document",
+            &json!({"collection": "docs", "id": "b",
+                    "vectors": [[0.0, 0.0, 1.0]], "payload": {"lang": "fr"}}),
+        )
+        .unwrap();
+
+        let out = call_tool(
+            &mut db,
+            "search_multi_vector",
+            &json!({"collection": "docs", "query": [[0.0, 0.0, 1.0]], "k": 2}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["matches"][0]["id"], "b");
+
+        let msg = call_tool(
+            &mut db,
+            "delete_document",
+            &json!({"collection": "docs", "id": "b"}),
+        )
+        .unwrap();
+        assert!(msg.contains("deleted document 'b'"));
     }
 }
