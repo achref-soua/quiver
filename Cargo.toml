@@ -116,6 +116,12 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 tonic-prost-build = "0.14"
 protoc-bin-vendored = "3"
 
+# Live migration connectors (ADR-0027): a blocking HTTP client on rustls over
+# `ring` (matching the transport TLS), with no async runtime — it fits the
+# synchronous, tokio-free `quiver-import` crate, where `reqwest` (async, dev-only
+# here) would not.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
 # Dev-only dependencies (tests, property tests, fixtures).
 proptest = "1"
 # Self-signed certificate generation for TLS tests, ring-backed (no aws-lc-rs).

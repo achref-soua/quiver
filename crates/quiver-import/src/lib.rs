@@ -8,9 +8,11 @@
 //! same crash-safety, encryption, indexing, and filterable fields apply as to
 //! any other write (ADR-0024).
 //!
-//! Inputs are *files* the user exports from the source tool — no live network
-//! connection is opened — which keeps the importer dependency-light and its
-//! adapters fully testable. Live-connector variants are a future enhancement.
+//! Offline imports take *files* the user exports from the source tool, which
+//! keeps the adapters fully testable. A **live** connector ([`live`], ADR-0027)
+//! instead pulls directly from a running source over HTTP and reuses the same
+//! per-source normalization; Qdrant is supported, with Chroma and pgvector
+//! staying on the offline path for now.
 //!
 //! Formats (see `docs/migration.md`):
 //!
@@ -29,6 +31,9 @@ use std::str::FromStr;
 use quiver_embed::{Database, Descriptor};
 use serde_json::{Map, Value};
 use thiserror::Error;
+
+pub mod live;
+pub use live::{QdrantSource, fetch_qdrant};
 
 /// A vector database whose export Quiver can import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +88,9 @@ pub enum ImportError {
     /// The points had zero or inconsistent dimensionality.
     #[error("dimensionality error: {0}")]
     Dim(String),
+    /// A live connector could not reach or read from the source.
+    #[error("{0} connector http error: {1}")]
+    Http(Source, String),
     /// The database rejected the create or upsert.
     #[error(transparent)]
     Db(#[from] quiver_embed::Error),

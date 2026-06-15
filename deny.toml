@@ -26,6 +26,9 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "MPL-2.0",
+    # The Mozilla CA root bundle (`webpki-roots`) that `ureq` uses to verify TLS
+    # for the live migration connectors (ADR-0027); a permissive data license.
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]
