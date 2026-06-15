@@ -1013,6 +1013,13 @@ fn validate_index(descriptor: &Descriptor) -> Result<()> {
             "multi-vector collections require a similarity metric (cosine or dot)",
         ));
     }
+    // DCPE (ADR-0031) preserves Euclidean distance comparison; the secret scaling
+    // changes vector norms, so cosine and dot orderings are not preserved.
+    if descriptor.encrypted_vectors && descriptor.metric != DistanceMetric::L2 {
+        return Err(Error::Unsupported(
+            "dcpe-encrypted collections require the l2 metric",
+        ));
+    }
     match descriptor.index.kind {
         IndexKind::Vamana | IndexKind::Ivf | IndexKind::DiskVamana
             if descriptor.metric == DistanceMetric::Dot =>
@@ -1710,6 +1717,25 @@ mod tests {
             db.create_collection("b", dot_disk),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn dcpe_collections_require_the_l2_metric() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        // DCPE preserves Euclidean distance, so cosine/dot are rejected.
+        for metric in [DistanceMetric::Cosine, DistanceMetric::Dot] {
+            let bad = Descriptor::new(4, Dtype::F32, metric).with_encrypted_vectors(true);
+            assert!(matches!(
+                db.create_collection("bad", bad),
+                Err(Error::Unsupported(_))
+            ));
+        }
+        // L2 is accepted, and the flag persists on the descriptor.
+        let good = Descriptor::new(4, Dtype::F32, DistanceMetric::L2).with_encrypted_vectors(true);
+        db.create_collection("enc", good)
+            .expect("l2 dcpe collection");
+        assert!(db.descriptor("enc").expect("descriptor").encrypted_vectors);
     }
 
     // Recursively check whether a file named `name` exists under `dir`.
