@@ -151,10 +151,15 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
                 .get("multivector")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let encrypted_vectors = args
+                .get("encrypted_vectors")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let descriptor = Descriptor::new(dim, Dtype::F32, metric)
                 .with_index(index)
                 .with_filterable(filterable)
-                .with_multivector(multivector);
+                .with_multivector(multivector)
+                .with_encrypted_vectors(encrypted_vectors);
             db.create_collection(collection, descriptor)
                 .map_err(|e| e.to_string())?;
             Ok(format!("created collection '{collection}' (dim {dim})"))
@@ -312,6 +317,11 @@ pub fn tool_definitions() -> Value {
                         "type": "boolean",
                         "default": false,
                         "description": "Create a multi-vector (late-interaction / ColBERT) collection; documents are token sets searched by MaxSim (cosine/dot only)"
+                    },
+                    "encrypted_vectors": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Create a DCPE-encrypted collection (ADR-0031): the client encrypts vectors with property-preserving encryption before upserting. Experimental, L2 only, and NOT semantically secure (leaks the approximate distance-comparison relation by design)"
                     }
                 },
                 "required": ["name", "dim"]
@@ -849,6 +859,26 @@ mod tests {
         );
         assert_eq!(r["result"]["isError"], true);
         assert!(result_text(&r).contains("unknown field_type"));
+    }
+
+    #[test]
+    fn create_collection_supports_dcpe_and_enforces_l2() {
+        let (_t, mut db) = db();
+        // A DCPE + L2 collection is created (encrypted vectors are ordinary L2
+        // vectors to the engine).
+        call_tool(
+            &mut db,
+            "create_collection",
+            &json!({"name": "enc", "dim": 3, "metric": "l2", "encrypted_vectors": true}),
+        )
+        .unwrap();
+        // A DCPE collection with a non-L2 metric is rejected (ADR-0031).
+        let r = call(
+            &mut db,
+            "create_collection",
+            json!({"name": "bad", "dim": 3, "metric": "cosine", "encrypted_vectors": true}),
+        );
+        assert_eq!(r["result"]["isError"], true);
     }
 
     #[test]
