@@ -149,4 +149,56 @@ describe("Quiver TypeScript client", () => {
     });
     expect(await new Client("http://x", { fetch: down }).healthz()).toBe(false);
   });
+
+  it("multivector documents: create, upsert, search, and delete", async () => {
+    let createBody: Record<string, unknown> | undefined;
+    let upsertBody: Record<string, unknown> | undefined;
+    let searchBody: Record<string, unknown> | undefined;
+    let deleteCalled = false;
+    const fetch = mockFetch(async (path, method, init) => {
+      if (path === "/v1/collections") {
+        createBody = parseBody(init);
+        return json({ name: "docs", dim: 3, metric: "cosine", count: 0, multivector: true });
+      }
+      if (path === "/v1/collections/docs/documents" && method === "POST") {
+        upsertBody = parseBody(init);
+        return json({ upserted: 2 });
+      }
+      if (path === "/v1/collections/docs/documents" && method === "DELETE") {
+        deleteCalled = true;
+        return json({ deleted: 1 });
+      }
+      if (path === "/v1/collections/docs/documents/query") {
+        searchBody = parseBody(init);
+        return json({ matches: [{ id: "b", score: 1, payload: { lang: "fr" } }] });
+      }
+      return json({}, 404);
+    });
+    const client = new Client("http://x", { fetch });
+
+    const info = await client.createCollection("docs", 3, { metric: "cosine", multivector: true });
+    expect(info.multivector).toBe(true);
+    expect(createBody?.["multivector"]).toBe(true);
+
+    const n = await client.upsertDocuments("docs", [
+      {
+        id: "a",
+        vectors: [
+          [1, 0, 0],
+          [0, 1, 0],
+        ],
+        payload: { lang: "en" },
+      },
+      { id: "b", vectors: [[0, 0, 1]] },
+    ]);
+    expect(n).toBe(2);
+    expect((upsertBody?.["documents"] as unknown[]).length).toBe(2);
+
+    const matches = await client.searchMultiVector("docs", [[0, 0, 1]], { k: 2 });
+    expect(matches).toEqual([{ id: "b", score: 1, payload: { lang: "fr" } }]);
+    expect(searchBody?.["query"]).toEqual([[0, 0, 1]]);
+
+    expect(await client.deleteDocuments("docs", ["b"])).toBe(1);
+    expect(deleteCalled).toBe(true);
+  });
 });

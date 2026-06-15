@@ -36,6 +36,22 @@ export interface Match {
   vector?: number[];
 }
 
+/** A multi-vector (late-interaction / ColBERT) document: an id, its set of token
+ * vectors, and an optional payload. */
+export interface Document {
+  id: string;
+  vectors: number[][];
+  payload?: unknown;
+}
+
+/** A multi-vector document hit, ranked by MaxSim late interaction. */
+export interface DocumentMatch {
+  id: string;
+  score: number;
+  payload?: unknown;
+  vectors?: number[][];
+}
+
 /** The index structure a collection is served by (ADR-0007). */
 export type IndexKind = "hnsw" | "vamana" | "disk_vamana" | "ivf";
 
@@ -60,6 +76,7 @@ export interface CollectionInfo {
   index: IndexKind;
   pqSubspaces?: number;
   filterable: FilterableField[];
+  multivector: boolean;
 }
 
 /** Options for constructing a {@link Client}. */
@@ -79,6 +96,8 @@ export interface CreateCollectionOptions {
   pqSubspaces?: number;
   /** Payload fields to index for hybrid (pre-filtered) search. */
   filterable?: FilterableField[];
+  /** Create a multi-vector (late-interaction / ColBERT) collection. */
+  multivector?: boolean;
 }
 
 /** Options for {@link Client.search}. */
@@ -126,6 +145,7 @@ export class Client {
         field_type: f.fieldType ?? "keyword",
       }));
     }
+    if (opts.multivector) body["multivector"] = true;
     return toCollection(await this.#json("POST", "/v1/collections", body));
   }
 
@@ -204,6 +224,56 @@ export class Client {
     }));
   }
 
+  // --- documents (multi-vector / late interaction) ---
+
+  /** Insert or replace multi-vector documents; resolves to the number upserted. */
+  async upsertDocuments(collection: string, documents: Document[]): Promise<number> {
+    const body = { documents: documents.map(documentDict) };
+    const res = (await this.#json(
+      "POST",
+      `/v1/collections/${encodeURIComponent(collection)}/documents`,
+      body,
+    )) as { upserted?: number };
+    return Number(res.upserted ?? 0);
+  }
+
+  /** Delete multi-vector documents by id; resolves to the number deleted. */
+  async deleteDocuments(collection: string, ids: string[]): Promise<number> {
+    const res = (await this.#json(
+      "DELETE",
+      `/v1/collections/${encodeURIComponent(collection)}/documents`,
+      { ids },
+    )) as { deleted?: number };
+    return Number(res.deleted ?? 0);
+  }
+
+  /** Rank documents by MaxSim late interaction against the `query` token set. */
+  async searchMultiVector(
+    collection: string,
+    query: number[][],
+    opts: SearchOptions = {},
+  ): Promise<DocumentMatch[]> {
+    const body: Record<string, unknown> = {
+      query,
+      k: opts.k ?? 10,
+      ef_search: opts.efSearch ?? 64,
+      with_payload: opts.withPayload ?? true,
+      with_vector: opts.withVector ?? false,
+    };
+    if (opts.filter !== undefined) body["filter"] = opts.filter;
+    const res = (await this.#json(
+      "POST",
+      `/v1/collections/${encodeURIComponent(collection)}/documents/query`,
+      body,
+    )) as { matches?: DocumentMatch[] };
+    return (res.matches ?? []).map((m) => ({
+      id: m.id,
+      score: m.score,
+      payload: m.payload,
+      vectors: m.vectors,
+    }));
+  }
+
   // --- health ---
 
   /** Whether the server's liveness probe succeeds. */
@@ -257,7 +327,14 @@ function toCollection(body: unknown): CollectionInfo {
           fieldType: (f["field_type"] as FieldType) ?? "keyword",
         }))
       : [],
+    multivector: Boolean(b["multivector"]),
   };
+}
+
+function documentDict(doc: Document): Record<string, unknown> {
+  const out: Record<string, unknown> = { id: doc.id, vectors: doc.vectors };
+  if (doc.payload !== undefined) out["payload"] = doc.payload;
+  return out;
 }
 
 function pointDict(point: Point): Record<string, unknown> {

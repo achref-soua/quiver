@@ -35,6 +35,16 @@ with Client("http://127.0.0.1:6333", api_key="your-api-key") as q:
 `create_collection` also takes `index` (`hnsw` | `vamana` | `disk_vamana` | `ivf`)
 and `pq_subspaces` to select the memory-frugal disk-resident path.
 
+For late-interaction (ColBERT) retrieval, create a collection with
+`multivector=True`, index documents as token sets with `upsert_documents`, and
+rank them by MaxSim with `search_multi_vector`:
+
+```python
+q.create_collection("papers", dim=128, metric="cosine", multivector=True)
+q.upsert_documents("papers", [Document("p1", token_vectors, {"title": "…"})])
+hits = q.search_multi_vector("papers", query_token_vectors, k=10)
+```
+
 ## Client-side payload encryption
 
 Seal payload fields with a key Quiver never sees (install

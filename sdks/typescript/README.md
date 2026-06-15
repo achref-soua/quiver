@@ -42,7 +42,11 @@ Embeddings are produced by the caller — Quiver is model-agnostic.
 | `listCollections()` / `getCollection(name)` / `deleteCollection(name)` | Collection CRUD |
 | `upsert(collection, points)` / `deletePoints(collection, ids)` / `getPoint(collection, id)` | Points |
 | `search(collection, vector, { k?, filter?, efSearch?, withPayload?, withVector? })` | Filtered k-NN |
+| `upsertDocuments(collection, documents)` / `deleteDocuments(collection, ids)` | Multi-vector (ColBERT) documents |
+| `searchMultiVector(collection, query, { k?, filter? })` | MaxSim late-interaction search |
 | `healthz()` | Liveness probe |
+
+Create a multi-vector collection with `createCollection(name, dim, { metric: "cosine", multivector: true })`, then index documents as token sets and rank them by MaxSim.
 
 Errors from the server (or transport) reject with a `QuiverError` carrying the
 HTTP `status`. A custom `fetch` can be injected via the constructor for testing
