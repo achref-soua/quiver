@@ -70,6 +70,16 @@ quiver admin import --source pgvector --input pgvector.jsonl \
   --id-field id --vector-field embedding --insecure
 ```
 
+For a **live** import from a running Qdrant — no export step — point at its URL
+instead of `--input`; it reads the same-named collection through the paginated
+`points/scroll` API ([ADR-0027](./adr/0027-live-migration-connectors.md)):
+
+```bash
+quiver admin import --source qdrant --qdrant-url http://localhost:6333 \
+  --collection my_collection --data-dir ./data --metric cosine
+# add --api-key <key> (or set QDRANT_API_KEY) for a secured Qdrant
+```
+
 Then serve it with the **same** key (the importer writes the same encrypted
 format the server reads):
 
@@ -82,8 +92,10 @@ QUIVER_ENCRYPTION_KEY=<same key> quiver serve   # data_dir defaults to ./data
 | Flag | Meaning | Default |
 |---|---|---|
 | `--source` | `qdrant`, `chroma`, or `pgvector` | required |
-| `--input` | export file (JSON Lines for qdrant/pgvector; one JSON object for chroma) | required |
-| `--collection` | target collection (created if absent, appended to otherwise) | required |
+| `--input` | export file for an offline import (JSON Lines for qdrant/pgvector; one JSON object for chroma) | one of `--input` / `--qdrant-url` |
+| `--qdrant-url` | base URL of a running Qdrant for a **live** import (qdrant only) | one of `--input` / `--qdrant-url` |
+| `--api-key` | API key for `--qdrant-url` (or `QDRANT_API_KEY`) | — |
+| `--collection` | target collection (created if absent, appended to otherwise); also the source collection name for a live import | required |
 | `--data-dir` | target data directory | `./data` |
 | `--metric` | `l2`, `cosine`, or `dot` (for a newly created collection) | `cosine` |
 | `--dim` | vector dimensionality | inferred from the export |
@@ -105,6 +117,8 @@ QUIVER_ENCRYPTION_KEY=<same key> quiver serve   # data_dir defaults to ./data
   [ADR-0022](./adr/0022-secondary-indexes.md)).
 - Importing the same export twice **appends** (re-upserting the same ids replaces
   them); the importer never drops an existing collection.
-- Live connectors (reading directly from a running Qdrant/Chroma/Postgres) are a
-  planned enhancement behind the same adapter seam; today the path is
-  export → import.
+- **Live import** is available for **Qdrant** (`--qdrant-url`,
+  [ADR-0027](./adr/0027-live-migration-connectors.md)): it pulls directly from a
+  running instance through the same normalization as the offline path. Chroma and
+  pgvector stay export → import for now (Chroma's HTTP API version churn and
+  Postgres's async driver are the reasons — see the ADR).
