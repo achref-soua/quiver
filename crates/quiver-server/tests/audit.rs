@@ -72,6 +72,8 @@ async fn audit_log_records_mutations_and_denials_without_leaking_secrets() {
         tls_client_ca: None,
         master_key_file: None,
         audit_log: Some(audit_path.clone()),
+        leader_url: None,
+        leader_api_key: None,
         insecure: false,
     };
     let server = tokio::spawn(async move {

@@ -26,6 +26,7 @@ mod audit;
 mod auth;
 mod error;
 mod grpc;
+mod replication;
 mod rest;
 
 use std::future::Future;
@@ -108,6 +109,15 @@ pub struct Config {
     /// also emitted as `tracing` events. Unset ⇒ tracing only. Secrets are never
     /// written — see `docs/security/audit.md`.
     pub audit_log: Option<PathBuf>,
+    /// Run as a **read-replica follower** (ADR-0030): connect to a leader's gRPC
+    /// endpoint at this URL (e.g. `http://leader:6334`) and continuously apply its
+    /// committed operations, serving reads. A follower **refuses writes**. Unset ⇒
+    /// this node is a normal read-write leader. (Plaintext `http://` for now; TLS
+    /// to the leader is a follow-up — run replication over a trusted network.)
+    pub leader_url: Option<String>,
+    /// API key the follower presents to the leader's admin-scoped `Replicate`
+    /// stream (used with `leader_url`). Source it like any secret.
+    pub leader_api_key: Option<String>,
     /// Opt out of the secure defaults (no auth, no encryption-at-rest, allow a
     /// non-loopback bind without TLS). For local development only; never the
     /// default.
@@ -127,6 +137,8 @@ impl Default for Config {
             tls_key: None,
             tls_client_ca: None,
             audit_log: None,
+            leader_url: None,
+            leader_api_key: None,
             insecure: false,
         }
     }
@@ -257,6 +269,9 @@ pub(crate) struct AppState {
     // Fan-out of every committed op to replication followers (ADR-0030). The
     // commit observer publishes here; each `Replicate` stream subscribes.
     replication_tx: broadcast::Sender<WalEntry>,
+    // True on a replication follower: external writes are refused; the engine's
+    // state is owned by the stream it applies from the leader (ADR-0030).
+    read_only: bool,
 }
 
 /// A collection's metadata.
@@ -378,6 +393,24 @@ impl AppState {
         .await
     }
 
+    /// Apply a replicated op received from the leader (ADR-0030). Internal to the
+    /// follower stream — deliberately NOT gated by `read_only`, which only refuses
+    /// *external* client writes.
+    pub(crate) async fn apply_replicated(&self, op: WalOp) -> Result<(), Error> {
+        self.run_blocking(move |db| db.apply_replicated(op)).await
+    }
+
+    // Refuse a mutating operation on a read-only replication follower (ADR-0030);
+    // its state is owned by the leader's stream, not by external clients.
+    fn ensure_writable(&self, op: &str) -> Result<(), Error> {
+        if self.read_only {
+            return Err(Error::Forbidden(format!(
+                "{op}: this node is a read-only replication follower"
+            )));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_collection(
         &self,
@@ -389,6 +422,7 @@ impl AppState {
         filterable: Vec<FilterableField>,
         multivector: bool,
     ) -> Result<CollectionInfo, Error> {
+        self.ensure_writable("create_collection")?;
         self.authorize(principal, Action::Admin, "create_collection", &name)?;
         let descriptor = Descriptor::new(dim, Dtype::F32, metric)
             .with_index(index)
@@ -486,6 +520,7 @@ impl AppState {
         principal: &Principal,
         name: String,
     ) -> Result<bool, Error> {
+        self.ensure_writable("delete_collection")?;
         self.authorize(principal, Action::Admin, "delete_collection", &name)?;
         let resource = name.clone();
         let result = self.run_blocking(move |db| db.drop_collection(&name)).await;
@@ -504,6 +539,7 @@ impl AppState {
         collection: String,
         points: Vec<PointIn>,
     ) -> Result<u64, Error> {
+        self.ensure_writable("upsert")?;
         self.authorize(principal, Action::Write, "upsert", &collection)?;
         let resource = collection.clone();
         let result = self
@@ -527,6 +563,7 @@ impl AppState {
         collection: String,
         ids: Vec<String>,
     ) -> Result<u64, Error> {
+        self.ensure_writable("delete_points")?;
         self.authorize(principal, Action::Write, "delete_points", &collection)?;
         let resource = collection.clone();
         let result = self
@@ -614,6 +651,7 @@ impl AppState {
         collection: String,
         documents: Vec<DocumentIn>,
     ) -> Result<u64, Error> {
+        self.ensure_writable("upsert_documents")?;
         self.authorize(principal, Action::Write, "upsert_documents", &collection)?;
         let resource = collection.clone();
         let result = self
@@ -641,6 +679,7 @@ impl AppState {
         collection: String,
         ids: Vec<String>,
     ) -> Result<u64, Error> {
+        self.ensure_writable("delete_documents")?;
         self.authorize(principal, Action::Write, "delete_documents", &collection)?;
         let resource = collection.clone();
         let result = self
@@ -746,7 +785,13 @@ pub async fn serve(
         keys: Arc::new(config.api_keys.clone()),
         audit,
         replication_tx,
+        read_only: config.leader_url.is_some(),
     };
+
+    // A follower continuously applies the leader's committed-op stream (ADR-0030).
+    if let Some(leader_url) = config.leader_url.clone() {
+        replication::spawn_follower(state.clone(), leader_url, config.leader_api_key.clone());
+    }
 
     let app = rest::router(state.clone());
     let grpc = grpc::service(state);

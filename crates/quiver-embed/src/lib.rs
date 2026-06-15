@@ -34,7 +34,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use quiver_core::{CollectionId, SecPredicate, SecValue, Store};
+use quiver_core::{SecPredicate, SecValue, Store};
 use quiver_index::{
     DiskSearchParams, DiskVamana, Hnsw, HnswConfig, Index, Ivf, IvfConfig, Metric, Neighbor,
     ProductQuantizer, Vamana, VamanaConfig, max_sim, ordering_distance, report_metric,
@@ -45,7 +45,7 @@ use thiserror::Error;
 
 pub use quiver_core::keyring::{KeyRing, SingleCodecKeyRing};
 pub use quiver_core::page::PageCodec;
-pub use quiver_core::{CommitObserver, WalEntry, WalOp};
+pub use quiver_core::{CollectionId, CommitObserver, WalEntry, WalOp};
 pub use quiver_core::{
     Descriptor, DistanceMetric, Dtype, FieldType, FilterableField, IndexKind, IndexSpec,
 };
