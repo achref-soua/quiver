@@ -156,6 +156,16 @@ quiver admin import --source pgvector \
 
 The importer preserves ids, vectors, and payloads, optionally declares `--filterable path:type` fields for hybrid search, and writes the same encrypted format the server reads — so the result is an ordinary Quiver store you can `quiver serve` immediately. Live connectors for all three sources share the offline path's normalization ([ADR-0027](./docs/adr/0027-live-migration-connectors.md), [ADR-0029](./docs/adr/0029-live-chroma-postgres-connectors.md)). Per-source recipes and the full option reference are in [`docs/migration.md`](./docs/migration.md) ([ADR-0024](./docs/adr/0024-migration-importers.md)).
 
+## Replication
+
+Run **asynchronous read replicas** (ADR-0030): point a follower at a leader with `QUIVER_LEADER_URL` and it continuously applies the leader's committed operations and serves reads, lagging by the replication delay. Followers refuse writes; the leader exposes an admin-scoped `Replicate` stream that ships a logical snapshot, then the live commit tail. This scales reads and gives warm standbys **without** consensus or failover — single-node stays the primary topology, and this is a clearly-labelled advanced feature.
+
+```bash
+QUIVER_LEADER_URL=http://leader-host:6334 QUIVER_LEADER_API_KEY=<admin key> quiver serve
+```
+
+See [`docs/replication.md`](./docs/replication.md) for the topology, guarantees, and limits.
+
 ## Configuration
 
 Every option is an environment variable with a secure default; see [`.env.example`](./.env.example) and [ADR-0013](./docs/adr/0013-config-and-secure-defaults.md). Encryption-at-rest is on by default: the server requires a 256-bit key in `QUIVER_ENCRYPTION_KEY` (generate one with `openssl rand -hex 32`) unless `QUIVER_INSECURE=true`, and seals segments, the manifest, and the WAL alike. That key is a **master key** that wraps a per-collection data-encryption key (envelope encryption, [ADR-0010](./docs/adr/0010-crypto-envelope-aead.md)), so dropping a collection **crypto-shreds** it — its key is destroyed and its data becomes unrecoverable, even from a backup ([details](./docs/security/crypto.md)). TLS is required for any non-loopback bind.
