@@ -1,7 +1,8 @@
 # ADR-0025: Durable on-disk incremental index (IVF)
 
-- **Status:** Proposed — design-first; the implementation lands as a later
-  `v0.5.0` increment and flips this to Accepted once the crash gate covers it.
+- **Status:** Accepted — implemented in `v0.6.0` (the `Ivf` snapshot/restore,
+  manifest persistence, the embed load-and-replay path, and the crash-gate
+  extension), with the `kill -9` gate now covering the index.
 - **Date:** 2026-06-14
 - **Deciders:** Achref Soua
 
@@ -84,6 +85,26 @@ ADR-0019) keep deriving on open; durable incremental *graph* updates
 without a snapshot always recovers via the existing rebuild, so the change is
 backward-compatible and effectively opt-in per index kind.
 
+## Implementation
+
+Shipped in `v0.6.0`:
+
+- The `Ivf` serializes to a **versioned, self-describing** snapshot
+  (`[b"QVIS"][u16 version][postcard(state)]`); the derived id maps are rebuilt and
+  structurally revalidated on restore, so a malformed snapshot is rejected rather
+  than silently mis-served.
+- The manifest gains (**format v2**, with transparent v1 upgrade) a per-collection
+  `IndexSnapshotRef { id, lsn }`; the snapshot file is sealed with the collection's
+  page codec and published by the same atomic swap as the segments. Compaction
+  carries the reference forward; superseded and orphaned snapshots are
+  garbage-collected like segments.
+- The embeddable database snapshots each built IVF at checkpoint and, on open,
+  restores it and replays only the post-checkpoint WAL tail — the active-buffer
+  upserts and the ids tombstoned this window — falling back to a full rebuild on
+  any problem.
+- Scope held to IVF, as decided: only the IVF index participates, and a snapshot
+  is always an optional fast path over the authoritative store.
+
 ## Consequences
 
 - **+** A restart **loads** the index (sequential read, map-and-decrypt, `O(N)`
@@ -98,6 +119,9 @@ backward-compatible and effectively opt-in per index kind.
   grows, and a checkpoint now also writes the snapshot (more checkpoint I/O and
   disk footprint — bounded by reusing the immutable-then-swap discipline and
   reclaiming superseded snapshots like superseded segments).
+- **−** A flat (non-PQ) IVF snapshot duplicates the resident vectors that also live
+  in the segments; a PQ-configured IVF keeps the snapshot to compact codes, so it
+  is preferred for large collections.
 - **−** Only IVF is durable; graph indexes still rebuild on open until their own
   increment.
 - **−** A very long WAL tail after a missed checkpoint lengthens replay; mitigated
@@ -105,16 +129,33 @@ backward-compatible and effectively opt-in per index kind.
 
 ## Verification
 
-The crash gate (R3, ADR-0005; `quiver-core/tests/crash_recovery.rs`) **extends to
-the index**: build an IVF collection, drive an incremental insert/delete stream
-that triggers splits and merges, checkpoint (snapshotting the index), then
-`SIGKILL` the writer at randomized points — mid-snapshot-write, mid-WAL-append,
-and between snapshot `fsync` and manifest swap. On reopen assert: every
-acknowledged upsert is findable by search; no torn snapshot is ever loaded
-(AEAD/CRC + atomic rename reject it); and the recovered index's membership equals
-a freshly-rebuilt index over the same data. As today, the gate must stay green in
-isolation (`cargo test -p quiver-core --test crash_recovery`), since it can flake
-under parallel load.
+Crash-safety splits into two proofs that together cover "recovers correctly
+across a crash":
+
+- **Artifact durability — the `kill -9` gate** (R3, ADR-0005;
+  `quiver-core/tests/crash_recovery.rs`). The `crash_writer` fixture seals an index
+  snapshot at every checkpoint, so the randomized `SIGKILL`s land
+  mid-snapshot-write, between the snapshot `fsync` and the manifest swap, and
+  during snapshot GC — the points already covered for segments. On reopen the gate
+  asserts that reading the snapshot **never errors** (a torn snapshot is never
+  referenced — the atomic manifest swap plus per-page CRC/AEAD see to that) and
+  that any **surviving snapshot is consistent** with the recovered store (its count
+  reflects a checkpointed prefix, so it cannot exceed the recovered row count). A
+  warmup guarantees a snapshot exists before the kill rounds, so the path is
+  provably exercised. Run it in isolation
+  (`cargo test -p quiver-core --test crash_recovery`) if it flakes under parallel
+  load.
+- **Restore + replay correctness — the embed reopen tests** (`quiver-embed`). They
+  prove a reopened IVF is **genuinely loaded** from the snapshot rather than
+  rebuilt (the preserved insertion-order id mapping diverges from a rebuild's
+  sorted order), that the post-checkpoint WAL tail (upserts, deletes, in-place
+  updates) **replays correctly**, and that a corrupt or absent snapshot **falls
+  back** to an authoritative rebuild.
+
+Because the atomic manifest swap makes every crash-recovered store a consistent
+`(segments, snapshot)` pair, artifact durability plus restore correctness give
+correct index recovery across a crash: every acknowledged write stays findable and
+the recovered index matches a fresh rebuild over the same data.
 
 ## Alternatives considered
 
