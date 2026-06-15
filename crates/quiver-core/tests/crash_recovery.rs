@@ -9,6 +9,11 @@
 //! 2. recovery never errors (no torn page is mistaken for valid); and
 //! 3. recovery is idempotent (reopening twice yields the same state).
 //!
+//! Since ADR-0025 the fixture also seals a durable index snapshot at each
+//! checkpoint, so the same kills land mid-snapshot-write and during snapshot GC.
+//! Recovery must never accept a torn snapshot, and any survivor must be
+//! consistent with the recovered store (it reflects a checkpointed prefix).
+//!
 //! The invariant under test: an acknowledged write (its WAL record `fsync`'d,
 //! then its id `fsync`'d to the ack log) is durable across `kill -9`. The test
 //! only ever requires that acknowledged ⊆ recovered, so it cannot flake on
@@ -24,7 +29,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quiver_core::Store;
 
@@ -38,7 +43,7 @@ fn acked_ids(ack_path: &Path) -> BTreeSet<u64> {
         .collect()
 }
 
-fn verify(data_dir: &Path, ack_path: &Path) {
+fn verify(data_dir: &Path, ack_path: &Path) -> bool {
     let acked = acked_ids(ack_path);
     let store = Store::open(data_dir).expect("store must reopen cleanly after a kill");
     let Some(cid) = store.collection_id("crash") else {
@@ -46,7 +51,7 @@ fn verify(data_dir: &Path, ack_path: &Path) {
             acked.is_empty(),
             "writes were acknowledged but no collection was recovered"
         );
-        return;
+        return false;
     };
     for n in &acked {
         let record = store
@@ -60,6 +65,28 @@ fn verify(data_dir: &Path, ack_path: &Path) {
             format!(r#"{{"n":{n}}}"#).into_bytes(),
             "wrong payload recovered for k{n}"
         );
+    }
+    // The durable index snapshot (ADR-0025) joins the kill path: recovery must
+    // never accept a torn snapshot (a referenced one always passes its page CRC),
+    // and any survivor must be consistent with the recovered store — it reflects a
+    // checkpointed prefix, so its encoded count cannot exceed the recovered row
+    // count. Returns whether a consistent snapshot was present, so the harness can
+    // assert the durable-index path was actually exercised.
+    match store
+        .read_index_snapshot(cid)
+        .expect("a torn index snapshot must never be accepted after a kill")
+    {
+        Some(bytes) => {
+            assert_eq!(bytes.len(), 8, "recovered index snapshot is the wrong size");
+            let count = u64::from_le_bytes(bytes.try_into().unwrap());
+            let recovered = store.len(cid).expect("len must not error") as u64;
+            assert!(
+                count <= recovered,
+                "index snapshot count {count} exceeds the recovered store size {recovered}"
+            );
+            true
+        }
+        None => false,
     }
 }
 
@@ -90,12 +117,39 @@ fn kill_mid_write_preserves_acknowledged_writes() {
     fs::create_dir_all(&data_dir).expect("create data dir");
 
     let mut rng = Rng::new(0x5EED_1234);
+
+    // Warmup: let the writer run uninterrupted until it has completed at least one
+    // checkpoint, so a durable index snapshot exists on disk before the kill
+    // rounds stress its crash-safety. With checkpoint_every = 4, the checkpoint
+    // after row 3 commits before row 4 is acked, so >= 6 acks guarantees one.
+    {
+        let mut child = Command::new(exe)
+            .arg(&data_dir)
+            .arg(&ack_path)
+            .arg("4")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn crash_writer");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while acked_ids(&ack_path).len() < 6 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child.kill().expect("kill child");
+        let _ = child.wait();
+    }
+    let mut saw_snapshot = verify(&data_dir, &ack_path);
+    assert!(
+        saw_snapshot,
+        "warmup did not establish a durable index snapshot"
+    );
+
     let rounds = 25;
     for _ in 0..rounds {
         let mut child = Command::new(exe)
             .arg(&data_dir)
             .arg(&ack_path)
-            .arg("16") // checkpoint every 16 upserts, exercising the flush path
+            .arg("4") // checkpoint every 4 upserts — exercises the flush + snapshot path
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -108,7 +162,7 @@ fn kill_mid_write_preserves_acknowledged_writes() {
         let _ = child.wait();
 
         // After every kill, all acknowledged writes must be intact.
-        verify(&data_dir, &ack_path);
+        saw_snapshot |= verify(&data_dir, &ack_path);
     }
 
     // At least one round should have acknowledged some writes; otherwise the
@@ -119,6 +173,13 @@ fn kill_mid_write_preserves_acknowledged_writes() {
     );
 
     // Recovery is idempotent: reopening again yields the same valid state.
-    verify(&data_dir, &ack_path);
-    verify(&data_dir, &ack_path);
+    saw_snapshot |= verify(&data_dir, &ack_path);
+    saw_snapshot |= verify(&data_dir, &ack_path);
+
+    // At least one kill must have left a consistent index snapshot behind, or the
+    // durable-index path (ADR-0025) was never actually exercised by this run.
+    assert!(
+        saw_snapshot,
+        "no index snapshot survived any kill — the durable-index path was not exercised"
+    );
 }

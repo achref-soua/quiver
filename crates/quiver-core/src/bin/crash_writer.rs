@@ -8,6 +8,7 @@
 //! restart it resumes from the recovered row count, so repeated kills make
 //! forward progress. See `tests/crash_recovery.rs`.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
@@ -52,7 +53,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ack.sync_data()?;
 
         if checkpoint_every > 0 && (next + 1).is_multiple_of(checkpoint_every) {
-            store.checkpoint()?;
+            // Seal an index snapshot too (ADR-0025): an 8-byte blob encoding the
+            // checkpointed row count, so the recovery test can confirm a surviving
+            // snapshot is consistent with the recovered store and never torn.
+            let blob = (store.len(cid)? as u64).to_le_bytes().to_vec();
+            store.checkpoint_with_index_snapshots(&HashMap::from([(cid, blob)]))?;
         }
         next += 1;
     }
