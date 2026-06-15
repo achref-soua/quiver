@@ -97,6 +97,7 @@ class CollectionInfo:
     pq_subspaces: Optional[int] = None
     filterable: list[FilterableField] = field(default_factory=list)
     multivector: bool = False
+    encrypted_vectors: bool = False
 
 
 PointInput = Union[Point, Mapping[str, Any]]
@@ -151,6 +152,7 @@ class Client:
         pq_subspaces: Optional[int] = None,
         filterable: Optional[Sequence[FilterableField]] = None,
         multivector: bool = False,
+        encrypted_vectors: bool = False,
     ) -> CollectionInfo:
         """Create a collection. Raises [`QuiverError`] if the name is taken.
 
@@ -158,6 +160,11 @@ class Client:
         ``ivf``, default ``hnsw``); ``pq_subspaces`` tunes the quantized kinds.
         ``filterable`` declares payload fields to index for hybrid (pre-filtered)
         search, each a :class:`FilterableField` of ``keyword`` or ``numeric`` type.
+
+        ``encrypted_vectors`` marks an experimental DCPE-encrypted collection
+        (ADR-0031): the caller encrypts vectors client-side with
+        :class:`quiver.dcpe.DcpeCipher` before upserting. It requires the ``l2``
+        metric and is **not** semantically secure — see the ``quiver.dcpe`` module.
         """
         body: dict[str, Any] = {"name": name, "dim": dim, "metric": metric}
         if index is not None:
@@ -170,6 +177,8 @@ class Client:
             ]
         if multivector:
             body["multivector"] = True
+        if encrypted_vectors:
+            body["encrypted_vectors"] = True
         return _collection(self._send("POST", "/v1/collections", body).json())
 
     def list_collections(self) -> list[CollectionInfo]:
@@ -331,6 +340,7 @@ def _collection(body: Mapping[str, Any]) -> CollectionInfo:
             for f in body.get("filterable", [])
         ],
         multivector=bool(body.get("multivector", False)),
+        encrypted_vectors=bool(body.get("encrypted_vectors", False)),
     )
 
 

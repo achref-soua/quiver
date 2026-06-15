@@ -77,6 +77,7 @@ export interface CollectionInfo {
   pqSubspaces?: number;
   filterable: FilterableField[];
   multivector: boolean;
+  encryptedVectors: boolean;
 }
 
 /** Options for constructing a {@link Client}. */
@@ -98,6 +99,12 @@ export interface CreateCollectionOptions {
   filterable?: FilterableField[];
   /** Create a multi-vector (late-interaction / ColBERT) collection. */
   multivector?: boolean;
+  /**
+   * Create an experimental DCPE-encrypted collection (ADR-0031): vectors are
+   * encrypted client-side with property-preserving encryption before upserting.
+   * Requires the `l2` metric and is not semantically secure.
+   */
+  encryptedVectors?: boolean;
 }
 
 /** Options for {@link Client.search}. */
@@ -146,6 +153,7 @@ export class Client {
       }));
     }
     if (opts.multivector) body["multivector"] = true;
+    if (opts.encryptedVectors) body["encrypted_vectors"] = true;
     return toCollection(await this.#json("POST", "/v1/collections", body));
   }
 
@@ -328,6 +336,7 @@ function toCollection(body: unknown): CollectionInfo {
         }))
       : [],
     multivector: Boolean(b["multivector"]),
+    encryptedVectors: Boolean(b["encrypted_vectors"]),
   };
 }
 

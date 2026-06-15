@@ -21,6 +21,7 @@ from .client import (
     Point,
     QuiverError,
 )
+from .dcpe import DcpeCipher, DcpeError, EncryptedVector
 from .encryption import ENVELOPE_KEY, PayloadCipher, PayloadError, is_sealed
 
 __all__ = [
@@ -36,5 +37,8 @@ __all__ = [
     "PayloadError",
     "is_sealed",
     "ENVELOPE_KEY",
+    "DcpeCipher",
+    "DcpeError",
+    "EncryptedVector",
 ]
 __version__ = "0.9.0"

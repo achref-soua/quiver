@@ -66,6 +66,30 @@ with Client("http://127.0.0.1:6333", api_key="…") as q:
 The envelope (XChaCha20-Poly1305) matches the Rust reference and the TypeScript
 SDK byte-for-byte — see [client-side encryption](https://github.com/achref-soua/quiver/blob/main/docs/security/crypto.md#client-side-payload-encryption-adr-0012).
 
+## Encrypted vector search (DCPE, experimental)
+
+Encrypt the **vectors** themselves so the server can run nearest-neighbour
+search without ever seeing the plaintext embeddings (install
+`quiver-client[dcpe]`). This is property-preserving (distance-comparison-
+preserving) encryption — **experimental, L2-only, and not semantically secure**:
+it leaks the approximate distance-comparison relation by design. Use a dedicated
+key, and encrypt both the data and the queries with the same cipher.
+
+```python
+from quiver import Client
+from quiver.dcpe import DcpeCipher
+
+cipher = DcpeCipher.from_hex("…64 hex chars…", approximation_factor=0.02)
+with Client("http://127.0.0.1:6333", api_key="…") as q:
+    q.create_collection("vault", dim=8, metric="l2", encrypted_vectors=True)
+    sealed = cipher.encrypt([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
+    q.upsert("vault", [{"id": "a", "vector": sealed.ciphertext}])
+    hits = q.search("vault", cipher.encrypt_query(my_query), k=10)
+```
+
+See [ADR-0031](https://github.com/achref-soua/quiver/blob/main/docs/adr/0031-dcpe-vector-encryption.md)
+and [docs/security/dcpe.md](https://github.com/achref-soua/quiver/blob/main/docs/security/dcpe.md).
+
 ## LangChain
 
 A LangChain `VectorStore` adapter ships in `quiver.langchain` (install

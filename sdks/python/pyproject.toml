@@ -13,6 +13,9 @@ dependencies = ["httpx>=0.27"]
 # Client-side payload encryption (quiver.encryption). Install with
 # `pip install quiver-client[encryption]`.
 encryption = ["pynacl>=1.5"]
+# Client-side DCPE vector encryption (quiver.dcpe, ADR-0031). Install with
+# `pip install quiver-client[dcpe]`. Uses ChaCha20 from `cryptography`.
+dcpe = ["cryptography>=42"]
 # The LangChain VectorStore adapter (quiver.langchain). Install with
 # `pip install quiver-client[langchain]`.
 langchain = ["langchain-core>=1.0"]
@@ -35,6 +38,7 @@ dev = [
     "pytest>=8",
     "respx>=0.21",
     "pynacl>=1.5",
+    "cryptography>=42",
     "langchain-core>=1.0",
     "llama-index-core>=0.11",
 ]
