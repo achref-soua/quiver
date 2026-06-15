@@ -150,6 +150,24 @@ describe("Quiver TypeScript client", () => {
     expect(await new Client("http://x", { fetch: down }).healthz()).toBe(false);
   });
 
+  it("createCollection sends encrypted_vectors and parses it back", async () => {
+    let createBody: Record<string, unknown> | undefined;
+    const fetch = mockFetch(async (path, _method, init) => {
+      if (path === "/v1/collections") {
+        createBody = parseBody(init);
+        return json({ name: "vault", dim: 8, metric: "l2", count: 0, encrypted_vectors: true });
+      }
+      return json({}, 404);
+    });
+    const client = new Client("http://x", { fetch });
+    const info = await client.createCollection("vault", 8, {
+      metric: "l2",
+      encryptedVectors: true,
+    });
+    expect(info.encryptedVectors).toBe(true);
+    expect(createBody?.["encrypted_vectors"]).toBe(true);
+  });
+
   it("multivector documents: create, upsert, search, and delete", async () => {
     let createBody: Record<string, unknown> | undefined;
     let upsertBody: Record<string, unknown> | undefined;
