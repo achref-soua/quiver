@@ -128,6 +128,14 @@ pub struct Descriptor {
     /// `false` on read).
     #[serde(default)]
     pub multivector: bool,
+    /// Whether this collection holds **DCPE-encrypted** vectors: the client
+    /// applies property-preserving (distance-comparison-preserving) encryption
+    /// before upserting, so the server searches ciphertexts it cannot decrypt
+    /// (ADR-0031). Experimental and **off by default**; when set, the collection
+    /// must use the `L2` metric. Absent in descriptors written before DCPE existed
+    /// (defaulted to `false` on read).
+    #[serde(default)]
+    pub encrypted_vectors: bool,
 }
 
 impl Descriptor {
@@ -142,6 +150,7 @@ impl Descriptor {
             index: IndexSpec::default(),
             filterable: Vec::new(),
             multivector: false,
+            encrypted_vectors: false,
         }
     }
 
@@ -168,22 +177,33 @@ impl Descriptor {
         self
     }
 
+    /// Mark this collection as holding DCPE-encrypted vectors (builder style):
+    /// the client encrypts vectors with property-preserving encryption before
+    /// upserting, and the server searches the ciphertexts (ADR-0031).
+    /// Experimental; a DCPE collection must use the `L2` metric.
+    #[must_use]
+    pub fn with_encrypted_vectors(mut self, encrypted_vectors: bool) -> Self {
+        self.encrypted_vectors = encrypted_vectors;
+        self
+    }
+
     /// Decode a descriptor from its postcard bytes, tolerating every earlier
     /// layout.
     ///
     /// postcard is non-self-describing, so a missing *trailing* field cannot be
     /// defaulted by `#[serde(default)]` alone (the reader hits end-of-input and
     /// errors). We therefore try the layouts newest-to-oldest — current
-    /// (with `multivector`) → the five-field `filterable` layout → the four-field
-    /// `index`-only layout → the original three-field layout — defaulting the
-    /// missing trailing fields. The order matters: postcard ignores trailing
-    /// bytes, so an older decoder would silently mis-read a newer buffer if tried
-    /// first.
+    /// (with `encrypted_vectors`) → the six-field `multivector` layout → the
+    /// five-field `filterable` layout → the four-field `index`-only layout → the
+    /// original three-field layout — defaulting the missing trailing fields. The
+    /// order matters: postcard ignores trailing bytes, so an older decoder would
+    /// silently mis-read a newer buffer if tried first.
     ///
     /// # Errors
     /// Returns the postcard error if the bytes match no known layout.
     pub fn decode(bytes: &[u8]) -> std::result::Result<Self, postcard::Error> {
         postcard::from_bytes::<Self>(bytes)
+            .or_else(|_| postcard::from_bytes::<DescriptorV4>(bytes).map(Self::from))
             .or_else(|_| postcard::from_bytes::<DescriptorV3>(bytes).map(Self::from))
             .or_else(|_| postcard::from_bytes::<DescriptorV2>(bytes).map(Self::from))
             .or_else(|_| postcard::from_bytes::<LegacyDescriptor>(bytes).map(Self::from))
@@ -193,6 +213,34 @@ impl Descriptor {
     #[must_use]
     pub fn stride(&self) -> usize {
         self.dim as usize * self.dtype.element_size()
+    }
+}
+
+// The six-field layout (through `multivector`, no `encrypted_vectors`), kept only
+// to migrate descriptors written before DCPE existed, via [`Descriptor::decode`].
+// It must be tried before the five-field layout, which would otherwise silently
+// drop `multivector` (postcard ignores trailing bytes).
+#[derive(Deserialize)]
+struct DescriptorV4 {
+    dim: u32,
+    dtype: Dtype,
+    metric: DistanceMetric,
+    index: IndexSpec,
+    filterable: Vec<FilterableField>,
+    multivector: bool,
+}
+
+impl From<DescriptorV4> for Descriptor {
+    fn from(v: DescriptorV4) -> Self {
+        Self {
+            dim: v.dim,
+            dtype: v.dtype,
+            metric: v.metric,
+            index: v.index,
+            filterable: v.filterable,
+            multivector: v.multivector,
+            encrypted_vectors: false,
+        }
     }
 }
 
@@ -218,6 +266,7 @@ impl From<DescriptorV3> for Descriptor {
             index: v.index,
             filterable: v.filterable,
             multivector: false,
+            encrypted_vectors: false,
         }
     }
 }
@@ -241,6 +290,7 @@ impl From<DescriptorV2> for Descriptor {
             index: v.index,
             filterable: Vec::new(),
             multivector: false,
+            encrypted_vectors: false,
         }
     }
 }
@@ -263,6 +313,7 @@ impl From<LegacyDescriptor> for Descriptor {
             index: IndexSpec::default(),
             filterable: Vec::new(),
             multivector: false,
+            encrypted_vectors: false,
         }
     }
 }
@@ -412,5 +463,48 @@ mod tests {
         assert_eq!(back.filterable, vec![FilterableField::keyword("city")]);
         assert!(!back.multivector);
         assert_eq!(back.index.kind, IndexKind::Ivf);
+    }
+
+    #[test]
+    fn descriptor_with_encrypted_vectors_roundtrips() {
+        let d = Descriptor::new(64, Dtype::F32, DistanceMetric::L2).with_encrypted_vectors(true);
+        let bytes = postcard::to_allocvec(&d).unwrap();
+        let back = Descriptor::decode(&bytes).unwrap();
+        assert_eq!(back, d);
+        assert!(back.encrypted_vectors);
+    }
+
+    // A descriptor serialized before `encrypted_vectors` existed (six fields,
+    // through `multivector`) must still decode — via the six-field fallback, which
+    // keeps `multivector` and defaults `encrypted_vectors` to false. The five-field
+    // fallback would wrongly drop `multivector`, so the six-field one is tried first.
+    #[test]
+    fn pre_encrypted_vectors_descriptor_decodes_and_keeps_multivector() {
+        #[derive(serde::Serialize)]
+        struct DescriptorV4 {
+            dim: u32,
+            dtype: Dtype,
+            metric: DistanceMetric,
+            index: IndexSpec,
+            filterable: Vec<FilterableField>,
+            multivector: bool,
+        }
+        let old = DescriptorV4 {
+            dim: 8,
+            dtype: Dtype::F32,
+            metric: DistanceMetric::Cosine,
+            index: IndexSpec::default(),
+            filterable: vec![FilterableField::numeric("score")],
+            multivector: true,
+        };
+        let bytes = postcard::to_allocvec(&old).unwrap();
+        // The current seven-field decode fails on the shorter buffer...
+        assert!(postcard::from_bytes::<Descriptor>(&bytes).is_err());
+        // ...but `decode` falls back to the six-field layout: multivector and
+        // filterable kept, encrypted_vectors defaulted to false.
+        let back = Descriptor::decode(&bytes).unwrap();
+        assert!(back.multivector);
+        assert_eq!(back.filterable, vec![FilterableField::numeric("score")]);
+        assert!(!back.encrypted_vectors);
     }
 }
