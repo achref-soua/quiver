@@ -1,6 +1,6 @@
 # ADR-0030: Leader-follower replication (async read replicas)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-15
 - **Deciders:** Achref Soua
 
@@ -58,6 +58,32 @@ state.
 read replicas — labelled **advanced / experimental**. A follower lags the leader;
 reads can be stale; there is no failover and no consensus. Single-node remains
 the primary, fully-supported topology.
+
+## Implementation
+
+Shipped across the engine and server:
+
+- **Engine** (`quiver-core` / `quiver-embed`): a synchronous `set_commit_observer`
+  hook fired after each durable commit (the tail source; a plain `Fn` keeps the
+  engine runtime-agnostic), `replication_snapshot` (the bootstrap ops), and
+  `apply_replicated` (a follower persists each op to its own WAL under a
+  locally-assigned LSN, preserving the leader's collection id, then applies it
+  through the recovery path). The `Database` reconciles its index handles on
+  apply.
+- **Leader** (`quiver-server`): a `Replicate` gRPC server-streaming RPC. The
+  `AppState` holds a `tokio::broadcast` of committed ops, fed by the commit
+  observer. The handler subscribes to the broadcast **inside the same engine
+  critical section** that takes the snapshot, so no commit can interleave — the
+  stream is race-free with no dedup. Admin-scoped.
+- **Follower** (`quiver-server`): `leader_url` makes a node a follower; a
+  background task applies the leader's stream, and a `read_only` flag refuses
+  external writes. On a stream error the follower serves stale read-only state
+  until an operator restarts it.
+
+Honest deviations: the follower re-bootstraps a full snapshot on reconnect (no
+incremental resume yet), and TLS to the leader is a follow-up — run replication
+over a trusted network for now. Validated hermetically (an in-process leader and
+follower on loopback); a multi-host deployment is an operator step.
 
 ## Consequences
 
