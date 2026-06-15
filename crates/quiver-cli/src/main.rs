@@ -65,10 +65,17 @@ enum AdminCommand {
         /// Source tool: qdrant, chroma, or pgvector.
         #[arg(long)]
         source: String,
-        /// Export file: JSON Lines for qdrant/pgvector; a single
+        /// Export file (offline import): JSON Lines for qdrant/pgvector; a single
         /// `collection.get(...)` JSON object for chroma.
         #[arg(long)]
-        input: PathBuf,
+        input: Option<PathBuf>,
+        /// Live import: base URL of a running Qdrant (e.g. http://localhost:6333)
+        /// to pull the same-named collection directly, instead of `--input`.
+        #[arg(long)]
+        qdrant_url: Option<String>,
+        /// API key for `--qdrant-url`, sent as the `api-key` header.
+        #[arg(long, env = "QDRANT_API_KEY")]
+        api_key: Option<String>,
         /// Target collection name (created if absent, appended to otherwise).
         #[arg(long)]
         collection: String,
@@ -129,6 +136,8 @@ async fn main() -> anyhow::Result<()> {
             AdminCommand::Import {
                 source,
                 input,
+                qdrant_url,
+                api_key,
                 collection,
                 data_dir,
                 metric,
@@ -143,6 +152,8 @@ async fn main() -> anyhow::Result<()> {
                 let args = admin::ImportArgs {
                     source: source.parse().map_err(|e: String| anyhow::anyhow!(e))?,
                     input,
+                    qdrant_url,
+                    api_key,
                     collection: collection.clone(),
                     data_dir,
                     metric: admin::parse_metric(&metric)?,

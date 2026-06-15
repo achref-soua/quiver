@@ -11,13 +11,20 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
 use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, FieldType, FilterableField};
-use quiver_import::{ParseOptions, Source, import_into, infer_dim, parse};
+use quiver_import::{
+    ParseOptions, QdrantSource, Source, fetch_qdrant, import_into, infer_dim, parse,
+};
 
 // Typed arguments for `quiver admin import`, decoupled from clap so the command
 // logic is unit-testable without spawning the binary.
 pub(crate) struct ImportArgs {
     pub source: Source,
-    pub input: PathBuf,
+    // Offline export file, or `None` for a live import.
+    pub input: Option<PathBuf>,
+    // Live Qdrant base URL, or `None` for an offline (file) import.
+    pub qdrant_url: Option<String>,
+    // API key for a live Qdrant import.
+    pub api_key: Option<String>,
     pub collection: String,
     pub data_dir: PathBuf,
     pub metric: DistanceMetric,
@@ -33,9 +40,6 @@ pub(crate) struct ImportArgs {
 // Parse the export, then create/append the collection and bulk-load it. Returns
 // the number of points imported.
 pub(crate) fn import(args: ImportArgs) -> anyhow::Result<usize> {
-    let text = std::fs::read_to_string(&args.input)
-        .with_context(|| format!("reading export {}", args.input.display()))?;
-
     let mut opts = ParseOptions::new(args.source);
     if let Some(field) = args.id_field {
         opts.id_field = field;
@@ -45,9 +49,25 @@ pub(crate) fn import(args: ImportArgs) -> anyhow::Result<usize> {
     }
     opts.vector_name = args.vector_name;
 
-    let points = parse(&opts, &text)?;
+    // Acquire points either live (a running Qdrant) or from an offline export.
+    let points = if let Some(url) = &args.qdrant_url {
+        if args.source != Source::Qdrant {
+            bail!("--qdrant-url is only supported with --source qdrant");
+        }
+        let src = QdrantSource {
+            api_key: args.api_key.clone(),
+            ..QdrantSource::new(url.clone(), args.collection.clone())
+        };
+        fetch_qdrant(&src, &opts)?
+    } else if let Some(input) = &args.input {
+        let text = std::fs::read_to_string(input)
+            .with_context(|| format!("reading export {}", input.display()))?;
+        parse(&opts, &text)?
+    } else {
+        bail!("provide an export file (--input) or a live source (--qdrant-url)");
+    };
     if points.is_empty() {
-        bail!("no points found in {}", args.input.display());
+        bail!("no points found");
     }
     let dim = match args.dim {
         Some(d) => d,
@@ -148,7 +168,9 @@ mod tests {
 
         let args = ImportArgs {
             source: Source::Qdrant,
-            input: export,
+            input: Some(export),
+            qdrant_url: None,
+            api_key: None,
             collection: "places".to_string(),
             data_dir: data_dir.clone(),
             metric: DistanceMetric::L2,
@@ -188,7 +210,9 @@ mod tests {
 
         let args = ImportArgs {
             source: Source::Qdrant,
-            input: export,
+            input: Some(export),
+            qdrant_url: None,
+            api_key: None,
             collection: "c".to_string(),
             data_dir: data_dir.clone(),
             metric: DistanceMetric::L2,
@@ -214,7 +238,9 @@ mod tests {
         std::fs::write(&export, "{\"id\": 1, \"vector\": [1.0], \"payload\": {}}\n").unwrap();
         let args = ImportArgs {
             source: Source::Qdrant,
-            input: export,
+            input: Some(export),
+            qdrant_url: None,
+            api_key: None,
             collection: "c".to_string(),
             data_dir: dir.path().join("data"),
             metric: DistanceMetric::L2,
@@ -225,6 +251,91 @@ mod tests {
             vector_name: None,
             encryption_key: None,
             insecure: false,
+        };
+        assert!(import(args).is_err());
+    }
+
+    #[test]
+    fn live_qdrant_import_loads_a_running_collection() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        // A one-shot HTTP server returning a single scroll page (then done).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 2048];
+            loop {
+                let n = s.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let len = String::from_utf8_lossy(&buf[..end + 4])
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() - (end + 4) >= len {
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"result":{"points":[{"id":1,"vector":[1.0,0.0],"payload":{"city":"paris"}}],"next_page_offset":null},"status":"ok"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let args = ImportArgs {
+            source: Source::Qdrant,
+            input: None,
+            qdrant_url: Some(format!("http://{addr}")),
+            api_key: None,
+            collection: "places".to_string(),
+            data_dir: dir.path().join("data"),
+            metric: DistanceMetric::L2,
+            dim: None,
+            filterable: Vec::new(),
+            id_field: None,
+            vector_field: None,
+            vector_name: None,
+            encryption_key: None,
+            insecure: true,
+        };
+        assert_eq!(import(args).unwrap(), 1);
+        let db = Database::open(&dir.path().join("data")).unwrap();
+        assert_eq!(db.len("places").unwrap(), 1);
+    }
+
+    #[test]
+    fn live_import_rejects_a_non_qdrant_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = ImportArgs {
+            source: Source::Chroma,
+            input: None,
+            qdrant_url: Some("http://localhost:6333".to_string()),
+            api_key: None,
+            collection: "c".to_string(),
+            data_dir: dir.path().join("data"),
+            metric: DistanceMetric::L2,
+            dim: None,
+            filterable: Vec::new(),
+            id_field: None,
+            vector_field: None,
+            vector_name: None,
+            encryption_key: None,
+            insecure: true,
         };
         assert!(import(args).is_err());
     }
