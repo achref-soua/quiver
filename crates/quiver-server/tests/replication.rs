@@ -117,6 +117,7 @@ async fn replicate_streams_a_snapshot_then_the_live_tail() {
             pq_subspaces: None,
             filterable: vec![],
             multivector: false,
+            encrypted_vectors: false,
         })
         .await
         .unwrap();
@@ -201,6 +202,7 @@ async fn a_follower_mirrors_the_leader_and_refuses_writes() {
             pq_subspaces: None,
             filterable: vec![],
             multivector: false,
+            encrypted_vectors: false,
         })
         .await
         .unwrap();

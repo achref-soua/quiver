@@ -118,6 +118,31 @@ async fn rest_and_grpc_round_trip() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
+    // --- REST: the DCPE flag flows through, and is L2-only (ADR-0031) ---
+    let resp = http
+        .post(format!("{base}/v1/collections"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({
+            "name": "encrypted", "dim": 4, "metric": "l2", "encrypted_vectors": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["encrypted_vectors"], true);
+    // A DCPE collection with a non-L2 metric is a 400, not a 500.
+    let resp = http
+        .post(format!("{base}/v1/collections"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({
+            "name": "enc_bad", "dim": 4, "metric": "cosine", "encrypted_vectors": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
     // --- REST: upsert points with payloads ---
     let resp = http
         .post(format!("{base}/v1/collections/items/points"))

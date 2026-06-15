@@ -39,6 +39,7 @@ mod tests {
                 field_type: v1::FieldType::Keyword as i32,
             }],
             multivector: false,
+            encrypted_vectors: false,
         };
         assert_eq!(req.dim, 8);
         assert_eq!(req.index, v1::IndexKind::DiskVamana as i32);
