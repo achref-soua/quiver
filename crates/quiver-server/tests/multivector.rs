@@ -58,6 +58,8 @@ async fn multivector_round_trip() {
         tls_client_ca: None,
         master_key_file: None,
         audit_log: None,
+        leader_url: None,
+        leader_api_key: None,
         insecure: false,
     };
     let server = tokio::spawn(async move {
