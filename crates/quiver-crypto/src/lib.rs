@@ -3,15 +3,20 @@
 //! and write-ahead-log records, with HKDF-SHA256 key derivation.
 //!
 //! Quiver implements no cryptographic primitives of its own — every primitive
-//! comes from an audited library (XChaCha20-Poly1305, HKDF-SHA256, and SHA-256
-//! from the RustCrypto project; `rustls` for TLS in the server). This crate is a
-//! thin, well-tested integration layer that plugs an [`AeadCodec`] into the
-//! storage engine's [`quiver_core::page::PageCodec`] seam, so enabling
-//! encryption-at-rest is a one-line change at `open` time and covers **all**
-//! durable data — paged manifest and segment files *and* the record-framed WAL.
+//! comes from an audited library (XChaCha20-Poly1305, ChaCha20, HMAC-SHA256,
+//! HKDF-SHA256, and SHA-256 from the RustCrypto project; `rustls` for TLS in the
+//! server). This crate is a thin, well-tested integration layer that plugs an
+//! [`AeadCodec`] into the storage engine's [`quiver_core::page::PageCodec`] seam,
+//! so enabling encryption-at-rest is a one-line change at `open` time and covers
+//! **all** durable data — paged manifest and segment files *and* the
+//! record-framed WAL. It also hosts the **client-side** ciphers Quiver never sees
+//! the key for: [`PayloadCipher`] (payload envelopes) and the experimental
+//! [`DcpeCipher`] (property-preserving vector encryption).
 //!
 //! Design: [`docs/security/crypto.md`](https://github.com/achref-soua/quiver/blob/main/docs/security/crypto.md),
-//! ADR-0010 (envelope encryption & AEAD) and ADR-0012 (client-side encryption).
+//! ADR-0010 (envelope encryption & AEAD), ADR-0012 (client-side encryption), and
+//! ADR-0031 (experimental DCPE vector encryption — composed from the primitives
+//! above; it is **not** semantically secure, see [`dcpe`]).
 //!
 //! ```no_run
 //! use quiver_crypto::AeadCodec;
@@ -30,10 +35,12 @@ use std::path::Path;
 use quiver_core::KeyRing;
 
 mod codec;
+pub mod dcpe;
 pub mod envelope;
 pub mod payload;
 
 pub use codec::{AeadCodec, KEY_LEN};
+pub use dcpe::{DcpeCipher, DcpeError, EncryptedVector};
 pub use envelope::EnvelopeKeyRing;
 pub use payload::{ENVELOPE_KEY, PayloadCipher, PayloadError, is_sealed};
 
