@@ -22,7 +22,7 @@ pub use hnsw::{Hnsw, HnswConfig};
 pub use ivf::{Ivf, IvfConfig, SnapshotError};
 pub use quant::{BinaryQuantizer, CodeScorer, ProductQuantizer, Quantizer, ScalarQuantizer};
 pub use quiver_simd::Metric;
-pub use score::{ordering_distance, report_metric};
+pub use score::{max_sim, ordering_distance, report_metric};
 pub use vamana::{Vamana, VamanaConfig};
 
 use thiserror::Error;
