@@ -38,6 +38,7 @@ mod tests {
                 path: "city".to_owned(),
                 field_type: v1::FieldType::Keyword as i32,
             }],
+            multivector: false,
         };
         assert_eq!(req.dim, 8);
         assert_eq!(req.index, v1::IndexKind::DiskVamana as i32);

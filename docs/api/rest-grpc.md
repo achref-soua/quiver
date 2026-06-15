@@ -54,6 +54,9 @@ message SearchResponse { repeated Match matches = 1; string next_cursor = 2; }
 | `DELETE /v1/collections/{id}/points` | DeletePoints |
 | `POST /v1/collections/{id}/query` | Search |
 | `POST /v1/collections/{id}/query/batch` | BatchSearch |
+| `POST /v1/collections/{id}/documents` | UpsertMultiVector (late-interaction docs) |
+| `DELETE /v1/collections/{id}/documents` | DeleteDocuments |
+| `POST /v1/collections/{id}/documents/query` | SearchMultiVector (MaxSim) |
 | `POST /v1/keys` · `GET /v1/keys` · `DELETE /v1/keys/{id}` | API-key admin |
 | `GET /v1/collections/{id}/stats` | Stats |
 | `GET /healthz` · `GET /readyz` · `GET /metrics` | ops |

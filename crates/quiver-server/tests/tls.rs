@@ -163,6 +163,7 @@ async fn tls_secures_both_rest_and_grpc() {
                 index: v1::IndexKind::Unspecified as i32,
                 pq_subspaces: None,
                 filterable: Vec::new(),
+                multivector: false,
             },
         ))
         .await
