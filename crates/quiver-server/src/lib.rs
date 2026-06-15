@@ -40,12 +40,14 @@ use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use quiver_crypto::AeadCodec;
 use quiver_embed::{
     Database, Descriptor, DistanceMetric, Dtype, FilterableField, IndexSpec, SearchParams,
+    WalEntry, WalOp,
 };
 use quiver_query::Filter;
 
@@ -252,6 +254,9 @@ pub(crate) struct AppState {
     db: Arc<Mutex<Database>>,
     keys: Arc<Vec<ApiKey>>,
     audit: Arc<AuditLog>,
+    // Fan-out of every committed op to replication followers (ADR-0030). The
+    // commit observer publishes here; each `Replicate` stream subscribes.
+    replication_tx: broadcast::Sender<WalEntry>,
 }
 
 /// A collection's metadata.
@@ -351,6 +356,26 @@ impl AppState {
         principal
             .require(action, None)
             .inspect_err(|_| self.audit.deny(principal.actor(), op, "*"))
+    }
+
+    /// Open a replication stream (ADR-0030): authorize (admin), then — in a single
+    /// engine critical section so no commit can interleave — subscribe to the live
+    /// commit tail and snapshot current state. The caller streams the snapshot,
+    /// then the tail from the receiver; because the subscription is taken under the
+    /// same lock as the snapshot, every post-snapshot op arrives on the receiver
+    /// and none is missed or duplicated.
+    pub(crate) async fn open_replication(
+        &self,
+        principal: &Principal,
+    ) -> Result<(Vec<WalOp>, broadcast::Receiver<WalEntry>), Error> {
+        self.authorize_global(principal, Action::Admin, "replicate")?;
+        let tx = self.replication_tx.clone();
+        self.run_blocking(move |db| {
+            let rx = tx.subscribe();
+            let snapshot = db.replication_snapshot()?;
+            Ok((snapshot, rx))
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -674,6 +699,10 @@ impl AppState {
     }
 }
 
+/// How many recently-committed ops the leader buffers for replication followers
+/// (ADR-0030). A follower that falls further behind than this re-bootstraps.
+const REPLICATION_BUFFER: usize = 1024;
+
 /// Run the server from `config` until a shutdown signal (Ctrl-C).
 pub async fn run(config: Config) -> Result<(), Error> {
     config.validate()?;
@@ -700,12 +729,23 @@ pub async fn serve(
     rest_listener: TcpListener,
     grpc_listener: TcpListener,
 ) -> Result<(), Error> {
-    let db = open_database(&config)?;
+    let mut db = open_database(&config)?;
     let audit = Arc::new(AuditLog::open(config.audit_log.as_deref())?);
+    // Publish every committed op to replication followers (ADR-0030). The observer
+    // runs inside the engine's write critical section; `broadcast::Sender::send` is
+    // non-blocking, so it never stalls a write.
+    let (replication_tx, _) = broadcast::channel(REPLICATION_BUFFER);
+    {
+        let tx = replication_tx.clone();
+        db.set_commit_observer(Arc::new(move |entry: &WalEntry| {
+            let _ = tx.send(entry.clone());
+        }));
+    }
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         keys: Arc::new(config.api_keys.clone()),
         audit,
+        replication_tx,
     };
 
     let app = rest::router(state.clone());
