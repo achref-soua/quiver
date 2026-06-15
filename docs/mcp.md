@@ -24,11 +24,14 @@ launched by an MCP-capable client (e.g. an agent runtime) as a subprocess.
 | Tool | Arguments | Purpose |
 |---|---|---|
 | `list_collections` | — | List collections |
-| `create_collection` | `name`, `dim`, `metric` (`l2`\|`cosine`\|`dot`), `index` (`hnsw`\|`vamana`\|`disk_vamana`\|`ivf`), `pq_subspaces?`, `filterable?` (`[{path, field_type: keyword\|numeric}]`) | Create a collection (pick the index, incl. the memory-frugal `disk_vamana`; declare `filterable` fields for hybrid pre-filtered search) |
+| `create_collection` | `name`, `dim`, `metric` (`l2`\|`cosine`\|`dot`), `index` (`hnsw`\|`vamana`\|`disk_vamana`\|`ivf`), `pq_subspaces?`, `filterable?` (`[{path, field_type: keyword\|numeric}]`), `multivector?` | Create a collection (pick the index, incl. the memory-frugal `disk_vamana`; declare `filterable` fields for hybrid pre-filtered search; set `multivector` for late-interaction / ColBERT) |
 | `upsert` | `collection`, `id`, `vector`, `payload?` | Insert/replace a point |
 | `search` | `collection`, `vector`, `k?`, `filter?` | k-NN with an optional payload filter |
 | `get` | `collection`, `id` | Fetch one point |
 | `delete` | `collection`, `id` | Delete one point |
+| `upsert_document` | `collection`, `id`, `vectors` (token set), `payload?` | Insert/replace a multi-vector (ColBERT) document |
+| `search_multi_vector` | `collection`, `query` (token set), `k?`, `filter?` | MaxSim late-interaction search with an optional payload filter |
+| `delete_document` | `collection`, `id` | Delete a multi-vector document |
 
 `filter` is a Quiver [payload filter](api/wire-protocol.md) tree, e.g.
 `{"eq": {"field": "color", "value": "blue"}}`. The full JSON-Schema for each
