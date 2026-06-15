@@ -121,6 +121,13 @@ pub struct Descriptor {
     /// descriptors written before secondary indexes existed (defaulted on read).
     #[serde(default)]
     pub filterable: Vec<FilterableField>,
+    /// Whether this is a multi-vector (late-interaction / ColBERT) collection:
+    /// each document is stored as a group of token-vector rows and searched by
+    /// MaxSim (ADR-0028). `false` for an ordinary single-vector collection, and
+    /// absent in descriptors written before late interaction existed (defaulted to
+    /// `false` on read).
+    #[serde(default)]
+    pub multivector: bool,
 }
 
 impl Descriptor {
@@ -134,6 +141,7 @@ impl Descriptor {
             metric,
             index: IndexSpec::default(),
             filterable: Vec::new(),
+            multivector: false,
         }
     }
 
@@ -151,21 +159,32 @@ impl Descriptor {
         self
     }
 
+    /// Mark this collection as multi-vector (late-interaction / ColBERT), so each
+    /// document is stored as a group of token-vector rows scored by MaxSim
+    /// (builder style). The dimensionality is the per-token dimension.
+    #[must_use]
+    pub fn with_multivector(mut self, multivector: bool) -> Self {
+        self.multivector = multivector;
+        self
+    }
+
     /// Decode a descriptor from its postcard bytes, tolerating every earlier
     /// layout.
     ///
     /// postcard is non-self-describing, so a missing *trailing* field cannot be
     /// defaulted by `#[serde(default)]` alone (the reader hits end-of-input and
     /// errors). We therefore try the layouts newest-to-oldest — current
-    /// (with `filterable`) → the four-field `index`-only layout → the original
-    /// three-field layout — defaulting the missing trailing fields. The order
-    /// matters: postcard ignores trailing bytes, so an older decoder would
-    /// silently mis-read a newer buffer if tried first.
+    /// (with `multivector`) → the five-field `filterable` layout → the four-field
+    /// `index`-only layout → the original three-field layout — defaulting the
+    /// missing trailing fields. The order matters: postcard ignores trailing
+    /// bytes, so an older decoder would silently mis-read a newer buffer if tried
+    /// first.
     ///
     /// # Errors
     /// Returns the postcard error if the bytes match no known layout.
     pub fn decode(bytes: &[u8]) -> std::result::Result<Self, postcard::Error> {
         postcard::from_bytes::<Self>(bytes)
+            .or_else(|_| postcard::from_bytes::<DescriptorV3>(bytes).map(Self::from))
             .or_else(|_| postcard::from_bytes::<DescriptorV2>(bytes).map(Self::from))
             .or_else(|_| postcard::from_bytes::<LegacyDescriptor>(bytes).map(Self::from))
     }
@@ -174,6 +193,32 @@ impl Descriptor {
     #[must_use]
     pub fn stride(&self) -> usize {
         self.dim as usize * self.dtype.element_size()
+    }
+}
+
+// The five-field layout (an `index` and `filterable` but no `multivector`), kept
+// only to migrate descriptors written before late interaction existed, via
+// [`Descriptor::decode`]. It must be tried before the four-field layout, which
+// would otherwise silently drop `filterable` (postcard ignores trailing bytes).
+#[derive(Deserialize)]
+struct DescriptorV3 {
+    dim: u32,
+    dtype: Dtype,
+    metric: DistanceMetric,
+    index: IndexSpec,
+    filterable: Vec<FilterableField>,
+}
+
+impl From<DescriptorV3> for Descriptor {
+    fn from(v: DescriptorV3) -> Self {
+        Self {
+            dim: v.dim,
+            dtype: v.dtype,
+            metric: v.metric,
+            index: v.index,
+            filterable: v.filterable,
+            multivector: false,
+        }
     }
 }
 
@@ -195,6 +240,7 @@ impl From<DescriptorV2> for Descriptor {
             metric: v.metric,
             index: v.index,
             filterable: Vec::new(),
+            multivector: false,
         }
     }
 }
@@ -216,6 +262,7 @@ impl From<LegacyDescriptor> for Descriptor {
             metric: v.metric,
             index: IndexSpec::default(),
             filterable: Vec::new(),
+            multivector: false,
         }
     }
 }
@@ -321,5 +368,49 @@ mod tests {
         ]);
         let bytes = postcard::to_allocvec(&d).unwrap();
         assert_eq!(Descriptor::decode(&bytes).unwrap(), d);
+    }
+
+    #[test]
+    fn descriptor_with_multivector_roundtrips() {
+        let d = Descriptor::new(128, Dtype::F32, DistanceMetric::Cosine).with_multivector(true);
+        let bytes = postcard::to_allocvec(&d).unwrap();
+        let back = Descriptor::decode(&bytes).unwrap();
+        assert_eq!(back, d);
+        assert!(back.multivector);
+    }
+
+    // A descriptor serialized before `multivector` existed (five fields, with a
+    // `filterable`) must still decode — via the five-field fallback, which keeps
+    // `filterable` and defaults `multivector` to false. The four-field fallback
+    // would wrongly drop `filterable`, so the five-field one must be tried first.
+    #[test]
+    fn pre_multivector_descriptor_decodes_and_keeps_filterable() {
+        #[derive(serde::Serialize)]
+        struct DescriptorV3 {
+            dim: u32,
+            dtype: Dtype,
+            metric: DistanceMetric,
+            index: IndexSpec,
+            filterable: Vec<FilterableField>,
+        }
+        let old = DescriptorV3 {
+            dim: 8,
+            dtype: Dtype::F32,
+            metric: DistanceMetric::Cosine,
+            index: IndexSpec {
+                kind: IndexKind::Ivf,
+                pq_subspaces: Some(8),
+            },
+            filterable: vec![FilterableField::keyword("city")],
+        };
+        let bytes = postcard::to_allocvec(&old).unwrap();
+        // The current six-field decode fails on the shorter buffer...
+        assert!(postcard::from_bytes::<Descriptor>(&bytes).is_err());
+        // ...but `decode` falls back to the five-field layout: filterable kept,
+        // multivector defaulted to false, index preserved.
+        let back = Descriptor::decode(&bytes).unwrap();
+        assert_eq!(back.filterable, vec![FilterableField::keyword("city")]);
+        assert!(!back.multivector);
+        assert_eq!(back.index.kind, IndexKind::Ivf);
     }
 }
