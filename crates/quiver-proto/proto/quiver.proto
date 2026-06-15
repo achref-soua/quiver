@@ -78,6 +78,9 @@ message Collection {
   repeated FilterableField filterable = 7;
   // Whether this is a multi-vector (late-interaction / ColBERT) collection.
   bool multivector = 8;
+  // Whether this collection holds DCPE-encrypted vectors (ADR-0031): the client
+  // encrypts vectors before upserting and the server searches the ciphertexts.
+  bool encrypted_vectors = 9;
 }
 
 message CreateCollectionRequest {
@@ -92,6 +95,9 @@ message CreateCollectionRequest {
   // Create a multi-vector (late-interaction / ColBERT) collection (ADR-0028),
   // whose documents are token-vector sets searched by MaxSim.
   bool multivector = 7;
+  // Create a DCPE-encrypted collection (ADR-0031): the client encrypts vectors
+  // with property-preserving encryption before upserting. Requires the L2 metric.
+  bool encrypted_vectors = 8;
 }
 
 message GetCollectionRequest {

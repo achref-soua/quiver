@@ -225,6 +225,8 @@ struct CollectionDto {
     filterable: Vec<FilterableFieldDto>,
     #[serde(skip_serializing_if = "is_false")]
     multivector: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    encrypted_vectors: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -242,6 +244,7 @@ impl From<CollectionInfo> for CollectionDto {
             pq_subspaces: info.index.pq_subspaces,
             filterable: info.filterable.into_iter().map(Into::into).collect(),
             multivector: info.multivector,
+            encrypted_vectors: info.encrypted_vectors,
         }
     }
 }
@@ -260,6 +263,8 @@ struct CreateCollectionBody {
     filterable: Vec<FilterableFieldDto>,
     #[serde(default)]
     multivector: bool,
+    #[serde(default)]
+    encrypted_vectors: bool,
 }
 
 async fn create_collection(
@@ -281,6 +286,7 @@ async fn create_collection(
             index,
             filterable,
             body.multivector,
+            body.encrypted_vectors,
         )
         .await?;
     Ok(Json(info.into()))

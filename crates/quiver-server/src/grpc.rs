@@ -127,6 +127,7 @@ fn collection_to_proto(info: CollectionInfo) -> v1::Collection {
         pq_subspaces: info.index.pq_subspaces,
         filterable: filterable_to_proto(info.filterable),
         multivector: info.multivector,
+        encrypted_vectors: info.encrypted_vectors,
     }
 }
 
@@ -290,6 +291,7 @@ impl Quiver for QuiverService {
                 index,
                 filterable,
                 req.multivector,
+                req.encrypted_vectors,
             )
             .await
             .map_err(|e| e.to_status())?;

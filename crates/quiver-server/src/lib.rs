@@ -283,6 +283,7 @@ pub(crate) struct CollectionInfo {
     pub index: IndexSpec,
     pub filterable: Vec<FilterableField>,
     pub multivector: bool,
+    pub encrypted_vectors: bool,
 }
 
 /// A point to upsert.
@@ -421,13 +422,15 @@ impl AppState {
         index: IndexSpec,
         filterable: Vec<FilterableField>,
         multivector: bool,
+        encrypted_vectors: bool,
     ) -> Result<CollectionInfo, Error> {
         self.ensure_writable("create_collection")?;
         self.authorize(principal, Action::Admin, "create_collection", &name)?;
         let descriptor = Descriptor::new(dim, Dtype::F32, metric)
             .with_index(index)
             .with_filterable(filterable.clone())
-            .with_multivector(multivector);
+            .with_multivector(multivector)
+            .with_encrypted_vectors(encrypted_vectors);
         let owned = name.clone();
         let result = self
             .run_blocking(move |db| db.create_collection(&owned, descriptor))
@@ -447,6 +450,7 @@ impl AppState {
             index,
             filterable,
             multivector,
+            encrypted_vectors,
         })
     }
 
@@ -476,6 +480,7 @@ impl AppState {
                 index: descriptor.index,
                 filterable: descriptor.filterable,
                 multivector: descriptor.multivector,
+                encrypted_vectors: descriptor.encrypted_vectors,
             })
         })
         .await
@@ -504,6 +509,7 @@ impl AppState {
                             index: descriptor.index,
                             filterable: descriptor.filterable,
                             multivector: descriptor.multivector,
+                            encrypted_vectors: descriptor.encrypted_vectors,
                         });
                     }
                 }
