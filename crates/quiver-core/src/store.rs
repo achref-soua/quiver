@@ -40,6 +40,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
@@ -197,6 +198,12 @@ struct PendingSegment {
     sealed: SealedSegment,
 }
 
+/// A synchronous hook invoked with each committed [`WalEntry`], in commit order.
+/// Leader-follower replication (ADR-0030) installs one to publish each op to its
+/// replication stream. A plain `Fn` keeps the engine runtime-agnostic — no async
+/// dependency leaks into `quiver-core`.
+pub type CommitObserver = Arc<dyn Fn(&WalEntry) + Send + Sync>;
+
 /// The durable storage engine for one data directory.
 pub struct Store {
     dir: PathBuf,
@@ -210,6 +217,7 @@ pub struct Store {
     last_checkpointed_lsn: Lsn,
     wal: WalWriter,
     wal_seq: u64,
+    commit_observer: Option<CommitObserver>,
 }
 
 impl Store {
@@ -326,7 +334,76 @@ impl Store {
             last_checkpointed_lsn: floor,
             wal,
             wal_seq,
+            commit_observer: None,
         })
+    }
+
+    /// Install a hook invoked with each committed [`WalEntry`], in commit order
+    /// (ADR-0030). Used by the server to drive a leader's replication stream;
+    /// replaces any previous observer.
+    pub fn set_commit_observer(&mut self, observer: CommitObserver) {
+        self.commit_observer = Some(observer);
+    }
+
+    // Notify the commit observer (if any) of a durably-committed entry.
+    fn publish(&self, entry: &WalEntry) {
+        if let Some(observer) = &self.commit_observer {
+            observer(entry);
+        }
+    }
+
+    /// The operations that recreate the store's current logical state, for a
+    /// replication follower to bootstrap from (ADR-0030): a `CreateCollection`
+    /// per collection, each followed by an `Upsert` per live point. Collections
+    /// are emitted before their points so a follower can apply the stream in
+    /// order.
+    pub fn replication_snapshot(&self) -> Result<Vec<WalOp>> {
+        let mut ops = Vec::new();
+        for (&id, state) in &self.collections {
+            ops.push(WalOp::CreateCollection {
+                collection_id: id,
+                name: state.name.clone(),
+                descriptor: postcard::to_allocvec(&state.descriptor)?,
+            });
+            for (external_id, record) in self.scan(id)? {
+                ops.push(WalOp::Upsert {
+                    collection_id: id,
+                    external_id,
+                    vector: f32_to_le_bytes(&record.vector),
+                    payload: record.payload,
+                });
+            }
+        }
+        Ok(ops)
+    }
+
+    /// Apply a replicated operation received from a leader (ADR-0030). The op is
+    /// persisted to *this* node's WAL under a locally-assigned LSN — preserving
+    /// the leader's collection id so later ops resolve — then applied to in-memory
+    /// state through the same path crash recovery uses. `Checkpoint` ops are a
+    /// per-node concern and are ignored; followers checkpoint themselves.
+    pub fn apply_replicated(&mut self, op: WalOp) -> Result<()> {
+        if let WalOp::Checkpoint { .. } = op {
+            return Ok(());
+        }
+        if let WalOp::CreateCollection { collection_id, .. } = &op {
+            // Provision key material before the collection's codec is needed, and
+            // keep the local id allocator ahead of the leader's ids.
+            self.keyring.provision_collection(*collection_id)?;
+            self.next_collection_id = self.next_collection_id.max(collection_id.0 + 1);
+        }
+        let lsn = self.next_lsn;
+        let entry = WalEntry { lsn, op };
+        self.wal.append_sync(self.keyring.catalog_codec(), &entry)?;
+        self.next_lsn = lsn.next();
+        apply_wal_entry(
+            &mut self.collections,
+            &mut self.name_index,
+            &entry,
+            self.keyring.as_ref(),
+        )?;
+        self.publish(&entry);
+        Ok(())
     }
 
     /// Create a collection. Fails if the name is already taken.
@@ -349,18 +426,17 @@ impl Store {
         self.keyring.provision_collection(id)?;
         let descriptor_bytes = postcard::to_allocvec(&descriptor)?;
         let lsn = self.next_lsn;
-        self.wal.append_sync(
-            self.keyring.catalog_codec(),
-            &WalEntry {
-                lsn,
-                op: WalOp::CreateCollection {
-                    collection_id: id,
-                    name: name.to_owned(),
-                    descriptor: descriptor_bytes,
-                },
+        let entry = WalEntry {
+            lsn,
+            op: WalOp::CreateCollection {
+                collection_id: id,
+                name: name.to_owned(),
+                descriptor: descriptor_bytes,
             },
-        )?;
+        };
+        self.wal.append_sync(self.keyring.catalog_codec(), &entry)?;
         self.next_lsn = lsn.next();
+        self.publish(&entry);
         self.next_collection_id += 1;
         let codec = self.keyring.collection_codec(id)?;
         self.collections.insert(
@@ -378,14 +454,13 @@ impl Store {
             return Ok(false);
         };
         let lsn = self.next_lsn;
-        self.wal.append_sync(
-            self.keyring.catalog_codec(),
-            &WalEntry {
-                lsn,
-                op: WalOp::DropCollection { collection_id: id },
-            },
-        )?;
+        let entry = WalEntry {
+            lsn,
+            op: WalOp::DropCollection { collection_id: id },
+        };
+        self.wal.append_sync(self.keyring.catalog_codec(), &entry)?;
         self.next_lsn = lsn.next();
+        self.publish(&entry);
         self.collections.remove(&id);
         self.name_index.remove(name);
         Ok(true)
@@ -436,19 +511,18 @@ impl Store {
         }
         let vector_bytes = f32_to_le_bytes(vector);
         let lsn = self.next_lsn;
-        self.wal.append_sync(
-            self.keyring.catalog_codec(),
-            &WalEntry {
-                lsn,
-                op: WalOp::Upsert {
-                    collection_id: collection,
-                    external_id: external_id.to_owned(),
-                    vector: vector_bytes.clone(),
-                    payload: payload.to_vec(),
-                },
+        let entry = WalEntry {
+            lsn,
+            op: WalOp::Upsert {
+                collection_id: collection,
+                external_id: external_id.to_owned(),
+                vector: vector_bytes.clone(),
+                payload: payload.to_vec(),
             },
-        )?;
+        };
+        self.wal.append_sync(self.keyring.catalog_codec(), &entry)?;
         self.next_lsn = lsn.next();
+        self.publish(&entry);
         let state = self
             .collections
             .get_mut(&collection)
@@ -469,17 +543,16 @@ impl Store {
             return Ok(false);
         }
         let lsn = self.next_lsn;
-        self.wal.append_sync(
-            self.keyring.catalog_codec(),
-            &WalEntry {
-                lsn,
-                op: WalOp::Delete {
-                    collection_id: collection,
-                    external_id: external_id.to_owned(),
-                },
+        let entry = WalEntry {
+            lsn,
+            op: WalOp::Delete {
+                collection_id: collection,
+                external_id: external_id.to_owned(),
             },
-        )?;
+        };
+        self.wal.append_sync(self.keyring.catalog_codec(), &entry)?;
         self.next_lsn = lsn.next();
+        self.publish(&entry);
         let state = self
             .collections
             .get_mut(&collection)
