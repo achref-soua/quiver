@@ -7,7 +7,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 # MSRV: 1.88 — the minimum the dependency tree supports (ratatui 0.30's
 # `ratatui-core`/`-widgets`/`-crossterm`). Bumped from 1.85 when updating ratatui
@@ -34,17 +34,17 @@ todo = "warn"
 [workspace.dependencies]
 # Internal crates (path deps with a version so `cargo deny` sees no wildcard),
 # referenced as `quiver-x = { workspace = true }`.
-quiver-core = { path = "crates/quiver-core", version = "0.9" }
-quiver-crypto = { path = "crates/quiver-crypto", version = "0.9" }
-quiver-embed = { path = "crates/quiver-embed", version = "0.9" }
-quiver-import = { path = "crates/quiver-import", version = "0.9" }
-quiver-index = { path = "crates/quiver-index", version = "0.9" }
-quiver-mcp = { path = "crates/quiver-mcp", version = "0.9" }
-quiver-proto = { path = "crates/quiver-proto", version = "0.9" }
-quiver-query = { path = "crates/quiver-query", version = "0.9" }
-quiver-server = { path = "crates/quiver-server", version = "0.9" }
-quiver-simd = { path = "crates/quiver-simd", version = "0.9" }
-quiver-tui = { path = "crates/quiver-tui", version = "0.9" }
+quiver-core = { path = "crates/quiver-core", version = "0.10" }
+quiver-crypto = { path = "crates/quiver-crypto", version = "0.10" }
+quiver-embed = { path = "crates/quiver-embed", version = "0.10" }
+quiver-import = { path = "crates/quiver-import", version = "0.10" }
+quiver-index = { path = "crates/quiver-index", version = "0.10" }
+quiver-mcp = { path = "crates/quiver-mcp", version = "0.10" }
+quiver-proto = { path = "crates/quiver-proto", version = "0.10" }
+quiver-query = { path = "crates/quiver-query", version = "0.10" }
+quiver-server = { path = "crates/quiver-server", version = "0.10" }
+quiver-simd = { path = "crates/quiver-simd", version = "0.10" }
+quiver-tui = { path = "crates/quiver-tui", version = "0.10" }
 
 anyhow = "1"
 axum = "0.8"
