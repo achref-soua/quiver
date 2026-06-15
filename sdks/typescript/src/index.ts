@@ -4,6 +4,8 @@ export {
   QuiverError,
   type Point,
   type Match,
+  type Document,
+  type DocumentMatch,
   type CollectionInfo,
   type IndexKind,
   type Metric,

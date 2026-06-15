@@ -11,13 +11,24 @@ Example::
         hits = q.search("items", [0.1, 0.2, 0.3], k=5)
 """
 
-from .client import Client, CollectionInfo, FilterableField, Match, Point, QuiverError
+from .client import (
+    Client,
+    CollectionInfo,
+    Document,
+    DocumentMatch,
+    FilterableField,
+    Match,
+    Point,
+    QuiverError,
+)
 from .encryption import ENVELOPE_KEY, PayloadCipher, PayloadError, is_sealed
 
 __all__ = [
     "Client",
     "Point",
     "Match",
+    "Document",
+    "DocumentMatch",
     "CollectionInfo",
     "FilterableField",
     "QuiverError",

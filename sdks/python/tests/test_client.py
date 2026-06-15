@@ -7,7 +7,16 @@ import httpx
 import pytest
 import respx
 
-from quiver import Client, CollectionInfo, FilterableField, Match, Point, QuiverError
+from quiver import (
+    Client,
+    CollectionInfo,
+    Document,
+    DocumentMatch,
+    FilterableField,
+    Match,
+    Point,
+    QuiverError,
+)
 
 BASE = "http://quiver.test"
 
@@ -150,3 +159,50 @@ def test_healthz():
     respx.get(f"{BASE}/healthz").mock(return_value=httpx.Response(200, text="ok"))
     with Client(BASE) as q:
         assert q.healthz() is True
+
+
+@respx.mock
+def test_multivector_documents_roundtrip():
+    create = respx.post(f"{BASE}/v1/collections").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "name": "docs",
+                "dim": 3,
+                "metric": "cosine",
+                "count": 0,
+                "multivector": True,
+            },
+        )
+    )
+    upsert = respx.post(f"{BASE}/v1/collections/docs/documents").mock(
+        return_value=httpx.Response(200, json={"upserted": 2})
+    )
+    search = respx.post(f"{BASE}/v1/collections/docs/documents/query").mock(
+        return_value=httpx.Response(
+            200, json={"matches": [{"id": "b", "score": 1.0, "payload": {"lang": "fr"}}]}
+        )
+    )
+    delete = respx.delete(f"{BASE}/v1/collections/docs/documents").mock(
+        return_value=httpx.Response(200, json={"deleted": 1})
+    )
+    with Client(BASE, api_key="k") as q:
+        info = q.create_collection("docs", 3, metric="cosine", multivector=True)
+        assert info.multivector is True
+        n = q.upsert_documents(
+            "docs",
+            [
+                Document("a", [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], {"lang": "en"}),
+                Document("b", [[0.0, 0.0, 1.0]], {"lang": "fr"}),
+            ],
+        )
+        assert n == 2
+        matches = q.search_multi_vector("docs", [[0.0, 0.0, 1.0]], k=2)
+        assert matches == [DocumentMatch(id="b", score=1.0, payload={"lang": "fr"})]
+        assert q.delete_documents("docs", ["b"]) == 1
+
+    assert json.loads(create.calls.last.request.content)["multivector"] is True
+    up_body = json.loads(upsert.calls.last.request.content)
+    assert up_body["documents"][0]["vectors"] == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    assert json.loads(search.calls.last.request.content)["query"] == [[0.0, 0.0, 1.0]]
+    assert delete.calls.call_count == 1
