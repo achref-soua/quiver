@@ -45,6 +45,7 @@ use thiserror::Error;
 
 pub use quiver_core::keyring::{KeyRing, SingleCodecKeyRing};
 pub use quiver_core::page::PageCodec;
+pub use quiver_core::{CommitObserver, WalEntry, WalOp};
 pub use quiver_core::{
     Descriptor, DistanceMetric, Dtype, FieldType, FilterableField, IndexKind, IndexSpec,
 };
@@ -320,6 +321,77 @@ impl Database {
         let existed = self.store.shred_collection(name)?;
         self.collections.remove(name);
         Ok(existed)
+    }
+
+    /// Install a replication commit observer, invoked with each committed
+    /// [`WalEntry`] in commit order (ADR-0030). The server uses this to drive a
+    /// leader's replication stream.
+    pub fn set_commit_observer(&mut self, observer: CommitObserver) {
+        self.store.set_commit_observer(observer);
+    }
+
+    /// The operations that recreate the current logical state, for a replication
+    /// follower to bootstrap from (ADR-0030).
+    ///
+    /// # Errors
+    /// Propagates a store read error.
+    pub fn replication_snapshot(&self) -> Result<Vec<WalOp>> {
+        Ok(self.store.replication_snapshot()?)
+    }
+
+    /// Apply a replicated operation from a leader (ADR-0030): persist and apply it
+    /// to the store (preserving the leader's collection id), then reconcile the
+    /// in-memory index handles — register a new collection, drop a removed one, or
+    /// mark a touched collection's index stale so the next read rebuilds from the
+    /// replicated state.
+    ///
+    /// # Errors
+    /// Propagates a store apply error.
+    pub fn apply_replicated(&mut self, op: WalOp) -> Result<()> {
+        let target = match &op {
+            WalOp::CreateCollection { collection_id, .. }
+            | WalOp::DropCollection { collection_id }
+            | WalOp::Upsert { collection_id, .. }
+            | WalOp::Delete { collection_id, .. } => Some(*collection_id),
+            WalOp::Checkpoint { .. } => None,
+        };
+        let create_name = match &op {
+            WalOp::CreateCollection { name, .. } => Some(name.clone()),
+            _ => None,
+        };
+        let is_drop = matches!(op, WalOp::DropCollection { .. });
+        self.store.apply_replicated(op)?;
+
+        if let Some(name) = create_name {
+            // Register a fresh handle for the newly replicated collection.
+            if let Some(id) = target
+                && let Some(descriptor) = self.store.descriptor(id).cloned()
+            {
+                let docs = descriptor.multivector.then(BTreeMap::new);
+                let index = empty_index(&descriptor);
+                self.collections.insert(
+                    name,
+                    CollectionHandle {
+                        id,
+                        descriptor,
+                        index,
+                        int_to_ext: Vec::new(),
+                        ext_to_int: HashMap::new(),
+                        stale: false,
+                        docs,
+                    },
+                );
+            }
+        } else if is_drop {
+            if let Some(id) = target {
+                self.collections.retain(|_, h| h.id != id);
+            }
+        } else if let Some(id) = target
+            && let Some(handle) = self.collections.values_mut().find(|h| h.id == id)
+        {
+            handle.stale = true;
+        }
+        Ok(())
     }
 
     /// Names of all collections, sorted.
