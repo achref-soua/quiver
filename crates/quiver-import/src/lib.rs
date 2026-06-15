@@ -9,10 +9,10 @@
 //! any other write (ADR-0024).
 //!
 //! Offline imports take *files* the user exports from the source tool, which
-//! keeps the adapters fully testable. A **live** connector ([`live`], ADR-0027)
-//! instead pulls directly from a running source over HTTP and reuses the same
-//! per-source normalization; Qdrant is supported, with Chroma and pgvector
-//! staying on the offline path for now.
+//! keeps the adapters fully testable. A **live** connector ([`live`]) instead
+//! pulls directly from a running source over HTTP and reuses the same per-source
+//! normalization; Qdrant (ADR-0027) and Chroma (ADR-0029) are supported live,
+//! with pgvector following.
 //!
 //! Formats (see `docs/migration.md`):
 //!
@@ -33,7 +33,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 pub mod live;
-pub use live::{QdrantSource, fetch_qdrant};
+pub use live::{ChromaSource, QdrantSource, fetch_chroma, fetch_qdrant};
 
 /// A vector database whose export Quiver can import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,8 +273,16 @@ fn parse_chroma(input: &str) -> Result<Vec<ImportPoint>, ImportError> {
             "expected a single JSON object from collection.get(...)".to_string(),
         ));
     };
-    let ids = chroma_array(&obj, "ids")?;
-    let embeddings = chroma_array(&obj, "embeddings")?;
+    chroma_points(&obj)
+}
+
+// Normalize one Chroma `collection.get(...)` result object into points. Shared by
+// the offline export parser above and the live v2 `/get` connector (ADR-0029),
+// whose response carries the same parallel `ids`/`embeddings`/`metadatas`/
+// `documents` arrays, so both routes map identically.
+pub(crate) fn chroma_points(obj: &Map<String, Value>) -> Result<Vec<ImportPoint>, ImportError> {
+    let ids = chroma_array(obj, "ids")?;
+    let embeddings = chroma_array(obj, "embeddings")?;
     if ids.len() != embeddings.len() {
         return Err(ImportError::Shape(
             Source::Chroma,
