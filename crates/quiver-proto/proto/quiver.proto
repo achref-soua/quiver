@@ -26,6 +26,10 @@ service Quiver {
   rpc UpsertMultiVector(UpsertMultiVectorRequest) returns (UpsertMultiVectorResponse);
   rpc SearchMultiVector(SearchMultiVectorRequest) returns (SearchMultiVectorResponse);
   rpc DeleteDocuments(DeleteDocumentsRequest) returns (DeleteDocumentsResponse);
+
+  // Leader-follower replication (ADR-0030): stream the committed operation log to
+  // a read-replica follower. Admin-scoped.
+  rpc Replicate(ReplicateRequest) returns (stream ReplicationOp);
 }
 
 // Distance / similarity metric.
@@ -218,4 +222,45 @@ message DeleteDocumentsRequest {
 
 message DeleteDocumentsResponse {
   uint64 deleted = 1;
+}
+
+// Leader-follower replication (ADR-0030).
+
+// Open a replication stream. Empty for now (a full logical snapshot followed by
+// the live tail); reserved for a future incremental resume point.
+message ReplicateRequest {}
+
+// One replicated operation, mirroring the engine's WalOp. The Checkpoint op is a
+// per-node concern and is never streamed.
+message ReplicationOp {
+  // The leader's monotonic log sequence number for this op (for lag/observability).
+  uint64 lsn = 1;
+  oneof op {
+    ReplCreateCollection create_collection = 2;
+    ReplDropCollection drop_collection = 3;
+    ReplUpsert upsert = 4;
+    ReplDelete delete = 5;
+  }
+}
+
+message ReplCreateCollection {
+  uint64 collection_id = 1;
+  string name = 2;
+  bytes descriptor = 3; // postcard-encoded collection descriptor
+}
+
+message ReplDropCollection {
+  uint64 collection_id = 1;
+}
+
+message ReplUpsert {
+  uint64 collection_id = 1;
+  string external_id = 2;
+  bytes vector = 3; // little-endian vector element bytes (dtype per the descriptor)
+  bytes payload = 4;
+}
+
+message ReplDelete {
+  uint64 collection_id = 1;
+  string external_id = 2;
 }

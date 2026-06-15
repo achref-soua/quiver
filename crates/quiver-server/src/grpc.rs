@@ -3,9 +3,11 @@
 //! engine state. Auth is checked per call from the `authorization` metadata.
 
 use serde_json::Value;
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use quiver_embed::{DistanceMetric, FieldType, FilterableField, IndexKind, IndexSpec};
+use quiver_embed::{DistanceMetric, FieldType, FilterableField, IndexKind, IndexSpec, WalOp};
 use quiver_proto::v1::{
     self,
     quiver_server::{Quiver, QuiverServer},
@@ -178,8 +180,98 @@ fn parse_payload(bytes: &[u8]) -> Result<Value, Status> {
     }
 }
 
+// Convert a committed op to its replication proto form (ADR-0030). Checkpoint ops
+// are a per-node concern and are never streamed (returns `None`).
+fn repl_op_to_proto(lsn: u64, op: &WalOp) -> Option<v1::ReplicationOp> {
+    use v1::replication_op::Op;
+    let inner = match op {
+        WalOp::CreateCollection {
+            collection_id,
+            name,
+            descriptor,
+        } => Op::CreateCollection(v1::ReplCreateCollection {
+            collection_id: collection_id.0,
+            name: name.clone(),
+            descriptor: descriptor.clone(),
+        }),
+        WalOp::DropCollection { collection_id } => Op::DropCollection(v1::ReplDropCollection {
+            collection_id: collection_id.0,
+        }),
+        WalOp::Upsert {
+            collection_id,
+            external_id,
+            vector,
+            payload,
+        } => Op::Upsert(v1::ReplUpsert {
+            collection_id: collection_id.0,
+            external_id: external_id.clone(),
+            vector: vector.clone(),
+            payload: payload.clone(),
+        }),
+        WalOp::Delete {
+            collection_id,
+            external_id,
+        } => Op::Delete(v1::ReplDelete {
+            collection_id: collection_id.0,
+            external_id: external_id.clone(),
+        }),
+        WalOp::Checkpoint { .. } => return None,
+    };
+    Some(v1::ReplicationOp {
+        lsn,
+        op: Some(inner),
+    })
+}
+
 #[tonic::async_trait]
 impl Quiver for QuiverService {
+    type ReplicateStream = ReceiverStream<Result<v1::ReplicationOp, Status>>;
+
+    async fn replicate(
+        &self,
+        request: Request<v1::ReplicateRequest>,
+    ) -> Result<Response<Self::ReplicateStream>, Status> {
+        let principal = self.authenticate(&request)?;
+        let (snapshot, mut rx) = self
+            .state
+            .open_replication(&principal)
+            .await
+            .map_err(|e| e.to_status())?;
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(async move {
+            // Bootstrap with the logical snapshot (pre-tail state, no leader LSN).
+            for op in snapshot {
+                if let Some(proto) = repl_op_to_proto(0, &op)
+                    && out_tx.send(Ok(proto)).await.is_err()
+                {
+                    return;
+                }
+            }
+            // Then the live commit tail, in order.
+            loop {
+                match rx.recv().await {
+                    Ok(entry) => {
+                        if let Some(proto) = repl_op_to_proto(entry.lsn.value(), &entry.op)
+                            && out_tx.send(Ok(proto)).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        let _ = out_tx
+                            .send(Err(Status::data_loss(format!(
+                                "replication fell {n} ops behind; reconnect to re-bootstrap"
+                            ))))
+                            .await;
+                        return;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(out_rx)))
+    }
+
     async fn create_collection(
         &self,
         request: Request<v1::CreateCollectionRequest>,
