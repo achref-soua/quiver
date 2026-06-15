@@ -113,6 +113,12 @@ pub struct DocumentMatch {
     pub vectors: Option<Vec<Vec<f32>>>,
 }
 
+// A candidate document during multi-vector re-ranking, before it becomes a
+// [`DocumentMatch`]: `(MaxSim score, document id, anchor payload, token vectors
+// when requested)`. Named so the re-rank buffer stays under clippy's
+// type-complexity threshold.
+type ScoredDocument = (f32, String, Option<Value>, Option<Vec<Vec<f32>>>);
+
 /// Parameters for a [`Database::search`].
 #[derive(Debug, Clone)]
 pub struct SearchParams {
@@ -716,7 +722,7 @@ impl Database {
         let handle = self.handle(collection)?;
         let cid = handle.id;
         let metric = to_index_metric(handle.descriptor.metric);
-        let mut scored: Vec<(f32, String, Option<Value>, Option<Vec<Vec<f32>>>)> = Vec::new();
+        let mut scored: Vec<ScoredDocument> = Vec::new();
         for doc in &candidates {
             let count = handle
                 .docs
