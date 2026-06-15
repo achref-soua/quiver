@@ -31,13 +31,13 @@
 //! stale index). A server serializes access behind a lock; the lock-free MVCC
 //! snapshot model (ADR-0006) arrives with Phase 2.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use quiver_core::{CollectionId, SecPredicate, SecValue, Store};
 use quiver_index::{
     DiskSearchParams, DiskVamana, Hnsw, HnswConfig, Index, Ivf, IvfConfig, Metric, Neighbor,
-    ProductQuantizer, Vamana, VamanaConfig, ordering_distance, report_metric,
+    ProductQuantizer, Vamana, VamanaConfig, max_sim, ordering_distance, report_metric,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -96,6 +96,21 @@ pub struct Match {
     pub payload: Option<Value>,
     /// The vector, if requested.
     pub vector: Option<Vec<f32>>,
+}
+
+/// A multi-vector (late-interaction / ColBERT) document result: a document id, its
+/// MaxSim relevance, the payload, and — if requested — the document's token
+/// vectors (ADR-0028).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentMatch {
+    /// Document id.
+    pub id: String,
+    /// MaxSim relevance score (0 for a direct fetch).
+    pub score: f32,
+    /// The document payload, if requested / present (stored on the anchor token).
+    pub payload: Option<Value>,
+    /// The document's token vectors, if requested.
+    pub vectors: Option<Vec<Vec<f32>>>,
 }
 
 /// Parameters for a [`Database::search`].
@@ -199,6 +214,12 @@ struct CollectionHandle {
     int_to_ext: Vec<String>,
     ext_to_int: HashMap<String, u64>,
     stale: bool,
+    // For a multi-vector (ColBERT) collection: each document id mapped to its
+    // token count, so a re-rank can gather all of a document's token rows
+    // (`<doc-id><US><ordinal>`) and `document_count` is O(1). `None` for a
+    // single-vector collection. Maintained eagerly on document writes and rebuilt
+    // authoritatively from the store on open / rebuild; never persisted (ADR-0028).
+    docs: Option<BTreeMap<String, u32>>,
 }
 
 /// An in-process Quiver database over one data directory.
@@ -247,6 +268,7 @@ impl Database {
                 int_to_ext: Vec::new(),
                 ext_to_int: HashMap::new(),
                 stale: true,
+                docs: None,
             };
             load_index(&store, &mut handle)?;
             collections.insert(name, handle);
@@ -260,6 +282,7 @@ impl Database {
         validate_index(&descriptor)?;
         let id = self.store.create_collection(name, descriptor.clone())?;
         let index = empty_index(&descriptor);
+        let docs = descriptor.multivector.then(BTreeMap::new);
         self.collections.insert(
             name.to_owned(),
             CollectionHandle {
@@ -269,6 +292,7 @@ impl Database {
                 int_to_ext: Vec::new(),
                 ext_to_int: HashMap::new(),
                 stale: false,
+                docs,
             },
         );
         Ok(())
@@ -327,6 +351,7 @@ impl Database {
             .collections
             .get_mut(collection)
             .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+        require_single_vector(handle)?;
         let payload_bytes = serde_json::to_vec(payload)?;
         self.store.upsert(handle.id, id, vector, &payload_bytes)?;
         // Maintain the in-memory index in place where the kind allows it, else
@@ -374,6 +399,7 @@ impl Database {
             .collections
             .get_mut(collection)
             .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+        require_single_vector(handle)?;
         let existed = self.store.delete(handle.id, id)?;
         if !existed {
             return Ok(false);
@@ -409,6 +435,7 @@ impl Database {
     /// Fetch a single point by id, with its payload and vector.
     pub fn get(&self, collection: &str, id: &str) -> Result<Option<Match>> {
         let handle = self.handle(collection)?;
+        require_single_vector(handle)?;
         match self.store.get(handle.id, id)? {
             Some(record) => Ok(Some(Match {
                 id: id.to_owned(),
@@ -428,6 +455,7 @@ impl Database {
         query: &[f32],
         params: &SearchParams,
     ) -> Result<Vec<Match>> {
+        require_single_vector(self.handle(collection)?)?;
         // Rebuild the index first if a prior update/delete left it stale.
         if self.handle(collection)?.stale {
             let store = &self.store;
@@ -555,6 +583,252 @@ impl Database {
             .collect())
     }
 
+    /// Insert or replace a multi-vector (late-interaction / ColBERT) document: its
+    /// `vectors` are stored as a group of token rows and its `payload` once on the
+    /// anchor token (ADR-0028). Re-upserting a document first removes the tokens a
+    /// shorter version would leave behind, so the document is replaced cleanly.
+    ///
+    /// # Errors
+    /// Errors if the collection is single-vector, the document has no vectors, a
+    /// vector's dimensionality is wrong, or the id contains the reserved separator.
+    pub fn upsert_document(
+        &mut self,
+        collection: &str,
+        doc_id: &str,
+        vectors: &[Vec<f32>],
+        payload: &Value,
+    ) -> Result<()> {
+        let handle = self
+            .collections
+            .get_mut(collection)
+            .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+        require_multivector(handle)?;
+        if doc_id.contains(DOC_TOKEN_SEP) {
+            return Err(Error::Unsupported(
+                "document id must not contain the reserved 0x1f separator",
+            ));
+        }
+        if vectors.is_empty() {
+            return Err(Error::Unsupported("a document needs at least one vector"));
+        }
+        let dim = handle.descriptor.dim as usize;
+        if vectors.iter().any(|v| v.len() != dim) {
+            return Err(Error::Unsupported(
+                "every document vector must match the collection dimensionality",
+            ));
+        }
+        // Remove only the trailing tokens a shorter re-upsert leaves behind; the
+        // rest are overwritten by the upserts below.
+        let previous = handle
+            .docs
+            .as_ref()
+            .and_then(|d| d.get(doc_id))
+            .copied()
+            .unwrap_or(0) as usize;
+        for j in vectors.len()..previous {
+            self.store.delete(handle.id, &token_id(doc_id, j))?;
+        }
+        let payload_bytes = serde_json::to_vec(payload)?;
+        for (j, vector) in vectors.iter().enumerate() {
+            // The payload is stored once, on the anchor token; the rest carry none.
+            let bytes: &[u8] = if j == 0 {
+                payload_bytes.as_slice()
+            } else {
+                &[]
+            };
+            self.store
+                .upsert(handle.id, &token_id(doc_id, j), vector, bytes)?;
+        }
+        if let Some(docs) = handle.docs.as_mut() {
+            docs.insert(doc_id.to_owned(), vectors.len() as u32);
+        }
+        // The token pool changed; rebuild the ANN index on the next search.
+        handle.stale = true;
+        Ok(())
+    }
+
+    /// Search a multi-vector collection by a set of query token vectors, ranking
+    /// documents by MaxSim late interaction (ADR-0028). At or below the exact-scan
+    /// threshold every document is scored exactly; above it, candidates are
+    /// generated by nearest-neighbour search over the token pool (recall tuned by
+    /// `ef_search`) and re-ranked exactly. An optional `filter` is applied to each
+    /// document's payload, exactly. A document has no single vector, so `with_payload`
+    /// returns the anchor payload and `with_vector` returns the token vectors.
+    pub fn search_multi_vector(
+        &mut self,
+        collection: &str,
+        query_tokens: &[Vec<f32>],
+        params: &SearchParams,
+    ) -> Result<Vec<DocumentMatch>> {
+        require_multivector(self.handle(collection)?)?;
+        let dim = self.handle(collection)?.descriptor.dim as usize;
+        if query_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        if query_tokens.iter().any(|v| v.len() != dim) {
+            return Err(Error::Unsupported(
+                "every query token must match the collection dimensionality",
+            ));
+        }
+
+        let doc_count = self
+            .handle(collection)?
+            .docs
+            .as_ref()
+            .map_or(0, BTreeMap::len);
+        let candidates: Vec<String> = if doc_count <= MULTIVECTOR_EXACT_DOC_THRESHOLD {
+            // Exact: score every document. No ANN index needed.
+            self.handle(collection)?
+                .docs
+                .as_ref()
+                .map(|d| d.keys().cloned().collect())
+                .unwrap_or_default()
+        } else {
+            // Large corpus: generate candidates from the token pool, rebuilding the
+            // ANN index first if a prior write left it stale.
+            if self.handle(collection)?.stale {
+                let store = &self.store;
+                let handle = self
+                    .collections
+                    .get_mut(collection)
+                    .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+                rebuild_index(store, handle)?;
+            }
+            let handle = self.handle(collection)?;
+            let per_token_k = params
+                .k
+                .saturating_mul(MULTIVECTOR_CANDIDATE_FACTOR)
+                .max(params.ef_search);
+            let mut set = BTreeSet::new();
+            for token in query_tokens {
+                for neighbor in handle.index.search(token, per_token_k, params.ef_search)? {
+                    if let Some(ext) = handle.int_to_ext.get(neighbor.id as usize)
+                        && let Some((doc, _)) = parse_token_id(ext)
+                    {
+                        set.insert(doc.to_owned());
+                    }
+                }
+            }
+            set.into_iter().collect()
+        };
+
+        // Re-rank the candidate documents by exact MaxSim over all their tokens.
+        let handle = self.handle(collection)?;
+        let cid = handle.id;
+        let metric = to_index_metric(handle.descriptor.metric);
+        let mut scored: Vec<(f32, String, Option<Value>, Option<Vec<Vec<f32>>>)> = Vec::new();
+        for doc in &candidates {
+            let count = handle
+                .docs
+                .as_ref()
+                .and_then(|d| d.get(doc))
+                .copied()
+                .unwrap_or(0) as usize;
+            let (tokens, payload) = self.gather_document(cid, doc, count)?;
+            if tokens.is_empty() {
+                continue;
+            }
+            if let Some(filter) = &params.filter {
+                let value = payload.clone().unwrap_or(Value::Null);
+                if !filter.matches(&value) {
+                    continue;
+                }
+            }
+            let score = max_sim(metric, query_tokens, &tokens);
+            let vectors = params.with_vector.then_some(tokens);
+            scored.push((score, doc.clone(), payload, vectors));
+        }
+        // Higher MaxSim first; ties broken by id for a deterministic order.
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        scored.truncate(params.k);
+        Ok(scored
+            .into_iter()
+            .map(|(score, id, payload, vectors)| DocumentMatch {
+                id,
+                score,
+                payload: params.with_payload.then_some(payload).flatten(),
+                vectors,
+            })
+            .collect())
+    }
+
+    /// Fetch a multi-vector document by id: its anchor payload and, if
+    /// `with_vectors`, its token vectors. `None` if the document does not exist.
+    pub fn get_document(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        with_vectors: bool,
+    ) -> Result<Option<DocumentMatch>> {
+        let handle = self.handle(collection)?;
+        require_multivector(handle)?;
+        let Some(&count) = handle.docs.as_ref().and_then(|d| d.get(doc_id)) else {
+            return Ok(None);
+        };
+        let (tokens, payload) = self.gather_document(handle.id, doc_id, count as usize)?;
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(DocumentMatch {
+            id: doc_id.to_owned(),
+            score: 0.0,
+            payload,
+            vectors: with_vectors.then_some(tokens),
+        }))
+    }
+
+    /// Delete a multi-vector document and all of its token rows. Returns whether it
+    /// existed.
+    pub fn delete_document(&mut self, collection: &str, doc_id: &str) -> Result<bool> {
+        let handle = self
+            .collections
+            .get_mut(collection)
+            .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+        require_multivector(handle)?;
+        let Some(count) = handle.docs.as_ref().and_then(|d| d.get(doc_id)).copied() else {
+            return Ok(false);
+        };
+        for j in 0..count as usize {
+            self.store.delete(handle.id, &token_id(doc_id, j))?;
+        }
+        if let Some(docs) = handle.docs.as_mut() {
+            docs.remove(doc_id);
+        }
+        handle.stale = true;
+        Ok(true)
+    }
+
+    /// The number of documents in a multi-vector collection. Errors if the
+    /// collection is single-vector.
+    pub fn document_count(&self, collection: &str) -> Result<usize> {
+        let handle = self.handle(collection)?;
+        require_multivector(handle)?;
+        Ok(handle.docs.as_ref().map_or(0, BTreeMap::len))
+    }
+
+    // Read a document's token vectors (in ordinal order) and its anchor payload
+    // from the store. Missing token rows are skipped, so a torn document yields a
+    // short token list the caller treats as empty.
+    fn gather_document(
+        &self,
+        cid: CollectionId,
+        doc_id: &str,
+        count: usize,
+    ) -> Result<(Vec<Vec<f32>>, Option<Value>)> {
+        let mut tokens = Vec::with_capacity(count);
+        let mut payload: Option<Value> = None;
+        for j in 0..count {
+            let Some(record) = self.store.get(cid, &token_id(doc_id, j))? else {
+                continue;
+            };
+            if j == 0 && !record.payload.is_empty() {
+                payload = Some(serde_json::from_slice(&record.payload)?);
+            }
+            tokens.push(record.vector);
+        }
+        Ok((tokens, payload))
+    }
+
     /// Flush a durable checkpoint of all collections, capturing a durable
     /// snapshot of each built, up-to-date IVF index (ADR-0025) so it reloads on
     /// open instead of rebuilding. Other index kinds, and a stale or unbuilt IVF,
@@ -595,6 +869,55 @@ impl Database {
     }
 }
 
+// The byte separating a multi-vector document id from a token ordinal in a token
+// row's external id (`<doc-id><US><ordinal>`): the ASCII Unit Separator, which is
+// disallowed in user document ids (ADR-0028).
+const DOC_TOKEN_SEP: char = '\u{1f}';
+
+// At or below this document count a multi-vector search scores every document
+// exactly; above it, nearest-neighbour candidate generation over the token pool
+// kicks in (mirrors the single-vector planner's full-scan threshold).
+const MULTIVECTOR_EXACT_DOC_THRESHOLD: usize = 10_000;
+
+// Per-query-token candidate breadth for the large-corpus path: each query token
+// retrieves about `k × this` nearest token rows before the documents are unioned.
+const MULTIVECTOR_CANDIDATE_FACTOR: usize = 4;
+
+// The external id of a multi-vector document's `ordinal`-th token row.
+fn token_id(doc_id: &str, ordinal: usize) -> String {
+    format!("{doc_id}{DOC_TOKEN_SEP}{ordinal}")
+}
+
+// Split a token row's external id back into its document id and ordinal, or `None`
+// if it is not a token id. Splits from the right, so a document id (which cannot
+// contain the separator) is recovered intact.
+fn parse_token_id(ext: &str) -> Option<(&str, u32)> {
+    let (doc, ordinal) = ext.rsplit_once(DOC_TOKEN_SEP)?;
+    Some((doc, ordinal.parse().ok()?))
+}
+
+// Reject the single-vector API on a multi-vector collection.
+fn require_single_vector(handle: &CollectionHandle) -> Result<()> {
+    if handle.descriptor.multivector {
+        Err(Error::Unsupported(
+            "collection is multi-vector; use upsert_document / search_multi_vector",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+// Reject the document API on a single-vector collection.
+fn require_multivector(handle: &CollectionHandle) -> Result<()> {
+    if handle.descriptor.multivector {
+        Ok(())
+    } else {
+        Err(Error::Unsupported(
+            "collection is single-vector; use upsert / search",
+        ))
+    }
+}
+
 fn to_index_metric(metric: DistanceMetric) -> Metric {
     match metric {
         DistanceMetric::Dot => Metric::Dot,
@@ -605,6 +928,13 @@ fn to_index_metric(metric: DistanceMetric) -> Metric {
 
 // Reject index/metric combinations the engine cannot serve.
 fn validate_index(descriptor: &Descriptor) -> Result<()> {
+    // Late interaction (MaxSim) is a similarity, so multi-vector collections need a
+    // similarity metric.
+    if descriptor.multivector && descriptor.metric == DistanceMetric::L2 {
+        return Err(Error::Unsupported(
+            "multi-vector collections require a similarity metric (cosine or dot)",
+        ));
+    }
     match descriptor.index.kind {
         IndexKind::Vamana | IndexKind::Ivf | IndexKind::DiskVamana
             if descriptor.metric == DistanceMetric::Dot =>
@@ -718,7 +1048,10 @@ fn build_disk_index(
 // rebuild from the store. The snapshot is only a fast path — any problem reading
 // or restoring it falls back to the authoritative rebuild.
 fn load_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
-    if handle.descriptor.index.kind == IndexKind::Ivf
+    // Multi-vector collections always rebuild on open, so the document grouping is
+    // derived from the live rows; the IVF snapshot fast-path stays single-vector.
+    if !handle.descriptor.multivector
+        && handle.descriptor.index.kind == IndexKind::Ivf
         && let Ok(Some(blob)) = store.read_index_snapshot(handle.id)
         && restore_ivf_snapshot(store, handle, &blob).is_ok()
     {
@@ -775,14 +1108,21 @@ fn restore_ivf_snapshot(store: &Store, handle: &mut CollectionHandle, blob: &[u8
     Ok(())
 }
 
-// Rebuild a collection's index from the store's current live rows.
+// Rebuild a collection's index from the store's current live rows. For a
+// multi-vector collection it also rebuilds the document grouping (doc id → token
+// count) authoritatively from those live rows.
 fn rebuild_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
+    let multivector = handle.descriptor.multivector;
     let mut int_to_ext = Vec::new();
     let mut ext_to_int = HashMap::new();
     let mut flat: Vec<f32> = Vec::new();
+    let mut docs: BTreeMap<String, u32> = BTreeMap::new();
     for (ext_id, record) in store.scan(handle.id)? {
         let internal = int_to_ext.len() as u64;
         flat.extend_from_slice(&record.vector);
+        if multivector && let Some((doc, _)) = parse_token_id(&ext_id) {
+            *docs.entry(doc.to_owned()).or_insert(0) += 1;
+        }
         ext_to_int.insert(ext_id.clone(), internal);
         int_to_ext.push(ext_id);
     }
@@ -793,6 +1133,7 @@ fn rebuild_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
     handle.index = build_index(store, handle.id, &handle.descriptor, &ids, &flat)?;
     handle.int_to_ext = int_to_ext;
     handle.ext_to_int = ext_to_int;
+    handle.docs = multivector.then_some(docs);
     handle.stale = false;
     Ok(())
 }
@@ -1748,5 +2089,263 @@ mod tests {
 
         let mut db = open(tmp.path());
         assert_eq!(nearest(&mut db, &[7.0, 0.0, 0.0, 0.0])[0], "p7");
+    }
+
+    // ---- Multi-vector / late interaction (ColBERT, ADR-0028) ----
+
+    fn mv_desc() -> Descriptor {
+        Descriptor::new(3, Dtype::F32, DistanceMetric::Cosine).with_multivector(true)
+    }
+
+    // Brute-force MaxSim ranking over a corpus: the reference the pipeline must
+    // reproduce (score desc, ties by id), using the same shared scorer.
+    fn bf_rank(query: &[Vec<f32>], corpus: &[(&str, Vec<Vec<f32>>)]) -> Vec<(String, f32)> {
+        let mut v: Vec<(String, f32)> = corpus
+            .iter()
+            .map(|(id, toks)| ((*id).to_owned(), max_sim(Metric::Cosine, query, toks)))
+            .collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
+    #[test]
+    fn multivector_search_ranks_documents_by_maxsim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("docs", mv_desc()).unwrap();
+        let corpus: Vec<(&str, Vec<Vec<f32>>)> = vec![
+            ("d_cat", vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]]),
+            ("d_dog", vec![vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]]),
+            (
+                "d_mix",
+                vec![
+                    vec![1.0, 1.0, 0.0],
+                    vec![0.0, 0.0, 1.0],
+                    vec![1.0, 0.0, 1.0],
+                ],
+            ),
+        ];
+        for (id, toks) in &corpus {
+            db.upsert_document("docs", id, toks, &json!({ "id": id }))
+                .unwrap();
+        }
+        assert_eq!(db.document_count("docs").unwrap(), 3);
+
+        let query = vec![vec![1.0, 0.0, 0.0], vec![0.0, 0.0, 1.0]];
+        let params = SearchParams {
+            k: 3,
+            with_payload: false,
+            ..SearchParams::default()
+        };
+        let got = db.search_multi_vector("docs", &query, &params).unwrap();
+        let expected = bf_rank(&query, &corpus);
+
+        assert_eq!(got.len(), 3);
+        for (g, (eid, escore)) in got.iter().zip(expected.iter()) {
+            assert_eq!(&g.id, eid, "ranking matches brute force");
+            assert!(
+                (g.score - escore).abs() < 1e-5,
+                "{} score {} vs {escore}",
+                g.id,
+                g.score
+            );
+        }
+    }
+
+    #[test]
+    fn multivector_search_truncates_to_k() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("docs", mv_desc()).unwrap();
+        for i in 0..5 {
+            let v = vec![vec![1.0, i as f32, 0.0]];
+            db.upsert_document("docs", &format!("d{i}"), &v, &json!({}))
+                .unwrap();
+        }
+        let params = SearchParams {
+            k: 2,
+            ..SearchParams::default()
+        };
+        let got = db
+            .search_multi_vector("docs", &[vec![1.0, 0.0, 0.0]], &params)
+            .unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn multivector_filter_selects_documents_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("docs", mv_desc()).unwrap();
+        // Identical token sets, so only the filter distinguishes the documents.
+        db.upsert_document("docs", "a", &[vec![1.0, 0.0, 0.0]], &json!({"lang":"en"}))
+            .unwrap();
+        db.upsert_document("docs", "b", &[vec![1.0, 0.0, 0.0]], &json!({"lang":"fr"}))
+            .unwrap();
+        let params = SearchParams {
+            k: 10,
+            filter: Some(Filter::Eq {
+                field: "lang".into(),
+                value: json!("fr"),
+            }),
+            ..SearchParams::default()
+        };
+        let got = db
+            .search_multi_vector("docs", &[vec![1.0, 0.0, 0.0]], &params)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "b");
+        assert_eq!(got[0].payload, Some(json!({"lang":"fr"})));
+    }
+
+    #[test]
+    fn multivector_reopen_rebuilds_grouping_and_ranking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let query = vec![vec![1.0, 0.0, 0.0], vec![0.0, 0.0, 1.0]];
+        let corpus: Vec<(&str, Vec<Vec<f32>>)> = vec![
+            ("x", vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]]),
+            ("y", vec![vec![0.0, 0.0, 1.0], vec![1.0, 0.0, 1.0]]),
+        ];
+        {
+            let mut db = open(tmp.path());
+            db.create_collection("docs", mv_desc()).unwrap();
+            for (id, toks) in &corpus {
+                db.upsert_document("docs", id, toks, &json!({})).unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        // Reopen: the document grouping is rebuilt from the live rows.
+        let mut db = open(tmp.path());
+        assert_eq!(db.document_count("docs").unwrap(), 2);
+        let params = SearchParams {
+            k: 2,
+            ..SearchParams::default()
+        };
+        let got = db.search_multi_vector("docs", &query, &params).unwrap();
+        let expected = bf_rank(&query, &corpus);
+        assert_eq!(
+            got.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn multivector_delete_document_removes_all_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("docs", mv_desc()).unwrap();
+        db.upsert_document(
+            "docs",
+            "a",
+            &[vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]],
+            &json!({}),
+        )
+        .unwrap();
+        db.upsert_document("docs", "b", &[vec![0.0, 0.0, 1.0]], &json!({}))
+            .unwrap();
+        assert_eq!(db.document_count("docs").unwrap(), 2);
+        assert_eq!(db.len("docs").unwrap(), 3);
+
+        assert!(db.delete_document("docs", "a").unwrap());
+        assert_eq!(db.document_count("docs").unwrap(), 1);
+        assert_eq!(db.len("docs").unwrap(), 1);
+        assert!(db.get_document("docs", "a", false).unwrap().is_none());
+        let params = SearchParams {
+            k: 10,
+            ..SearchParams::default()
+        };
+        let got = db
+            .search_multi_vector("docs", &[vec![1.0, 0.0, 0.0]], &params)
+            .unwrap();
+        assert!(got.iter().all(|m| m.id != "a"));
+        assert!(!db.delete_document("docs", "a").unwrap());
+    }
+
+    #[test]
+    fn multivector_reupsert_replaces_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("docs", mv_desc()).unwrap();
+        db.upsert_document(
+            "docs",
+            "a",
+            &[
+                vec![1.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 1.0],
+            ],
+            &json!({"v":1}),
+        )
+        .unwrap();
+        assert_eq!(db.len("docs").unwrap(), 3);
+        // Re-upsert with a single token: the trailing two must be gone.
+        db.upsert_document("docs", "a", &[vec![0.0, 0.0, 1.0]], &json!({"v":2}))
+            .unwrap();
+        assert_eq!(db.document_count("docs").unwrap(), 1);
+        assert_eq!(db.len("docs").unwrap(), 1);
+        let doc = db.get_document("docs", "a", true).unwrap().unwrap();
+        assert_eq!(doc.payload, Some(json!({"v":2})));
+        assert_eq!(doc.vectors, Some(vec![vec![0.0, 0.0, 1.0]]));
+    }
+
+    #[test]
+    fn single_and_multi_vector_apis_are_mutually_exclusive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("mv", mv_desc()).unwrap();
+        db.create_collection("sv", Descriptor::new(3, Dtype::F32, DistanceMetric::Cosine))
+            .unwrap();
+        // Single-vector ops on a multi-vector collection are rejected.
+        assert!(matches!(
+            db.upsert("mv", "a", &[1.0, 0.0, 0.0], &json!({})),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            db.search("mv", &[1.0, 0.0, 0.0], &SearchParams::default()),
+            Err(Error::Unsupported(_))
+        ));
+        // Document ops on a single-vector collection are rejected.
+        assert!(matches!(
+            db.upsert_document("sv", "a", &[vec![1.0, 0.0, 0.0]], &json!({})),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            db.search_multi_vector("sv", &[vec![1.0, 0.0, 0.0]], &SearchParams::default()),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            db.document_count("sv"),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn multivector_rejects_l2_metric_and_bad_documents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        let l2 = Descriptor::new(3, Dtype::F32, DistanceMetric::L2).with_multivector(true);
+        assert!(matches!(
+            db.create_collection("bad", l2),
+            Err(Error::Unsupported(_))
+        ));
+
+        db.create_collection("docs", mv_desc()).unwrap();
+        // A document id may not contain the reserved separator.
+        assert!(matches!(
+            db.upsert_document("docs", "a\u{1f}b", &[vec![1.0, 0.0, 0.0]], &json!({})),
+            Err(Error::Unsupported(_))
+        ));
+        // A document needs at least one vector, of the right dimensionality.
+        assert!(matches!(
+            db.upsert_document("docs", "a", &[], &json!({})),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            db.upsert_document("docs", "a", &[vec![1.0, 0.0]], &json!({})),
+            Err(Error::Unsupported(_))
+        ));
     }
 }
