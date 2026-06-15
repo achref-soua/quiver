@@ -139,14 +139,22 @@ The **disk-resident path** is the memory-frugality wedge. On SIFTSMALL (128-d), 
 
 ## Migrating from another vector database
 
-Move an existing collection out of **Qdrant**, **Chroma**, or **pgvector** with one command. Export it from the source tool, then:
+Move an existing collection out of **Qdrant**, **Chroma**, or **pgvector** with one command — from an export file, or **live** from a running instance (no export step):
 
 ```bash
+# from an export file
 quiver admin import --source qdrant --input qdrant.jsonl \
   --collection my_collection --data-dir ./data --metric cosine
+
+# or live, straight from a running source
+quiver admin import --source chroma --chroma-url http://localhost:8000 \
+  --collection docs --data-dir ./data --metric cosine
+quiver admin import --source pgvector \
+  --postgres-url postgresql://user:pass@localhost/db \
+  --table items --collection items --data-dir ./data --metric l2
 ```
 
-The importer preserves ids, vectors, and payloads, optionally declares `--filterable path:type` fields for hybrid search, and writes the same encrypted format the server reads — so the result is an ordinary Quiver store you can `quiver serve` immediately. Per-source export recipes and the full option reference are in [`docs/migration.md`](./docs/migration.md) ([ADR-0024](./docs/adr/0024-migration-importers.md)).
+The importer preserves ids, vectors, and payloads, optionally declares `--filterable path:type` fields for hybrid search, and writes the same encrypted format the server reads — so the result is an ordinary Quiver store you can `quiver serve` immediately. Live connectors for all three sources share the offline path's normalization ([ADR-0027](./docs/adr/0027-live-migration-connectors.md), [ADR-0029](./docs/adr/0029-live-chroma-postgres-connectors.md)). Per-source recipes and the full option reference are in [`docs/migration.md`](./docs/migration.md) ([ADR-0024](./docs/adr/0024-migration-importers.md)).
 
 ## Configuration
 
