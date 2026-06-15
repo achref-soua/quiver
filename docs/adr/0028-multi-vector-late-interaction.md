@@ -1,6 +1,8 @@
 # ADR-0028: Multi-vector documents & late-interaction (ColBERT) retrieval
 
-- **Status:** Proposed
+- **Status:** Accepted — implemented in `v0.7.0` (the MaxSim scorer, the
+  `multivector` descriptor flag, the embeddable document API and two-stage
+  retrieval, the REST/gRPC surface, the MCP tools, and the Python/TypeScript SDKs).
 - **Date:** 2026-06-15
 - **Deciders:** Achref Soua
 
@@ -104,6 +106,30 @@ are later increments with their own ADRs if measurement shows they are needed.
 Token-level PQ — the frugality story — is the existing IVF+PQ / disk path applied
 to the token pool, not new code.
 
+## Implementation
+
+Shipped in `v0.7.0`:
+
+- `quiver-index` gained `max_sim`, the shared MaxSim scorer, beside
+  `ordering_distance` / `report_metric`, reusing the `quiver-simd` kernels so an
+  index search and a re-rank never diverge.
+- `quiver-core`'s `Descriptor` gained a `multivector` flag (with a
+  backward-compatible decode fallback that keeps `filterable`), so a collection's
+  mode is persisted schema.
+- The embeddable database stores a document as token rows
+  (`<doc-id><US><ordinal>`, the payload on the anchor token), derives the
+  `doc-id → token count` grouping in memory (eagerly on writes, authoritatively
+  from the live rows on open), and serves `upsert_document` /
+  `search_multi_vector` / `get_document` / `delete_document` / `document_count`.
+  Search scores every document exactly at or below a threshold and falls back to
+  token-pool ANN candidate generation above it; the single-vector and document
+  APIs reject each other.
+- The REST gateway and gRPC service expose `UpsertMultiVector` /
+  `SearchMultiVector` / `DeleteDocuments` and the `multivector` collection flag;
+  the MCP server adds the matching agent tools; and the Python and TypeScript SDKs
+  add the document methods. Multi-vector collections require a similarity metric
+  (cosine or dot).
+
 ## Consequences
 
 - **+** True late-interaction quality (token-level MaxSim, PLAID-style candidate
@@ -129,26 +155,27 @@ to the token pool, not new code.
   across proto / server / SDKs / MCP — kept strictly additive so the single-vector
   path carries no cost.
 
-## Verification (plan)
+## Verification
 
-- **`quiver-index`** — unit tests for `max_sim`: the MaxSim identity (sum of
-  per-query-token maxima), peaks on aligned tokens, Cosine vs Dot behaviour, and
-  degenerate (empty query / empty document) cases; a differential check against a
-  brute-force reference.
-- **`quiver-embed`** — end-to-end: upsert documents as token sets →
-  `search_multi_vector` returns documents ranked by MaxSim, equal to a brute-force
-  MaxSim over the whole corpus (exactness on a small set); the document-level
-  filter is honoured and exact; **reopen** rebuilds the doc↔token grouping and
-  returns identical rankings; a per-document delete removes all its tokens; and the
-  **`kill -9` crash gate is re-run and stays green** (multi-vector adds ordinary
-  rows only — asserted, not assumed).
-- **Wire / SDK** — REST + gRPC round-trip a multi-vector upsert + search; a
-  `multivector` collection rejects single-vector ops and vice-versa; the
-  Python / TS SDK and MCP paths are covered by their suites.
-- **Frugality** — a documented example serves a token pool from PQ codes with
-  exact re-rank (recall preserved, RAM reduced), host-independent figures only;
+- **`quiver-index`** — `max_sim` unit tests cover the MaxSim identity (sum of
+  per-query-token maxima), the aligned-token peak, Cosine vs Dot, the degenerate
+  (empty query / empty document) cases, and a differential against a brute-force
+  reference computed straight from the simd kernels.
+- **`quiver-embed`** — end-to-end tests prove `search_multi_vector` ranks
+  documents by MaxSim **equal to a brute-force MaxSim over the whole corpus** on
+  the exact path, that the document-level filter is honoured and exact, that a
+  **reopen** rebuilds the doc↔token grouping and returns identical rankings, that
+  a per-document delete removes all its tokens, that a re-upsert replaces them, and
+  that the single-vector and document APIs reject each other. The **`kill -9`
+  crash gate stays green** — multi-vector adds only ordinary rows, so nothing new
+  joins the durability path.
+- **Wire / SDK** — a server test round-trips create → upsert → MaxSim search →
+  document-level filter → mode rejection → gRPC search → delete over both
+  transports; the MCP server and the Python / TypeScript SDKs each gain a
+  multi-vector round-trip test.
+- **Frugality** — the token pool compresses under the existing IVF+PQ / disk path;
   raw RSS stays reference-hardware-gated and is never fabricated.
-- Coverage stays ≥ 80% on the core-engine crates; `just verify` green on every PR.
+- Core-engine coverage stays ≥ 80%; `just verify` is green on every PR.
 
 ## Alternatives considered
 

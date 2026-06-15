@@ -46,6 +46,6 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0025](0025-durable-incremental-index.md) | Durable on-disk incremental index (IVF) | Accepted | 4 |
 | [0026](0026-hnsw-incremental-delete.md) | HNSW incremental delete (soft-delete) | Accepted | 4 |
 | [0027](0027-live-migration-connectors.md) | Live migration connectors (Qdrant over HTTP) | Accepted | 4 |
-| [0028](0028-multi-vector-late-interaction.md) | Multi-vector documents & late interaction (ColBERT / MaxSim) | Proposed | 4 |
+| [0028](0028-multi-vector-late-interaction.md) | Multi-vector documents & late interaction (ColBERT / MaxSim) | Accepted | 4 |
 
 Phase-0 ADRs (0001–0018) are Accepted; Phase-2 decisions span 0019–0022; Phase-4 decisions begin at 0023. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.
