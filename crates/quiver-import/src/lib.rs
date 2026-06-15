@@ -10,9 +10,9 @@
 //!
 //! Offline imports take *files* the user exports from the source tool, which
 //! keeps the adapters fully testable. A **live** connector ([`live`]) instead
-//! pulls directly from a running source over HTTP and reuses the same per-source
-//! normalization; Qdrant (ADR-0027) and Chroma (ADR-0029) are supported live,
-//! with pgvector following.
+//! pulls directly from a running source and reuses the same per-source
+//! normalization; Qdrant (ADR-0027), Chroma, and Postgres/pgvector (ADR-0029)
+//! are all supported live.
 //!
 //! Formats (see `docs/migration.md`):
 //!
@@ -33,7 +33,9 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 pub mod live;
-pub use live::{ChromaSource, QdrantSource, fetch_chroma, fetch_qdrant};
+pub use live::{
+    ChromaSource, PgvectorSource, QdrantSource, fetch_chroma, fetch_pgvector, fetch_qdrant,
+};
 
 /// A vector database whose export Quiver can import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
