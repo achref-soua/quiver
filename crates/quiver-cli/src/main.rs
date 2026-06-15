@@ -73,7 +73,24 @@ enum AdminCommand {
         /// to pull the same-named collection directly, instead of `--input`.
         #[arg(long)]
         qdrant_url: Option<String>,
-        /// API key for `--qdrant-url`, sent as the `api-key` header.
+        /// Live import: base URL of a running Chroma (e.g. http://localhost:8000)
+        /// to pull the same-named collection over its v2 API.
+        #[arg(long)]
+        chroma_url: Option<String>,
+        /// Chroma tenant for `--chroma-url` (default: default_tenant).
+        #[arg(long)]
+        chroma_tenant: Option<String>,
+        /// Chroma database for `--chroma-url` (default: default_database).
+        #[arg(long)]
+        chroma_database: Option<String>,
+        /// Live import: Postgres URL (postgresql://user:pass@host/db) to pull
+        /// pgvector rows directly, instead of `--input`.
+        #[arg(long)]
+        postgres_url: Option<String>,
+        /// Source table for `--postgres-url` (defaults to `--collection`).
+        #[arg(long)]
+        table: Option<String>,
+        /// API key for a live import: Qdrant `api-key` or Chroma `x-chroma-token`.
         #[arg(long, env = "QDRANT_API_KEY")]
         api_key: Option<String>,
         /// Target collection name (created if absent, appended to otherwise).
@@ -137,6 +154,11 @@ async fn main() -> anyhow::Result<()> {
                 source,
                 input,
                 qdrant_url,
+                chroma_url,
+                chroma_tenant,
+                chroma_database,
+                postgres_url,
+                table,
                 api_key,
                 collection,
                 data_dir,
@@ -153,6 +175,11 @@ async fn main() -> anyhow::Result<()> {
                     source: source.parse().map_err(|e: String| anyhow::anyhow!(e))?,
                     input,
                     qdrant_url,
+                    chroma_url,
+                    chroma_tenant,
+                    chroma_database,
+                    postgres_url,
+                    table,
                     api_key,
                     collection: collection.clone(),
                     data_dir,

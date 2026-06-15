@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow, bail};
 use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, FieldType, FilterableField};
 use quiver_import::{
-    ParseOptions, QdrantSource, Source, fetch_qdrant, import_into, infer_dim, parse,
+    ChromaSource, ParseOptions, PgvectorSource, QdrantSource, Source, fetch_chroma, fetch_pgvector,
+    fetch_qdrant, import_into, infer_dim, parse,
 };
 
 // Typed arguments for `quiver admin import`, decoupled from clap so the command
@@ -23,7 +24,16 @@ pub(crate) struct ImportArgs {
     pub input: Option<PathBuf>,
     // Live Qdrant base URL, or `None` for an offline (file) import.
     pub qdrant_url: Option<String>,
-    // API key for a live Qdrant import.
+    // Live Chroma base URL, or `None`.
+    pub chroma_url: Option<String>,
+    // Chroma tenant / database overrides (the v2 defaults apply when `None`).
+    pub chroma_tenant: Option<String>,
+    pub chroma_database: Option<String>,
+    // Live Postgres connection URL, or `None`.
+    pub postgres_url: Option<String>,
+    // Source table for a live Postgres import (defaults to `collection`).
+    pub table: Option<String>,
+    // API key for a live import (Qdrant `api-key` / Chroma `x-chroma-token`).
     pub api_key: Option<String>,
     pub collection: String,
     pub data_dir: PathBuf,
@@ -49,7 +59,7 @@ pub(crate) fn import(args: ImportArgs) -> anyhow::Result<usize> {
     }
     opts.vector_name = args.vector_name;
 
-    // Acquire points either live (a running Qdrant) or from an offline export.
+    // Acquire points either live (a running source) or from an offline export.
     let points = if let Some(url) = &args.qdrant_url {
         if args.source != Source::Qdrant {
             bail!("--qdrant-url is only supported with --source qdrant");
@@ -59,12 +69,38 @@ pub(crate) fn import(args: ImportArgs) -> anyhow::Result<usize> {
             ..QdrantSource::new(url.clone(), args.collection.clone())
         };
         fetch_qdrant(&src, &opts)?
+    } else if let Some(url) = &args.chroma_url {
+        if args.source != Source::Chroma {
+            bail!("--chroma-url is only supported with --source chroma");
+        }
+        let mut src = ChromaSource::new(url.clone(), args.collection.clone());
+        if let Some(tenant) = &args.chroma_tenant {
+            src.tenant = tenant.clone();
+        }
+        if let Some(database) = &args.chroma_database {
+            src.database = database.clone();
+        }
+        src.api_key = args.api_key.clone();
+        fetch_chroma(&src)?
+    } else if let Some(url) = &args.postgres_url {
+        if args.source != Source::Pgvector {
+            bail!("--postgres-url is only supported with --source pgvector");
+        }
+        let table = args
+            .table
+            .clone()
+            .unwrap_or_else(|| args.collection.clone());
+        let src = PgvectorSource::new(url.clone(), table);
+        fetch_pgvector(&src, &opts)?
     } else if let Some(input) = &args.input {
         let text = std::fs::read_to_string(input)
             .with_context(|| format!("reading export {}", input.display()))?;
         parse(&opts, &text)?
     } else {
-        bail!("provide an export file (--input) or a live source (--qdrant-url)");
+        bail!(
+            "provide an export file (--input) or a live source \
+             (--qdrant-url / --chroma-url / --postgres-url)"
+        );
     };
     if points.is_empty() {
         bail!("no points found");
@@ -170,6 +206,11 @@ mod tests {
             source: Source::Qdrant,
             input: Some(export),
             qdrant_url: None,
+            chroma_url: None,
+            chroma_tenant: None,
+            chroma_database: None,
+            postgres_url: None,
+            table: None,
             api_key: None,
             collection: "places".to_string(),
             data_dir: data_dir.clone(),
@@ -212,6 +253,11 @@ mod tests {
             source: Source::Qdrant,
             input: Some(export),
             qdrant_url: None,
+            chroma_url: None,
+            chroma_tenant: None,
+            chroma_database: None,
+            postgres_url: None,
+            table: None,
             api_key: None,
             collection: "c".to_string(),
             data_dir: data_dir.clone(),
@@ -240,6 +286,11 @@ mod tests {
             source: Source::Qdrant,
             input: Some(export),
             qdrant_url: None,
+            chroma_url: None,
+            chroma_tenant: None,
+            chroma_database: None,
+            postgres_url: None,
+            table: None,
             api_key: None,
             collection: "c".to_string(),
             data_dir: dir.path().join("data"),
@@ -301,6 +352,11 @@ mod tests {
             source: Source::Qdrant,
             input: None,
             qdrant_url: Some(format!("http://{addr}")),
+            chroma_url: None,
+            chroma_tenant: None,
+            chroma_database: None,
+            postgres_url: None,
+            table: None,
             api_key: None,
             collection: "places".to_string(),
             data_dir: dir.path().join("data"),
@@ -325,6 +381,138 @@ mod tests {
             source: Source::Chroma,
             input: None,
             qdrant_url: Some("http://localhost:6333".to_string()),
+            chroma_url: None,
+            chroma_tenant: None,
+            chroma_database: None,
+            postgres_url: None,
+            table: None,
+            api_key: None,
+            collection: "c".to_string(),
+            data_dir: dir.path().join("data"),
+            metric: DistanceMetric::L2,
+            dim: None,
+            filterable: Vec::new(),
+            id_field: None,
+            vector_field: None,
+            vector_name: None,
+            encryption_key: None,
+            insecure: true,
+        };
+        assert!(import(args).is_err());
+    }
+
+    #[test]
+    fn live_chroma_import_loads_a_running_collection() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // Serve the v2 collection list (name -> id), then one short `get` page.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let bodies = [
+                r#"[{"id":"col-1","name":"places"}]"#.to_string(),
+                r#"{"ids":["1"],"embeddings":[[1.0,0.0]],"metadatas":[{"city":"paris"}],"documents":[null]}"#.to_string(),
+            ];
+            for body in bodies {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 2048];
+                loop {
+                    let n = s.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let len = String::from_utf8_lossy(&buf[..end + 4])
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() - (end + 4) >= len {
+                            break;
+                        }
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                s.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let args = ImportArgs {
+            source: Source::Chroma,
+            input: None,
+            qdrant_url: None,
+            chroma_url: Some(format!("http://{addr}")),
+            chroma_tenant: None,
+            chroma_database: None,
+            postgres_url: None,
+            table: None,
+            api_key: None,
+            collection: "places".to_string(),
+            data_dir: dir.path().join("data"),
+            metric: DistanceMetric::Cosine,
+            dim: None,
+            filterable: Vec::new(),
+            id_field: None,
+            vector_field: None,
+            vector_name: None,
+            encryption_key: None,
+            insecure: true,
+        };
+        assert_eq!(import(args).unwrap(), 1);
+        let db = Database::open(&dir.path().join("data")).unwrap();
+        assert_eq!(db.len("places").unwrap(), 1);
+    }
+
+    #[test]
+    fn live_chroma_import_rejects_a_non_chroma_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = ImportArgs {
+            source: Source::Qdrant,
+            input: None,
+            qdrant_url: None,
+            chroma_url: Some("http://localhost:8000".to_string()),
+            chroma_tenant: None,
+            chroma_database: None,
+            postgres_url: None,
+            table: None,
+            api_key: None,
+            collection: "c".to_string(),
+            data_dir: dir.path().join("data"),
+            metric: DistanceMetric::L2,
+            dim: None,
+            filterable: Vec::new(),
+            id_field: None,
+            vector_field: None,
+            vector_name: None,
+            encryption_key: None,
+            insecure: true,
+        };
+        assert!(import(args).is_err());
+    }
+
+    #[test]
+    fn live_postgres_import_rejects_a_non_pgvector_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = ImportArgs {
+            source: Source::Chroma,
+            input: None,
+            qdrant_url: None,
+            chroma_url: None,
+            chroma_tenant: None,
+            chroma_database: None,
+            postgres_url: Some("postgresql://localhost/db".to_string()),
+            table: None,
             api_key: None,
             collection: "c".to_string(),
             data_dir: dir.path().join("data"),
