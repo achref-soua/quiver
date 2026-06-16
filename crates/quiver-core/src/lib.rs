@@ -35,6 +35,7 @@ pub mod wal;
 
 pub use descriptor::{
     Descriptor, DistanceMetric, Dtype, FieldType, FilterableField, IndexKind, IndexSpec,
+    VectorEncryption,
 };
 pub use error::{CoreError, Result};
 pub use ids::{CollectionId, Lsn};

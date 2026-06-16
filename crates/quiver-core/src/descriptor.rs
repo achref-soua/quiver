@@ -104,6 +104,40 @@ impl FilterableField {
     }
 }
 
+/// How a collection's vectors are encrypted (ADR-0031, ADR-0032). Encryption is
+/// always **client-side** — the server never holds the key. Defaults to
+/// [`VectorEncryption::None`]. The variants sit on Quiver's encrypted-search
+/// spectrum, from fastest to most confidential:
+///
+/// - [`None`](VectorEncryption::None): plaintext vectors; the server ranks and
+///   sees everything (the default).
+/// - [`Dcpe`](VectorEncryption::Dcpe): experimental property-preserving
+///   encryption; the server ranks ciphertexts but the approximate
+///   distance-comparison relation leaks **by design**. `L2` only; not
+///   semantically secure (ADR-0031).
+/// - [`ClientSide`](VectorEncryption::ClientSide): semantically secure (IND-CPA)
+///   opaque AEAD ciphertext; the server stores blobs it cannot read and does
+///   **no** distance math, so the client fetches and ranks locally (ADR-0032).
+///
+/// The discriminants are chosen so a descriptor written when this flag was a
+/// `bool encrypted_vectors` decodes unchanged: `false` (byte 0) is
+/// [`None`](VectorEncryption::None) and `true` (byte 1) is
+/// [`Dcpe`](VectorEncryption::Dcpe) — no data migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorEncryption {
+    /// Plaintext vectors; the server ranks (the default).
+    #[default]
+    None,
+    /// Experimental DCPE ciphertext (ADR-0031): the server ranks, the approximate
+    /// distance-comparison relation leaks by design, `L2` only, not semantically
+    /// secure.
+    Dcpe,
+    /// Semantically secure opaque AEAD ciphertext (ADR-0032): the server stores
+    /// blobs it cannot read and does no distance math; the client ranks locally.
+    ClientSide,
+}
+
 /// The immutable schema of a collection, fixed at creation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Descriptor {
@@ -128,14 +162,14 @@ pub struct Descriptor {
     /// `false` on read).
     #[serde(default)]
     pub multivector: bool,
-    /// Whether this collection holds **DCPE-encrypted** vectors: the client
-    /// applies property-preserving (distance-comparison-preserving) encryption
-    /// before upserting, so the server searches ciphertexts it cannot decrypt
-    /// (ADR-0031). Experimental and **off by default**; when set, the collection
-    /// must use the `L2` metric. Absent in descriptors written before DCPE existed
-    /// (defaulted to `false` on read).
+    /// How this collection's vectors are encrypted (ADR-0031, ADR-0032).
+    /// [`VectorEncryption::None`] by default; [`Dcpe`](VectorEncryption::Dcpe)
+    /// requires the `L2` metric. Absent in descriptors written before the flag
+    /// existed (defaulted to `None` on read); a descriptor written while the flag
+    /// was a `bool encrypted_vectors` decodes unchanged (`false`→`None`,
+    /// `true`→`Dcpe`).
     #[serde(default)]
-    pub encrypted_vectors: bool,
+    pub vector_encryption: VectorEncryption,
 }
 
 impl Descriptor {
@@ -150,7 +184,7 @@ impl Descriptor {
             index: IndexSpec::default(),
             filterable: Vec::new(),
             multivector: false,
-            encrypted_vectors: false,
+            vector_encryption: VectorEncryption::None,
         }
     }
 
@@ -177,13 +211,13 @@ impl Descriptor {
         self
     }
 
-    /// Mark this collection as holding DCPE-encrypted vectors (builder style):
-    /// the client encrypts vectors with property-preserving encryption before
-    /// upserting, and the server searches the ciphertexts (ADR-0031).
-    /// Experimental; a DCPE collection must use the `L2` metric.
+    /// Set how this collection's vectors are encrypted (builder style). A
+    /// [`Dcpe`](VectorEncryption::Dcpe) collection must use the `L2` metric; a
+    /// [`ClientSide`](VectorEncryption::ClientSide) collection is searched by the
+    /// client, not the server (ADR-0031, ADR-0032).
     #[must_use]
-    pub fn with_encrypted_vectors(mut self, encrypted_vectors: bool) -> Self {
-        self.encrypted_vectors = encrypted_vectors;
+    pub fn with_vector_encryption(mut self, vector_encryption: VectorEncryption) -> Self {
+        self.vector_encryption = vector_encryption;
         self
     }
 
@@ -193,7 +227,7 @@ impl Descriptor {
     /// postcard is non-self-describing, so a missing *trailing* field cannot be
     /// defaulted by `#[serde(default)]` alone (the reader hits end-of-input and
     /// errors). We therefore try the layouts newest-to-oldest — current
-    /// (with `encrypted_vectors`) → the six-field `multivector` layout → the
+    /// (with `vector_encryption`) → the six-field `multivector` layout → the
     /// five-field `filterable` layout → the four-field `index`-only layout → the
     /// original three-field layout — defaulting the missing trailing fields. The
     /// order matters: postcard ignores trailing bytes, so an older decoder would
@@ -216,8 +250,9 @@ impl Descriptor {
     }
 }
 
-// The six-field layout (through `multivector`, no `encrypted_vectors`), kept only
-// to migrate descriptors written before DCPE existed, via [`Descriptor::decode`].
+// The six-field layout (through `multivector`, no `vector_encryption`), kept only
+// to migrate descriptors written before client-side encryption existed, via
+// [`Descriptor::decode`].
 // It must be tried before the five-field layout, which would otherwise silently
 // drop `multivector` (postcard ignores trailing bytes).
 #[derive(Deserialize)]
@@ -239,7 +274,7 @@ impl From<DescriptorV4> for Descriptor {
             index: v.index,
             filterable: v.filterable,
             multivector: v.multivector,
-            encrypted_vectors: false,
+            vector_encryption: VectorEncryption::None,
         }
     }
 }
@@ -266,7 +301,7 @@ impl From<DescriptorV3> for Descriptor {
             index: v.index,
             filterable: v.filterable,
             multivector: false,
-            encrypted_vectors: false,
+            vector_encryption: VectorEncryption::None,
         }
     }
 }
@@ -290,7 +325,7 @@ impl From<DescriptorV2> for Descriptor {
             index: v.index,
             filterable: Vec::new(),
             multivector: false,
-            encrypted_vectors: false,
+            vector_encryption: VectorEncryption::None,
         }
     }
 }
@@ -313,7 +348,7 @@ impl From<LegacyDescriptor> for Descriptor {
             index: IndexSpec::default(),
             filterable: Vec::new(),
             multivector: false,
-            encrypted_vectors: false,
+            vector_encryption: VectorEncryption::None,
         }
     }
 }
@@ -466,20 +501,58 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_with_encrypted_vectors_roundtrips() {
-        let d = Descriptor::new(64, Dtype::F32, DistanceMetric::L2).with_encrypted_vectors(true);
+    fn descriptor_with_vector_encryption_roundtrips() {
+        let d = Descriptor::new(64, Dtype::F32, DistanceMetric::L2)
+            .with_vector_encryption(VectorEncryption::ClientSide);
         let bytes = postcard::to_allocvec(&d).unwrap();
         let back = Descriptor::decode(&bytes).unwrap();
         assert_eq!(back, d);
-        assert!(back.encrypted_vectors);
+        assert_eq!(back.vector_encryption, VectorEncryption::ClientSide);
     }
 
-    // A descriptor serialized before `encrypted_vectors` existed (six fields,
+    // The vector-encryption flag used to be a `bool encrypted_vectors`. The enum's
+    // discriminants are chosen so those descriptors decode unchanged — a trailing
+    // `true` byte is `Dcpe`, `false` is `None` — so existing DCPE collections need
+    // no data migration.
+    #[test]
+    fn legacy_encrypted_vectors_bool_decodes_as_the_enum() {
+        #[derive(serde::Serialize)]
+        struct OldDescriptor {
+            dim: u32,
+            dtype: Dtype,
+            metric: DistanceMetric,
+            index: IndexSpec,
+            filterable: Vec<FilterableField>,
+            multivector: bool,
+            encrypted_vectors: bool,
+        }
+        let make = |enc: bool| OldDescriptor {
+            dim: 8,
+            dtype: Dtype::F32,
+            metric: DistanceMetric::L2,
+            index: IndexSpec::default(),
+            filterable: Vec::new(),
+            multivector: false,
+            encrypted_vectors: enc,
+        };
+        let dcpe = postcard::to_allocvec(&make(true)).unwrap();
+        assert_eq!(
+            Descriptor::decode(&dcpe).unwrap().vector_encryption,
+            VectorEncryption::Dcpe
+        );
+        let none = postcard::to_allocvec(&make(false)).unwrap();
+        assert_eq!(
+            Descriptor::decode(&none).unwrap().vector_encryption,
+            VectorEncryption::None
+        );
+    }
+
+    // A descriptor serialized before `vector_encryption` existed (six fields,
     // through `multivector`) must still decode — via the six-field fallback, which
-    // keeps `multivector` and defaults `encrypted_vectors` to false. The five-field
+    // keeps `multivector` and defaults `vector_encryption` to None. The five-field
     // fallback would wrongly drop `multivector`, so the six-field one is tried first.
     #[test]
-    fn pre_encrypted_vectors_descriptor_decodes_and_keeps_multivector() {
+    fn pre_vector_encryption_descriptor_decodes_and_keeps_multivector() {
         #[derive(serde::Serialize)]
         struct DescriptorV4 {
             dim: u32,
@@ -501,10 +574,10 @@ mod tests {
         // The current seven-field decode fails on the shorter buffer...
         assert!(postcard::from_bytes::<Descriptor>(&bytes).is_err());
         // ...but `decode` falls back to the six-field layout: multivector and
-        // filterable kept, encrypted_vectors defaulted to false.
+        // filterable kept, vector_encryption defaulted to None.
         let back = Descriptor::decode(&bytes).unwrap();
         assert!(back.multivector);
         assert_eq!(back.filterable, vec![FilterableField::numeric("score")]);
-        assert!(!back.encrypted_vectors);
+        assert_eq!(back.vector_encryption, VectorEncryption::None);
     }
 }

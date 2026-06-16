@@ -58,6 +58,15 @@ enum FieldType {
   FIELD_TYPE_NUMERIC = 2;
 }
 
+// How a collection's vectors are encrypted, always client-side (ADR-0031,
+// ADR-0032). The discriminants match the former `bool encrypted_vectors`
+// (false = NONE, true = DCPE) so the wire stays compatible.
+enum VectorEncryption {
+  VECTOR_ENCRYPTION_NONE = 0;
+  VECTOR_ENCRYPTION_DCPE = 1;
+  VECTOR_ENCRYPTION_CLIENT_SIDE = 2;
+}
+
 // A payload field declared filterable at collection creation, indexed for
 // pre-filtered (hybrid) search.
 message FilterableField {
@@ -78,9 +87,10 @@ message Collection {
   repeated FilterableField filterable = 7;
   // Whether this is a multi-vector (late-interaction / ColBERT) collection.
   bool multivector = 8;
-  // Whether this collection holds DCPE-encrypted vectors (ADR-0031): the client
-  // encrypts vectors before upserting and the server searches the ciphertexts.
-  bool encrypted_vectors = 9;
+  // How this collection's vectors are encrypted (ADR-0031, ADR-0032): NONE
+  // (plaintext, server ranks), DCPE (server ranks ciphertexts, leaks distance
+  // ordering by design), or CLIENT_SIDE (opaque AEAD, server does not rank).
+  VectorEncryption vector_encryption = 9;
 }
 
 message CreateCollectionRequest {
@@ -95,9 +105,10 @@ message CreateCollectionRequest {
   // Create a multi-vector (late-interaction / ColBERT) collection (ADR-0028),
   // whose documents are token-vector sets searched by MaxSim.
   bool multivector = 7;
-  // Create a DCPE-encrypted collection (ADR-0031): the client encrypts vectors
-  // with property-preserving encryption before upserting. Requires the L2 metric.
-  bool encrypted_vectors = 8;
+  // How to encrypt this collection's vectors (ADR-0031, ADR-0032): unset/NONE =
+  // plaintext; DCPE = property-preserving (requires the L2 metric); CLIENT_SIDE =
+  // opaque AEAD, searched client-side.
+  VectorEncryption vector_encryption = 8;
 }
 
 message GetCollectionRequest {

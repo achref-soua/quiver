@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use quiver_embed::{
     Database, Descriptor, DistanceMetric, Dtype, FieldType, Filter, FilterableField, IndexKind,
-    IndexSpec, SearchParams,
+    IndexSpec, SearchParams, VectorEncryption,
 };
 
 /// The MCP protocol revision this server implements.
@@ -151,15 +151,16 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
                 .get("multivector")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let encrypted_vectors = args
-                .get("encrypted_vectors")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            let vector_encryption = match args.get("vector_encryption").and_then(Value::as_str) {
+                Some("dcpe") => VectorEncryption::Dcpe,
+                Some("client_side") => VectorEncryption::ClientSide,
+                _ => VectorEncryption::None,
+            };
             let descriptor = Descriptor::new(dim, Dtype::F32, metric)
                 .with_index(index)
                 .with_filterable(filterable)
                 .with_multivector(multivector)
-                .with_encrypted_vectors(encrypted_vectors);
+                .with_vector_encryption(vector_encryption);
             db.create_collection(collection, descriptor)
                 .map_err(|e| e.to_string())?;
             Ok(format!("created collection '{collection}' (dim {dim})"))
@@ -318,10 +319,11 @@ pub fn tool_definitions() -> Value {
                         "default": false,
                         "description": "Create a multi-vector (late-interaction / ColBERT) collection; documents are token sets searched by MaxSim (cosine/dot only)"
                     },
-                    "encrypted_vectors": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Create a DCPE-encrypted collection (ADR-0031): the client encrypts vectors with property-preserving encryption before upserting. Experimental, L2 only, and NOT semantically secure (leaks the approximate distance-comparison relation by design)"
+                    "vector_encryption": {
+                        "type": "string",
+                        "enum": ["none", "dcpe", "client_side"],
+                        "default": "none",
+                        "description": "Client-side vector encryption (the server never holds the key). 'none' = plaintext, the server ranks. 'dcpe' = experimental property-preserving encryption (ADR-0031): the server ranks ciphertexts, L2 only, NOT semantically secure — leaks the approximate distance-comparison relation by design. 'client_side' = semantically secure opaque AEAD (ADR-0032): the server stores blobs it cannot read and does not rank, so the client fetches and ranks locally."
                     }
                 },
                 "required": ["name", "dim"]
@@ -869,14 +871,14 @@ mod tests {
         call_tool(
             &mut db,
             "create_collection",
-            &json!({"name": "enc", "dim": 3, "metric": "l2", "encrypted_vectors": true}),
+            &json!({"name": "enc", "dim": 3, "metric": "l2", "vector_encryption": "dcpe"}),
         )
         .unwrap();
         // A DCPE collection with a non-L2 metric is rejected (ADR-0031).
         let r = call(
             &mut db,
             "create_collection",
-            json!({"name": "bad", "dim": 3, "metric": "cosine", "encrypted_vectors": true}),
+            json!({"name": "bad", "dim": 3, "metric": "cosine", "vector_encryption": "dcpe"}),
         );
         assert_eq!(r["result"]["isError"], true);
     }

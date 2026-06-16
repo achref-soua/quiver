@@ -123,20 +123,20 @@ async fn rest_and_grpc_round_trip() {
         .post(format!("{base}/v1/collections"))
         .bearer_auth(key)
         .json(&serde_json::json!({
-            "name": "encrypted", "dim": 4, "metric": "l2", "encrypted_vectors": true
+            "name": "encrypted", "dim": 4, "metric": "l2", "vector_encryption": "dcpe"
         }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["encrypted_vectors"], true);
+    assert_eq!(body["vector_encryption"], "dcpe");
     // A DCPE collection with a non-L2 metric is a 400, not a 500.
     let resp = http
         .post(format!("{base}/v1/collections"))
         .bearer_auth(key)
         .json(&serde_json::json!({
-            "name": "enc_bad", "dim": 4, "metric": "cosine", "encrypted_vectors": true
+            "name": "enc_bad", "dim": 4, "metric": "cosine", "vector_encryption": "dcpe"
         }))
         .send()
         .await

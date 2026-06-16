@@ -48,6 +48,7 @@ pub use quiver_core::page::PageCodec;
 pub use quiver_core::{CollectionId, CommitObserver, WalEntry, WalOp};
 pub use quiver_core::{
     Descriptor, DistanceMetric, Dtype, FieldType, FilterableField, IndexKind, IndexSpec,
+    VectorEncryption,
 };
 pub use quiver_query::Filter;
 
@@ -1015,7 +1016,9 @@ fn validate_index(descriptor: &Descriptor) -> Result<()> {
     }
     // DCPE (ADR-0031) preserves Euclidean distance comparison; the secret scaling
     // changes vector norms, so cosine and dot orderings are not preserved.
-    if descriptor.encrypted_vectors && descriptor.metric != DistanceMetric::L2 {
+    if descriptor.vector_encryption == VectorEncryption::Dcpe
+        && descriptor.metric != DistanceMetric::L2
+    {
         return Err(Error::Unsupported(
             "dcpe-encrypted collections require the l2 metric",
         ));
@@ -1725,17 +1728,22 @@ mod tests {
         let mut db = open(tmp.path());
         // DCPE preserves Euclidean distance, so cosine/dot are rejected.
         for metric in [DistanceMetric::Cosine, DistanceMetric::Dot] {
-            let bad = Descriptor::new(4, Dtype::F32, metric).with_encrypted_vectors(true);
+            let bad = Descriptor::new(4, Dtype::F32, metric)
+                .with_vector_encryption(VectorEncryption::Dcpe);
             assert!(matches!(
                 db.create_collection("bad", bad),
                 Err(Error::Unsupported(_))
             ));
         }
         // L2 is accepted, and the flag persists on the descriptor.
-        let good = Descriptor::new(4, Dtype::F32, DistanceMetric::L2).with_encrypted_vectors(true);
+        let good = Descriptor::new(4, Dtype::F32, DistanceMetric::L2)
+            .with_vector_encryption(VectorEncryption::Dcpe);
         db.create_collection("enc", good)
             .expect("l2 dcpe collection");
-        assert!(db.descriptor("enc").expect("descriptor").encrypted_vectors);
+        assert_eq!(
+            db.descriptor("enc").expect("descriptor").vector_encryption,
+            VectorEncryption::Dcpe
+        );
     }
 
     // Recursively check whether a file named `name` exists under `dir`.
