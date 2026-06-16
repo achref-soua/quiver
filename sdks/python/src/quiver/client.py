@@ -8,10 +8,14 @@ are produced by the caller — Quiver is model-agnostic.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Sequence, Union
 
 import httpx
+
+if TYPE_CHECKING:
+    from .vector import VectorCipher
 
 __all__ = [
     "Client",
@@ -97,7 +101,7 @@ class CollectionInfo:
     pq_subspaces: Optional[int] = None
     filterable: list[FilterableField] = field(default_factory=list)
     multivector: bool = False
-    encrypted_vectors: bool = False
+    vector_encryption: str = "none"
 
 
 PointInput = Union[Point, Mapping[str, Any]]
@@ -152,7 +156,7 @@ class Client:
         pq_subspaces: Optional[int] = None,
         filterable: Optional[Sequence[FilterableField]] = None,
         multivector: bool = False,
-        encrypted_vectors: bool = False,
+        vector_encryption: str = "none",
     ) -> CollectionInfo:
         """Create a collection. Raises [`QuiverError`] if the name is taken.
 
@@ -161,10 +165,17 @@ class Client:
         ``filterable`` declares payload fields to index for hybrid (pre-filtered)
         search, each a :class:`FilterableField` of ``keyword`` or ``numeric`` type.
 
-        ``encrypted_vectors`` marks an experimental DCPE-encrypted collection
-        (ADR-0031): the caller encrypts vectors client-side with
-        :class:`quiver.dcpe.DcpeCipher` before upserting. It requires the ``l2``
-        metric and is **not** semantically secure — see the ``quiver.dcpe`` module.
+        ``vector_encryption`` selects client-side vector encryption (the server
+        never holds the key):
+
+        * ``"none"`` — plaintext vectors, the server ranks (the default).
+        * ``"dcpe"`` — experimental property-preserving encryption (ADR-0031): the
+          server ranks ciphertexts, requires the ``l2`` metric, and is **not**
+          semantically secure (see :class:`quiver.dcpe.DcpeCipher`).
+        * ``"client_side"`` — semantically secure opaque AEAD (ADR-0032): the
+          server stores blobs it cannot read and does **not** rank, so you
+          :meth:`fetch` and rank locally (see :class:`quiver.vector.VectorCipher`
+          and :meth:`search_client_side`).
         """
         body: dict[str, Any] = {"name": name, "dim": dim, "metric": metric}
         if index is not None:
@@ -177,8 +188,8 @@ class Client:
             ]
         if multivector:
             body["multivector"] = True
-        if encrypted_vectors:
-            body["encrypted_vectors"] = True
+        if vector_encryption != "none":
+            body["vector_encryption"] = vector_encryption
         return _collection(self._send("POST", "/v1/collections", body).json())
 
     def list_collections(self) -> list[CollectionInfo]:
@@ -248,6 +259,77 @@ class Client:
             Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
             for m in matches
         ]
+
+    def fetch(
+        self,
+        collection: str,
+        *,
+        filter: Optional[Mapping[str, Any]] = None,
+        limit: int = 100,
+        with_payload: bool = True,
+        with_vector: bool = False,
+    ) -> list[Match]:
+        """Fetch points without ranking; an optional payload ``filter`` narrows the
+        set and ``limit`` bounds it.
+
+        This is the retrieval path for ``client_side``-encrypted collections
+        (ADR-0032): the server returns the entitled set — each payload carries the
+        sealed vector under ``__quiver_vec__`` — and you decrypt and rank locally
+        (see :meth:`search_client_side`). It is also a general list-points call for
+        any collection. Returned matches carry ``score`` 0.0 (no ranking).
+        """
+        body: dict[str, Any] = {
+            "limit": limit,
+            "with_payload": with_payload,
+            "with_vector": with_vector,
+        }
+        if filter is not None:
+            body["filter"] = filter
+        points = self._send("POST", f"/v1/collections/{collection}/fetch", body).json()[
+            "points"
+        ]
+        return [
+            Match(id=p["id"], score=0.0, payload=p.get("payload"), vector=p.get("vector"))
+            for p in points
+        ]
+
+    def search_client_side(
+        self,
+        collection: str,
+        query: Sequence[float],
+        cipher: VectorCipher,
+        *,
+        k: int = 10,
+        filter: Optional[Mapping[str, Any]] = None,
+        metric: str = "l2",
+        candidate_limit: int = 10_000,
+    ) -> list[Match]:
+        """Nearest-neighbour search over a ``client_side``-encrypted collection
+        (ADR-0032), done entirely client-side.
+
+        :meth:`fetch` es the (optionally filtered) candidate set, decrypts each
+        vector with ``cipher`` (a :class:`quiver.vector.VectorCipher`), ranks by
+        ``metric`` (``"l2"`` | ``"cosine"`` | ``"dot"``), and returns the top ``k``.
+        The server never ranks and never sees the key. ``candidate_limit`` bounds
+        how many points are fetched before ranking — this mode suits small/medium
+        or pre-filtered collections.
+
+        Each returned :class:`Match` carries the decrypted ``vector`` and a ``score``
+        under the chosen metric (the raw distance for ``l2``, the similarity for
+        ``cosine``/``dot``).
+        """
+        q = [float(x) for x in query]
+        ranked: list[tuple[float, Match]] = []
+        for m in self.fetch(
+            collection, filter=filter, limit=candidate_limit, with_payload=True
+        ):
+            vector = cipher.open(m.payload)
+            ordering, score = _client_side_score(metric, q, vector)
+            ranked.append(
+                (ordering, Match(id=m.id, score=score, payload=m.payload, vector=vector))
+            )
+        ranked.sort(key=lambda pair: pair[0])
+        return [m for _, m in ranked[:k]]
 
     # --- documents (multi-vector / late interaction) ---
 
@@ -340,8 +422,30 @@ def _collection(body: Mapping[str, Any]) -> CollectionInfo:
             for f in body.get("filterable", [])
         ],
         multivector=bool(body.get("multivector", False)),
-        encrypted_vectors=bool(body.get("encrypted_vectors", False)),
+        vector_encryption=str(body.get("vector_encryption", "none")),
     )
+
+
+def _client_side_score(
+    metric: str, query: Sequence[float], vector: Sequence[float]
+) -> tuple[float, float]:
+    """Score a candidate for client-side ranking (ADR-0032).
+
+    Returns ``(ordering, score)``: ``ordering`` sorts ascending so the nearest
+    point comes first; ``score`` is the value reported on the :class:`Match`.
+    """
+    if metric == "l2":
+        d = math.fsum((x - y) ** 2 for x, y in zip(query, vector))
+        return d, d
+    dot = math.fsum(x * y for x, y in zip(query, vector))
+    if metric == "dot":
+        return -dot, dot
+    if metric == "cosine":
+        nq = math.sqrt(math.fsum(x * x for x in query)) or 1.0
+        nv = math.sqrt(math.fsum(y * y for y in vector)) or 1.0
+        sim = dot / (nq * nv)
+        return -sim, sim
+    raise ValueError(f"unknown metric: {metric!r}")
 
 
 def _point_dict(point: PointInput) -> dict[str, Any]:
