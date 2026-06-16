@@ -40,6 +40,7 @@ pub(crate) fn router(state: AppState) -> Router {
         )
         .route("/v1/collections/{name}/points/{id}", get(get_point))
         .route("/v1/collections/{name}/query", post(search))
+        .route("/v1/collections/{name}/fetch", post(fetch))
         .route(
             "/v1/collections/{name}/documents",
             post(upsert_documents).delete(delete_documents),
@@ -487,6 +488,67 @@ async fn search(
         .await?;
     Ok(Json(SearchResponse {
         matches: matches.into_iter().map(MatchDto::from).collect(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct FetchBody {
+    #[serde(default)]
+    filter: Option<Filter>,
+    #[serde(default = "default_fetch_limit")]
+    limit: usize,
+    #[serde(default = "default_true")]
+    with_payload: bool,
+    #[serde(default)]
+    with_vector: bool,
+}
+
+fn default_fetch_limit() -> usize {
+    100
+}
+
+#[derive(Serialize)]
+struct FetchedPoint {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vector: Option<Vec<f32>>,
+}
+
+impl From<MatchOut> for FetchedPoint {
+    fn from(m: MatchOut) -> Self {
+        Self {
+            id: m.id,
+            payload: m.payload,
+            vector: m.vector,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct FetchResponse {
+    points: Vec<FetchedPoint>,
+}
+
+async fn fetch(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(name): Path<String>,
+    Json(body): Json<FetchBody>,
+) -> Result<Json<FetchResponse>, Error> {
+    let points = state
+        .fetch(
+            &principal,
+            name,
+            body.filter,
+            body.limit,
+            body.with_payload,
+            body.with_vector,
+        )
+        .await?;
+    Ok(Json(FetchResponse {
+        points: points.into_iter().map(FetchedPoint::from).collect(),
     }))
 }
 

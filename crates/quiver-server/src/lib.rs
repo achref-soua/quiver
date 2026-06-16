@@ -651,6 +651,37 @@ impl AppState {
         .await
     }
 
+    pub(crate) async fn fetch(
+        &self,
+        principal: &Principal,
+        collection: String,
+        filter: Option<Filter>,
+        limit: usize,
+        with_payload: bool,
+        with_vector: bool,
+    ) -> Result<Vec<MatchOut>, Error> {
+        self.authorize(principal, Action::Read, "fetch", &collection)?;
+        self.run_blocking(move |db| {
+            let matches = db.fetch(
+                &collection,
+                filter.as_ref(),
+                limit,
+                with_payload,
+                with_vector,
+            )?;
+            Ok(matches
+                .into_iter()
+                .map(|m| MatchOut {
+                    id: m.id,
+                    score: m.score,
+                    payload: m.payload,
+                    vector: m.vector,
+                })
+                .collect())
+        })
+        .await
+    }
+
     pub(crate) async fn upsert_documents(
         &self,
         principal: &Principal,

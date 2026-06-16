@@ -22,6 +22,10 @@ service Quiver {
 
   rpc Search(SearchRequest) returns (SearchResponse);
 
+  // Fetch points without server-side ranking — the retrieval path for
+  // client-side-encrypted collections (ADR-0032); the client decrypts and ranks.
+  rpc Fetch(FetchRequest) returns (FetchResponse);
+
   // Multi-vector (late-interaction / ColBERT) documents (ADR-0028).
   rpc UpsertMultiVector(UpsertMultiVectorRequest) returns (UpsertMultiVectorResponse);
   rpc SearchMultiVector(SearchMultiVectorRequest) returns (SearchMultiVectorResponse);
@@ -183,6 +187,21 @@ message Match {
 }
 
 message SearchResponse {
+  repeated Match matches = 1;
+}
+
+// Fetch points (no ranking) with an optional cleartext payload filter and a limit
+// (ADR-0032). Reuses Match; its score field is 0 for an unranked fetch.
+message FetchRequest {
+  string collection = 1;
+  // JSON-encoded quiver-query Filter; empty = no filter.
+  bytes filter = 2;
+  uint32 limit = 3;
+  bool with_payload = 4;
+  bool with_vector = 5;
+}
+
+message FetchResponse {
   repeated Match matches = 1;
 }
 
