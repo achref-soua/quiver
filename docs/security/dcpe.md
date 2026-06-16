@@ -12,7 +12,9 @@ what it does **not** do. Read it before turning the feature on.
 > client-side payload encryption ([ADR-0012](../adr/0012-client-side-encryption.md)),
 > for a *different* problem: approximate nearest-neighbour search over encrypted
 > vectors on an untrusted server. It **complements** encryption-at-rest; it does
-> not replace it.
+> not replace it. For a **semantically secure** alternative that leaks *nothing*
+> about the vectors — at the cost that the server no longer ranks — see
+> [client-side opaque vectors](client-side-vectors.md).
 
 ## The problem it solves
 
@@ -100,14 +102,14 @@ from quiver.dcpe import DcpeCipher          # pip install quiver-client[dcpe]
 
 cipher = DcpeCipher.from_hex("…64 hex chars…", approximation_factor=0.02)
 with Client("https://…", api_key="…") as q:
-    q.create_collection("vault", dim=8, metric="l2", encrypted_vectors=True)
+    q.create_collection("vault", dim=8, metric="l2", vector_encryption="dcpe")
     sealed = cipher.encrypt([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
     q.upsert("vault", [{"id": "a", "vector": sealed.ciphertext}])
     hits = q.search("vault", cipher.encrypt_query(my_query), k=10)
 ```
 
 The Rust reference (`quiver_crypto::dcpe::DcpeCipher`) is available to embedders;
-the MCP `create_collection` tool accepts `encrypted_vectors`; and the TypeScript
+the MCP `create_collection` tool accepts `vector_encryption="dcpe"`; and the TypeScript
 SDK can create DCPE collections (a native TS cipher is a planned follow-up).
 
 ## Key management

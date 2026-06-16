@@ -79,13 +79,21 @@ Encrypted fields cannot be filtered or indexed server-side. To keep a field serv
 
 The client owns the key. **Never reuse the `QUIVER_ENCRYPTION_KEY` (at-rest) key** for payloads, and never send the payload key to the server. Losing the key means the data is unrecoverable. The boundary is exact: this hides *only* the sealed fields; cleartext siblings and all vectors remain visible to the server.
 
-## Experimental: vector confidentiality vs the server (DCPE)
+## Vector confidentiality vs the server
 
-Standard ANN needs plaintext vectors server-side. The only path to *vector* confidentiality against the server is **property-preserving encryption** — specifically a **published distance-comparison-preserving encryption (DCPE)** scheme — implemented **behind an experimental feature flag**, off by default. We will:
+Standard ANN needs plaintext vectors server-side, so vector confidentiality against the server is **opt-in, per collection** (`vector_encryption`), at two honest points on a spectrum — both client-side, the server never holding the key.
 
-- implement a **specific, cited, peer-reviewed** construction (named precisely when the feature is built), **never** an invented one;
-- **document the leakage honestly**: DCPE reveals approximate distances/ordering by design (that is what lets the server rank), which is a real confidentiality reduction and is *not* equivalent to semantic security;
-- make **no claim** of homomorphic-encrypted search in core.
+**DCPE (`dcpe`, experimental, [`dcpe.md`](./dcpe.md)).** A *published, peer-reviewed* distance-comparison-preserving construction (Scale-And-Perturb — never invented), so the server keeps ranking ciphertexts by approximate L2 distance. It **reveals approximate distances/ordering by design** (that is what lets the server rank) — a real confidentiality reduction, **not** semantic security.
+
+**Client-side opaque vectors (`client_side`, semantically secure, [`client-side-vectors.md`](./client-side-vectors.md)).** [`quiver_crypto::vector::VectorCipher`](https://github.com/achref-soua/quiver/blob/main/crates/quiver-crypto/src/vector.rs) seals the vector's raw little-endian `f32` bytes with the **same** XChaCha20-Poly1305 envelope as payloads (no new primitive), under the reserved key `__quiver_vec__` with associated data `quiver/vector/v1`:
+
+```json
+{ "__quiver_vec__": { "v": 1, "alg": "xchacha20poly1305", "dim": 8, "n": "…", "ct": "…" } }
+```
+
+The server stores the blob plus a zero placeholder vector and does **no** distance math, so it is genuinely **IND-CPA** for vectors — at the cost that the server cannot rank (the client fetches and ranks). The Python and TypeScript SDKs mirror the envelope **bit-exactly** (raw bytes, no transcendental floats).
+
+Core makes **no claim** of homomorphic-encrypted search.
 
 ## Test posture
 
