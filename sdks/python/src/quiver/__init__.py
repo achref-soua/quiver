@@ -23,6 +23,15 @@ from .client import (
 )
 from .dcpe import DcpeCipher, DcpeError, EncryptedVector
 from .encryption import ENVELOPE_KEY, PayloadCipher, PayloadError, is_sealed
+from .vector import (
+    VECTOR_ENVELOPE_KEY,
+    MalformedVectorEnvelopeError,
+    NotEncryptedVectorError,
+    VectorCipher,
+    VectorDecryptError,
+    VectorError,
+    is_sealed_vector,
+)
 
 __all__ = [
     "Client",
@@ -40,5 +49,12 @@ __all__ = [
     "DcpeCipher",
     "DcpeError",
     "EncryptedVector",
+    "VectorCipher",
+    "VectorError",
+    "VectorDecryptError",
+    "NotEncryptedVectorError",
+    "MalformedVectorEnvelopeError",
+    "is_sealed_vector",
+    "VECTOR_ENVELOPE_KEY",
 ]
 __version__ = "0.10.0"

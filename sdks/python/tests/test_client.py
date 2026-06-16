@@ -60,6 +60,66 @@ def test_create_collection_with_filterable_fields():
 
 
 @respx.mock
+def test_create_collection_sends_vector_encryption():
+    route = respx.post(f"{BASE}/v1/collections").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "name": "vault",
+                "dim": 8,
+                "metric": "l2",
+                "count": 0,
+                "vector_encryption": "client_side",
+            },
+        )
+    )
+    with Client(BASE) as q:
+        info = q.create_collection("vault", 8, vector_encryption="client_side")
+    assert info.vector_encryption == "client_side"
+    body = json.loads(route.calls.last.request.content)
+    assert body["vector_encryption"] == "client_side"
+
+
+@respx.mock
+def test_fetch_returns_unranked_points():
+    respx.post(f"{BASE}/v1/collections/vault/fetch").mock(
+        return_value=httpx.Response(
+            200,
+            json={"points": [
+                {"id": "a", "payload": {"k": 1}},
+                {"id": "b", "payload": {"k": 2}},
+            ]},
+        )
+    )
+    with Client(BASE) as q:
+        points = q.fetch("vault", limit=10)
+    assert [p.id for p in points] == ["a", "b"]
+    assert all(p.score == 0.0 for p in points)
+
+
+@respx.mock
+def test_search_client_side_fetches_decrypts_and_ranks():
+    from quiver.vector import VectorCipher
+
+    cipher = VectorCipher.from_hex("11" * 32)
+    target = [1.0, 0.0, 0.0]
+    near = [0.75, 0.25, 0.0]  # exact in f32, so the round-trip is exact
+    far = [0.0, 1.0, 1.0]
+    points = [
+        {"id": "far", "payload": cipher.seal(far)},
+        {"id": "near", "payload": cipher.seal(near)},
+    ]
+    respx.post(f"{BASE}/v1/collections/vault/fetch").mock(
+        return_value=httpx.Response(200, json={"points": points})
+    )
+    with Client(BASE) as q:
+        hits = q.search_client_side("vault", target, cipher, k=1)
+    assert len(hits) == 1
+    assert hits[0].id == "near"
+    assert hits[0].vector == near
+
+
+@respx.mock
 def test_list_get_and_delete_collection():
     respx.get(f"{BASE}/v1/collections").mock(
         return_value=httpx.Response(

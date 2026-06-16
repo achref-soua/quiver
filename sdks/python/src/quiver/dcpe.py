@@ -21,7 +21,7 @@ Usage — encrypt vectors before upserting, and queries before searching, with t
 
     cipher = DcpeCipher.from_hex("…64 hex chars…", approximation_factor=0.02)
     q = Client("http://localhost:4000", api_key="…")
-    q.create_collection("vault", dim=8, metric="l2", encrypted_vectors=True)
+    q.create_collection("vault", dim=8, metric="l2", vector_encryption="dcpe")
     sealed = cipher.encrypt([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
     q.upsert("vault", [{"id": "a", "vector": sealed.ciphertext}])
     hits = q.search("vault", cipher.encrypt_query(my_query_vector), k=10)
