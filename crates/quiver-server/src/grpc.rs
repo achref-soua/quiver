@@ -452,6 +452,42 @@ impl Quiver for QuiverService {
         }))
     }
 
+    async fn fetch(
+        &self,
+        request: Request<v1::FetchRequest>,
+    ) -> Result<Response<v1::FetchResponse>, Status> {
+        let principal = self.authenticate(&request)?;
+        let req = request.into_inner();
+        let filter: Option<Filter> = if req.filter.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_slice(&req.filter)
+                    .map_err(|e| Status::invalid_argument(format!("invalid filter json: {e}")))?,
+            )
+        };
+        let limit = if req.limit == 0 {
+            100
+        } else {
+            req.limit as usize
+        };
+        let matches = self
+            .state
+            .fetch(
+                &principal,
+                req.collection,
+                filter,
+                limit,
+                req.with_payload,
+                req.with_vector,
+            )
+            .await
+            .map_err(|e| e.to_status())?;
+        Ok(Response::new(v1::FetchResponse {
+            matches: matches.into_iter().map(match_to_proto).collect(),
+        }))
+    }
+
     async fn upsert_multi_vector(
         &self,
         request: Request<v1::UpsertMultiVectorRequest>,
