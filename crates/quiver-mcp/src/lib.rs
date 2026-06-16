@@ -199,6 +199,25 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
                 .collect();
             to_text(&json!({ "matches": rendered }))
         }
+        "fetch" => {
+            let collection = want_str(args, "collection")?;
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+            let filter = match args.get("filter") {
+                Some(f) if !f.is_null() => Some(
+                    serde_json::from_value::<Filter>(f.clone())
+                        .map_err(|e| format!("invalid filter: {e}"))?,
+                ),
+                _ => None,
+            };
+            let points = db
+                .fetch(collection, filter.as_ref(), limit, true, false)
+                .map_err(|e| e.to_string())?;
+            let rendered: Vec<Value> = points
+                .iter()
+                .map(|m| json!({ "id": m.id, "payload": m.payload }))
+                .collect();
+            to_text(&json!({ "points": rendered }))
+        }
         "get" => {
             let collection = want_str(args, "collection")?;
             let point_id = want_str(args, "id")?;
@@ -355,6 +374,19 @@ pub fn tool_definitions() -> Value {
                     "filter": { "type": "object", "description": "Quiver payload filter tree" }
                 },
                 "required": ["collection", "vector"]
+            }
+        },
+        {
+            "name": "fetch",
+            "description": "List points without ranking, with an optional payload filter and a limit. The retrieval path for client-side-encrypted collections (ADR-0032) that the server cannot rank — the key holder decrypts the returned payload blobs and ranks. Also a general list-points tool.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "collection": collection_arg,
+                    "filter": { "type": "object", "description": "Quiver payload filter tree" },
+                    "limit": { "type": "integer", "default": 100 }
+                },
+                "required": ["collection"]
             }
         },
         {
@@ -879,6 +911,40 @@ mod tests {
             &mut db,
             "create_collection",
             json!({"name": "bad", "dim": 3, "metric": "cosine", "vector_encryption": "dcpe"}),
+        );
+        assert_eq!(r["result"]["isError"], true);
+    }
+
+    #[test]
+    fn fetch_tool_lists_points_and_client_side_rejects_search() {
+        let (_t, mut db) = db();
+        call_tool(
+            &mut db,
+            "create_collection",
+            &json!({"name": "vault", "dim": 2, "metric": "l2", "vector_encryption": "client_side"}),
+        )
+        .unwrap();
+        for i in 0..3 {
+            call_tool(
+                &mut db,
+                "upsert",
+                &json!({
+                    "collection": "vault",
+                    "id": format!("p{i}"),
+                    "vector": [0.0, 0.0],
+                    "payload": {"__quiver_vec__": "ciphertext", "n": i}
+                }),
+            )
+            .unwrap();
+        }
+        // fetch lists the points without ranking.
+        let out = call_tool(&mut db, "fetch", &json!({"collection": "vault"})).unwrap();
+        assert!(out.contains("\"p0\"") && out.contains("\"p2\""));
+        // A ranked search is rejected — the server cannot rank opaque vectors.
+        let r = call(
+            &mut db,
+            "search",
+            json!({"collection": "vault", "vector": [0.0, 0.0]}),
         );
         assert_eq!(r["result"]["isError"], true);
     }
