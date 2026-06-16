@@ -174,6 +174,10 @@ const HNSW_REBUILD_DELETED_FRACTION: f64 = 0.2;
 // store (the `Option` is `None` until first build) and rebuild lazily after
 // writes, so they suit bulk-load-then-query.
 enum CollectionIndex {
+    // A fetch-only collection with no server-side ANN index: a client-side-encrypted
+    // collection (ADR-0032) stores opaque ciphertext the server never ranks, so the
+    // client fetches points and ranks locally.
+    None,
     Hnsw(Hnsw),
     Vamana(Option<Vamana>),
     Ivf(Option<Ivf>),
@@ -192,7 +196,8 @@ impl CollectionIndex {
             CollectionIndex::Disk(Some(d)) => {
                 d.search(query, k, &DiskSearchParams { l_search: ef })?
             }
-            CollectionIndex::Vamana(None)
+            CollectionIndex::None
+            | CollectionIndex::Vamana(None)
             | CollectionIndex::Ivf(None)
             | CollectionIndex::Disk(None) => Vec::new(),
         })
@@ -433,6 +438,12 @@ impl Database {
         require_single_vector(handle)?;
         let payload_bytes = serde_json::to_vec(payload)?;
         self.store.upsert(handle.id, id, vector, &payload_bytes)?;
+        // Client-side-encrypted collections have no server-side index to maintain
+        // (ADR-0032): the stored vector is an opaque placeholder the server never
+        // ranks. The point is durable in the store; nothing else to do.
+        if handle.descriptor.vector_encryption == VectorEncryption::ClientSide {
+            return Ok(());
+        }
         // Maintain the in-memory index in place where the kind allows it, else
         // defer to a lazy rebuild on the next search. HNSW absorbs a brand-new id
         // (it cannot update one in place); a built/trained IVF inserts or
@@ -483,6 +494,11 @@ impl Database {
         if !existed {
             return Ok(false);
         }
+        // No server-side index to update for client-side-encrypted collections
+        // (ADR-0032); the store delete is authoritative.
+        if handle.descriptor.vector_encryption == VectorEncryption::ClientSide {
+            return Ok(true);
+        }
         // A built IVF removes in place (ADR-0023) and a built HNSW soft-deletes
         // (ADR-0026); other kinds defer to a rebuild. The id->internal mapping is
         // kept so a later re-insert reuses the slot — a removed or soft-deleted
@@ -526,6 +542,50 @@ impl Database {
         }
     }
 
+    /// Fetch points without ranking — an optional cleartext payload `filter`
+    /// narrows the set and `limit` bounds it. This is the retrieval path for a
+    /// client-side-encrypted collection (ADR-0032): the server returns the entitled
+    /// set (each point's payload carries the sealed vector blob under the reserved
+    /// `__quiver_vec__` key) and the client decrypts and ranks locally. It also
+    /// serves as a general "list points" primitive for any single-vector collection.
+    ///
+    /// Results come in the store's scan order, not by relevance; the filter is
+    /// re-checked exactly against each candidate (a selective filter could use the
+    /// secondary index in future — today it scans).
+    ///
+    /// # Errors
+    /// Errors if the collection does not exist or is multi-vector.
+    pub fn fetch(
+        &self,
+        collection: &str,
+        filter: Option<&Filter>,
+        limit: usize,
+        with_payload: bool,
+        with_vector: bool,
+    ) -> Result<Vec<Match>> {
+        let handle = self.handle(collection)?;
+        require_single_vector(handle)?;
+        let mut out = Vec::new();
+        for (id, record) in self.store.scan(handle.id)? {
+            if out.len() >= limit {
+                break;
+            }
+            let payload: Value = serde_json::from_slice(&record.payload)?;
+            if let Some(filter) = filter
+                && !filter.matches(&payload)
+            {
+                continue;
+            }
+            out.push(Match {
+                id,
+                score: 0.0,
+                payload: with_payload.then_some(payload),
+                vector: with_vector.then_some(record.vector),
+            });
+        }
+        Ok(out)
+    }
+
     /// Search a collection for the nearest points to `query`, optionally
     /// post-filtered by payload predicate.
     pub fn search(
@@ -535,6 +595,7 @@ impl Database {
         params: &SearchParams,
     ) -> Result<Vec<Match>> {
         require_single_vector(self.handle(collection)?)?;
+        require_server_searchable(self.handle(collection)?)?;
         // Rebuild the index first if a prior update/delete left it stale.
         if self.handle(collection)?.stale {
             let store = &self.store;
@@ -997,6 +1058,20 @@ fn require_multivector(handle: &CollectionHandle) -> Result<()> {
     }
 }
 
+// Reject server-side ranked search on a client-side-encrypted collection: the
+// server holds only opaque ciphertext and cannot rank it. The client fetches the
+// entitled set (see `Database::fetch`) and ranks locally (ADR-0032).
+fn require_server_searchable(handle: &CollectionHandle) -> Result<()> {
+    if handle.descriptor.vector_encryption == VectorEncryption::ClientSide {
+        Err(Error::Unsupported(
+            "collection is client-side encrypted; the server cannot rank opaque vectors — \
+             fetch points and rank client-side",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn to_index_metric(metric: DistanceMetric) -> Metric {
     match metric {
         DistanceMetric::Dot => Metric::Dot,
@@ -1013,6 +1088,17 @@ fn validate_index(descriptor: &Descriptor) -> Result<()> {
         return Err(Error::Unsupported(
             "multi-vector collections require a similarity metric (cosine or dot)",
         ));
+    }
+    // Client-side opaque encryption (ADR-0032) is searched by the client, not the
+    // server, so it has no metric or index constraints — but it cannot combine with
+    // the multi-vector document layout.
+    if descriptor.vector_encryption == VectorEncryption::ClientSide {
+        if descriptor.multivector {
+            return Err(Error::Unsupported(
+                "client-side vector encryption is not supported for multi-vector collections",
+            ));
+        }
+        return Ok(());
     }
     // DCPE (ADR-0031) preserves Euclidean distance comparison; the secret scaling
     // changes vector norms, so cosine and dot orderings are not preserved.
@@ -1037,6 +1123,9 @@ fn validate_index(descriptor: &Descriptor) -> Result<()> {
 
 // An empty index of the kind the descriptor selects. Batch kinds start unbuilt.
 fn empty_index(descriptor: &Descriptor) -> CollectionIndex {
+    if descriptor.vector_encryption == VectorEncryption::ClientSide {
+        return CollectionIndex::None;
+    }
     match descriptor.index.kind {
         IndexKind::Vamana => CollectionIndex::Vamana(None),
         IndexKind::DiskVamana => CollectionIndex::Disk(None),
@@ -1073,6 +1162,11 @@ fn build_index(
     ids: &[u64],
     flat: &[f32],
 ) -> Result<CollectionIndex> {
+    // Client-side-encrypted collections have no server-side index (ADR-0032): the
+    // server stores opaque ciphertext it never ranks.
+    if descriptor.vector_encryption == VectorEncryption::ClientSide {
+        return Ok(CollectionIndex::None);
+    }
     let dim = descriptor.dim as usize;
     let metric = to_index_metric(descriptor.metric);
     Ok(match descriptor.index.kind {
@@ -1744,6 +1838,93 @@ mod tests {
             db.descriptor("enc").expect("descriptor").vector_encryption,
             VectorEncryption::Dcpe
         );
+    }
+
+    #[test]
+    fn client_side_collections_are_fetch_only_and_reject_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        // Any metric is allowed (the server never ranks), so there is no L2
+        // restriction as there is for DCPE.
+        let desc = Descriptor::new(4, Dtype::F32, DistanceMetric::Cosine)
+            .with_vector_encryption(VectorEncryption::ClientSide);
+        db.create_collection("vault", desc)
+            .expect("create client-side collection");
+        // No server-side index is built for a client-side collection (ADR-0032).
+        assert!(matches!(
+            db.collections["vault"].index,
+            CollectionIndex::None
+        ));
+
+        // Upsert opaque placeholder points: a zero vector plus a payload carrying a
+        // stand-in sealed vector blob and a cleartext, server-filterable field.
+        for i in 0..5 {
+            let tier = if i < 2 { "vip" } else { "std" };
+            db.upsert(
+                "vault",
+                &format!("p{i}"),
+                &[0.0; 4],
+                &serde_json::json!({ "__quiver_vec__": format!("ct-{i}"), "tier": tier }),
+            )
+            .expect("upsert");
+        }
+        assert_eq!(db.len("vault").unwrap(), 5);
+        // Still no index after writes — it never goes stale or rebuilds.
+        assert!(matches!(
+            db.collections["vault"].index,
+            CollectionIndex::None
+        ));
+
+        // Ranked search is rejected: the server cannot rank opaque vectors.
+        assert!(matches!(
+            db.search("vault", &[0.0; 4], &SearchParams::default()),
+            Err(Error::Unsupported(_))
+        ));
+
+        // Fetch returns the entitled set; each payload carries the blob the client
+        // would decrypt and rank locally, and vectors are omitted when not asked for.
+        let all = db.fetch("vault", None, 100, true, false).unwrap();
+        assert_eq!(all.len(), 5);
+        assert!(
+            all.iter()
+                .all(|m| m.payload.is_some() && m.vector.is_none())
+        );
+
+        // A cleartext payload filter narrows the set server-side.
+        let vip = db
+            .fetch(
+                "vault",
+                Some(&Filter::Eq {
+                    field: "tier".to_owned(),
+                    value: serde_json::json!("vip"),
+                }),
+                100,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(vip.len(), 2);
+        // A limit bounds the returned set.
+        assert_eq!(db.fetch("vault", None, 2, false, false).unwrap().len(), 2);
+
+        // get returns the stored placeholder + blob payload by id; delete works
+        // through the store with no index to update.
+        assert_eq!(db.get("vault", "p0").unwrap().unwrap().id, "p0");
+        assert!(db.delete("vault", "p0").unwrap());
+        assert_eq!(db.len("vault").unwrap(), 4);
+    }
+
+    #[test]
+    fn client_side_encryption_rejects_multivector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        let desc = Descriptor::new(4, Dtype::F32, DistanceMetric::Cosine)
+            .with_multivector(true)
+            .with_vector_encryption(VectorEncryption::ClientSide);
+        assert!(matches!(
+            db.create_collection("bad", desc),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     // Recursively check whether a file named `name` exists under `dir`.
