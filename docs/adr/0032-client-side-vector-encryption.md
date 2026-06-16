@@ -1,6 +1,6 @@
 # ADR-0032: Semantically secure client-side vector encryption (opaque vectors)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-16
 - **Deciders:** Achref Soua
 
@@ -154,6 +154,33 @@ to anyone holding the ciphertexts; this mode leaks none of it. The price is
 symmetric — DCPE lets the server rank (fast, scales); this mode does not (the
 client ranks a downloaded set). Both compose *with* at-rest encryption; neither
 replaces it.
+
+## Implementation
+
+Shipped across the crypto crate, the engine, the network surface, and the SDKs
+(v0.11.0):
+
+- **Cipher** (`quiver_crypto::vector`): `VectorCipher` seals a vector's raw
+  little-endian `f32` bytes with XChaCha20-Poly1305 (fresh 192-bit nonce, AAD
+  `quiver/vector/v1`) under the reserved `__quiver_vec__` payload key. Reuses the
+  existing audited AEAD — no new primitive, no new dependency — and the byte layout
+  is fixed so it reproduces bit-exactly in other languages.
+- **Flag**: `Descriptor.encrypted_vectors: bool` migrated to
+  `vector_encryption: VectorEncryption { None, Dcpe, ClientSide }`, byte-compatible
+  on disk (`false`→`None`, `true`→`Dcpe`) so existing DCPE collections need no data
+  migration; surfaced across REST/gRPC, the MCP tool, and the SDKs.
+- **Engine**: a `client_side` collection builds **no** ANN index and **rejects** a
+  ranked search; an opaque point is a zero placeholder vector plus the sealed blob,
+  so the on-disk format and the `kill -9` crash gate are unchanged. Retrieval is
+  `Database::fetch` (optional cleartext filter + limit), exposed as
+  `POST /v1/collections/{c}/fetch`, a gRPC `Fetch` RPC, and an MCP `fetch` tool.
+- **SDKs**: native `VectorCipher` in Python (`quiver.vector`) and TypeScript
+  (`quiver-client/vector`), each validated by a bit-exact cross-language
+  known-answer test, plus `search_client_side` / `searchClientSide` helpers that
+  fetch, decrypt, and rank.
+- **Gate proof**: with encryption-at-rest off, a `client_side` collection rejects a
+  ranked query, the client fetches + decrypts + ranks to the true nearest
+  neighbour, and the plaintext vectors are **absent** from disk.
 
 ## Consequences
 

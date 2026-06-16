@@ -50,6 +50,6 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0029](0029-live-chroma-postgres-connectors.md) | Live Chroma & Postgres migration connectors | Accepted | 4 |
 | [0030](0030-leader-follower-replication.md) | Leader-follower replication (async read replicas) | Accepted | 4 |
 | [0031](0031-dcpe-vector-encryption.md) | Experimental property-preserving vector encryption (DCPE) | Accepted | 4 |
-| [0032](0032-client-side-vector-encryption.md) | Semantically secure client-side vector encryption (opaque vectors) | Proposed | 4 |
+| [0032](0032-client-side-vector-encryption.md) | Semantically secure client-side vector encryption (opaque vectors) | Accepted | 4 |
 
 Phase-0 ADRs (0001–0018) are Accepted; Phase-2 decisions span 0019–0022; Phase-4 decisions begin at 0023. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.
