@@ -4,16 +4,16 @@
 
 **The security-first vector database.** Client-side-encryptable, memory-frugal approximate-nearest-neighbour search that runs on a laptop — with a retro terminal cockpit.
 
-[![license](https://img.shields.io/github/license/achref-soua/quiver?color=blue)](./LICENSE)
+[![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 [![rust](https://img.shields.io/badge/rust-stable-orange)](./rust-toolchain.toml)
 [![CI](https://img.shields.io/badge/CI-manual%20dispatch-informational)](.github/workflows)
-[![release](https://img.shields.io/github/v/release/achref-soua/quiver?color=FFB000&label=release)](https://github.com/achref-soua/quiver/releases)
+[![release](https://img.shields.io/badge/release-v0.11.0-FFB000)](https://github.com/achref-soua/quiver/releases)
 [![status](https://img.shields.io/badge/status-v0.11.0%20·%20phase%204-FFB000)](./docs/roadmap.md)
-[![stars](https://img.shields.io/github/stars/achref-soua/quiver?style=flat)](https://github.com/achref-soua/quiver/stargazers)
+[![stars](https://img.shields.io/badge/Star_on-GitHub-FFB000?logo=github)](https://github.com/achref-soua/quiver/stargazers)
 
 </div>
 
-> **Status: `v0.11.0` released Â· Phase 4 (advanced features) in progress.** Phase 1 (`v0.1.0`) shipped the single-node core â an encrypted, crash-safe storage engine, HNSW, SIMD kernels, REST/gRPC, the TUI, and the Python SDK. Phase 2 (`v0.2.0`) delivered memory frugality: the disk-resident DiskANN/Vamana and IVF indexes with product/scalar/binary quantization, a row-addressed storage engine (stride-addressed vector columns, paged payload heaps, roaring tombstones, compaction, secondary indexes), **hybrid filtered search**, the TypeScript SDK, the MCP server, and LangChain/LlamaIndex adapters. Phase 3 (`v0.3.0`) added security depth and cockpit polish: client-side payload encryption, RBAC with scoped API keys and optional mTLS, an append-only audit log, per-collection-DEK encryption with crypto-shredding, master-key-file secret handling, the 2-D **constellation view**, and `cargo-fuzz` targets. Phase 4 ships the advanced backlog incrementally: `v0.4.0` added **incremental in-place index updates** (SpFresh/LIRE for IVF) and **migration importers** (`quiver admin import` for Qdrant/Chroma/pgvector); `v0.5.0` added **HNSW incremental delete**, a neighbor-bounded IVF reassignment, a unified secure database-open path across the server/MCP/CLI, and the design for a durable on-disk incremental index. `v0.6.0` made that durable index real â the IVF index now loads on open (snapshot + WAL-tail replay) instead of an `O(N)` rebuild, crash-gated â and added a **live Qdrant migration connector** (`quiver admin import --qdrant-url`). `v0.7.0` adds **multi-vector / late-interaction (ColBERT) retrieval**: a collection can store each document as a set of token vectors and rank documents by **MaxSim** â reusing the row store (so the crash gate is untouched) and the IVF+PQ frugality path â reachable from the embeddable database, REST/gRPC, the MCP server, and the SDKs. `v0.8.0` extends migration to **live Chroma and Postgres connectors** (`quiver admin import --chroma-url` / `--postgres-url`), so all three supported sources can import directly from a running instance â no export step. `v0.9.0` adds **asynchronous leader-follower read replicas** (point a follower at a leader with `QUIVER_LEADER_URL`) — scaling reads and giving warm standbys without consensus or failover. `v0.10.0` adds an **experimental, opt-in DCPE vector-encryption mode** (`vector_encryption="dcpe"`): a client encrypts embeddings with a published distance-comparison-preserving scheme so an untrusted server can rank ciphertexts by approximate L2 distance without ever holding the plaintext vectors or the key — honestly labelled, since it is L2-only, not semantically secure, and leaks the approximate distance ordering by design. `v0.11.0` adds a **semantically secure** client-side mode (`vector_encryption="client_side"`): the server stores only XChaCha20-Poly1305 ciphertext plus a zero placeholder, learns nothing about the vectors (genuinely IND-CPA), and does no ranking — so the client fetches the (optionally pre-filtered) set and ranks locally, with native Rust/Python/TypeScript ciphers validated by a bit-exact cross-language test. Every performance/memory claim in this README is backed by a reproducible benchmark on documented reference hardware â until those numbers are recorded, that table stays empty rather than guess.
+> **Status: `v0.11.0` released · Phase 4 (advanced features) in progress.** Phase 1 (`v0.1.0`) shipped the single-node core — an encrypted, crash-safe storage engine, HNSW, SIMD kernels, REST/gRPC, the TUI, and the Python SDK. Phase 2 (`v0.2.0`) delivered memory frugality: the disk-resident DiskANN/Vamana and IVF indexes with product/scalar/binary quantization, a row-addressed storage engine (stride-addressed vector columns, paged payload heaps, roaring tombstones, compaction, secondary indexes), **hybrid filtered search**, the TypeScript SDK, the MCP server, and LangChain/LlamaIndex adapters. Phase 3 (`v0.3.0`) added security depth and cockpit polish: client-side payload encryption, RBAC with scoped API keys and optional mTLS, an append-only audit log, per-collection-DEK encryption with crypto-shredding, master-key-file secret handling, the 2-D **constellation view**, and `cargo-fuzz` targets. Phase 4 ships the advanced backlog incrementally: `v0.4.0` added **incremental in-place index updates** (SpFresh/LIRE for IVF) and **migration importers** (`quiver admin import` for Qdrant/Chroma/pgvector); `v0.5.0` added **HNSW incremental delete**, a neighbor-bounded IVF reassignment, a unified secure database-open path across the server/MCP/CLI, and the design for a durable on-disk incremental index. `v0.6.0` made that durable index real — the IVF index now loads on open (snapshot + WAL-tail replay) instead of an `O(N)` rebuild, crash-gated — and added a **live Qdrant migration connector** (`quiver admin import --qdrant-url`). `v0.7.0` adds **multi-vector / late-interaction (ColBERT) retrieval**: a collection can store each document as a set of token vectors and rank documents by **MaxSim** — reusing the row store (so the crash gate is untouched) and the IVF+PQ frugality path — reachable from the embeddable database, REST/gRPC, the MCP server, and the SDKs. `v0.8.0` extends migration to **live Chroma and Postgres connectors** (`quiver admin import --chroma-url` / `--postgres-url`), so all three supported sources can import directly from a running instance — no export step. `v0.9.0` adds **asynchronous leader-follower read replicas** (point a follower at a leader with `QUIVER_LEADER_URL`) — scaling reads and giving warm standbys without consensus or failover. `v0.10.0` adds an **experimental, opt-in DCPE vector-encryption mode** (`vector_encryption="dcpe"`): a client encrypts embeddings with a published distance-comparison-preserving scheme so an untrusted server can rank ciphertexts by approximate L2 distance without ever holding the plaintext vectors or the key — honestly labelled, since it is L2-only, not semantically secure, and leaks the approximate distance ordering by design. `v0.11.0` adds a **semantically secure** client-side mode (`vector_encryption="client_side"`): the server stores only XChaCha20-Poly1305 ciphertext plus a zero placeholder, learns nothing about the vectors (genuinely IND-CPA), and does no ranking — so the client fetches the (optionally pre-filtered) set and ranks locally, with native Rust/Python/TypeScript ciphers validated by a bit-exact cross-language test. Every performance/memory claim in this README is backed by a reproducible benchmark on documented reference hardware — until those numbers are recorded, that table stays empty rather than guess.
 
 ## Why Quiver
 
@@ -62,12 +62,17 @@ cargo run -p quiver-cli -- --help
 ```
 
 ```bash
-# planned (build from source today):
-cargo install quiver-cli       # or: docker run ghcr.io/achref-soua/quiver
+# install the `quiver` CLI from the cloned repo (a crates.io release and a
+# container image are on the roadmap — see the note below):
+cargo install --path crates/quiver-cli
 quiver serve                   # gRPC + REST, encrypted by default
 quiver tui                     # the cockpit
 quiver mcp                     # MCP server (stdio) so AI agents can drive Quiver
 ```
+
+> **Heads-up:** the `quiver-cli` crate currently on crates.io is an unrelated
+> third-party project — install from this repository (above), not with
+> `cargo install quiver-cli`.
 
 The [MCP server](./docs/mcp.md) exposes `create_collection`, `upsert`, `search`,
 `get`, `delete`, and the multi-vector `upsert_document` / `search_multi_vector` /
@@ -95,7 +100,7 @@ CI workflows exist under [`.github/workflows`](.github/workflows) but are **manu
 
 ## SDK & benchmarks
 
-The **Python SDK** lives in [`sdks/python`](./sdks/python) (`uv add quiver-client`):
+The **Python SDK** lives in [`sdks/python`](./sdks/python) (`pip install ./sdks/python`):
 
 ```python
 from quiver import Client, Point
@@ -106,7 +111,7 @@ with Client("http://127.0.0.1:6333", api_key="…") as q:
     hits = q.search("items", [0.1, 0.2, 0.3], k=5)
 ```
 
-The **TypeScript SDK** lives in [`sdks/typescript`](./sdks/typescript) (`pnpm add quiver-client`), dependency-free over the global `fetch`, and can pick the memory-frugal disk index:
+The **TypeScript SDK** lives in [`sdks/typescript`](./sdks/typescript) (`pnpm add ./sdks/typescript`), dependency-free over the global `fetch`, and can pick the memory-frugal disk index:
 
 ```ts
 import { Client } from "quiver-client";
@@ -117,7 +122,7 @@ await q.upsert("items", [{ id: "a", vector: [0.1, 0.2, 0.3], payload: { tag: "x"
 const hits = await q.search("items", [0.1, 0.2, 0.3], { k: 5 });
 ```
 
-A **LangChain** `VectorStore` adapter ships in `quiver.langchain` (`pip install quiver-client[langchain]`), and a **LlamaIndex** `VectorStore` in `quiver.llamaindex` (`pip install quiver-client[llamaindex]`) — so any Quiver index, including the memory-frugal disk path, backs a LangChain or LlamaIndex retriever. The LlamaIndex adapter maps `MetadataFilters` onto Quiver's hybrid pre-filter.
+A **LangChain** `VectorStore` adapter ships in `quiver.langchain` (`pip install "./sdks/python[langchain]"`), and a **LlamaIndex** `VectorStore` in `quiver.llamaindex` (`pip install "./sdks/python[llamaindex]"`) — so any Quiver index, including the memory-frugal disk path, backs a LangChain or LlamaIndex retriever. The LlamaIndex adapter maps `MetadataFilters` onto Quiver's hybrid pre-filter.
 
 **Client-side payload encryption** (ADR-0012): seal payload fields with a key the server never sees, so it stores and returns only ciphertext, while cleartext sibling fields stay server-filterable. The `PayloadCipher` helper ships in both SDKs (`quiver.encryption` / `quiver-client/encryption`) and a Rust reference (`quiver_crypto::payload`), sharing one XChaCha20-Poly1305 envelope byte-for-byte. The trust boundary is honest — it protects payloads, not vectors — and proven by a test that runs a server with at-rest encryption off and shows the sealed field never appears in plaintext over the API or on disk.
 
