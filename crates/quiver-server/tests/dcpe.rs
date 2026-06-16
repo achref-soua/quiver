@@ -115,7 +115,7 @@ async fn server_searches_encrypted_vectors_without_seeing_plaintext() {
         .post(format!("{base}/v1/collections"))
         .bearer_auth(key)
         .json(&json!({
-            "name": "vault", "dim": 8, "metric": "l2", "encrypted_vectors": true
+            "name": "vault", "dim": 8, "metric": "l2", "vector_encryption": "dcpe"
         }))
         .send()
         .await

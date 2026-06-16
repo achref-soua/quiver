@@ -166,7 +166,7 @@ async fn tls_secures_both_rest_and_grpc() {
                 pq_subspaces: None,
                 filterable: Vec::new(),
                 multivector: false,
-                encrypted_vectors: false,
+                vector_encryption: v1::VectorEncryption::None as i32,
             },
         ))
         .await

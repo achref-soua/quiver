@@ -12,7 +12,9 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use quiver_embed::{DistanceMetric, FieldType, FilterableField, IndexKind, IndexSpec};
+use quiver_embed::{
+    DistanceMetric, FieldType, FilterableField, IndexKind, IndexSpec, VectorEncryption,
+};
 use quiver_query::Filter;
 
 use crate::auth::Principal;
@@ -225,12 +227,16 @@ struct CollectionDto {
     filterable: Vec<FilterableFieldDto>,
     #[serde(skip_serializing_if = "is_false")]
     multivector: bool,
-    #[serde(skip_serializing_if = "is_false")]
-    encrypted_vectors: bool,
+    #[serde(skip_serializing_if = "is_none_encryption")]
+    vector_encryption: VectorEncryption,
 }
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_none_encryption(v: &VectorEncryption) -> bool {
+    *v == VectorEncryption::None
 }
 
 impl From<CollectionInfo> for CollectionDto {
@@ -244,7 +250,7 @@ impl From<CollectionInfo> for CollectionDto {
             pq_subspaces: info.index.pq_subspaces,
             filterable: info.filterable.into_iter().map(Into::into).collect(),
             multivector: info.multivector,
-            encrypted_vectors: info.encrypted_vectors,
+            vector_encryption: info.vector_encryption,
         }
     }
 }
@@ -264,7 +270,7 @@ struct CreateCollectionBody {
     #[serde(default)]
     multivector: bool,
     #[serde(default)]
-    encrypted_vectors: bool,
+    vector_encryption: VectorEncryption,
 }
 
 async fn create_collection(
@@ -286,7 +292,7 @@ async fn create_collection(
             index,
             filterable,
             body.multivector,
-            body.encrypted_vectors,
+            body.vector_encryption,
         )
         .await?;
     Ok(Json(info.into()))

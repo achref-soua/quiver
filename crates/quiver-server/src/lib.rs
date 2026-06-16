@@ -48,7 +48,7 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use quiver_crypto::AeadCodec;
 use quiver_embed::{
     Database, Descriptor, DistanceMetric, Dtype, FilterableField, IndexSpec, SearchParams,
-    WalEntry, WalOp,
+    VectorEncryption, WalEntry, WalOp,
 };
 use quiver_query::Filter;
 
@@ -283,7 +283,7 @@ pub(crate) struct CollectionInfo {
     pub index: IndexSpec,
     pub filterable: Vec<FilterableField>,
     pub multivector: bool,
-    pub encrypted_vectors: bool,
+    pub vector_encryption: VectorEncryption,
 }
 
 /// A point to upsert.
@@ -422,7 +422,7 @@ impl AppState {
         index: IndexSpec,
         filterable: Vec<FilterableField>,
         multivector: bool,
-        encrypted_vectors: bool,
+        vector_encryption: VectorEncryption,
     ) -> Result<CollectionInfo, Error> {
         self.ensure_writable("create_collection")?;
         self.authorize(principal, Action::Admin, "create_collection", &name)?;
@@ -430,7 +430,7 @@ impl AppState {
             .with_index(index)
             .with_filterable(filterable.clone())
             .with_multivector(multivector)
-            .with_encrypted_vectors(encrypted_vectors);
+            .with_vector_encryption(vector_encryption);
         let owned = name.clone();
         let result = self
             .run_blocking(move |db| db.create_collection(&owned, descriptor))
@@ -450,7 +450,7 @@ impl AppState {
             index,
             filterable,
             multivector,
-            encrypted_vectors,
+            vector_encryption,
         })
     }
 
@@ -480,7 +480,7 @@ impl AppState {
                 index: descriptor.index,
                 filterable: descriptor.filterable,
                 multivector: descriptor.multivector,
-                encrypted_vectors: descriptor.encrypted_vectors,
+                vector_encryption: descriptor.vector_encryption,
             })
         })
         .await
@@ -509,7 +509,7 @@ impl AppState {
                             index: descriptor.index,
                             filterable: descriptor.filterable,
                             multivector: descriptor.multivector,
-                            encrypted_vectors: descriptor.encrypted_vectors,
+                            vector_encryption: descriptor.vector_encryption,
                         });
                     }
                 }

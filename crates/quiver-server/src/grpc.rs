@@ -7,7 +7,9 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use quiver_embed::{DistanceMetric, FieldType, FilterableField, IndexKind, IndexSpec, WalOp};
+use quiver_embed::{
+    DistanceMetric, FieldType, FilterableField, IndexKind, IndexSpec, VectorEncryption, WalOp,
+};
 use quiver_proto::v1::{
     self,
     quiver_server::{Quiver, QuiverServer},
@@ -89,6 +91,24 @@ fn field_type_from_proto(value: i32) -> FieldType {
     }
 }
 
+fn vector_encryption_from_proto(value: i32) -> VectorEncryption {
+    match v1::VectorEncryption::try_from(value) {
+        Ok(v1::VectorEncryption::Dcpe) => VectorEncryption::Dcpe,
+        Ok(v1::VectorEncryption::ClientSide) => VectorEncryption::ClientSide,
+        // NONE and any unknown value map to plaintext.
+        _ => VectorEncryption::None,
+    }
+}
+
+fn vector_encryption_to_proto(encryption: VectorEncryption) -> i32 {
+    let value = match encryption {
+        VectorEncryption::None => v1::VectorEncryption::None,
+        VectorEncryption::Dcpe => v1::VectorEncryption::Dcpe,
+        VectorEncryption::ClientSide => v1::VectorEncryption::ClientSide,
+    };
+    value as i32
+}
+
 fn field_type_to_proto(field_type: FieldType) -> i32 {
     let value = match field_type {
         FieldType::Numeric => v1::FieldType::Numeric,
@@ -127,7 +147,7 @@ fn collection_to_proto(info: CollectionInfo) -> v1::Collection {
         pq_subspaces: info.index.pq_subspaces,
         filterable: filterable_to_proto(info.filterable),
         multivector: info.multivector,
-        encrypted_vectors: info.encrypted_vectors,
+        vector_encryption: vector_encryption_to_proto(info.vector_encryption),
     }
 }
 
@@ -291,7 +311,7 @@ impl Quiver for QuiverService {
                 index,
                 filterable,
                 req.multivector,
-                req.encrypted_vectors,
+                vector_encryption_from_proto(req.vector_encryption),
             )
             .await
             .map_err(|e| e.to_status())?;
