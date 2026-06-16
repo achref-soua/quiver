@@ -50,7 +50,7 @@ Quiver is built phase by phase. A phase is not "done" until its Definition of Do
 
 ## Phase 4 — Advanced / stretch features → `v0.4.0`, `v0.5.0`, … (launch is `v1.0.0`, several releases out)
 
-Unlike the earlier phases, Phase 4 is a **backlog shipped incrementally**: each minor release (`v0.4.0`, `v0.5.0`, …) delivers a coherent, owner-gated subset, and **`v1.0.0` is reserved for the launch release** once the backlog and the launch polish below are complete. Releases ship incrementally — **`v0.4.0`**, **`v0.5.0`**, **`v0.6.0`**, **`v0.7.0`**, **`v0.8.0`**, **`v0.9.0`**, and **`v0.10.0`** are out; we remain deliberately far from `v1.0.0`.
+Unlike the earlier phases, Phase 4 is a **backlog shipped incrementally**: each minor release (`v0.4.0`, `v0.5.0`, …) delivers a coherent, owner-gated subset, and **`v1.0.0` is reserved for the launch release** once the backlog and the launch polish below are complete. Releases ship incrementally — **`v0.4.0`**, **`v0.5.0`**, **`v0.6.0`**, **`v0.7.0`**, **`v0.8.0`**, **`v0.9.0`**, **`v0.10.0`**, and **`v0.11.0`** are out; we remain deliberately far from `v1.0.0`.
 
 **Backlog (rough priority):** incremental in-place updates (SpFresh-style); migration importers (Qdrant/Chroma/pgvector); multi-vector / late-interaction scoring; optional leader-follower replication (clearly labeled); the **experimental** DCPE feature flag (published scheme only, honest caveats); then the launch polish — docs site, benchmark-table fill-in, regenerated TUI cast, published load-test results.
 
