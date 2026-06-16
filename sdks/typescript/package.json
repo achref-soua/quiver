@@ -14,6 +14,10 @@
     "./encryption": {
       "types": "./dist/encryption.d.ts",
       "import": "./dist/encryption.js"
+    },
+    "./vector": {
+      "types": "./dist/vector.d.ts",
+      "import": "./dist/vector.js"
     }
   },
   "files": [

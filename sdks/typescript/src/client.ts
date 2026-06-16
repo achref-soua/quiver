@@ -7,6 +7,11 @@
 // by the caller — Quiver is model-agnostic. Uses the global `fetch`, so it runs
 // on Node >= 20 and modern runtimes with no dependencies.
 
+// Type-only import (erased at compile time, so no runtime dependency is added)
+// for the client-side search helper; the cipher itself lives at the
+// `quiver-client/vector` subpath to keep this core client dependency-free.
+import type { VectorCipher } from "./vector.js";
+
 const DEFAULT_BASE_URL = "http://127.0.0.1:6333";
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -58,6 +63,13 @@ export type IndexKind = "hnsw" | "vamana" | "disk_vamana" | "ivf";
 /** A distance metric. */
 export type Metric = "l2" | "cosine" | "dot";
 
+/** Client-side vector encryption mode — the server never holds the key (ADR-0031,
+ * ADR-0032): `none` (plaintext, the server ranks), `dcpe` (the server ranks
+ * ciphertexts but leaks distance ordering by design; not semantically secure), or
+ * `client_side` (semantically secure opaque AEAD; the server does not rank, so you
+ * fetch and rank locally). */
+export type VectorEncryption = "none" | "dcpe" | "client_side";
+
 /** The value type of a filterable payload field (ADR-0022). */
 export type FieldType = "keyword" | "numeric";
 
@@ -77,7 +89,7 @@ export interface CollectionInfo {
   pqSubspaces?: number;
   filterable: FilterableField[];
   multivector: boolean;
-  encryptedVectors: boolean;
+  vectorEncryption: VectorEncryption;
 }
 
 /** Options for constructing a {@link Client}. */
@@ -100,11 +112,13 @@ export interface CreateCollectionOptions {
   /** Create a multi-vector (late-interaction / ColBERT) collection. */
   multivector?: boolean;
   /**
-   * Create an experimental DCPE-encrypted collection (ADR-0031): vectors are
-   * encrypted client-side with property-preserving encryption before upserting.
-   * Requires the `l2` metric and is not semantically secure.
+   * Client-side vector encryption (the server never holds the key): `"dcpe"` is
+   * experimental property-preserving encryption (ADR-0031; the server ranks,
+   * requires `l2`, not semantically secure); `"client_side"` is semantically
+   * secure opaque AEAD (ADR-0032; the server does not rank — use
+   * {@link Client.fetch} / {@link Client.searchClientSide}). Defaults to `"none"`.
    */
-  encryptedVectors?: boolean;
+  vectorEncryption?: VectorEncryption;
 }
 
 /** Options for {@link Client.search}. */
@@ -115,6 +129,27 @@ export interface SearchOptions {
   efSearch?: number;
   withPayload?: boolean;
   withVector?: boolean;
+}
+
+/** Options for {@link Client.fetch}. */
+export interface FetchOptions {
+  /** A Quiver payload filter expression to narrow the set. */
+  filter?: unknown;
+  /** Maximum number of points to return (default 100). */
+  limit?: number;
+  withPayload?: boolean;
+  withVector?: boolean;
+}
+
+/** Options for {@link Client.searchClientSide}. */
+export interface ClientSideSearchOptions {
+  k?: number;
+  /** A Quiver payload filter expression (applied server-side, on cleartext fields). */
+  filter?: unknown;
+  /** Metric to rank by, client-side (default `"l2"`). */
+  metric?: Metric;
+  /** How many candidates to fetch before ranking locally (default 10000). */
+  candidateLimit?: number;
 }
 
 /** A synchronous-feeling, promise-based Quiver REST client. */
@@ -153,7 +188,9 @@ export class Client {
       }));
     }
     if (opts.multivector) body["multivector"] = true;
-    if (opts.encryptedVectors) body["encrypted_vectors"] = true;
+    if (opts.vectorEncryption && opts.vectorEncryption !== "none") {
+      body["vector_encryption"] = opts.vectorEncryption;
+    }
     return toCollection(await this.#json("POST", "/v1/collections", body));
   }
 
@@ -230,6 +267,61 @@ export class Client {
       payload: m.payload,
       vector: m.vector,
     }));
+  }
+
+  /** Fetch points without ranking; an optional payload `filter` narrows the set
+   * and `limit` bounds it. The retrieval path for `client_side`-encrypted
+   * collections (ADR-0032): the server returns the entitled set (each payload
+   * carries the sealed vector under `__quiver_vec__`) and you decrypt and rank
+   * locally (see {@link searchClientSide}). Also a general list-points call for
+   * any collection; returned matches carry `score` 0. */
+  async fetch(collection: string, opts: FetchOptions = {}): Promise<Match[]> {
+    const body: Record<string, unknown> = {
+      limit: opts.limit ?? 100,
+      with_payload: opts.withPayload ?? true,
+      with_vector: opts.withVector ?? false,
+    };
+    if (opts.filter !== undefined) body["filter"] = opts.filter;
+    const res = (await this.#json(
+      "POST",
+      `/v1/collections/${encodeURIComponent(collection)}/fetch`,
+      body,
+    )) as { points?: Match[] };
+    return (res.points ?? []).map((p) => ({
+      id: p.id,
+      score: 0,
+      payload: p.payload,
+      vector: p.vector,
+    }));
+  }
+
+  /** Nearest-neighbour search over a `client_side`-encrypted collection (ADR-0032),
+   * done entirely client-side: {@link fetch} the (optionally filtered) candidate
+   * set, decrypt each vector with `cipher` (a `VectorCipher` from
+   * `quiver-client/vector`), rank by metric, and return the top `k`. The server
+   * never ranks and never sees the key. This mode suits small/medium or
+   * pre-filtered collections; `candidateLimit` bounds how many points are fetched
+   * before ranking. Each result carries the decrypted `vector` and a `score` under
+   * the chosen metric. */
+  async searchClientSide(
+    collection: string,
+    query: number[],
+    cipher: VectorCipher,
+    opts: ClientSideSearchOptions = {},
+  ): Promise<Match[]> {
+    const metric = opts.metric ?? "l2";
+    const points = await this.fetch(collection, {
+      filter: opts.filter,
+      limit: opts.candidateLimit ?? 10000,
+      withPayload: true,
+    });
+    const ranked = points.map((m) => {
+      const vector = cipher.open(m.payload);
+      const [ordering, score] = clientSideScore(metric, query, vector);
+      return { ordering, match: { id: m.id, score, payload: m.payload, vector } };
+    });
+    ranked.sort((a, b) => a.ordering - b.ordering);
+    return ranked.slice(0, opts.k ?? 10).map((r) => r.match);
   }
 
   // --- documents (multi-vector / late interaction) ---
@@ -320,6 +412,30 @@ export class Client {
   }
 }
 
+function clientSideScore(
+  metric: Metric,
+  query: number[],
+  vector: number[],
+): [number, number] {
+  if (metric === "l2") {
+    let d = 0;
+    for (let i = 0; i < query.length; i++) {
+      const diff = (query[i] ?? 0) - (vector[i] ?? 0);
+      d += diff * diff;
+    }
+    return [d, d];
+  }
+  let dot = 0;
+  for (let i = 0; i < query.length; i++) dot += (query[i] ?? 0) * (vector[i] ?? 0);
+  if (metric === "dot") return [-dot, dot];
+  let nq = 0;
+  let nv = 0;
+  for (let i = 0; i < query.length; i++) nq += (query[i] ?? 0) ** 2;
+  for (let i = 0; i < vector.length; i++) nv += (vector[i] ?? 0) ** 2;
+  const sim = dot / ((Math.sqrt(nq) || 1) * (Math.sqrt(nv) || 1));
+  return [-sim, sim];
+}
+
 function toCollection(body: unknown): CollectionInfo {
   const b = body as Record<string, unknown>;
   return {
@@ -336,7 +452,10 @@ function toCollection(body: unknown): CollectionInfo {
         }))
       : [],
     multivector: Boolean(b["multivector"]),
-    encryptedVectors: Boolean(b["encrypted_vectors"]),
+    vectorEncryption:
+      typeof b["vector_encryption"] === "string"
+        ? (b["vector_encryption"] as VectorEncryption)
+        : "none",
   };
 }
 

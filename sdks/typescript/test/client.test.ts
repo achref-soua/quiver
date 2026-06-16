@@ -150,22 +150,54 @@ describe("Quiver TypeScript client", () => {
     expect(await new Client("http://x", { fetch: down }).healthz()).toBe(false);
   });
 
-  it("createCollection sends encrypted_vectors and parses it back", async () => {
+  it("createCollection sends vector_encryption and parses it back", async () => {
     let createBody: Record<string, unknown> | undefined;
     const fetch = mockFetch(async (path, _method, init) => {
       if (path === "/v1/collections") {
         createBody = parseBody(init);
-        return json({ name: "vault", dim: 8, metric: "l2", count: 0, encrypted_vectors: true });
+        return json({
+          name: "vault",
+          dim: 8,
+          metric: "l2",
+          count: 0,
+          vector_encryption: "client_side",
+        });
       }
       return json({}, 404);
     });
     const client = new Client("http://x", { fetch });
     const info = await client.createCollection("vault", 8, {
       metric: "l2",
-      encryptedVectors: true,
+      vectorEncryption: "client_side",
     });
-    expect(info.encryptedVectors).toBe(true);
-    expect(createBody?.["encrypted_vectors"]).toBe(true);
+    expect(info.vectorEncryption).toBe("client_side");
+    expect(createBody?.["vector_encryption"]).toBe("client_side");
+  });
+
+  it("fetch returns unranked points and searchClientSide ranks locally", async () => {
+    const { VectorCipher } = await import("../src/vector.js");
+    const cipher = VectorCipher.fromHex("11".repeat(32));
+    const near = [0.75, 0.25, 0.0]; // exact in f32 ⇒ exact round-trip
+    const far = [0.0, 1.0, 1.0];
+    const fetch = mockFetch(async (path) => {
+      if (path === "/v1/collections/vault/fetch") {
+        return json({
+          points: [
+            { id: "far", payload: cipher.seal(far) },
+            { id: "near", payload: cipher.seal(near) },
+          ],
+        });
+      }
+      return json({}, 404);
+    });
+    const client = new Client("http://x", { fetch });
+    const points = await client.fetch("vault", { limit: 10 });
+    expect(points.map((p) => p.id)).toEqual(["far", "near"]);
+    expect(points.every((p) => p.score === 0)).toBe(true);
+    const hits = await client.searchClientSide("vault", [1.0, 0.0, 0.0], cipher, { k: 1 });
+    expect(hits.length).toBe(1);
+    expect(hits[0]?.id).toBe("near");
+    expect(hits[0]?.vector).toEqual(near);
   });
 
   it("multivector documents: create, upsert, search, and delete", async () => {
