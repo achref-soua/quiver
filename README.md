@@ -35,6 +35,8 @@ A Cargo workspace: a from-scratch storage engine, index structures, SIMD distanc
 
 ## Quickstart
 
+> **Full documentation** lives in the [docs site](./apps/docs) (an mdBook; build it with `just docs`, or read the chapters under [`apps/docs/src`](./apps/docs/src)) — concepts, self-hosting, every feature, the API/MCP/SDK references, the security docs, and an architecture deep dive.
+
 Pre-built binaries and container images are on the roadmap; today, build from source:
 
 ```bash
@@ -189,6 +191,7 @@ Every option is an environment variable with a secure default; see [`.env.exampl
 
 ## Project
 
+- **Documentation site** — [`apps/docs`](./apps/docs) (mdBook; `just docs`)
 - **Roadmap & Definitions of Done** — [`docs/roadmap.md`](./docs/roadmap.md)
 - **Security policy** — [`SECURITY.md`](./SECURITY.md) · **Threat model** — [`docs/security/threat-model.md`](./docs/security/threat-model.md)
 - **Contributing** — [`CONTRIBUTING.md`](./CONTRIBUTING.md)
