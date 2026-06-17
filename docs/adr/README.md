@@ -54,5 +54,6 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0033](0033-graph-incremental-freshdiskann.md) | Graph-index incremental updates (FreshDiskANN StreamingMerge) | Accepted | 4 |
 | [0034](0034-multivector-followups.md) | Multi-vector follow-ups (incremental maintenance, native rows, ColBERTv2/PLAID) | Accepted | 4 |
 | [0035](0035-docs-site-and-dcpe-hardening.md) | Documentation site (mdBook), DCPE hardening (shuffle + normalisation), native TS cipher | Accepted | 4 |
+| [0036](0036-retro-cockpit-design-system.md) | Retro cockpit design system (Bronze Quiver theme, logo, decoration vocabulary) | Proposed | 4 |
 
 Phase-0 ADRs (0001–0018) are Accepted; Phase-2 decisions span 0019–0022; Phase-4 decisions begin at 0023. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.
