@@ -3,8 +3,9 @@
 //! and a collection browser over a running server's REST surface.
 //!
 //! The cockpit polls `/readyz` and `/v1/collections` and shows connection
-//! health, aggregate counts, and a per-collection browser in a phosphor-amber
-//! theme. Pressing `v`/`enter` on a collection opens the **constellation view**:
+//! health, aggregate counts, and a per-collection browser in the **Bronze Quiver**
+//! retro theme (ADR-0036) — bronze chrome, a 3-D arrowhead logo, verdigris accents.
+//! Pressing `v`/`enter` on a collection opens the **constellation view**:
 //! a 2-D random-projection scatter of its vector space (fetched via
 //! `POST .../query` with vectors), with the query's nearest neighbour
 //! highlighted and a cursor that can re-query around any point. Richer
@@ -17,19 +18,22 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Points};
 use ratatui::widgets::{Block, Paragraph};
 use serde::Deserialize;
 use tokio_stream::StreamExt;
 
-/// Phosphor amber — the cockpit's primary colour.
-const AMBER: Color = Color::Rgb(255, 176, 0);
-/// A dimmer amber for secondary text and borders.
-const AMBER_DIM: Color = Color::Rgb(170, 117, 0);
-/// A soft red for an unreachable server.
-const OFFLINE: Color = Color::Rgb(220, 90, 80);
+mod logo;
+mod theme;
+
+/// Bronze chrome — the cockpit's primary colour (ADR-0036, sourced from [`theme`]).
+const AMBER: Color = theme::CHROME;
+/// Leather — secondary text and borders.
+const AMBER_DIM: Color = theme::DIM;
+/// Rust-red — an unreachable server.
+const OFFLINE: Color = theme::ALERT;
 
 /// How often the cockpit polls the server.
 const REFRESH: Duration = Duration::from_secs(2);
@@ -37,8 +41,8 @@ const REFRESH: Duration = Duration::from_secs(2);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 /// How many points the constellation view samples per query.
 const CONSTELLATION_K: usize = 256;
-/// Selected-point colour in the constellation (bright, against amber points).
-const SELECT: Color = Color::Rgb(255, 255, 255);
+/// Selected-point colour in the constellation (bright verdigris, against bronze points).
+const SELECT: Color = theme::ACCENT_HI;
 
 /// How to reach the server.
 #[derive(Debug, Clone)]
@@ -540,16 +544,18 @@ async fn run_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
 }
 
 fn ui(frame: &mut Frame, app: &App) {
-    let rows = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .split(frame.area());
-    frame.render_widget(header(app), rows[0]);
+    // Oak-black background across the whole cockpit (ADR-0036).
+    frame.render_widget(Block::new().style(Style::new().bg(theme::BG)), frame.area());
 
     match &app.view {
         View::Browser => {
+            let rows = Layout::vertical([
+                Constraint::Length(9), // the logo banner hero
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(frame.area());
+            frame.render_widget(banner_header(app), rows[0]);
             let body = Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)])
                 .split(rows[1]);
             frame.render_widget(status_panel(app), body[0]);
@@ -557,6 +563,13 @@ fn ui(frame: &mut Frame, app: &App) {
             frame.render_widget(footer(), rows[2]);
         }
         View::Constellation(view) => {
+            let rows = Layout::vertical([
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(frame.area());
+            frame.render_widget(compact_header(app), rows[0]);
             render_constellation(frame, rows[1], view);
             frame.render_widget(constellation_footer(), rows[2]);
         }
@@ -621,8 +634,8 @@ fn render_constellation(frame: &mut Frame, area: Rect, view: &ConstellationView)
     let canvas = Canvas::default()
         .block(
             Block::bordered()
-                .title(title)
-                .border_style(Style::new().fg(AMBER_DIM)),
+                .title(Span::styled(title, theme::chrome()))
+                .border_style(theme::border()),
         )
         .marker(ratatui::symbols::Marker::Braille)
         .x_bounds([-0.05, 1.05])
@@ -644,25 +657,41 @@ fn render_constellation(frame: &mut Frame, area: Rect, view: &ConstellationView)
     frame.render_widget(canvas, area);
 }
 
-fn header(app: &App) -> Paragraph<'_> {
-    let line = Line::from(vec![
-        Span::styled(
-            "QUIVER",
-            Style::new().fg(AMBER).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ▸  cockpit   ", Style::new().fg(AMBER_DIM)),
-        Span::styled(app.options.base_url.clone(), Style::new().fg(AMBER)),
-    ]);
-    Paragraph::new(line).block(Block::bordered().border_style(Style::new().fg(AMBER_DIM)))
+// The dashboard hero: the QUIVER logo banner (the V is a 3-D arrowhead) in a
+// bordered frame titled with the tagline and the server URL.
+fn banner_header(app: &App) -> Paragraph<'static> {
+    Paragraph::new(logo::banner()).block(
+        Block::bordered()
+            .border_style(theme::border())
+            .title(Line::from(Span::styled(
+                " QUIVER · the cockpit ",
+                theme::dim(),
+            )))
+            .title(
+                Line::from(Span::styled(
+                    format!(" {} ", app.options.base_url),
+                    theme::accent(),
+                ))
+                .right_aligned(),
+            ),
+    )
+}
+
+// A compact one-line header for the constellation view.
+fn compact_header(app: &App) -> Paragraph<'static> {
+    let mut spans = logo::compact().spans;
+    spans.push(Span::styled("   ", theme::dim()));
+    spans.push(Span::styled(app.options.base_url.clone(), theme::accent()));
+    Paragraph::new(Line::from(spans)).block(Block::bordered().border_style(theme::border()))
 }
 
 fn status_panel(app: &App) -> Paragraph<'_> {
     let agg = aggregate(&app.collections);
-    let (dot, label, color) = match &app.status {
-        ConnStatus::Connecting => ("◌", "connecting…".to_owned(), AMBER_DIM),
-        ConnStatus::Online { ready: true } => ("●", "online · ready".to_owned(), AMBER),
-        ConnStatus::Online { ready: false } => ("●", "online · not ready".to_owned(), AMBER_DIM),
-        ConnStatus::Offline(err) => ("●", format!("offline · {err}"), OFFLINE),
+    let (dot, label, style) = match &app.status {
+        ConnStatus::Connecting => ("◌", "connecting…".to_owned(), theme::dim()),
+        ConnStatus::Online { ready: true } => ("●", "online · ready".to_owned(), theme::ok()),
+        ConnStatus::Online { ready: false } => ("●", "online · not ready".to_owned(), theme::dim()),
+        ConnStatus::Offline(err) => ("●", format!("offline · {err}"), theme::alert()),
     };
     let refreshed = app
         .last_refresh
@@ -671,79 +700,78 @@ fn status_panel(app: &App) -> Paragraph<'_> {
 
     let lines = vec![
         Line::from(vec![
-            Span::styled(format!("{dot} "), Style::new().fg(color)),
-            Span::styled(label, Style::new().fg(color)),
+            Span::styled(format!("{dot} "), style),
+            Span::styled(label, style),
         ]),
         Line::from(""),
         kv("collections", &agg.collections.to_string()),
         kv("total points", &agg.total_points.to_string()),
         kv("refreshed", &refreshed),
         Line::from(""),
-        Line::from(Span::styled(
-            "encryption-at-rest: on",
-            Style::new().fg(AMBER_DIM),
-        )),
+        Line::from(vec![
+            Span::styled("encryption-at-rest ", theme::dim()),
+            Span::styled("● on", theme::ok()),
+        ]),
     ];
     Paragraph::new(lines).block(
         Block::bordered()
-            .title(" status ")
-            .border_style(Style::new().fg(AMBER_DIM)),
+            .title(Span::styled(" status ", theme::heading()))
+            .border_style(theme::border()),
     )
 }
 
 fn kv<'a>(key: &'a str, value: &str) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!("{key:<13}"), Style::new().fg(AMBER_DIM)),
-        Span::styled(value.to_owned(), Style::new().fg(AMBER)),
+        Span::styled(format!("{key:<13}"), theme::dim()),
+        Span::styled(value.to_owned(), theme::text()),
     ])
 }
 
 fn collections_panel(app: &App) -> Paragraph<'_> {
     let lines: Vec<Line> = if app.collections.is_empty() {
-        vec![Line::from(Span::styled(
-            "no collections yet",
-            Style::new().fg(AMBER_DIM),
-        ))]
+        vec![Line::from(Span::styled("no collections yet", theme::dim()))]
     } else {
         app.collections
             .iter()
             .enumerate()
             .map(|(i, c)| {
                 let selected = i == app.selected;
-                let marker = if selected { "▸ " } else { "  " };
-                let style = if selected {
-                    Style::new().fg(AMBER).add_modifier(Modifier::BOLD)
+                let (marker, style) = if selected {
+                    ("▸ ", theme::selected())
                 } else {
-                    Style::new().fg(AMBER)
+                    ("  ", theme::text())
                 };
-                Line::from(Span::styled(
-                    format!(
-                        "{marker}{:<24} dim={:<6} metric={:<8} count={}",
-                        c.name, c.dim, c.metric, c.count
+                Line::from(vec![
+                    Span::styled(marker, theme::accent()),
+                    Span::styled(
+                        format!(
+                            "{:<24} dim={:<6} metric={:<8} count={}",
+                            c.name, c.dim, c.metric, c.count
+                        ),
+                        style,
                     ),
-                    style,
-                ))
+                ])
             })
             .collect()
     };
     Paragraph::new(lines).block(
         Block::bordered()
-            .title(" collections ")
-            .border_style(Style::new().fg(AMBER_DIM)),
+            .title(Span::styled(" collections ", theme::heading()))
+            .border_style(theme::border_active()),
     )
 }
 
 fn footer() -> Paragraph<'static> {
     Paragraph::new(Line::from(Span::styled(
         " [q] quit   [r] refresh   [↑/↓] select   [v/enter] constellation ",
-        Style::new().fg(AMBER_DIM),
+        theme::dim(),
     )))
 }
 
 fn constellation_footer() -> Paragraph<'static> {
     Paragraph::new(Line::from(Span::styled(
         " [↑/↓] move cursor   [enter] query around point   [r] re-query   [esc] back   [q] quit ",
-        Style::new().fg(AMBER_DIM),
+        theme::dim(),
     )))
 }
 
