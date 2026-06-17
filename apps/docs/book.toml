@@ -1,0 +1,18 @@
+[book]
+title = "Quiver"
+description = "The security-first, memory-frugal vector database — concepts, self-hosting, features, API, SDKs, and security."
+authors = ["Achref Soua"]
+language = "en"
+src = "src"
+
+[output.html]
+preferred-dark-theme = "coal"
+git-repository-url = "https://github.com/achref-soua/quiver"
+edit-url-template = "https://github.com/achref-soua/quiver/edit/main/apps/docs/{path}"
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+limit-results = 20

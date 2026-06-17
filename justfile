@@ -36,6 +36,10 @@ fmt:
 doc:
     cargo doc --workspace --no-deps
 
+# Build the documentation site (requires mdbook: `cargo install mdbook`).
+docs:
+    mdbook build apps/docs
+
 # Dependency advisory scan — no suppressions; the tree is advisory-clean.
 audit:
     cargo audit
