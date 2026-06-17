@@ -35,21 +35,46 @@ SCN 2022) — the same scheme behind IronCore Labs' Cloaked AI. **No primitive i
 invented**; only the published composition, built from audited RustCrypto crates
 (ChaCha20, HMAC-SHA256, HKDF-SHA256).
 
-One master secret derives, via HKDF-SHA256, a secret scaling factor `s ∈ [1, 2)`,
-a CSPRNG key, and an HMAC key. To encrypt `m ∈ ℝ^d` with approximation factor
-`β ≥ 0`:
+This is **cipher v2** ([ADR-0035](../adr/0035-docs-site-and-dcpe-hardening.md)): it
+adds the paper's two hardening steps — a key-derived component **shuffle** and an
+optional ordering-preserving **normalisation** — on top of the core SAP cipher of
+[ADR-0031](../adr/0031-dcpe-vector-encryption.md). v2 is a breaking change from v1
+(v1 ciphertexts are not v2-decryptable); since the cipher is client-side, there is
+**no on-disk format change**.
 
-1. draw a fresh random 96-bit IV;
-2. seed ChaCha20 from `(prfKey, iv)` and sample a perturbation `λ` **uniformly in
+One master secret derives, via HKDF-SHA256, a secret scaling factor `s ∈ [1, 2)`,
+a CSPRNG key, a shuffle CSPRNG key, and an HMAC key. To encrypt `m ∈ ℝ^d` with
+approximation factor `β ≥ 0`:
+
+1. **normalise** (optional, ordering-preserving): apply a *fixed* global affine
+   transform `m₁ = (m − μ)·α` — a per-dimension shift vector `μ` (default `0`) and a
+   **single** positive scalar `α` (default `1`);
+2. **shuffle**: permute the components with a permutation `π` derived **from the key
+   alone** (HKDF sub-key + a fixed-IV ChaCha20 Fisher–Yates), identical for every
+   vector and query;
+3. draw a fresh random 96-bit IV;
+4. seed ChaCha20 from `(prfKey, iv)` and sample a perturbation `λ` **uniformly in
    the d-ball of radius `(s/4)·β`** (a Box-Muller Gaussian direction normalised
    and scaled by `radius = (s/4)·β·U^{1/d}`, `U ~ Uniform[0,1)`);
-3. the ciphertext vector is `c = s·m + λ`;
-4. an HMAC-SHA256 tag over `(domain ‖ β ‖ iv ‖ c)` gives tamper-evidence.
+5. the ciphertext vector is `c = s·π(m₁) + λ`;
+6. an HMAC-SHA256 tag over `(domain ‖ β ‖ iv ‖ c)`, with the domain bumped to
+   `quiver/dcpe/v2/tag`, gives tamper-evidence (a v1 ciphertext fails a v2 integrity
+   check — fail-closed — rather than decrypting to garbage).
 
 Decryption re-derives `λ` from `(prfKey, iv)` (the perturbation is pseudorandom,
-so it cancels), verifies the tag, and returns `(c − λ)/s`. A query is encrypted
-the same way: the secret `s` is identical for data and queries, so it cancels in
-distance ordering, while the bounded per-vector perturbations are the margin `β`.
+so it cancels), verifies the tag, and reverses the pipeline `m = T⁻¹(π⁻¹((c − λ)/s))`.
+A query is encrypted the same way: the secret `s`, the permutation `π`, and the
+normalisation are identical for data and queries, so they cancel in the distance
+ordering, while the bounded per-vector perturbations are the margin `β`.
+
+Both hardening steps **preserve the L2 distance-comparison ordering exactly**: L2
+distance is invariant under any permutation of coordinates (so the shuffle costs
+zero recall and only hides which ciphertext coordinate is which plaintext
+coordinate), and a uniform per-coordinate shift cancels in any difference while a
+single positive scalar scales every distance by the same factor (so normalisation
+just canonicalises the cloud's centroid and overall scale — making `β`'s meaning
+consistent across datasets). The shuffle and normalisation therefore harden the
+cipher **without changing its accuracy or its leakage class.**
 
 ## What it hides, and what it leaks — honestly
 
@@ -87,10 +112,21 @@ recall target; there is no universally correct value.
 - **L2 only.** The secret scaling changes vector norms, so cosine and inner-product
   orderings are not preserved. A DCPE collection must use the `l2` metric (the
   server rejects anything else with a 400).
-- **Encrypt and query from the same client**, with the same key and `β`.
+- **Encrypt and query from the same client**, with the same key, `β`, and
+  normalisation.
+- **Normalisation cannot whiten per-axis variance.** The optional normalisation is a
+  *global* affine transform (a per-axis shift plus a single scalar scale) because
+  that is the strongest normalisation that preserves the L2 distance-comparison
+  ordering. Standardising each dimension by its own variance is *anisotropic* — it
+  re-weights the dimensions in the L2 distance and so **breaks the ordering** the
+  untrusted server ranks on. Full per-axis whitening is therefore **incompatible**
+  with searchable DCPE and is deliberately not offered; supply real corpus
+  statistics (a per-axis mean as the shift, a global RMS radius as `1/scale`) to get
+  the normalisation that *is* compatible.
 - The float-valued ciphertext uses transcendental functions, so cross-language
-  reproduction is validated within a tolerance, not bit-exactly. The Rust module
-  `quiver_crypto::dcpe` is the canonical reference.
+  reproduction is validated within a tolerance, not bit-exactly (the integrity tag,
+  being over bytes, *is* bit-exact). The Rust module `quiver_crypto::dcpe` is the
+  canonical reference.
 
 ## Using it
 
@@ -108,9 +144,23 @@ with Client("https://…", api_key="…") as q:
     hits = q.search("vault", cipher.encrypt_query(my_query), k=10)
 ```
 
-The Rust reference (`quiver_crypto::dcpe::DcpeCipher`) is available to embedders;
-the MCP `create_collection` tool accepts `vector_encryption="dcpe"`; and the TypeScript
-SDK can create DCPE collections (a native TS cipher is a planned follow-up).
+A native cipher ships in all three languages — the Rust reference
+(`quiver_crypto::dcpe::DcpeCipher`, available to embedders), the Python
+`quiver.dcpe.DcpeCipher`, and the TypeScript `DcpeCipher` at the
+`quiver-client/dcpe` subpath (`pnpm add @stablelib/{chacha,hkdf,hmac,sha256}`):
+
+```ts
+import { DcpeCipher } from "quiver-client/dcpe";
+
+const cipher = DcpeCipher.fromHex("…64 hex chars…", 0.02);
+const sealed = cipher.encrypt([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+// upsert sealed.ciphertext; search with cipher.encryptQuery(myQuery).
+```
+
+To use the optional normalisation, build it from a one-time measurement of your
+corpus and pass it to the cipher (`Normalization` in each SDK; `with_normalization`
+on the Rust cipher). The MCP `create_collection` tool accepts
+`vector_encryption="dcpe"`.
 
 ## Key management
 
@@ -122,7 +172,17 @@ the vectors unrecoverable. Ideally use a distinct key per collection.
 
 Shipped in v0.10.0 ([ADR-0031](../adr/0031-dcpe-vector-encryption.md)): the core
 scale-and-perturb cipher with an integrity tag, the per-collection flag across the
-API/MCP/SDKs, the Python cipher, and an end-to-end gate proof. The paper's two
-security-boosting pre-processing steps — the secret component **shuffle** and
-**plaintext-distribution normalisation** — and a native **TypeScript** cipher are
-documented follow-ups.
+API/MCP/SDKs, the Python cipher, and an end-to-end gate proof.
+
+**Hardened to cipher v2 in v0.15.0**
+([ADR-0035](../adr/0035-docs-site-and-dcpe-hardening.md)): the paper's two
+security-boosting pre-processing steps now ship — the secret component **shuffle**
+(a key-derived permutation, an exact L2 isometry) and an ordering-preserving global
+**normalisation** (a per-dimension shift plus a single scalar scale) — together with
+a native **TypeScript** cipher, closing the SDK gap so Rust, Python, and TypeScript
+all have native DCPE ciphers validated against each other by a cross-language
+known-answer test. The honest limit recorded above stands: full per-axis variance
+whitening is incompatible with searchable encryption and is not offered. v2 is a
+breaking cipher change (v1 ciphertexts are not v2-decryptable), acceptable because
+DCPE is experimental, off by default, and stored as ordinary L2 vectors (no on-disk
+change).

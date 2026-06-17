@@ -1,6 +1,6 @@
 # ADR-0035: Documentation site, DCPE hardening, and a native TypeScript cipher
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-17
 - **Deciders:** Achref Soua
 
@@ -217,6 +217,56 @@ this ADR records the hardened `v2` cipher as the new state.
   complexity for an experimental, off-by-default, pre-1.0 feature with no on-disk
   footprint; a clean breaking change with a fail-closed domain is simpler and
   honest.
+
+## Implementation
+
+All four pieces shipped in `v0.15.0`.
+
+- **Docs site.** `apps/docs` is an mdBook (`book.toml` + `src/`) with a `just docs`
+  recipe. The connective chapters (introduction, concepts, quickstart,
+  self-hosting, the feature overviews, SDK usage, the ADR index) are authored in
+  `src/`; the deep reference chapters reuse the canonical top-level `docs/` via
+  mdBook `{{#include}}` (the four security docs, the architecture/index design, and
+  the migration / replication / REST-gRPC / MCP references), so there is a single
+  source of truth. The build stays out of `just verify` (ADR-0015); the built
+  `book/` is git-ignored.
+- **Quickstart polish.** The clean-clone build → run → first-query path was verified
+  end to end against a fresh build (CLI surface, default ports 6333/6334, the demo
+  key, and the Python/TypeScript SDK signatures all match; a live boot with
+  encryption-at-rest on created a collection, upserted, and searched through the
+  Python SDK). No drift was found; the README now points into the docs site.
+- **Native TypeScript `DcpeCipher`.** `sdks/typescript/src/dcpe.ts`, exported at the
+  `quiver-client/dcpe` subpath, ports the cipher using audited `@stablelib` packages
+  (`chacha`, `hkdf`, `hmac`, `sha256`) as optional peer dependencies. The 64-bit
+  keystream words are read with `BigInt` so the `u64` arithmetic matches Rust/Python
+  exactly.
+- **DCPE v2 hardening.** The Rust reference (`quiver_crypto::dcpe`), the Python port
+  (`quiver.dcpe`), and the new TS cipher all gained: a key-derived Fisher–Yates
+  **component shuffle** (HKDF sub-key `quiver/dcpe/v2/shuffle`, a ChaCha20 CSPRNG
+  with a fixed zero IV) applied identically to every vector and query; an optional
+  ordering-preserving global affine **`Normalization`** (a per-dimension shift plus a
+  single positive scalar scale); and the integrity-tag domain bumped to
+  `quiver/dcpe/v2/tag`. Per-axis variance whitening is **not** implemented — it is
+  anisotropic and would break the L2 distance-comparison ordering — and that limit is
+  documented in each cipher's module docs and in `docs/security/dcpe.md`. The cipher
+  is client-side, so there was no server/wire change and no on-disk format change.
+
+## Verification
+
+- **DCPE v2 cross-language KAT.** The Rust, Python, and TS ciphers are validated
+  against a single known-answer vector produced by the Rust reference: the
+  HMAC-SHA256 tag verifies **bit-exact** (HKDF + HMAC are deterministic across
+  languages) and the plaintext is recovered within float tolerance after
+  un-shuffling — proving all three agree, including the derived permutation
+  (`[2,6,1,5,7,0,4,3]` for the KAT key at `d=8`). Each language also tests the
+  shuffle (a valid, deterministic, key-dependent permutation; an effect at `β=0`),
+  normalisation (round-trip, nearest-neighbour preservation, and rejection of bad
+  parameters / dimension mismatch), and the prior DCPE properties (which still hold,
+  since the shuffle and normalisation are transparent when the same cipher encrypts
+  and queries). `just verify`, `just test-py` (50), and `just test-ts` (43) are green.
+- **Docs site.** `mdbook build apps/docs` is clean; the embedded canonical content
+  (the DCPE spec, the index design, migration, the threat model) renders and search
+  is built.
 
 ## References
 
