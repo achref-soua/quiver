@@ -38,8 +38,9 @@ use std::path::Path;
 
 use quiver_core::{SecPredicate, SecValue, Store};
 use quiver_index::{
-    DiskVamana, FreshDiskVamana, FreshVamana, Hnsw, HnswConfig, Index, Ivf, IvfConfig, Metric,
-    Neighbor, ProductQuantizer, Vamana, VamanaConfig, max_sim, ordering_distance, report_metric,
+    ColbertConfig, ColbertIndex, DiskVamana, FreshDiskVamana, FreshVamana, Hnsw, HnswConfig, Index,
+    Ivf, IvfConfig, Metric, Neighbor, ProductQuantizer, Vamana, VamanaConfig, max_sim,
+    ordering_distance, report_metric,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -196,6 +197,10 @@ enum CollectionIndex {
     // (encrypted) SSD, exact re-rank (ADR-0019), with a FreshDiskANN in-memory
     // delta layered on top so the on-disk artifact stays immutable.
     Disk(Option<FreshDiskVamana>),
+    // The ColBERTv2/PLAID compressed token-pool index for a multi-vector
+    // collection (ADR-0034): centroid + residual-PQ codes with centroid-pruned
+    // candidate generation.
+    Colbert(Option<ColbertIndex>),
 }
 
 impl CollectionIndex {
@@ -206,10 +211,12 @@ impl CollectionIndex {
             CollectionIndex::Vamana(Some(g)) => g.search(query, k, ef)?,
             CollectionIndex::Ivf(Some(i)) => i.search(query, k, ef)?,
             CollectionIndex::Disk(Some(d)) => d.search(query, k, ef)?,
+            CollectionIndex::Colbert(Some(c)) => c.search(query, k, ef)?,
             CollectionIndex::None
             | CollectionIndex::Vamana(None)
             | CollectionIndex::Ivf(None)
-            | CollectionIndex::Disk(None) => Vec::new(),
+            | CollectionIndex::Disk(None)
+            | CollectionIndex::Colbert(None) => Vec::new(),
         })
     }
 }
@@ -1072,6 +1079,13 @@ fn validate_index(descriptor: &Descriptor) -> Result<()> {
             "dcpe-encrypted collections require the l2 metric",
         ));
     }
+    // ColBERT is a late-interaction token-pool index (ADR-0034): valid only for a
+    // multi-vector collection (which already requires a similarity metric).
+    if descriptor.index.kind == IndexKind::Colbert && !descriptor.multivector {
+        return Err(Error::Unsupported(
+            "the colbert index is only for multi-vector collections",
+        ));
+    }
     match descriptor.index.kind {
         IndexKind::Vamana | IndexKind::Ivf | IndexKind::DiskVamana
             if descriptor.metric == DistanceMetric::Dot =>
@@ -1093,6 +1107,7 @@ fn empty_index(descriptor: &Descriptor) -> CollectionIndex {
         IndexKind::Vamana => CollectionIndex::Vamana(None),
         IndexKind::DiskVamana => CollectionIndex::Disk(None),
         IndexKind::Ivf => CollectionIndex::Ivf(None),
+        IndexKind::Colbert => CollectionIndex::Colbert(None),
         _ => CollectionIndex::Hnsw(Hnsw::new(
             descriptor.dim as usize,
             to_index_metric(descriptor.metric),
@@ -1149,6 +1164,22 @@ fn build_index(
                 ..IvfConfig::default()
             };
             CollectionIndex::Ivf(Some(Ivf::build(ids, flat, dim, metric, cfg)?))
+        }
+        IndexKind::Colbert => {
+            // Coarse centroids scale ~√(tokens); probe a quarter of them (PLAID),
+            // and PQ the residual with the same subspace default as the disk path.
+            let n = ids.len();
+            let n_centroids = ((n as f64).sqrt().ceil() as usize).clamp(1, 4096);
+            let cfg = ColbertConfig {
+                n_centroids,
+                n_probe: n_centroids.div_ceil(4).clamp(1, n_centroids),
+                pq_subspaces: descriptor
+                    .index
+                    .pq_subspaces
+                    .map_or_else(|| default_pq_m(dim), |m| m as usize),
+                seed: PQ_SEED,
+            };
+            CollectionIndex::Colbert(Some(ColbertIndex::build(ids, flat, dim, metric, cfg)?))
         }
         _ => {
             let mut h = Hnsw::new(dim, metric, HnswConfig::default());
@@ -1272,6 +1303,7 @@ fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32
         handle.index,
         CollectionIndex::Vamana(Some(_)) | CollectionIndex::Disk(Some(_))
     );
+    let is_live_colbert = matches!(handle.index, CollectionIndex::Colbert(Some(_)));
     if is_hnsw && !known {
         let internal = handle.int_to_ext.len() as u64;
         if let CollectionIndex::Hnsw(h) = &mut handle.index {
@@ -1321,6 +1353,25 @@ fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32
         if pending >= GRAPH_REBUILD_PENDING_FRACTION {
             handle.stale = true;
         }
+    } else if is_live_colbert {
+        // ColBERT appends a new token and tombstones the prior copy on an update —
+        // its centroids are fixed until a rebuild (ADR-0034); the deletion fraction
+        // drives consolidation, as for HNSW.
+        let old = handle.ext_to_int.get(ext_id).copied();
+        let internal = handle.int_to_ext.len() as u64;
+        let mut crowded = false;
+        if let CollectionIndex::Colbert(Some(c)) = &mut handle.index {
+            if let Some(o) = old {
+                c.mark_deleted(o);
+            }
+            c.insert(internal, vector)?;
+            crowded = c.deleted_fraction() >= HNSW_REBUILD_DELETED_FRACTION;
+        }
+        handle.ext_to_int.insert(ext_id.to_owned(), internal);
+        handle.int_to_ext.push(ext_id.to_owned());
+        if crowded {
+            handle.stale = true;
+        }
     } else {
         handle.stale = true;
     }
@@ -1344,6 +1395,7 @@ fn index_delete_point(handle: &mut CollectionHandle, ext_id: &str) {
         handle.index,
         CollectionIndex::Vamana(Some(_)) | CollectionIndex::Disk(Some(_))
     );
+    let live_colbert = matches!(handle.index, CollectionIndex::Colbert(Some(_)));
     match internal {
         Some(internal) if live_ivf => {
             if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
@@ -1372,6 +1424,16 @@ fn index_delete_point(handle: &mut CollectionHandle, ext_id: &str) {
                     crowded = fresh.pending_fraction() >= GRAPH_REBUILD_PENDING_FRACTION;
                 }
                 _ => {}
+            }
+            if crowded {
+                handle.stale = true;
+            }
+        }
+        Some(internal) if live_colbert => {
+            let mut crowded = false;
+            if let CollectionIndex::Colbert(Some(c)) = &mut handle.index {
+                c.mark_deleted(internal);
+                crowded = c.deleted_fraction() >= HNSW_REBUILD_DELETED_FRACTION;
             }
             if crowded {
                 handle.stale = true;
@@ -2204,7 +2266,12 @@ mod tests {
         // relies on is the same code the single-vector index tests exercise.)
         let dir = |theta: f32| vec![theta.cos(), theta.sin(), 0.0, 0.0];
         let doc = |theta: f32| vec![dir(theta), dir(theta)];
-        for kind in [IndexKind::Ivf, IndexKind::Hnsw, IndexKind::Vamana] {
+        for kind in [
+            IndexKind::Ivf,
+            IndexKind::Hnsw,
+            IndexKind::Vamana,
+            IndexKind::Colbert,
+        ] {
             let tmp = tempfile::tempdir().unwrap();
             let desc = Descriptor::new(4, Dtype::F32, DistanceMetric::Cosine)
                 .with_multivector(true)
@@ -2277,6 +2344,30 @@ mod tests {
                 "{kind:?} deleted doc resurfaced"
             );
         }
+    }
+
+    #[test]
+    fn colbert_index_requires_multivector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        // ColBERT is a late-interaction token-pool index — invalid for a
+        // single-vector collection (ADR-0034).
+        let single = Descriptor::new(4, Dtype::F32, DistanceMetric::Cosine).with_index(IndexSpec {
+            kind: IndexKind::Colbert,
+            pq_subspaces: None,
+        });
+        assert!(matches!(
+            db.create_collection("c", single),
+            Err(Error::Unsupported(_))
+        ));
+        // ...but valid for a multi-vector collection.
+        let multi = Descriptor::new(4, Dtype::F32, DistanceMetric::Cosine)
+            .with_multivector(true)
+            .with_index(IndexSpec {
+                kind: IndexKind::Colbert,
+                pq_subspaces: None,
+            });
+        assert!(db.create_collection("m", multi).is_ok());
     }
 
     // ---- hybrid (pre-filtered) search ----
