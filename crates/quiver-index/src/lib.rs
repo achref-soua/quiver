@@ -9,6 +9,7 @@
 //! to `quiver-simd`. Design: `docs/index/design.md`, ADR-0007, ADR-0008.
 
 pub mod disk;
+mod fresh;
 mod hnsw;
 mod ivf;
 mod kmeans;
@@ -18,6 +19,7 @@ mod score;
 mod vamana;
 
 pub use disk::{DiskError, DiskSearchParams, DiskVamana};
+pub use fresh::{FreshDiskVamana, FreshVamana};
 pub use hnsw::{Hnsw, HnswConfig};
 pub use ivf::{Ivf, IvfConfig, SnapshotError};
 pub use quant::{BinaryQuantizer, CodeScorer, ProductQuantizer, Quantizer, ScalarQuantizer};

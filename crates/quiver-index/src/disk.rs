@@ -344,6 +344,18 @@ impl DiskVamana {
         self.meta.n == 0
     }
 
+    /// Dimensionality of the indexed vectors.
+    #[must_use]
+    pub fn dim(&self) -> usize {
+        self.meta.dim as usize
+    }
+
+    /// The metric this index searches under.
+    #[must_use]
+    pub fn metric(&self) -> Metric {
+        self.meta.metric
+    }
+
     /// Search for the `k` nearest neighbors to `query`, closest first.
     ///
     /// # Errors
