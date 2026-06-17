@@ -48,6 +48,11 @@ pub enum IndexKind {
     DiskVamana,
     /// Inverted-file index with coarse Voronoi partitioning.
     Ivf,
+    /// ColBERTv2/PLAID compressed token-pool index for late-interaction
+    /// (`multivector`) collections: centroid + residual-PQ codes in RAM with
+    /// centroid-pruned candidate generation (ADR-0034). Valid only for a
+    /// `multivector` collection.
+    Colbert,
 }
 
 /// Which index a collection uses and how its vectors are compressed (ADR-0007,
