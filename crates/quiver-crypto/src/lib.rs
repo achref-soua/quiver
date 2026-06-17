@@ -43,7 +43,7 @@ pub mod payload;
 pub mod vector;
 
 pub use codec::{AeadCodec, KEY_LEN};
-pub use dcpe::{DcpeCipher, DcpeError, EncryptedVector};
+pub use dcpe::{DcpeCipher, DcpeError, EncryptedVector, Normalization};
 pub use envelope::EnvelopeKeyRing;
 pub use payload::{ENVELOPE_KEY, PayloadCipher, PayloadError, is_sealed};
 pub use vector::{VECTOR_ENVELOPE_KEY, VectorCipher, VectorError, is_sealed_vector};
