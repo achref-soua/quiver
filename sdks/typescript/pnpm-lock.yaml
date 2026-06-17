@@ -8,6 +8,18 @@ importers:
 
   .:
     devDependencies:
+      '@stablelib/chacha':
+        specifier: ^2.0.1
+        version: 2.0.1
+      '@stablelib/hkdf':
+        specifier: ^2.0.1
+        version: 2.0.1
+      '@stablelib/hmac':
+        specifier: ^2.0.1
+        version: 2.0.1
+      '@stablelib/sha256':
+        specifier: ^2.0.1
+        version: 2.0.1
       '@stablelib/xchacha20poly1305':
         specifier: ^2.0.1
         version: 2.0.1
@@ -157,11 +169,23 @@ packages:
   '@stablelib/constant-time@2.0.1':
     resolution: {integrity: sha512-0NWPogffRm+UWBH0+iM5otZmNrVe5OHFIvyoNIVankMAYOQzMwcdVALOVPrB5Ho0dST+Oc3H8/hPh65Z8R/uew==}
 
+  '@stablelib/hash@2.0.0':
+    resolution: {integrity: sha512-u3WPSqGido8lwJuMcrBgM5K54LrPGhkWAdtsyccf7dGsLixAZUds77zOAbu7bvKPwQlmoByH0txBi5rTmEKuHg==}
+
+  '@stablelib/hkdf@2.0.1':
+    resolution: {integrity: sha512-R8w5r43QpM92FhyGPsQAhd4KOKwhmMFgvihoRJjiEi/YNwwXlluQoYruNQxyBA1fEMmJ8QHtQvEZEX/Uyr6MwQ==}
+
+  '@stablelib/hmac@2.0.1':
+    resolution: {integrity: sha512-YDMEmogYNDWESU8ggMiTi4VDMfHt2XG+pgVskJCHuKVlmWwXxYKZ6bn5dq24/jU3vzZSajwKzRCU6iafT2OKUA==}
+
   '@stablelib/int@2.0.1':
     resolution: {integrity: sha512-Ht63fQp3wz/F8U4AlXEPb7hfJOIILs8Lq55jgtD7KueWtyjhVuzcsGLSTAWtZs3XJDZYdF1WcSKn+kBtbzupww==}
 
   '@stablelib/poly1305@2.0.1':
     resolution: {integrity: sha512-D8xfZcL/5zeVARJ9I2fZOUCnZvsJx8G4JDQvD+ecsnaCildPtqZDwqqjtOc4cfHAdScrMjOzUVsssjXUTBw3YQ==}
+
+  '@stablelib/sha256@2.0.1':
+    resolution: {integrity: sha512-LA1PaLDc6Lv72ppA4PEZ7abDE741KfG7k7QhBiUyIfViMqrwWv8HqQQFPeuPfS4k2OxFv++IAgc8HlvdBatD+w==}
 
   '@stablelib/wipe@2.0.1':
     resolution: {integrity: sha512-1eU2K9EgOcV4qc9jcP6G72xxZxEm5PfeI5H55l08W95b4oRJaqhmlWRc4xZAm6IVSKhVNxMi66V67hCzzuMTAg==}
@@ -593,11 +617,31 @@ snapshots:
 
   '@stablelib/constant-time@2.0.1': {}
 
+  '@stablelib/hash@2.0.0': {}
+
+  '@stablelib/hkdf@2.0.1':
+    dependencies:
+      '@stablelib/hash': 2.0.0
+      '@stablelib/hmac': 2.0.1
+      '@stablelib/wipe': 2.0.1
+
+  '@stablelib/hmac@2.0.1':
+    dependencies:
+      '@stablelib/constant-time': 2.0.1
+      '@stablelib/hash': 2.0.0
+      '@stablelib/wipe': 2.0.1
+
   '@stablelib/int@2.0.1': {}
 
   '@stablelib/poly1305@2.0.1':
     dependencies:
       '@stablelib/constant-time': 2.0.1
+      '@stablelib/wipe': 2.0.1
+
+  '@stablelib/sha256@2.0.1':
+    dependencies:
+      '@stablelib/binary': 2.0.1
+      '@stablelib/hash': 2.0.0
       '@stablelib/wipe': 2.0.1
 
   '@stablelib/wipe@2.0.1': {}

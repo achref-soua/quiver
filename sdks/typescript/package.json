@@ -18,6 +18,10 @@
     "./vector": {
       "types": "./dist/vector.d.ts",
       "import": "./dist/vector.js"
+    },
+    "./dcpe": {
+      "types": "./dist/dcpe.d.ts",
+      "import": "./dist/dcpe.js"
     }
   },
   "files": [
@@ -33,14 +37,34 @@
     "test": "vitest run"
   },
   "peerDependencies": {
+    "@stablelib/chacha": "^2.0.0",
+    "@stablelib/hkdf": "^2.0.0",
+    "@stablelib/hmac": "^2.0.0",
+    "@stablelib/sha256": "^2.0.0",
     "@stablelib/xchacha20poly1305": "^2.0.0"
   },
   "peerDependenciesMeta": {
+    "@stablelib/chacha": {
+      "optional": true
+    },
+    "@stablelib/hkdf": {
+      "optional": true
+    },
+    "@stablelib/hmac": {
+      "optional": true
+    },
+    "@stablelib/sha256": {
+      "optional": true
+    },
     "@stablelib/xchacha20poly1305": {
       "optional": true
     }
   },
   "devDependencies": {
+    "@stablelib/chacha": "^2.0.1",
+    "@stablelib/hkdf": "^2.0.1",
+    "@stablelib/hmac": "^2.0.1",
+    "@stablelib/sha256": "^2.0.1",
     "@stablelib/xchacha20poly1305": "^2.0.1",
     "@types/node": "^25.0.0",
     "typescript": "^6.0.0",
