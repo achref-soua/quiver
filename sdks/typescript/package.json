@@ -1,6 +1,6 @@
 {
   "name": "quiver-client",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "TypeScript client for Quiver — a security-first, memory-frugal vector database.",
   "license": "AGPL-3.0-only",
   "type": "module",
