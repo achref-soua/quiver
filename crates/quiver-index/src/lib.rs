@@ -8,6 +8,7 @@
 //! and IVF landing behind the same [`Index`] trait. Distance math is delegated
 //! to `quiver-simd`. Design: `docs/index/design.md`, ADR-0007, ADR-0008.
 
+mod colbert;
 pub mod disk;
 mod fresh;
 mod hnsw;
@@ -18,6 +19,7 @@ mod rng;
 mod score;
 mod vamana;
 
+pub use colbert::{ColbertConfig, ColbertIndex};
 pub use disk::{DiskError, DiskSearchParams, DiskVamana};
 pub use fresh::{FreshDiskVamana, FreshVamana};
 pub use hnsw::{Hnsw, HnswConfig};
