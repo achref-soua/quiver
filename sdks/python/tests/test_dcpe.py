@@ -9,7 +9,7 @@ import random
 
 import pytest
 
-from quiver.dcpe import DcpeCipher, DcpeError, EncryptedVector
+from quiver.dcpe import DcpeCipher, DcpeError, EncryptedVector, Normalization
 
 # A known-answer vector produced by the Rust reference implementation. Decrypting
 # it here exercises the whole construction — HKDF (the scale and sub-keys), the
@@ -19,17 +19,20 @@ KAT_BETA = 0.05
 KAT_SCALE = 1.95453267099551331
 KAT_IV = "112233445566778899aabbcc"
 KAT_PLAIN = [0.1, -0.2, 0.3, -0.4, 0.5, 0.6, -0.7, 0.8]
+# Cipher v2 (ADR-0035): the ciphertext components are the *shuffled* plaintext
+# scale-and-perturbed; the key-derived permutation for this key at d=8 is
+# [2, 6, 1, 5, 7, 0, 4, 3]. Decrypt un-shuffles to recover KAT_PLAIN.
 KAT_CT = [
-    0.18811184,
-    -0.38771802,
-    0.59725165,
-    -0.77283484,
-    0.98074514,
-    1.1670436,
-    -1.3554889,
-    1.5567491,
+    0.5790184,
+    -1.3649843,
+    -0.3800147,
+    1.1816978,
+    1.5671049,
+    0.18977723,
+    0.98995024,
+    -0.7886901,
 ]
-KAT_TAG = "6d534c01663b535d59bf1f1ae7f247a8fe7d0cf4d92d60cd05337e8a7381e33e"
+KAT_TAG = "0e37dacb37dd8b1bc6f2f2eced612fc66e9dd2ca1efe859817328680454ba176"
 
 
 def test_kat_matches_the_rust_reference() -> None:
@@ -109,3 +112,56 @@ def test_rejects_invalid_inputs() -> None:
     cipher = DcpeCipher.from_hex("77" * 32, 0.1)
     with pytest.raises(DcpeError):
         cipher.encrypt([])
+
+
+def test_shuffle_matches_the_rust_reference() -> None:
+    # The key-derived permutation for the KAT key at d=8 (cipher v2).
+    cipher = DcpeCipher.from_hex(KAT_KEY, KAT_BETA)
+    assert cipher._permutation(8) == [2, 6, 1, 5, 7, 0, 4, 3]
+    # It is a valid permutation, deterministic, and key-dependent.
+    perm = cipher._permutation(16)
+    assert sorted(perm) == list(range(16))
+    assert perm == cipher._permutation(16)
+    assert perm != DcpeCipher.from_hex("88" * 32, 0.1)._permutation(16)
+
+
+def test_normalization_round_trips() -> None:
+    norm = Normalization(shift=[0.5, -0.5, 1.0, 0.0, 2.0, -1.0, 0.25, -0.25], scale=3.0)
+    cipher = DcpeCipher.from_hex("99" * 32, 0.1, norm)
+    plain = [0.1, -0.2, 0.3, -0.4, 0.5, 0.6, -0.7, 0.8]
+    recovered = cipher.decrypt(cipher.encrypt(plain))
+    for got, want in zip(recovered, plain):
+        assert abs(got - want) < 1e-3, f"{got} vs {want}"
+
+
+def test_normalization_preserves_nearest_neighbours() -> None:
+    rng = random.Random(7)
+    data = [[rng.uniform(-0.5, 0.5) for _ in range(16)] for _ in range(200)]
+    queries = [[rng.uniform(-0.5, 0.5) for _ in range(16)] for _ in range(10)]
+    norm = Normalization(shift=[0.1 * i for i in range(16)], scale=5.0)
+    cipher = DcpeCipher.from_hex("aa" * 32, 0.02, norm)
+    enc = [cipher.encrypt(v).ciphertext for v in data]
+
+    def l2(a: list[float], b: list[float]) -> float:
+        return sum((x - y) ** 2 for x, y in zip(a, b))
+
+    def top_k(q: list[float], pts: list[list[float]], k: int) -> set[int]:
+        return set(sorted(range(len(pts)), key=lambda i: l2(q, pts[i]))[:k])
+
+    k = 10
+    hits = sum(len(top_k(q, data, k) & top_k(cipher.encrypt_query(q), enc, k)) for q in queries)
+    assert hits / (len(queries) * k) > 0.9
+
+
+def test_normalization_rejects_bad_params() -> None:
+    for bad in (0.0, -1.0, math.nan, math.inf):
+        with pytest.raises(DcpeError):
+            Normalization(shift=[0.0] * 4, scale=bad)
+    with pytest.raises(DcpeError):
+        Normalization(shift=[math.nan] * 4, scale=1.0)
+
+
+def test_normalization_dimension_mismatch_errors() -> None:
+    cipher = DcpeCipher.from_hex("bb" * 32, 0.1, Normalization(shift=[0.0] * 4, scale=1.0))
+    with pytest.raises(DcpeError):
+        cipher.encrypt([1.0, 2.0, 3.0])

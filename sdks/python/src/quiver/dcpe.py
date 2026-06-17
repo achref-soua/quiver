@@ -8,6 +8,12 @@ embedding vectors so a Quiver server can answer approximate-nearest-neighbour
 queries over the ciphertexts **without ever holding the plaintext vectors or the
 key** — Euclidean distance comparison is preserved, up to a tunable margin.
 
+This is **cipher v2** (ADR-0035): it adds the paper's two hardening steps — a
+key-derived component **shuffle** (an exact L2 isometry, so zero recall cost) and
+an optional ordering-preserving global affine **normalisation** (:class:`Normalization`).
+v2 is a breaking change from v1 (v1 ciphertexts are not v2-decryptable); the cipher
+is client-side, so there is no on-disk format change.
+
 Requires the optional ``[dcpe]`` extra (the ``cryptography`` package, for
 ChaCha20)::
 
@@ -55,10 +61,13 @@ IV_LEN = 12
 #: DCPE integrity-tag length in bytes (full HMAC-SHA256 output).
 TAG_LEN = 32
 
+# The scale/prf/auth derivations are unchanged from v1; `shuffle` is new in v2,
+# and the tag domain is bumped to v2 so a v1 ciphertext fails a v2 integrity check.
 _INFO_SCALE = b"quiver/dcpe/v1/scale"
 _INFO_PRF = b"quiver/dcpe/v1/prf"
 _INFO_AUTH = b"quiver/dcpe/v1/auth"
-_AUTH_DOMAIN = b"quiver/dcpe/v1/tag"
+_INFO_SHUFFLE = b"quiver/dcpe/v2/shuffle"
+_AUTH_DOMAIN = b"quiver/dcpe/v2/tag"
 
 _TWO_POW_53 = float(1 << 53)
 
@@ -107,6 +116,10 @@ class _KeyStream:
         self._pos += 8
         return word
 
+    def next_u64(self) -> int:
+        """The next little-endian ``u64`` keystream word."""
+        return self._next_u64()
+
     def next_unit(self) -> float:
         """A uniform in ``[0, 1)`` with 53-bit resolution."""
         return (self._next_u64() >> 11) / _TWO_POW_53
@@ -140,6 +153,36 @@ class EncryptedVector:
     tag: bytes
 
 
+@dataclass
+class Normalization:
+    """A fixed, ordering-preserving global affine normalisation (ADR-0035).
+
+    Maps a plaintext ``m`` to ``(m - shift) * scale`` before encryption, where
+    ``shift`` is a per-dimension translation and ``scale`` is a **single** positive
+    scalar. Both steps preserve the L2 distance-comparison ordering (a uniform shift
+    cancels in any difference; a single positive scalar scales every distance by the
+    same factor) and are invertible. Supply it once from a one-time measurement of
+    your corpus and reuse it for the data *and* the queries.
+
+    .. note::
+
+       Per-axis variance *whitening* (a different scale per dimension) is
+       anisotropic, re-weights the dimensions in the L2 distance, and so breaks the
+       ordering — it is intentionally not expressible here. See ADR-0035.
+    """
+
+    shift: list[float]
+    scale: float
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.scale)
+            or self.scale <= 0.0
+            or any(not math.isfinite(x) for x in self.shift)
+        ):
+            raise DcpeError("invalid normalisation: scale must be finite and > 0 and shifts finite")
+
+
 class DcpeCipher:
     """A client-held DCPE key bound to one approximation factor (ADR-0031).
 
@@ -147,9 +190,14 @@ class DcpeCipher:
     same factor must be used for the data and the queries searched against it.
     """
 
-    __slots__ = ("_scale", "_prf_key", "_auth_key", "_beta")
+    __slots__ = ("_scale", "_prf_key", "_shuffle_key", "_auth_key", "_beta", "_normalization")
 
-    def __init__(self, key: bytes, approximation_factor: float) -> None:
+    def __init__(
+        self,
+        key: bytes,
+        approximation_factor: float,
+        normalization: Normalization | None = None,
+    ) -> None:
         if len(key) != 32:
             raise DcpeError("DCPE key must be exactly 32 bytes (256 bits)")
         if not math.isfinite(approximation_factor) or approximation_factor < 0.0:
@@ -160,16 +208,23 @@ class DcpeCipher:
         frac = (int.from_bytes(scale_bytes, "little") >> 11) / _TWO_POW_53
         self._scale = 1.0 + frac
         self._prf_key = _hkdf_sha256(key, _INFO_PRF, 32)
+        self._shuffle_key = _hkdf_sha256(key, _INFO_SHUFFLE, 32)
         self._auth_key = _hkdf_sha256(key, _INFO_AUTH, 32)
+        self._normalization = normalization
 
     @classmethod
-    def from_hex(cls, hex_key: str, approximation_factor: float) -> "DcpeCipher":
+    def from_hex(
+        cls,
+        hex_key: str,
+        approximation_factor: float,
+        normalization: Normalization | None = None,
+    ) -> "DcpeCipher":
         """Build a cipher from a 64-character hex-encoded 256-bit key."""
         try:
             key = bytes.fromhex(hex_key)
         except ValueError as exc:
             raise DcpeError(f"invalid DCPE key: {exc}") from exc
-        return cls(key, approximation_factor)
+        return cls(key, approximation_factor, normalization)
 
     @property
     def scale(self) -> float:
@@ -185,8 +240,9 @@ class DcpeCipher:
         """Encrypt a vector for storage with a fresh random IV."""
         if not vector:
             raise DcpeError("empty vector: DCPE needs at least one dimension")
+        pre = self._pretransform(vector)
         iv = os.urandom(IV_LEN)
-        ciphertext = self._scale_and_perturb(vector, iv)
+        ciphertext = self._scale_and_perturb(pre, iv)
         tag = self._tag(iv, ciphertext)
         return EncryptedVector(ciphertext=ciphertext, iv=iv, tag=tag)
 
@@ -194,7 +250,7 @@ class DcpeCipher:
         """Encrypt a query vector for searching against DCPE-encrypted data."""
         if not vector:
             raise DcpeError("empty vector: DCPE needs at least one dimension")
-        return self._scale_and_perturb(vector, os.urandom(IV_LEN))
+        return self._scale_and_perturb(self._pretransform(vector), os.urandom(IV_LEN))
 
     def decrypt(self, sealed: EncryptedVector) -> list[float]:
         """Verify the integrity tag (constant-time) and recover the plaintext."""
@@ -204,7 +260,59 @@ class DcpeCipher:
         if not hmac.compare_digest(expected, sealed.tag):
             raise DcpeError("integrity check failed: wrong key or tampered ciphertext")
         lam = self._perturbation(sealed.iv, len(sealed.ciphertext))
-        return [_f32((c - l) / self._scale) for c, l in zip(sealed.ciphertext, lam)]
+        # Recover the shuffled, normalised vector (c - lambda)/s, then reverse the
+        # pipeline: un-shuffle, then un-normalise.
+        shuffled = [(c - l) / self._scale for c, l in zip(sealed.ciphertext, lam)]
+        normalized = self._unshuffle(shuffled)
+        return self._denormalize(normalized)
+
+    def _pretransform(self, vector: list[float]) -> list[float]:
+        """Normalise (optional) then shuffle: ``pi((m - mu) * alpha)``."""
+        normalized = self._normalize(vector)
+        perm = self._permutation(len(vector))
+        return [normalized[p] for p in perm]
+
+    def _normalize(self, vector: list[float]) -> list[float]:
+        n = self._normalization
+        if n is None:
+            return list(vector)
+        if len(n.shift) != len(vector):
+            raise DcpeError(
+                f"dimension mismatch: vector has {len(vector)} dims, normalisation has {len(n.shift)}"
+            )
+        return [(m - mu) * n.scale for m, mu in zip(vector, n.shift)]
+
+    def _unshuffle(self, shuffled: list[float]) -> list[float]:
+        perm = self._permutation(len(shuffled))
+        out = [0.0] * len(shuffled)
+        for i, p in enumerate(perm):
+            out[p] = shuffled[i]
+        return out
+
+    def _denormalize(self, normalized: list[float]) -> list[float]:
+        n = self._normalization
+        if n is None:
+            return [_f32(x) for x in normalized]
+        if len(n.shift) != len(normalized):
+            raise DcpeError(
+                f"dimension mismatch: vector has {len(normalized)} dims, "
+                f"normalisation has {len(n.shift)}"
+            )
+        return [_f32(x / n.scale + mu) for x, mu in zip(normalized, n.shift)]
+
+    def _permutation(self, d: int) -> list[int]:
+        """The key-derived permutation of ``[0, d)`` (Fisher-Yates from the top over
+        the shuffle keystream with a fixed zero IV), identical for every vector and
+        query so all pairwise L2 distances are preserved. Matches the Rust reference
+        byte-for-byte; the ``% (i + 1)`` reduction's modulo bias is negligible."""
+        perm = list(range(d))
+        if d <= 1:
+            return perm
+        rng = _KeyStream(self._shuffle_key, b"\x00" * IV_LEN)
+        for i in range(d - 1, 0, -1):
+            j = rng.next_u64() % (i + 1)
+            perm[i], perm[j] = perm[j], perm[i]
+        return perm
 
     def _scale_and_perturb(self, vector: list[float], iv: bytes) -> list[float]:
         lam = self._perturbation(iv, len(vector))
