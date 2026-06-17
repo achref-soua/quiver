@@ -39,24 +39,50 @@
 //! to encrypt and query from the same client. The client owns the key; Quiver
 //! never sees it, and losing it makes the vectors unrecoverable.
 //!
-//! # Construction
+//! # Construction (cipher **v2**, ADR-0035)
 //!
 //! Key material is derived from one master secret with HKDF-SHA256: a secret
-//! scaling factor `s ∈ [1, 2)`, a CSPRNG key, and an HMAC key. To encrypt
-//! `m ∈ ℝ^d` with approximation factor `β ≥ 0`:
+//! scaling factor `s ∈ [1, 2)`, a CSPRNG key, an HMAC key, and (new in v2) a
+//! shuffle CSPRNG key. To encrypt `m ∈ ℝ^d` with approximation factor `β ≥ 0`:
 //!
-//! 1. draw a fresh random 96-bit IV;
-//! 2. seed ChaCha20 from `(prfKey, iv)` and sample a perturbation `λ` **uniformly
+//! 1. **Normalise** (optional, ordering-preserving): apply a fixed global affine
+//!    transform `m₁ = (m − μ)·α` — a per-dimension shift vector `μ` (default `0`)
+//!    and a *single* positive scalar `α` (default `1`). A uniform per-coordinate
+//!    shift cancels in any difference and a single scalar scales every distance
+//!    by the same `α`, so the distance-comparison ordering is preserved exactly
+//!    and the step is invertible (`m = m₁/α + μ`). See [`Normalization`].
+//! 2. **Shuffle**: permute the components with a permutation `π` derived from the
+//!    key alone (HKDF sub-key `quiver/dcpe/v2/shuffle`, a ChaCha20 CSPRNG with a
+//!    fixed zero IV, and a fully-specified Fisher–Yates). L2 distance is invariant
+//!    under any permutation of coordinates, so the *same* `π` applied to every
+//!    vector and query preserves all pairwise distances exactly (no recall cost);
+//!    it hides which ciphertext coordinate is which plaintext coordinate.
+//! 3. draw a fresh random 96-bit IV;
+//! 4. seed ChaCha20 from `(prfKey, iv)` and sample a perturbation `λ` **uniformly
 //!    in the d-ball of radius `(s/4)·β`** (a Gaussian direction normalised and
 //!    scaled by `radius = (s/4)·β·U^{1/d}`, `U ~ Uniform[0,1)`);
-//! 3. the ciphertext vector is `c = s·m + λ` (stored/indexed like any vector);
-//! 4. an HMAC-SHA256 tag over `(domain ‖ β ‖ iv ‖ c)` gives tamper-evidence.
+//! 5. the ciphertext vector is `c = s·π(m₁) + λ` (stored/indexed like any vector);
+//! 6. an HMAC-SHA256 tag over `(domain ‖ β ‖ iv ‖ c)` gives tamper-evidence, with
+//!    the domain bumped to `quiver/dcpe/v2/tag` so a v1 ciphertext fails a v2
+//!    integrity check (fail-closed) instead of decrypting to garbage.
 //!
 //! Decryption re-derives `λ` from `(prfKey, iv)` — the perturbation is
-//! *pseudorandom*, so it cancels — verifies the tag, and returns `(c − λ)/s`.
-//! Querying encrypts the query the same way; the secret `s` is identical for data
-//! and queries, so it cancels in distance ordering while the bounded per-vector
+//! *pseudorandom*, so it cancels — verifies the tag, and reverses the pipeline:
+//! `m = T⁻¹(π⁻¹((c − λ)/s))`. Querying encrypts the query the same way; the secret
+//! `s`, the permutation `π`, and the normalisation are identical for data and
+//! queries, so they cancel in the distance ordering while the bounded per-vector
 //! perturbations are the margin.
+//!
+//! **Honest limit (ADR-0035):** normalisation is restricted to a *global* affine
+//! transform (per-axis shift + a single scalar scale) because that is the strongest
+//! normalisation that preserves the L2 distance-comparison ordering. Per-axis
+//! variance *whitening* (an anisotropic per-dimension scale) re-weights the
+//! dimensions in the distance and so is **incompatible** with the untrusted-server
+//! search this scheme exists for; it is deliberately not offered.
+//!
+//! v2 is a breaking change from the v1 cipher of ADR-0031 (which stays immutable):
+//! v1 ciphertexts are not v2-decryptable. DCPE is experimental and off by default,
+//! and the cipher is client-side — there is no on-disk format change.
 //!
 //! The byte-level sampling (the ChaCha20 keystream as the CSPRNG, the
 //! `u64 → [0,1)` mapping, and Box-Muller normals) is fixed so it can be
@@ -104,12 +130,17 @@ pub const IV_LEN: usize = 12;
 /// DCPE integrity-tag length in bytes (full HMAC-SHA256 output).
 pub const TAG_LEN: usize = 32;
 
-// HKDF-SHA256 `info` strings: distinct sub-keys from one master secret.
+// HKDF-SHA256 `info` strings: distinct sub-keys from one master secret. The
+// scale/prf/auth derivations are unchanged from v1 (so the secret scale is stable
+// across the v1→v2 hardening); `shuffle` is new in v2.
 const INFO_SCALE: &[u8] = b"quiver/dcpe/v1/scale";
 const INFO_PRF: &[u8] = b"quiver/dcpe/v1/prf";
 const INFO_AUTH: &[u8] = b"quiver/dcpe/v1/auth";
-// Domain-separation prefix bound into every integrity tag.
-const AUTH_DOMAIN: &[u8] = b"quiver/dcpe/v1/tag";
+const INFO_SHUFFLE: &[u8] = b"quiver/dcpe/v2/shuffle";
+// Domain-separation prefix bound into every integrity tag. Bumped to v2 so a v1
+// ciphertext fails a v2 integrity check (fail-closed) rather than decrypting to
+// garbage under the hardened cipher.
+const AUTH_DOMAIN: &[u8] = b"quiver/dcpe/v2/tag";
 
 /// Errors from DCPE encryption, decryption, or construction.
 #[derive(Debug, thiserror::Error)]
@@ -130,6 +161,69 @@ pub enum DcpeError {
     /// corrupted ciphertext.
     #[error("ciphertext integrity check failed: wrong key or tampered ciphertext")]
     Integrity,
+    /// The normalisation parameters were invalid: a non-positive or non-finite
+    /// scale, or a non-finite shift component.
+    #[error("invalid normalisation: scale must be finite and > 0 and shifts finite")]
+    InvalidNormalization,
+    /// A vector's dimension did not match the normalisation shift length.
+    #[error("dimension mismatch: vector has {vector} dims, normalisation has {shift}")]
+    DimensionMismatch {
+        /// The vector's dimension.
+        vector: usize,
+        /// The normalisation shift vector's length.
+        shift: usize,
+    },
+}
+
+/// A fixed, ordering-preserving global affine normalisation for DCPE (ADR-0035).
+///
+/// Maps a plaintext `m ∈ ℝ^d` to `m₁ = (m − shift)·scale` before encryption,
+/// where `shift ∈ ℝ^d` is a per-dimension translation and `scale > 0` is a
+/// **single** scalar. Both steps preserve the L2 distance-comparison ordering the
+/// untrusted server ranks on (a uniform shift cancels in any difference; a single
+/// positive scalar scales every distance by the same factor) and are invertible.
+///
+/// Supply it once from a one-time measurement of your corpus — its per-dimension
+/// mean as `shift` and a global RMS radius as `1/scale`, say — and reuse it for
+/// the data *and* the queries. It is **fixed at construction**, never recomputed
+/// per batch.
+///
+/// # Honest limit
+///
+/// This is the strongest normalisation compatible with searchable DCPE. Per-axis
+/// variance *whitening* (a different scale per dimension) is anisotropic, re-weights
+/// the dimensions in the L2 distance, and so breaks the distance-comparison ordering
+/// — it is intentionally not expressible here. See ADR-0035 and `docs/security/dcpe.md`.
+#[derive(Clone, Debug)]
+pub struct Normalization {
+    shift: Vec<f32>,
+    scale: f32,
+}
+
+impl Normalization {
+    /// Build a normalisation from a per-dimension shift and a single positive scale.
+    ///
+    /// # Errors
+    /// [`DcpeError::InvalidNormalization`] if `scale` is not finite and `> 0`, or
+    /// any `shift` component is not finite.
+    pub fn new(shift: Vec<f32>, scale: f32) -> Result<Self, DcpeError> {
+        if !scale.is_finite() || scale <= 0.0 || shift.iter().any(|x| !x.is_finite()) {
+            return Err(DcpeError::InvalidNormalization);
+        }
+        Ok(Self { shift, scale })
+    }
+
+    /// The per-dimension shift vector.
+    #[must_use]
+    pub fn shift(&self) -> &[f32] {
+        &self.shift
+    }
+
+    /// The single scalar scale.
+    #[must_use]
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
 }
 
 /// A DCPE-encrypted vector: the ciphertext (upserted and indexed like any
@@ -158,10 +252,14 @@ pub struct DcpeCipher {
     scale: f64,
     // ChaCha20 CSPRNG key for the perturbation.
     prf_key: Zeroizing<[u8; 32]>,
+    // ChaCha20 CSPRNG key for the key-derived component shuffle (v2).
+    shuffle_key: Zeroizing<[u8; 32]>,
     // HMAC-SHA256 key for the integrity tag.
     auth_key: Zeroizing<[u8; 32]>,
     // The approximation factor `β` (the security/accuracy knob).
     approximation_factor: f32,
+    // Optional fixed global affine normalisation applied before encryption (v2).
+    normalization: Option<Normalization>,
 }
 
 impl DcpeCipher {
@@ -186,15 +284,29 @@ impl DcpeCipher {
 
         let mut prf_key = Zeroizing::new([0u8; 32]);
         expand(&hk, INFO_PRF, prf_key.as_mut_slice())?;
+        let mut shuffle_key = Zeroizing::new([0u8; 32]);
+        expand(&hk, INFO_SHUFFLE, shuffle_key.as_mut_slice())?;
         let mut auth_key = Zeroizing::new([0u8; 32]);
         expand(&hk, INFO_AUTH, auth_key.as_mut_slice())?;
 
         Ok(Self {
             scale,
             prf_key,
+            shuffle_key,
             auth_key,
             approximation_factor,
+            normalization: None,
         })
+    }
+
+    /// Attach a fixed global affine [`Normalization`] applied before encryption
+    /// (and reversed on decryption). Builder style: `DcpeCipher::new(..)?.with_normalization(n)`.
+    /// The same normalisation must be used for the data and the queries searched
+    /// against it. Defaults to none.
+    #[must_use]
+    pub fn with_normalization(mut self, normalization: Normalization) -> Self {
+        self.normalization = Some(normalization);
+        self
     }
 
     /// Build a cipher from a 64-character hex-encoded 256-bit master key.
@@ -224,14 +336,17 @@ impl DcpeCipher {
     /// vector encrypts differently every time (hiding equality).
     ///
     /// # Errors
-    /// [`DcpeError::EmptyVector`] if `vector` is empty.
+    /// [`DcpeError::EmptyVector`] if `vector` is empty;
+    /// [`DcpeError::DimensionMismatch`] if a normalisation is set and its shift
+    /// length differs from `vector.len()`.
     pub fn encrypt(&self, vector: &[f32]) -> Result<EncryptedVector, DcpeError> {
         if vector.is_empty() {
             return Err(DcpeError::EmptyVector);
         }
+        let pre = self.pretransform(vector)?;
         let mut iv = [0u8; IV_LEN];
         OsRng.fill_bytes(&mut iv);
-        let ciphertext = self.scale_and_perturb(vector, &iv);
+        let ciphertext = self.scale_and_perturb(&pre, &iv);
         let tag = self.compute_tag(&iv, &ciphertext)?;
         Ok(EncryptedVector {
             ciphertext,
@@ -245,14 +360,17 @@ impl DcpeCipher {
     /// never decrypted, so no IV or tag is retained.
     ///
     /// # Errors
-    /// [`DcpeError::EmptyVector`] if `vector` is empty.
+    /// [`DcpeError::EmptyVector`] if `vector` is empty;
+    /// [`DcpeError::DimensionMismatch`] if a normalisation is set and its shift
+    /// length differs from `vector.len()`.
     pub fn encrypt_query(&self, vector: &[f32]) -> Result<Vec<f32>, DcpeError> {
         if vector.is_empty() {
             return Err(DcpeError::EmptyVector);
         }
+        let pre = self.pretransform(vector)?;
         let mut iv = [0u8; IV_LEN];
         OsRng.fill_bytes(&mut iv);
-        Ok(self.scale_and_perturb(vector, &iv))
+        Ok(self.scale_and_perturb(&pre, &iv))
     }
 
     /// Recover the plaintext vector from an [`EncryptedVector`]. The integrity tag
@@ -261,7 +379,9 @@ impl DcpeCipher {
     ///
     /// # Errors
     /// [`DcpeError::Integrity`] if the tag does not verify (wrong key or tampered
-    /// ciphertext); [`DcpeError::EmptyVector`] if the ciphertext is empty.
+    /// ciphertext); [`DcpeError::EmptyVector`] if the ciphertext is empty;
+    /// [`DcpeError::DimensionMismatch`] if a normalisation is set and its shift
+    /// length differs from the ciphertext length.
     pub fn decrypt(&self, sealed: &EncryptedVector) -> Result<Vec<f32>, DcpeError> {
         if sealed.ciphertext.is_empty() {
             return Err(DcpeError::EmptyVector);
@@ -272,22 +392,102 @@ impl DcpeCipher {
             .map_err(|_| DcpeError::Integrity)?;
 
         let lambda = self.perturbation(&sealed.iv, sealed.ciphertext.len());
-        Ok(sealed
+        // Recover the shuffled, normalised vector `(c − λ)/s`, then reverse the
+        // pipeline: un-shuffle, then un-normalise.
+        let shuffled: Vec<f64> = sealed
             .ciphertext
             .iter()
             .zip(&lambda)
-            .map(|(&c, &l)| ((f64::from(c) - l) / self.scale) as f32)
-            .collect())
+            .map(|(&c, &l)| (f64::from(c) - l) / self.scale)
+            .collect();
+        let normalized = self.unshuffle(&shuffled);
+        self.denormalize(&normalized)
     }
 
-    // Compute `c = s·m + λ` in f64, storing f32.
-    fn scale_and_perturb(&self, vector: &[f32], iv: &[u8; IV_LEN]) -> Vec<f32> {
-        let lambda = self.perturbation(iv, vector.len());
-        vector
-            .iter()
+    // Compute `c = s·x + λ` in f64, storing f32. `x` is the normalised+shuffled
+    // vector from `pretransform`.
+    fn scale_and_perturb(&self, x: &[f64], iv: &[u8; IV_LEN]) -> Vec<f32> {
+        let lambda = self.perturbation(iv, x.len());
+        x.iter()
             .zip(&lambda)
-            .map(|(&m, &l)| (self.scale * f64::from(m) + l) as f32)
+            .map(|(&m, &l)| (self.scale * m + l) as f32)
             .collect()
+    }
+
+    // Normalise (optional) then shuffle: produce `π((m − μ)·α)` in f64.
+    fn pretransform(&self, vector: &[f32]) -> Result<Vec<f64>, DcpeError> {
+        let normalized = self.normalize(vector)?;
+        let perm = self.permutation(vector.len());
+        Ok(perm.iter().map(|&p| normalized[p]).collect())
+    }
+
+    // Apply the optional normalisation `(m − μ)·α` in f64 (identity if none).
+    fn normalize(&self, vector: &[f32]) -> Result<Vec<f64>, DcpeError> {
+        match &self.normalization {
+            None => Ok(vector.iter().map(|&x| f64::from(x)).collect()),
+            Some(n) => {
+                if n.shift.len() != vector.len() {
+                    return Err(DcpeError::DimensionMismatch {
+                        vector: vector.len(),
+                        shift: n.shift.len(),
+                    });
+                }
+                Ok(vector
+                    .iter()
+                    .zip(&n.shift)
+                    .map(|(&x, &mu)| (f64::from(x) - f64::from(mu)) * f64::from(n.scale))
+                    .collect())
+            }
+        }
+    }
+
+    // Invert the shuffle: `out[perm[i]] = shuffled[i]`.
+    fn unshuffle(&self, shuffled: &[f64]) -> Vec<f64> {
+        let perm = self.permutation(shuffled.len());
+        let mut out = vec![0.0f64; shuffled.len()];
+        for (i, &p) in perm.iter().enumerate() {
+            out[p] = shuffled[i];
+        }
+        out
+    }
+
+    // Invert the normalisation `m = m₁/α + μ` (identity if none), to f32.
+    fn denormalize(&self, normalized: &[f64]) -> Result<Vec<f32>, DcpeError> {
+        match &self.normalization {
+            None => Ok(normalized.iter().map(|&x| x as f32).collect()),
+            Some(n) => {
+                if n.shift.len() != normalized.len() {
+                    return Err(DcpeError::DimensionMismatch {
+                        vector: normalized.len(),
+                        shift: n.shift.len(),
+                    });
+                }
+                Ok(normalized
+                    .iter()
+                    .zip(&n.shift)
+                    .map(|(&x, &mu)| (x / f64::from(n.scale) + f64::from(mu)) as f32)
+                    .collect())
+            }
+        }
+    }
+
+    // The key-derived permutation of `[0, d)`, identical for every vector and
+    // query (it depends only on the key and `d`, with a fixed zero IV), so all
+    // pairwise L2 distances are preserved. Fisher–Yates from the top using the
+    // shuffle keystream; the `% (i + 1)` reduction has cryptographically negligible
+    // modulo bias and is fixed for cross-language reproducibility.
+    fn permutation(&self, d: usize) -> Vec<usize> {
+        let mut perm: Vec<usize> = (0..d).collect();
+        if d <= 1 {
+            return perm;
+        }
+        let iv = [0u8; IV_LEN];
+        let mut rng = KeyStream::new(&self.shuffle_key, &iv);
+        for i in (1..d).rev() {
+            let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+            perm.swap(i, j);
+        }
+        perm
     }
 
     // Derive the perturbation λ: a uniform point in the d-ball of radius
@@ -642,5 +842,127 @@ mod tests {
         let a = cipher.perturbation(&iv, 8);
         let b = cipher.perturbation(&iv, 8);
         assert_eq!(a, b);
+    }
+
+    // --- v2 hardening: the key-derived component shuffle ---
+
+    #[test]
+    fn shuffle_is_a_valid_deterministic_permutation() {
+        let c = cipher(0.1);
+        let p1 = c.permutation(16);
+        let p2 = c.permutation(16);
+        assert_eq!(p1, p2, "the permutation is deterministic for a key");
+        let mut sorted = p1.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            (0..16).collect::<Vec<_>>(),
+            "is a permutation of 0..d"
+        );
+        assert_ne!(
+            p1,
+            (0..16).collect::<Vec<_>>(),
+            "the shuffle actually permutes at d = 16"
+        );
+    }
+
+    #[test]
+    fn shuffle_is_key_dependent() {
+        let a = cipher(0.1).permutation(32);
+        let b = DcpeCipher::from_hex(&"11".repeat(KEY_LEN), 0.1)
+            .expect("key")
+            .permutation(32);
+        assert_ne!(a, b, "different keys give different shuffles");
+    }
+
+    #[test]
+    fn shuffle_hides_axis_alignment_but_round_trips() {
+        // At β = 0 there is no perturbation, so the ciphertext is exactly s·π(m):
+        // its component order differs from the un-shuffled s·m (the shuffle has an
+        // effect), yet decrypt recovers the original ordering.
+        let c = cipher(0.0);
+        let plaintext: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let sealed = c.encrypt(&plaintext).expect("encrypt");
+        let naive: Vec<f32> = plaintext
+            .iter()
+            .map(|&m| (c.scale() * f64::from(m)) as f32)
+            .collect();
+        assert_ne!(sealed.ciphertext, naive, "components are shuffled");
+        let recovered = c.decrypt(&sealed).expect("decrypt");
+        for (got, want) in recovered.iter().zip(&plaintext) {
+            assert!((got - want).abs() < 1e-3, "got {got} want {want}");
+        }
+    }
+
+    // --- v2 hardening: ordering-preserving global normalisation ---
+
+    #[test]
+    fn normalization_round_trips() {
+        let shift = vec![0.5f32, -0.5, 1.0, 0.0, 2.0, -1.0, 0.25, -0.25];
+        let norm = Normalization::new(shift, 3.0).expect("normalization");
+        let c = cipher(0.1).with_normalization(norm);
+        let plaintext = vec![0.1, -0.2, 0.3, -0.4, 0.5, 0.6, -0.7, 0.8];
+        let sealed = c.encrypt(&plaintext).expect("encrypt");
+        let recovered = c.decrypt(&sealed).expect("decrypt");
+        for (got, want) in recovered.iter().zip(&plaintext) {
+            assert!((got - want).abs() < 1e-3, "got {got} want {want}");
+        }
+    }
+
+    #[test]
+    fn normalization_preserves_nearest_neighbours() {
+        // A global affine (per-axis shift + a single positive scale) is an L2
+        // isometry up to a positive scalar, so search recall is unchanged.
+        let data = dataset(300, 16, 3);
+        let queries = dataset(15, 16, 99);
+        let shift: Vec<f32> = (0..16).map(|i| 0.1 * i as f32).collect();
+        let norm = Normalization::new(shift, 5.0).expect("normalization");
+        let c = cipher(0.02).with_normalization(norm);
+        let enc: Vec<Vec<f32>> = data
+            .iter()
+            .map(|v| c.encrypt(v).expect("enc").ciphertext)
+            .collect();
+        let k = 10;
+        let mut hits = 0usize;
+        for q in &queries {
+            let truth: std::collections::HashSet<_> = top_k(q, &data, k).into_iter().collect();
+            let eq = c.encrypt_query(q).expect("query");
+            hits += top_k(&eq, &enc, k)
+                .iter()
+                .filter(|i| truth.contains(i))
+                .count();
+        }
+        let recall = hits as f64 / (queries.len() * k) as f64;
+        assert!(
+            recall > 0.9,
+            "recall {recall:.3} should stay high with normalisation"
+        );
+    }
+
+    #[test]
+    fn normalization_rejects_bad_params() {
+        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(matches!(
+                Normalization::new(vec![0.0; 4], bad),
+                Err(DcpeError::InvalidNormalization)
+            ));
+        }
+        assert!(matches!(
+            Normalization::new(vec![f32::NAN; 4], 1.0),
+            Err(DcpeError::InvalidNormalization)
+        ));
+    }
+
+    #[test]
+    fn normalization_dimension_mismatch_errors() {
+        let norm = Normalization::new(vec![0.0f32; 4], 1.0).expect("normalization");
+        let c = cipher(0.1).with_normalization(norm);
+        assert!(matches!(
+            c.encrypt(&[1.0, 2.0, 3.0]),
+            Err(DcpeError::DimensionMismatch {
+                vector: 3,
+                shift: 4
+            })
+        ));
     }
 }
