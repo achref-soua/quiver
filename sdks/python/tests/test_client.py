@@ -81,6 +81,32 @@ def test_create_collection_sends_vector_encryption():
 
 
 @respx.mock
+def test_create_collection_sends_colbert_index():
+    route = respx.post(f"{BASE}/v1/collections").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "name": "docs",
+                "dim": 3,
+                "metric": "cosine",
+                "count": 0,
+                "index": "colbert",
+                "multivector": True,
+            },
+        )
+    )
+    with Client(BASE) as q:
+        info = q.create_collection(
+            "docs", 3, metric="cosine", multivector=True, index="colbert"
+        )
+    assert info.index == "colbert"
+    assert info.multivector is True
+    body = json.loads(route.calls.last.request.content)
+    assert body["index"] == "colbert"
+    assert body["multivector"] is True
+
+
+@respx.mock
 def test_fetch_returns_unranked_points():
     respx.post(f"{BASE}/v1/collections/vault/fetch").mock(
         return_value=httpx.Response(

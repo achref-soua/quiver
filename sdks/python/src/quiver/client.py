@@ -161,7 +161,9 @@ class Client:
         """Create a collection. Raises [`QuiverError`] if the name is taken.
 
         ``index`` picks the structure (``hnsw`` | ``vamana`` | ``disk_vamana`` |
-        ``ivf``, default ``hnsw``); ``pq_subspaces`` tunes the quantized kinds.
+        ``ivf`` | ``colbert``, default ``hnsw``; ``colbert`` is the ColBERTv2/PLAID
+        token-pool index for multivector collections); ``pq_subspaces`` tunes the
+        quantized kinds.
         ``filterable`` declares payload fields to index for hybrid (pre-filtered)
         search, each a :class:`FilterableField` of ``keyword`` or ``numeric`` type.
 

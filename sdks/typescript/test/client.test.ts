@@ -251,4 +251,22 @@ describe("Quiver TypeScript client", () => {
     expect(await client.deleteDocuments("docs", ["b"])).toBe(1);
     expect(deleteCalled).toBe(true);
   });
+
+  it("createCollection sends the colbert index for a multivector collection", async () => {
+    let captured: Record<string, unknown> | undefined;
+    const fetch = mockFetch(async (_path, _method, init) => {
+      captured = parseBody(init);
+      return json({ name: "docs", dim: 3, metric: "cosine", count: 0, index: "colbert", multivector: true });
+    });
+    const client = new Client("http://x", { fetch });
+    const info = await client.createCollection("docs", 3, {
+      metric: "cosine",
+      multivector: true,
+      index: "colbert",
+    });
+    expect(captured?.["index"]).toBe("colbert");
+    expect(captured?.["multivector"]).toBe(true);
+    expect(info.index).toBe("colbert");
+    expect(info.multivector).toBe(true);
+  });
 });

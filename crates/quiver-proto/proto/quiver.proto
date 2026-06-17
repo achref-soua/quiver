@@ -52,6 +52,8 @@ enum IndexKind {
   INDEX_KIND_VAMANA = 2;
   INDEX_KIND_DISK_VAMANA = 3;
   INDEX_KIND_IVF = 4;
+  // ColBERTv2/PLAID compressed token-pool index (ADR-0034); multi-vector only.
+  INDEX_KIND_COLBERT = 5;
 }
 
 // The value type of a filterable payload field (ADR-0022), which fixes how it is

@@ -68,6 +68,7 @@ fn index_spec_from_proto(kind: i32, pq_subspaces: Option<u32>) -> IndexSpec {
         Ok(v1::IndexKind::Vamana) => IndexKind::Vamana,
         Ok(v1::IndexKind::DiskVamana) => IndexKind::DiskVamana,
         Ok(v1::IndexKind::Ivf) => IndexKind::Ivf,
+        Ok(v1::IndexKind::Colbert) => IndexKind::Colbert,
         _ => IndexKind::Hnsw,
     };
     IndexSpec { kind, pq_subspaces }
@@ -78,6 +79,7 @@ fn index_kind_to_proto(kind: IndexKind) -> i32 {
         IndexKind::Vamana => v1::IndexKind::Vamana,
         IndexKind::DiskVamana => v1::IndexKind::DiskVamana,
         IndexKind::Ivf => v1::IndexKind::Ivf,
+        IndexKind::Colbert => v1::IndexKind::Colbert,
         _ => v1::IndexKind::Hnsw,
     };
     value as i32

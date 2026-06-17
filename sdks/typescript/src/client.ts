@@ -57,8 +57,9 @@ export interface DocumentMatch {
   vectors?: number[][];
 }
 
-/** The index structure a collection is served by (ADR-0007). */
-export type IndexKind = "hnsw" | "vamana" | "disk_vamana" | "ivf";
+/** The index structure a collection is served by (ADR-0007, ADR-0034).
+ * `colbert` is the ColBERTv2/PLAID token-pool index for multivector collections. */
+export type IndexKind = "hnsw" | "vamana" | "disk_vamana" | "ivf" | "colbert";
 
 /** A distance metric. */
 export type Metric = "l2" | "cosine" | "dot";
@@ -103,7 +104,8 @@ export interface ClientOptions {
 /** Options for {@link Client.createCollection}. */
 export interface CreateCollectionOptions {
   metric?: Metric;
-  /** Index structure; `disk_vamana` is the memory-frugal disk path (l2/cosine). */
+  /** Index structure; `disk_vamana` is the memory-frugal disk path (l2/cosine);
+   * `colbert` is the ColBERTv2/PLAID token-pool index for multivector collections. */
   index?: IndexKind;
   /** Product-quantization subspaces for `disk_vamana` / `ivf` (must divide dim). */
   pqSubspaces?: number;

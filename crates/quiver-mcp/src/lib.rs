@@ -313,9 +313,9 @@ pub fn tool_definitions() -> Value {
                     "metric": { "type": "string", "enum": ["l2", "cosine", "dot"], "default": "l2" },
                     "index": {
                         "type": "string",
-                        "enum": ["hnsw", "vamana", "disk_vamana", "ivf"],
+                        "enum": ["hnsw", "vamana", "disk_vamana", "ivf", "colbert"],
                         "default": "hnsw",
-                        "description": "Index structure; disk_vamana is the memory-frugal disk path (l2/cosine only)"
+                        "description": "Index structure; disk_vamana is the memory-frugal disk path (l2/cosine only); colbert is the ColBERTv2/PLAID token-pool index for multivector collections"
                     },
                     "pq_subspaces": {
                         "type": "integer",
@@ -535,9 +535,10 @@ fn want_index_spec(args: &Value) -> Result<IndexSpec, String> {
         "vamana" => IndexKind::Vamana,
         "disk_vamana" | "disk" => IndexKind::DiskVamana,
         "ivf" => IndexKind::Ivf,
+        "colbert" => IndexKind::Colbert,
         other => {
             return Err(format!(
-                "unknown index '{other}' (use hnsw, vamana, disk_vamana, or ivf)"
+                "unknown index '{other}' (use hnsw, vamana, disk_vamana, ivf, or colbert)"
             ));
         }
     };
@@ -838,6 +839,26 @@ mod tests {
         );
         assert_eq!(r["result"]["isError"], true);
         assert!(result_text(&r).contains("unknown index"));
+    }
+
+    #[test]
+    fn agent_can_create_a_colbert_multivector_collection() {
+        let (_t, mut db) = db();
+        // colbert is selectable for a multi-vector collection (ADR-0034).
+        let r = call(
+            &mut db,
+            "create_collection",
+            json!({"name":"c","dim":4,"metric":"cosine","multivector":true,"index":"colbert"}),
+        );
+        assert_eq!(r["result"]["isError"], false, "{}", result_text(&r));
+        // colbert on a single-vector collection is rejected by the engine.
+        let r = call(
+            &mut db,
+            "create_collection",
+            json!({"name":"bad","dim":4,"metric":"cosine","index":"colbert"}),
+        );
+        assert_eq!(r["result"]["isError"], true);
+        assert!(result_text(&r).contains("multi-vector"));
     }
 
     #[test]

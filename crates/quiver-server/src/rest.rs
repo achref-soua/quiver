@@ -140,6 +140,7 @@ enum IndexKindDto {
     Vamana,
     DiskVamana,
     Ivf,
+    Colbert,
 }
 
 impl From<IndexKindDto> for IndexKind {
@@ -149,6 +150,7 @@ impl From<IndexKindDto> for IndexKind {
             IndexKindDto::Vamana => IndexKind::Vamana,
             IndexKindDto::DiskVamana => IndexKind::DiskVamana,
             IndexKindDto::Ivf => IndexKind::Ivf,
+            IndexKindDto::Colbert => IndexKind::Colbert,
         }
     }
 }
@@ -159,6 +161,7 @@ impl From<IndexKind> for IndexKindDto {
             IndexKind::Vamana => IndexKindDto::Vamana,
             IndexKind::DiskVamana => IndexKindDto::DiskVamana,
             IndexKind::Ivf => IndexKindDto::Ivf,
+            IndexKind::Colbert => IndexKindDto::Colbert,
             _ => IndexKindDto::Hnsw,
         }
     }
