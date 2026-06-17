@@ -227,3 +227,117 @@ async fn multivector_round_trip() {
 
     server.abort();
 }
+
+/// The ColBERTv2/PLAID token-pool index (ADR-0034) is selectable over the wire
+/// (REST + gRPC + the SDK enums): a `colbert` multi-vector collection is created,
+/// reads its kind back over both transports, and `colbert` without `multivector`
+/// is rejected at creation.
+#[tokio::test]
+async fn colbert_index_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = "test-api-key";
+
+    let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rest_addr = rest_listener.local_addr().unwrap();
+    let grpc_addr = grpc_listener.local_addr().unwrap();
+
+    let config = Config {
+        data_dir: tmp.path().to_path_buf(),
+        rest_addr,
+        grpc_addr,
+        api_keys: vec![key.into()],
+        encryption_key: Some(
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_owned(),
+        ),
+        tls_cert: None,
+        tls_key: None,
+        tls_client_ca: None,
+        master_key_file: None,
+        audit_log: None,
+        leader_url: None,
+        leader_api_key: None,
+        insecure: false,
+    };
+    let server = tokio::spawn(async move {
+        let _ = serve(config, rest_listener, grpc_listener).await;
+    });
+
+    let http = reqwest::Client::new();
+    let base = format!("http://{rest_addr}");
+    wait_ready(&http, &base).await;
+
+    // --- REST: create a ColBERT multi-vector collection ---
+    let resp = http
+        .post(format!("{base}/v1/collections"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({
+            "name": "papers", "dim": 3, "metric": "cosine",
+            "multivector": true, "index": "colbert"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["index"], "colbert");
+    assert_eq!(body["multivector"], true);
+
+    // --- REST: the kind survives a read-back ---
+    let resp = http
+        .get(format!("{base}/v1/collections/papers"))
+        .bearer_auth(key)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["index"], "colbert");
+    assert_eq!(body["multivector"], true);
+
+    // --- REST: colbert without multivector is rejected (400, not 500) ---
+    let resp = http
+        .post(format!("{base}/v1/collections"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({
+            "name": "bad", "dim": 3, "metric": "cosine", "index": "colbert"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // --- gRPC: create a colbert collection and read its kind back ---
+    let mut client = QuiverClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .unwrap();
+    client
+        .create_collection(auth_request(
+            key,
+            v1::CreateCollectionRequest {
+                name: "grpc_papers".to_owned(),
+                dim: 3,
+                metric: v1::Metric::Cosine as i32,
+                index: v1::IndexKind::Colbert as i32,
+                pq_subspaces: None,
+                filterable: Vec::new(),
+                multivector: true,
+                vector_encryption: v1::VectorEncryption::None as i32,
+            },
+        ))
+        .await
+        .unwrap();
+    let collection = client
+        .get_collection(auth_request(
+            key,
+            v1::GetCollectionRequest {
+                name: "grpc_papers".to_owned(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(collection.index, v1::IndexKind::Colbert as i32);
+    assert!(collection.multivector);
+
+    server.abort();
+}
