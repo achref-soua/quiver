@@ -17,23 +17,20 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Points};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Paragraph, Widget};
 use serde::Deserialize;
 use tokio_stream::StreamExt;
 
+mod decor;
 mod logo;
 mod theme;
 
-/// Bronze chrome — the cockpit's primary colour (ADR-0036, sourced from [`theme`]).
-const AMBER: Color = theme::CHROME;
-/// Leather — secondary text and borders.
-const AMBER_DIM: Color = theme::DIM;
-/// Rust-red — an unreachable server.
-const OFFLINE: Color = theme::ALERT;
+pub use decor::Severity;
 
 /// How often the cockpit polls the server.
 const REFRESH: Duration = Duration::from_secs(2);
@@ -41,8 +38,6 @@ const REFRESH: Duration = Duration::from_secs(2);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 /// How many points the constellation view samples per query.
 const CONSTELLATION_K: usize = 256;
-/// Selected-point colour in the constellation (bright verdigris, against bronze points).
-const SELECT: Color = theme::ACCENT_HI;
 
 /// How to reach the server.
 #[derive(Debug, Clone)]
@@ -73,6 +68,14 @@ pub struct Collection {
     pub metric: String,
     /// Number of live points.
     pub count: u64,
+    /// Index kind (`hnsw`, `ivf`, `vamana`, `disk_vamana`, `colbert`), when the API
+    /// reports it; `None` otherwise.
+    #[serde(default)]
+    pub index: Option<String>,
+    /// Vector-encryption mode (`none`, `dcpe`, `client_side`), when the API reports
+    /// it; `None` otherwise.
+    #[serde(default)]
+    pub vector_encryption: Option<String>,
 }
 
 /// A point-in-time view of the server: readiness plus the collection list. This
@@ -316,6 +319,9 @@ struct App {
     collections: Vec<Collection>,
     selected: usize,
     last_refresh: Option<Instant>,
+    started: Instant,
+    history: Vec<u64>,
+    activity: Vec<Activity>,
     view: View,
     should_quit: bool,
 }
@@ -330,15 +336,40 @@ impl App {
             collections: Vec::new(),
             selected: 0,
             last_refresh: None,
+            started: Instant::now(),
+            history: Vec::new(),
+            activity: Vec::new(),
             view: View::Browser,
             should_quit: false,
         })
+    }
+
+    // A short monotonic timestamp ("+12s") for the activity log.
+    fn stamp(&self) -> String {
+        format!("+{}s", self.started.elapsed().as_secs())
+    }
+
+    fn log(&mut self, severity: Severity, message: impl Into<String>) {
+        let ts = self.stamp();
+        self.activity.push(Activity {
+            ts,
+            severity,
+            message: message.into(),
+        });
+        // Keep the tail bounded.
+        let len = self.activity.len();
+        if len > 64 {
+            self.activity.drain(0..len - 64);
+        }
     }
 
     async fn refresh(&mut self) {
         self.last_refresh = Some(Instant::now());
         match fetch_snapshot(&self.client, &self.options).await {
             Ok(snapshot) => {
+                let total: u64 = snapshot.collections.iter().map(|c| c.count).sum();
+                let n = snapshot.collections.len();
+                let was_offline = matches!(self.status, ConnStatus::Offline(_));
                 self.collections = snapshot.collections;
                 if self.selected >= self.collections.len() {
                     self.selected = self.collections.len().saturating_sub(1);
@@ -346,8 +377,47 @@ impl App {
                 self.status = ConnStatus::Online {
                     ready: snapshot.ready,
                 };
+                self.history.push(total);
+                let hlen = self.history.len();
+                if hlen > 64 {
+                    self.history.drain(0..hlen - 64);
+                }
+                if self.activity.is_empty() || was_offline {
+                    self.log(
+                        Severity::Info,
+                        format!("connected · {n} collections, {total} points"),
+                    );
+                } else {
+                    self.log(Severity::Info, format!("refreshed · {total} points"));
+                }
             }
-            Err(err) => self.status = ConnStatus::Offline(err.to_string()),
+            Err(err) => {
+                self.status = ConnStatus::Offline(err.to_string());
+                self.log(Severity::Error, format!("offline · {err}"));
+            }
+        }
+    }
+
+    // Build the renderable dashboard from the live state.
+    fn dashboard(&self) -> Dashboard {
+        let (ready, offline) = match &self.status {
+            ConnStatus::Online { ready } => (*ready, None),
+            ConnStatus::Offline(err) => (false, Some(err.clone())),
+            ConnStatus::Connecting => (false, None),
+        };
+        let refreshed = self
+            .last_refresh
+            .map(|t| format!("{}s ago", t.elapsed().as_secs()))
+            .unwrap_or_else(|| "—".to_owned());
+        Dashboard {
+            base_url: self.options.base_url.clone(),
+            ready,
+            offline,
+            collections: self.collections.clone(),
+            selected: self.selected,
+            refreshed,
+            history: self.history.clone(),
+            activity: self.activity.clone(),
         }
     }
 
@@ -543,222 +613,435 @@ async fn run_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
     Ok(())
 }
 
-fn ui(frame: &mut Frame, app: &App) {
-    // Oak-black background across the whole cockpit (ADR-0036).
-    frame.render_widget(Block::new().style(Style::new().bg(theme::BG)), frame.area());
+/// An activity-log entry shown in the cockpit's activity panel.
+#[derive(Debug, Clone)]
+pub struct Activity {
+    /// A short relative timestamp, e.g. `+12s`.
+    pub ts: String,
+    /// The line's severity (drives its glyph and colour).
+    pub severity: Severity,
+    /// The message.
+    pub message: String,
+}
 
-    match &app.view {
-        View::Browser => {
-            let rows = Layout::vertical([
-                Constraint::Length(9), // the logo banner hero
-                Constraint::Min(0),
-                Constraint::Length(1),
-            ])
-            .split(frame.area());
-            frame.render_widget(banner_header(app), rows[0]);
-            let body = Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)])
-                .split(rows[1]);
-            frame.render_widget(status_panel(app), body[0]);
-            frame.render_widget(collections_panel(app), body[1]);
-            frame.render_widget(footer(), rows[2]);
-        }
-        View::Constellation(view) => {
-            let rows = Layout::vertical([
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(1),
-            ])
-            .split(frame.area());
-            frame.render_widget(compact_header(app), rows[0]);
-            render_constellation(frame, rows[1], view);
-            frame.render_widget(constellation_footer(), rows[2]);
+/// Everything the dashboard renders, decoupled from the live HTTP client so the
+/// same view code drives the cockpit, the tests, and the screenshot tool (ADR-0036).
+#[derive(Debug, Clone)]
+pub struct Dashboard {
+    /// The server URL shown in the header.
+    pub base_url: String,
+    /// Whether the server reported ready.
+    pub ready: bool,
+    /// An offline error message, if the server is unreachable.
+    pub offline: Option<String>,
+    /// The collections to list.
+    pub collections: Vec<Collection>,
+    /// The selected collection index.
+    pub selected: usize,
+    /// A human "refreshed N s ago" string.
+    pub refreshed: String,
+    /// Total-point history for the trend sparkline.
+    pub history: Vec<u64>,
+    /// Recent activity-log entries.
+    pub activity: Vec<Activity>,
+}
+
+impl Dashboard {
+    /// A rich, fixed demo dashboard for screenshots and tests — never fetched.
+    #[must_use]
+    pub fn demo() -> Self {
+        let col = |name: &str, dim, metric: &str, count, index: &str, enc: &str| Collection {
+            name: name.to_owned(),
+            dim,
+            metric: metric.to_owned(),
+            count,
+            index: Some(index.to_owned()),
+            vector_encryption: Some(enc.to_owned()),
+        };
+        Dashboard {
+            base_url: "http://127.0.0.1:6333".to_owned(),
+            ready: true,
+            offline: None,
+            collections: vec![
+                col("contacts", 768, "cosine", 48_213, "hnsw", "none"),
+                col(
+                    "documents",
+                    1024,
+                    "cosine",
+                    1_284_098,
+                    "disk_vamana",
+                    "none",
+                ),
+                col("images", 512, "l2", 96_320, "ivf", "none"),
+                col("vault", 8, "l2", 1_024, "hnsw", "dcpe"),
+                col("sessions", 256, "dot", 7_740, "hnsw", "client_side"),
+            ],
+            selected: 1,
+            refreshed: "2s ago".to_owned(),
+            history: vec![
+                120, 180, 240, 300, 420, 560, 700, 880, 1010, 1180, 1300, 1437,
+            ],
+            activity: vec![
+                Activity {
+                    ts: "+0s".to_owned(),
+                    severity: Severity::Info,
+                    message: "connected · 5 collections, 1437395 points".to_owned(),
+                },
+                Activity {
+                    ts: "+2s".to_owned(),
+                    severity: Severity::Info,
+                    message: "refreshed · 1437395 points".to_owned(),
+                },
+                Activity {
+                    ts: "+4s".to_owned(),
+                    severity: Severity::Warn,
+                    message: "documents · disk index warming".to_owned(),
+                },
+                Activity {
+                    ts: "+6s".to_owned(),
+                    severity: Severity::Info,
+                    message: "vault · DCPE-encrypted vectors".to_owned(),
+                },
+            ],
         }
     }
 }
 
-// Render the constellation scatter: a braille canvas of the projected points,
-// with the query's nearest neighbour and the cursor highlighted.
-fn render_constellation(frame: &mut Frame, area: Rect, view: &ConstellationView) {
-    let query = view.query_id.as_deref().unwrap_or("origin (seed)");
-    if let Some(err) = &view.error {
-        let p = Paragraph::new(Line::from(Span::styled(
-            format!("query failed: {err}"),
-            Style::new().fg(OFFLINE),
-        )))
-        .block(
-            Block::bordered()
-                .title(format!(" constellation · {} ", view.collection))
-                .border_style(Style::new().fg(AMBER_DIM)),
-        );
-        frame.render_widget(p, area);
-        return;
-    }
-    if view.points.is_empty() {
-        let p = Paragraph::new(Line::from(Span::styled(
-            "no points to plot — upsert some vectors first",
-            Style::new().fg(AMBER_DIM),
-        )))
-        .block(
-            Block::bordered()
-                .title(format!(" constellation · {} ", view.collection))
-                .border_style(Style::new().fg(AMBER_DIM)),
-        );
-        frame.render_widget(p, area);
-        return;
-    }
+/// Render the dashboard for `dash` to a fresh `width`×`height` buffer (used by the
+/// screenshot tool and tests; the live cockpit renders into the frame's buffer).
+#[must_use]
+pub fn render_dashboard(width: u16, height: u16, dash: &Dashboard) -> Buffer {
+    let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+    draw_dashboard(buf.area, &mut buf, dash);
+    buf
+}
 
-    let selected = view.points.get(view.selected);
-    let sel_label = selected
-        .map(|p| format!("{} (#{}) ", p.id, p.rank))
-        .unwrap_or_default();
-    let title = format!(
-        " constellation · {} · {} pts · query={query} · ◆ {sel_label}",
-        view.collection,
-        view.points.len(),
-    );
-    // Points other than the nearest neighbour and the cursor.
-    let plain: Vec<(f64, f64)> = view
-        .points
-        .iter()
-        .enumerate()
-        .filter(|(i, p)| p.rank != 0 && *i != view.selected)
-        .map(|(_, p)| (p.x, p.y))
-        .collect();
-    let nn: Vec<(f64, f64)> = view
-        .points
-        .iter()
-        .filter(|p| p.rank == 0)
-        .map(|p| (p.x, p.y))
-        .collect();
-    let cursor: Vec<(f64, f64)> = selected.map(|p| vec![(p.x, p.y)]).unwrap_or_default();
-    let canvas = Canvas::default()
-        .block(
-            Block::bordered()
-                .title(Span::styled(title, theme::chrome()))
-                .border_style(theme::border()),
-        )
-        .marker(ratatui::symbols::Marker::Braille)
-        .x_bounds([-0.05, 1.05])
-        .y_bounds([-0.05, 1.05])
-        .paint(move |ctx| {
-            ctx.draw(&Points {
-                coords: &plain,
-                color: AMBER_DIM,
-            });
-            ctx.draw(&Points {
-                coords: &nn,
-                color: AMBER,
-            });
-            ctx.draw(&Points {
-                coords: &cursor,
-                color: SELECT,
-            });
+/// Render the constellation demo scatter to a fresh `width`×`height` buffer.
+#[must_use]
+pub fn render_constellation_demo(width: u16, height: u16) -> Buffer {
+    let view = demo_constellation_view();
+    let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+    draw_constellation(buf.area, &mut buf, &view, "http://127.0.0.1:6333");
+    buf
+}
+
+fn ui(frame: &mut Frame, app: &App) {
+    match &app.view {
+        View::Browser => draw_dashboard(frame.area(), frame.buffer_mut(), &app.dashboard()),
+        View::Constellation(view) => {
+            draw_constellation(
+                frame.area(),
+                frame.buffer_mut(),
+                view,
+                &app.options.base_url,
+            );
+        }
+    }
+}
+
+// Lay out and render the whole dashboard into `buf`: the logo banner hero, a left
+// column (status + relationships) and a right column (the collections table + the
+// activity log), and the footer — all in the Bronze Quiver theme.
+fn draw_dashboard(area: Rect, buf: &mut Buffer, dash: &Dashboard) {
+    Block::new()
+        .style(Style::new().bg(theme::BG))
+        .render(area, buf);
+    let rows = Layout::vertical([
+        Constraint::Length(9),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    banner_header(&dash.base_url).render(rows[0], buf);
+    let body =
+        Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).split(rows[1]);
+    let left = Layout::vertical([Constraint::Length(9), Constraint::Min(0)]).split(body[0]);
+    status_panel(dash).render(left[0], buf);
+    relationships_panel(dash).render(left[1], buf);
+    let right = Layout::vertical([Constraint::Min(0), Constraint::Length(8)]).split(body[1]);
+    collections_panel(dash).render(right[0], buf);
+    activity_panel(dash).render(right[1], buf);
+    footer().render(rows[2], buf);
+}
+
+// Render the constellation view into `buf`: a compact header, a braille canvas of
+// the projected points (the query's nearest neighbour and the cursor highlighted),
+// and the footer.
+fn draw_constellation(area: Rect, buf: &mut Buffer, view: &ConstellationView, url: &str) {
+    Block::new()
+        .style(Style::new().bg(theme::BG))
+        .render(area, buf);
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    compact_header(url).render(rows[0], buf);
+    let body = rows[1];
+    let query = view.query_id.as_deref().unwrap_or("origin (seed)");
+
+    if let Some(err) = &view.error {
+        Paragraph::new(Line::from(Span::styled(
+            format!("query failed: {err}"),
+            theme::alert(),
+        )))
+        .block(decor::panel(&format!(
+            "constellation · {}",
+            view.collection
+        )))
+        .render(body, buf);
+    } else if view.points.is_empty() {
+        Paragraph::new(Line::from(Span::styled(
+            "no points to plot — upsert some vectors first",
+            theme::dim(),
+        )))
+        .block(decor::panel(&format!(
+            "constellation · {}",
+            view.collection
+        )))
+        .render(body, buf);
+    } else {
+        let selected = view.points.get(view.selected);
+        let sel_label = selected
+            .map(|p| format!("{} (#{})", p.id, p.rank))
+            .unwrap_or_default();
+        let title = format!(
+            "constellation · {} · {} pts · query={query} · ◆ {sel_label}",
+            view.collection,
+            view.points.len(),
+        );
+        let plain: Vec<(f64, f64)> = view
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| p.rank != 0 && *i != view.selected)
+            .map(|(_, p)| (p.x, p.y))
+            .collect();
+        let nn: Vec<(f64, f64)> = view
+            .points
+            .iter()
+            .filter(|p| p.rank == 0)
+            .map(|p| (p.x, p.y))
+            .collect();
+        let cursor: Vec<(f64, f64)> = selected.map(|p| vec![(p.x, p.y)]).unwrap_or_default();
+        Canvas::default()
+            .block(decor::panel(&title))
+            .marker(ratatui::symbols::Marker::Braille)
+            .x_bounds([-0.05, 1.05])
+            .y_bounds([-0.05, 1.05])
+            .paint(move |ctx| {
+                ctx.draw(&Points {
+                    coords: &plain,
+                    color: theme::DIM,
+                });
+                ctx.draw(&Points {
+                    coords: &nn,
+                    color: theme::CHROME,
+                });
+                ctx.draw(&Points {
+                    coords: &cursor,
+                    color: theme::ACCENT_HI,
+                });
+            })
+            .render(body, buf);
+    }
+    constellation_footer().render(rows[2], buf);
+}
+
+// A reproducible demo scatter for screenshots: clustered points around the seed.
+fn demo_constellation_view() -> ConstellationView {
+    let mut s = 0x5151_1abe_1abe_5151u64;
+    let mut rng = || {
+        s = splitmix64(&mut s);
+        (s >> 40) as f64 / (1u64 << 24) as f64
+    };
+    let mut points = Vec::new();
+    let mut vectors = Vec::new();
+    for i in 0..180 {
+        let x = (rng() * 0.9 + 0.05).clamp(0.0, 1.0);
+        let y = (rng() * 0.9 + 0.05).clamp(0.0, 1.0);
+        vectors.push(vec![x as f32, y as f32]);
+        points.push(StarPoint {
+            id: format!("doc-{i}"),
+            x,
+            y,
+            rank: i,
         });
-    frame.render_widget(canvas, area);
+    }
+    ConstellationView {
+        collection: "documents".to_owned(),
+        dim: 1024,
+        points,
+        vectors,
+        selected: 7,
+        query_id: None,
+        error: None,
+    }
 }
 
 // The dashboard hero: the QUIVER logo banner (the V is a 3-D arrowhead) in a
-// bordered frame titled with the tagline and the server URL.
-fn banner_header(app: &App) -> Paragraph<'static> {
+// rounded frame titled with the tagline and the server URL.
+fn banner_header(url: &str) -> Paragraph<'static> {
     Paragraph::new(logo::banner()).block(
-        Block::bordered()
-            .border_style(theme::border())
-            .title(Line::from(Span::styled(
-                " QUIVER · the cockpit ",
-                theme::dim(),
-            )))
-            .title(
-                Line::from(Span::styled(
-                    format!(" {} ", app.options.base_url),
-                    theme::accent(),
-                ))
-                .right_aligned(),
-            ),
+        decor::panel("the cockpit")
+            .title(Line::from(Span::styled(format!(" {url} "), theme::accent())).right_aligned()),
     )
 }
 
 // A compact one-line header for the constellation view.
-fn compact_header(app: &App) -> Paragraph<'static> {
+fn compact_header(url: &str) -> Paragraph<'static> {
     let mut spans = logo::compact().spans;
     spans.push(Span::styled("   ", theme::dim()));
-    spans.push(Span::styled(app.options.base_url.clone(), theme::accent()));
+    spans.push(Span::styled(url.to_owned(), theme::accent()));
     Paragraph::new(Line::from(spans)).block(Block::bordered().border_style(theme::border()))
 }
 
-fn status_panel(app: &App) -> Paragraph<'_> {
-    let agg = aggregate(&app.collections);
-    let (dot, label, style) = match &app.status {
-        ConnStatus::Connecting => ("◌", "connecting…".to_owned(), theme::dim()),
-        ConnStatus::Online { ready: true } => ("●", "online · ready".to_owned(), theme::ok()),
-        ConnStatus::Online { ready: false } => ("●", "online · not ready".to_owned(), theme::dim()),
-        ConnStatus::Offline(err) => ("●", format!("offline · {err}"), theme::alert()),
+fn status_panel(dash: &Dashboard) -> Paragraph<'static> {
+    let agg = aggregate(&dash.collections);
+    let (badge_label, style) = if dash.offline.is_some() {
+        ("OFFLINE", theme::alert())
+    } else if dash.ready {
+        ("ONLINE · READY", theme::ok())
+    } else {
+        ("CONNECTING", theme::dim())
     };
-    let refreshed = app
-        .last_refresh
-        .map(|t| format!("{}s ago", t.elapsed().as_secs()))
-        .unwrap_or_else(|| "—".to_owned());
-
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(format!("{dot} "), style),
-            Span::styled(label, style),
-        ]),
+    let mut lines = vec![
+        Line::from(decor::badge(badge_label, style)),
         Line::from(""),
         kv("collections", &agg.collections.to_string()),
-        kv("total points", &agg.total_points.to_string()),
-        kv("refreshed", &refreshed),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("encryption-at-rest ", theme::dim()),
-            Span::styled("● on", theme::ok()),
-        ]),
+        kv("points", &agg.total_points.to_string()),
+        kv("refreshed", &dash.refreshed),
     ];
-    Paragraph::new(lines).block(
-        Block::bordered()
-            .title(Span::styled(" status ", theme::heading()))
-            .border_style(theme::border()),
-    )
+    if !dash.history.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("trend        ", theme::dim()),
+            Span::styled(decor::sparkline(&dash.history), theme::accent()),
+        ]));
+    }
+    if let Some(err) = &dash.offline {
+        lines.push(Line::from(Span::styled(truncate(err, 30), theme::alert())));
+    }
+    Paragraph::new(lines).block(decor::panel("status"))
 }
 
-fn kv<'a>(key: &'a str, value: &str) -> Line<'a> {
+fn kv(key: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{key:<13}"), theme::dim()),
         Span::styled(value.to_owned(), theme::text()),
     ])
 }
 
-fn collections_panel(app: &App) -> Paragraph<'_> {
-    let lines: Vec<Line> = if app.collections.is_empty() {
-        vec![Line::from(Span::styled("no collections yet", theme::dim()))]
+// The selected collection's structure as a relationship tree, atop a small drum.
+fn relationships_panel(dash: &Dashboard) -> Paragraph<'static> {
+    let mut lines: Vec<Line> = decor::db_icon()
+        .iter()
+        .map(|row| Line::from(Span::styled(format!("  {row}"), theme::dim())))
+        .collect();
+    if let Some(c) = dash.collections.get(dash.selected) {
+        let rows = vec![
+            (0usize, c.name.clone()),
+            (
+                1,
+                format!(
+                    "index    {}",
+                    c.index.clone().unwrap_or_else(|| "hnsw".to_owned())
+                ),
+            ),
+            (1, format!("metric   {}", c.metric)),
+            (
+                1,
+                format!(
+                    "vectors  {}",
+                    c.vector_encryption
+                        .clone()
+                        .unwrap_or_else(|| "plaintext".to_owned())
+                ),
+            ),
+            (1, format!("points   {}", c.count)),
+        ];
+        lines.extend(decor::tree(&rows));
     } else {
-        app.collections
+        lines.push(Line::from(Span::styled(
+            "no collection selected",
+            theme::dim(),
+        )));
+    }
+    Paragraph::new(lines).block(decor::panel("relationships"))
+}
+
+fn collections_panel(dash: &Dashboard) -> Paragraph<'static> {
+    let maxc = dash
+        .collections
+        .iter()
+        .map(|c| c.count)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "  {:<16}{:>4}  {:<8}{:<12}{:>9}",
+                "collection", "dim", "metric", "index", "points"
+            ),
+            theme::dim(),
+        )),
+        decor::divider(58),
+    ];
+    if dash.collections.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no collections yet — import or upsert some vectors",
+            theme::dim(),
+        )));
+    }
+    for (i, c) in dash.collections.iter().enumerate() {
+        let selected = i == dash.selected;
+        let name_style = if selected {
+            theme::selected()
+        } else {
+            theme::text()
+        };
+        let marker = if selected { "▸" } else { " " };
+        let idx = c.index.clone().unwrap_or_else(|| "hnsw".to_owned());
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} "), theme::accent()),
+            Span::styled(format!("{:<16}", truncate(&c.name, 16)), name_style),
+            Span::styled(format!("{:>4}  ", c.dim), theme::text()),
+            Span::styled(format!("{:<8}", c.metric), theme::dim()),
+            Span::styled(format!("{:<12}", idx), theme::dim()),
+            Span::styled(format!("{:>9}  ", c.count), theme::text()),
+            Span::styled(decor::bar(c.count, maxc, 8), theme::accent()),
+        ]));
+    }
+    Paragraph::new(lines).block(decor::panel_active("collections"))
+}
+
+// Recent activity-log lines (the latest few), each with a severity glyph.
+fn activity_panel(dash: &Dashboard) -> Paragraph<'static> {
+    let lines: Vec<Line> = if dash.activity.is_empty() {
+        vec![Line::from(Span::styled(
+            "waiting for the first poll…",
+            theme::dim(),
+        ))]
+    } else {
+        let n = dash.activity.len();
+        dash.activity[n.saturating_sub(6)..]
             .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let selected = i == app.selected;
-                let (marker, style) = if selected {
-                    ("▸ ", theme::selected())
-                } else {
-                    ("  ", theme::text())
-                };
-                Line::from(vec![
-                    Span::styled(marker, theme::accent()),
-                    Span::styled(
-                        format!(
-                            "{:<24} dim={:<6} metric={:<8} count={}",
-                            c.name, c.dim, c.metric, c.count
-                        ),
-                        style,
-                    ),
-                ])
-            })
+            .map(|a| decor::log_line(&a.ts, a.severity, &a.message))
             .collect()
     };
-    Paragraph::new(lines).block(
-        Block::bordered()
-            .title(Span::styled(" collections ", theme::heading()))
-            .border_style(theme::border_active()),
-    )
+    Paragraph::new(lines).block(decor::panel("activity"))
+}
+
+// Truncate to `max` chars, adding an ellipsis when cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 fn footer() -> Paragraph<'static> {
@@ -785,7 +1068,67 @@ mod tests {
             dim: 4,
             metric: "l2".to_owned(),
             count,
+            index: None,
+            vector_encryption: None,
         }
+    }
+
+    // Flatten a rendered buffer to a string of its cell symbols.
+    fn buffer_text(buf: &Buffer) -> String {
+        let area = buf.area;
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn dashboard_demo_renders_the_logo_table_relationships_and_activity() {
+        let buf = render_dashboard(110, 34, &Dashboard::demo());
+        let text = buffer_text(&buf);
+        // The collections table and its columns.
+        assert!(
+            text.contains("collection") && text.contains("points"),
+            "table header"
+        );
+        assert!(
+            text.contains("documents") && text.contains("disk_vamana"),
+            "a table row"
+        );
+        // The relationships tree and the activity log.
+        assert!(
+            text.contains("relationships") && text.contains("╰─►"),
+            "relationship tree"
+        );
+        assert!(
+            text.contains("activity") && text.contains('●'),
+            "activity log"
+        );
+        // The status badge and a load bar.
+        assert!(text.contains("ONLINE"), "status badge");
+        assert!(text.contains('█'), "logo / bar blocks");
+    }
+
+    #[test]
+    fn dashboard_handles_an_empty_and_offline_state() {
+        let mut dash = Dashboard::demo();
+        dash.collections.clear();
+        dash.selected = 0;
+        dash.offline = Some("connection refused".to_owned());
+        dash.ready = false;
+        let text = buffer_text(&render_dashboard(110, 34, &dash));
+        assert!(text.contains("OFFLINE"), "offline badge");
+        assert!(text.contains("no collections yet"), "empty table");
+    }
+
+    #[test]
+    fn constellation_demo_renders_a_scatter() {
+        let text = buffer_text(&render_constellation_demo(110, 34));
+        assert!(text.contains("constellation") && text.contains("documents"));
     }
 
     #[test]
