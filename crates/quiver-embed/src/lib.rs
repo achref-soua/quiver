@@ -12,11 +12,13 @@
 //! descriptor's [`IndexSpec`] (default in-memory HNSW); the index is built from
 //! the store on open. HNSW applies new-id inserts incrementally; once an IVF
 //! index is built it applies inserts, in-place updates, and deletes
-//! incrementally with LIRE rebalancing (ADR-0023). An update to HNSW, or any
-//! write to the Vamana / disk graph (built over the whole collection), marks the
-//! index stale and the next search rebuilds it — so those suit
-//! bulk-load-then-query. In-place incremental update for the disk graph is a
-//! later increment (SpFresh).
+//! incrementally with LIRE rebalancing (ADR-0023). The Vamana / disk graph
+//! family is maintained the FreshDiskANN way (ADR-0033): the batch-built graph
+//! is a read-only base, recent inserts land in an in-memory delta graph, and
+//! deletes are tombstoned, so writes are size-independent; when the pending work
+//! grows past [`GRAPH_REBUILD_PENDING_FRACTION`] the next access consolidates by
+//! rebuilding from the store. All indexes stay derived (rebuilt from the store
+//! on open), so the crash gate never sees an index write.
 //!
 //! ## Filtered (hybrid) search
 //! A search may carry a [`quiver_query::Filter`] over the payload. The planner
@@ -36,8 +38,8 @@ use std::path::Path;
 
 use quiver_core::{SecPredicate, SecValue, Store};
 use quiver_index::{
-    DiskSearchParams, DiskVamana, Hnsw, HnswConfig, Index, Ivf, IvfConfig, Metric, Neighbor,
-    ProductQuantizer, Vamana, VamanaConfig, max_sim, ordering_distance, report_metric,
+    DiskVamana, FreshDiskVamana, FreshVamana, Hnsw, HnswConfig, Index, Ivf, IvfConfig, Metric,
+    Neighbor, ProductQuantizer, Vamana, VamanaConfig, max_sim, ordering_distance, report_metric,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -169,21 +171,31 @@ const FULL_SCAN_THRESHOLD: usize = 10_000;
 // soft-delete; at it, the next access rebuilds.
 const HNSW_REBUILD_DELETED_FRACTION: f64 = 0.2;
 
+/// Pending graph work — delta inserts plus tombstones — at which a FreshDiskANN
+/// graph collection consolidates: the next access rebuilds the base from the
+/// store, reclaiming tombstones and folding in the delta (ADR-0033). Below it,
+/// inserts go to the in-memory delta and deletes are `O(1)` tombstones. Mirrors
+/// [`HNSW_REBUILD_DELETED_FRACTION`].
+const GRAPH_REBUILD_PENDING_FRACTION: f64 = 0.2;
+
 // The vector index backing one collection. HNSW and (once built) IVF are
-// maintained incrementally; Vamana and the disk graph are batch-built from the
-// store (the `Option` is `None` until first build) and rebuild lazily after
-// writes, so they suit bulk-load-then-query.
+// maintained incrementally; the Vamana and disk graphs are batch-built from the
+// store (the `Option` is `None` until first build) and then maintained
+// incrementally the FreshDiskANN way — a read-only base graph plus an in-memory
+// delta and deletion set, consolidated by a rebuild past a churn threshold
+// (ADR-0033).
 enum CollectionIndex {
     // A fetch-only collection with no server-side ANN index: a client-side-encrypted
     // collection (ADR-0032) stores opaque ciphertext the server never ranks, so the
     // client fetches points and ranks locally.
     None,
     Hnsw(Hnsw),
-    Vamana(Option<Vamana>),
+    Vamana(Option<FreshVamana>),
     Ivf(Option<Ivf>),
     // The disk-resident DiskANN index: PQ codes in RAM, graph + full vectors on
-    // (encrypted) SSD, exact re-rank (ADR-0019).
-    Disk(Option<DiskVamana>),
+    // (encrypted) SSD, exact re-rank (ADR-0019), with a FreshDiskANN in-memory
+    // delta layered on top so the on-disk artifact stays immutable.
+    Disk(Option<FreshDiskVamana>),
 }
 
 impl CollectionIndex {
@@ -193,9 +205,7 @@ impl CollectionIndex {
             CollectionIndex::Hnsw(h) => h.search(query, k, ef)?,
             CollectionIndex::Vamana(Some(g)) => g.search(query, k, ef)?,
             CollectionIndex::Ivf(Some(i)) => i.search(query, k, ef)?,
-            CollectionIndex::Disk(Some(d)) => {
-                d.search(query, k, &DiskSearchParams { l_search: ef })?
-            }
+            CollectionIndex::Disk(Some(d)) => d.search(query, k, ef)?,
             CollectionIndex::None
             | CollectionIndex::Vamana(None)
             | CollectionIndex::Ivf(None)
@@ -447,8 +457,9 @@ impl Database {
         // Maintain the in-memory index in place where the kind allows it, else
         // defer to a lazy rebuild on the next search. HNSW absorbs a brand-new id
         // (it cannot update one in place); a built/trained IVF inserts or
-        // replaces any id (ADR-0023). A batch graph, the disk index, an
-        // unbuilt/empty index, or an already-stale handle rebuilds instead.
+        // replaces any id (ADR-0023); a built FreshDiskANN graph inserts into its
+        // delta and tombstones the prior copy on an update (ADR-0033). An unbuilt
+        // index or an already-stale handle rebuilds instead.
         if handle.stale {
             return Ok(());
         }
@@ -456,6 +467,10 @@ impl Database {
         let is_hnsw = matches!(handle.index, CollectionIndex::Hnsw(_));
         let is_live_ivf =
             matches!(&handle.index, CollectionIndex::Ivf(Some(ivf)) if !ivf.is_empty());
+        let is_live_graph = matches!(
+            handle.index,
+            CollectionIndex::Vamana(Some(_)) | CollectionIndex::Disk(Some(_))
+        );
         if is_hnsw && !known {
             let internal = handle.int_to_ext.len() as u64;
             if let CollectionIndex::Hnsw(h) = &mut handle.index {
@@ -476,6 +491,36 @@ impl Database {
             };
             if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
                 ivf.insert(internal, vector)?;
+            }
+        } else if is_live_graph {
+            // A graph cannot update a node in place, so every upsert appends a new
+            // delta node under a fresh internal id and (on an update) tombstones the
+            // prior copy in the base/delta — FreshDiskANN's insert + deletion set
+            // (ADR-0033). Consolidate by a rebuild once the pending work is large.
+            let old = handle.ext_to_int.get(id).copied();
+            let internal = handle.int_to_ext.len() as u64;
+            let mut pending = 0.0;
+            match &mut handle.index {
+                CollectionIndex::Vamana(Some(fresh)) => {
+                    if let Some(o) = old {
+                        fresh.mark_deleted(o);
+                    }
+                    fresh.insert(internal, vector)?;
+                    pending = fresh.pending_fraction();
+                }
+                CollectionIndex::Disk(Some(fresh)) => {
+                    if let Some(o) = old {
+                        fresh.mark_deleted(o);
+                    }
+                    fresh.insert(internal, vector)?;
+                    pending = fresh.pending_fraction();
+                }
+                _ => {}
+            }
+            handle.ext_to_int.insert(id.to_owned(), internal);
+            handle.int_to_ext.push(id.to_owned());
+            if pending >= GRAPH_REBUILD_PENDING_FRACTION {
+                handle.stale = true;
             }
         } else {
             handle.stale = true;
@@ -499,13 +544,19 @@ impl Database {
         if handle.descriptor.vector_encryption == VectorEncryption::ClientSide {
             return Ok(true);
         }
-        // A built IVF removes in place (ADR-0023) and a built HNSW soft-deletes
-        // (ADR-0026); other kinds defer to a rebuild. The id->internal mapping is
+        // A built IVF removes in place (ADR-0023), a built HNSW soft-deletes
+        // (ADR-0026), and a built FreshDiskANN graph tombstones in its deletion set
+        // (ADR-0033); other kinds defer to a rebuild. The id->internal mapping is
         // kept so a later re-insert reuses the slot — a removed or soft-deleted
         // internal is simply never returned by the index.
         let internal = handle.ext_to_int.get(id).copied();
         let live_ivf = !handle.stale && matches!(handle.index, CollectionIndex::Ivf(Some(_)));
         let live_hnsw = !handle.stale && matches!(handle.index, CollectionIndex::Hnsw(_));
+        let live_graph = !handle.stale
+            && matches!(
+                handle.index,
+                CollectionIndex::Vamana(Some(_)) | CollectionIndex::Disk(Some(_))
+            );
         match internal {
             Some(internal) if live_ivf => {
                 if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
@@ -517,6 +568,23 @@ impl Database {
                 if let CollectionIndex::Hnsw(h) = &mut handle.index {
                     h.mark_deleted(internal as u32);
                     crowded = h.deleted_fraction() >= HNSW_REBUILD_DELETED_FRACTION;
+                }
+                if crowded {
+                    handle.stale = true;
+                }
+            }
+            Some(internal) if live_graph => {
+                let mut crowded = false;
+                match &mut handle.index {
+                    CollectionIndex::Vamana(Some(fresh)) => {
+                        fresh.mark_deleted(internal);
+                        crowded = fresh.pending_fraction() >= GRAPH_REBUILD_PENDING_FRACTION;
+                    }
+                    CollectionIndex::Disk(Some(fresh)) => {
+                        fresh.mark_deleted(internal);
+                        crowded = fresh.pending_fraction() >= GRAPH_REBUILD_PENDING_FRACTION;
+                    }
+                    _ => {}
                 }
                 if crowded {
                     handle.stale = true;
@@ -1170,16 +1238,16 @@ fn build_index(
     let dim = descriptor.dim as usize;
     let metric = to_index_metric(descriptor.metric);
     Ok(match descriptor.index.kind {
-        IndexKind::Vamana => CollectionIndex::Vamana(Some(Vamana::build(
+        IndexKind::Vamana => CollectionIndex::Vamana(Some(FreshVamana::new(Vamana::build(
             ids,
             flat,
             dim,
             metric,
             VamanaConfig::default(),
+        )?)?)),
+        IndexKind::DiskVamana => CollectionIndex::Disk(Some(FreshDiskVamana::new(
+            build_disk_index(store, cid, descriptor, ids, flat)?,
         )?)),
-        IndexKind::DiskVamana => {
-            CollectionIndex::Disk(Some(build_disk_index(store, cid, descriptor, ids, flat)?))
-        }
         IndexKind::Ivf => {
             let cfg = IvfConfig {
                 quantization: descriptor.index.pq_subspaces.map(|m| m as usize),
@@ -1978,6 +2046,127 @@ mod tests {
             .search("d", &[7.0, 0.0, 0.0, 0.0], &SearchParams::default())
             .unwrap();
         assert_eq!(res[0].id, "p7");
+    }
+
+    #[test]
+    fn graph_collections_maintain_writes_incrementally() {
+        // FreshDiskANN incremental maintenance (ADR-0033): after the base graph is
+        // built, inserts land in the delta, deletes tombstone, and updates move —
+        // all without a rebuild or a reopen, for both the in-memory and disk graphs.
+        for kind in [IndexKind::Vamana, IndexKind::DiskVamana] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut db = open(tmp.path());
+            db.create_collection("c", desc_with(kind)).unwrap();
+            for i in 0..40u32 {
+                db.upsert(
+                    "c",
+                    &format!("p{i}"),
+                    &[i as f32, 0.0, 0.0, 0.0],
+                    &json!({}),
+                )
+                .unwrap();
+            }
+            // The first search builds the read-only base graph.
+            let res = db
+                .search("c", &[7.0, 0.0, 0.0, 0.0], &SearchParams::default())
+                .unwrap();
+            assert_eq!(res[0].id, "p7", "{kind:?} base nearest");
+
+            // A brand-new point lands in the in-memory delta and is immediately
+            // findable — no rebuild, no reopen.
+            db.upsert("c", "p7b", &[7.4, 0.0, 0.0, 0.0], &json!({}))
+                .unwrap();
+            let res = db
+                .search("c", &[7.45, 0.0, 0.0, 0.0], &SearchParams::default())
+                .unwrap();
+            assert_eq!(res[0].id, "p7b", "{kind:?} delta insert not found");
+
+            // A delete tombstones the point: it is never returned again.
+            assert!(db.delete("c", "p7").unwrap());
+            let res = db
+                .search("c", &[7.0, 0.0, 0.0, 0.0], &SearchParams::default())
+                .unwrap();
+            assert!(
+                res.iter().all(|m| m.id != "p7"),
+                "{kind:?} deleted id returned"
+            );
+
+            // An update moves a vector: it is found at the new position and no
+            // longer dominates the old one.
+            db.upsert("c", "p20", &[500.0, 0.0, 0.0, 0.0], &json!({}))
+                .unwrap();
+            let res = db
+                .search("c", &[500.0, 0.0, 0.0, 0.0], &SearchParams::default())
+                .unwrap();
+            assert_eq!(res[0].id, "p20", "{kind:?} updated vector not at new spot");
+            let res = db
+                .search("c", &[20.0, 0.0, 0.0, 0.0], &SearchParams::default())
+                .unwrap();
+            assert_ne!(
+                res[0].id, "p20",
+                "{kind:?} stale copy still nearest old spot"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_consolidates_under_heavy_churn() {
+        // Churn past the 20% pending threshold forces a consolidation (a derived
+        // rebuild from the store); results stay correct throughout and across a
+        // reopen, since the store is the source of truth (ADR-0033).
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("c", desc_with(IndexKind::Vamana))
+            .unwrap();
+        for i in 0..50u32 {
+            db.upsert(
+                "c",
+                &format!("p{i}"),
+                &[i as f32, 0.0, 0.0, 0.0],
+                &json!({}),
+            )
+            .unwrap();
+        }
+        let _ = db.search("c", &[0.0; 4], &SearchParams::default()).unwrap();
+
+        let deleted: Vec<String> = (0..15u32).map(|i| format!("p{i}")).collect();
+        for i in 0..15u32 {
+            assert!(db.delete("c", &format!("p{i}")).unwrap());
+            db.upsert(
+                "c",
+                &format!("q{i}"),
+                &[1000.0 + i as f32, 0.0, 0.0, 0.0],
+                &json!({}),
+            )
+            .unwrap();
+        }
+
+        let near_origin = db
+            .search("c", &[5.0, 0.0, 0.0, 0.0], &SearchParams::default())
+            .unwrap();
+        assert!(
+            near_origin.iter().all(|m| !deleted.contains(&m.id)),
+            "a churned-out id was returned"
+        );
+        let near_q = db
+            .search("c", &[1007.0, 0.0, 0.0, 0.0], &SearchParams::default())
+            .unwrap();
+        assert_eq!(near_q[0].id, "q7", "new point not found after churn");
+
+        db.checkpoint().unwrap();
+        drop(db);
+        let mut db = open(tmp.path());
+        let near_q = db
+            .search("c", &[1007.0, 0.0, 0.0, 0.0], &SearchParams::default())
+            .unwrap();
+        assert_eq!(near_q[0].id, "q7", "new point lost across reopen");
+        let near_origin = db
+            .search("c", &[5.0, 0.0, 0.0, 0.0], &SearchParams::default())
+            .unwrap();
+        assert!(
+            near_origin.iter().all(|m| !deleted.contains(&m.id)),
+            "a churned-out id resurfaced after reopen"
+        );
     }
 
     // ---- hybrid (pre-filtered) search ----
