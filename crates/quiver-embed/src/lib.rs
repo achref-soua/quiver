@@ -455,76 +455,8 @@ impl Database {
             return Ok(());
         }
         // Maintain the in-memory index in place where the kind allows it, else
-        // defer to a lazy rebuild on the next search. HNSW absorbs a brand-new id
-        // (it cannot update one in place); a built/trained IVF inserts or
-        // replaces any id (ADR-0023); a built FreshDiskANN graph inserts into its
-        // delta and tombstones the prior copy on an update (ADR-0033). An unbuilt
-        // index or an already-stale handle rebuilds instead.
-        if handle.stale {
-            return Ok(());
-        }
-        let known = handle.ext_to_int.contains_key(id);
-        let is_hnsw = matches!(handle.index, CollectionIndex::Hnsw(_));
-        let is_live_ivf =
-            matches!(&handle.index, CollectionIndex::Ivf(Some(ivf)) if !ivf.is_empty());
-        let is_live_graph = matches!(
-            handle.index,
-            CollectionIndex::Vamana(Some(_)) | CollectionIndex::Disk(Some(_))
-        );
-        if is_hnsw && !known {
-            let internal = handle.int_to_ext.len() as u64;
-            if let CollectionIndex::Hnsw(h) = &mut handle.index {
-                h.insert(internal, vector)?;
-            }
-            handle.ext_to_int.insert(id.to_owned(), internal);
-            handle.int_to_ext.push(id.to_owned());
-        } else if is_live_ivf {
-            // Reuse the internal id for an in-place update; allocate a fresh,
-            // dense one for a new id (so `int_to_ext` stays index-addressable).
-            let internal = if known {
-                handle.ext_to_int[id]
-            } else {
-                let i = handle.int_to_ext.len() as u64;
-                handle.ext_to_int.insert(id.to_owned(), i);
-                handle.int_to_ext.push(id.to_owned());
-                i
-            };
-            if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
-                ivf.insert(internal, vector)?;
-            }
-        } else if is_live_graph {
-            // A graph cannot update a node in place, so every upsert appends a new
-            // delta node under a fresh internal id and (on an update) tombstones the
-            // prior copy in the base/delta — FreshDiskANN's insert + deletion set
-            // (ADR-0033). Consolidate by a rebuild once the pending work is large.
-            let old = handle.ext_to_int.get(id).copied();
-            let internal = handle.int_to_ext.len() as u64;
-            let mut pending = 0.0;
-            match &mut handle.index {
-                CollectionIndex::Vamana(Some(fresh)) => {
-                    if let Some(o) = old {
-                        fresh.mark_deleted(o);
-                    }
-                    fresh.insert(internal, vector)?;
-                    pending = fresh.pending_fraction();
-                }
-                CollectionIndex::Disk(Some(fresh)) => {
-                    if let Some(o) = old {
-                        fresh.mark_deleted(o);
-                    }
-                    fresh.insert(internal, vector)?;
-                    pending = fresh.pending_fraction();
-                }
-                _ => {}
-            }
-            handle.ext_to_int.insert(id.to_owned(), internal);
-            handle.int_to_ext.push(id.to_owned());
-            if pending >= GRAPH_REBUILD_PENDING_FRACTION {
-                handle.stale = true;
-            }
-        } else {
-            handle.stale = true;
-        }
+        // defer to a lazy rebuild on the next search (ADR-0023/0026/0033).
+        index_upsert_point(handle, id, vector)?;
         Ok(())
     }
 
@@ -547,51 +479,9 @@ impl Database {
         // A built IVF removes in place (ADR-0023), a built HNSW soft-deletes
         // (ADR-0026), and a built FreshDiskANN graph tombstones in its deletion set
         // (ADR-0033); other kinds defer to a rebuild. The id->internal mapping is
-        // kept so a later re-insert reuses the slot — a removed or soft-deleted
+        // kept so a later re-insert allocates afresh — a removed or soft-deleted
         // internal is simply never returned by the index.
-        let internal = handle.ext_to_int.get(id).copied();
-        let live_ivf = !handle.stale && matches!(handle.index, CollectionIndex::Ivf(Some(_)));
-        let live_hnsw = !handle.stale && matches!(handle.index, CollectionIndex::Hnsw(_));
-        let live_graph = !handle.stale
-            && matches!(
-                handle.index,
-                CollectionIndex::Vamana(Some(_)) | CollectionIndex::Disk(Some(_))
-            );
-        match internal {
-            Some(internal) if live_ivf => {
-                if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
-                    ivf.remove(internal);
-                }
-            }
-            Some(internal) if live_hnsw => {
-                let mut crowded = false;
-                if let CollectionIndex::Hnsw(h) = &mut handle.index {
-                    h.mark_deleted(internal as u32);
-                    crowded = h.deleted_fraction() >= HNSW_REBUILD_DELETED_FRACTION;
-                }
-                if crowded {
-                    handle.stale = true;
-                }
-            }
-            Some(internal) if live_graph => {
-                let mut crowded = false;
-                match &mut handle.index {
-                    CollectionIndex::Vamana(Some(fresh)) => {
-                        fresh.mark_deleted(internal);
-                        crowded = fresh.pending_fraction() >= GRAPH_REBUILD_PENDING_FRACTION;
-                    }
-                    CollectionIndex::Disk(Some(fresh)) => {
-                        fresh.mark_deleted(internal);
-                        crowded = fresh.pending_fraction() >= GRAPH_REBUILD_PENDING_FRACTION;
-                    }
-                    _ => {}
-                }
-                if crowded {
-                    handle.stale = true;
-                }
-            }
-            _ => handle.stale = true,
-        }
+        index_delete_point(handle, id);
         Ok(true)
     }
 
@@ -835,6 +725,8 @@ impl Database {
             .unwrap_or(0) as usize;
         for j in vectors.len()..previous {
             self.store.delete(handle.id, &token_id(doc_id, j))?;
+            // Tombstone the dropped token row in the ANN index too (ADR-0034).
+            index_delete_point(handle, &token_id(doc_id, j));
         }
         let payload_bytes = serde_json::to_vec(payload)?;
         for (j, vector) in vectors.iter().enumerate() {
@@ -846,12 +738,14 @@ impl Database {
             };
             self.store
                 .upsert(handle.id, &token_id(doc_id, j), vector, bytes)?;
+            // Fold the token row into the ANN index incrementally instead of
+            // marking the whole collection stale (ADR-0034); the underlying index
+            // consolidates by a rebuild past its own churn threshold.
+            index_upsert_point(handle, &token_id(doc_id, j), vector)?;
         }
         if let Some(docs) = handle.docs.as_mut() {
             docs.insert(doc_id.to_owned(), vectors.len() as u32);
         }
-        // The token pool changed; rebuild the ANN index on the next search.
-        handle.stale = true;
         Ok(())
     }
 
@@ -998,11 +892,12 @@ impl Database {
         };
         for j in 0..count as usize {
             self.store.delete(handle.id, &token_id(doc_id, j))?;
+            // Tombstone each token row in the ANN index incrementally (ADR-0034).
+            index_delete_point(handle, &token_id(doc_id, j));
         }
         if let Some(docs) = handle.docs.as_mut() {
             docs.remove(doc_id);
         }
-        handle.stale = true;
         Ok(true)
     }
 
@@ -1356,6 +1251,134 @@ fn restore_ivf_snapshot(store: &Store, handle: &mut CollectionHandle, blob: &[u8
         }
     }
     Ok(())
+}
+
+// Fold one point write (`ext_id` → `vector`) into a built index incrementally,
+// or mark the handle stale to defer to a rebuild when the kind cannot absorb it
+// in place. HNSW absorbs a brand-new id but cannot update one (a known id falls
+// to a rebuild); a built/trained IVF inserts or replaces any id (ADR-0023); a
+// built FreshDiskANN graph appends to its delta and tombstones the prior copy on
+// an update, consolidating past its churn threshold (ADR-0033). Shared by the
+// single-vector `upsert` and each token row of a multi-vector `upsert_document`
+// (ADR-0034). A no-op once the handle is stale (a rebuild is already pending).
+fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32]) -> Result<()> {
+    if handle.stale {
+        return Ok(());
+    }
+    let known = handle.ext_to_int.contains_key(ext_id);
+    let is_hnsw = matches!(handle.index, CollectionIndex::Hnsw(_));
+    let is_live_ivf = matches!(&handle.index, CollectionIndex::Ivf(Some(ivf)) if !ivf.is_empty());
+    let is_live_graph = matches!(
+        handle.index,
+        CollectionIndex::Vamana(Some(_)) | CollectionIndex::Disk(Some(_))
+    );
+    if is_hnsw && !known {
+        let internal = handle.int_to_ext.len() as u64;
+        if let CollectionIndex::Hnsw(h) = &mut handle.index {
+            h.insert(internal, vector)?;
+        }
+        handle.ext_to_int.insert(ext_id.to_owned(), internal);
+        handle.int_to_ext.push(ext_id.to_owned());
+    } else if is_live_ivf {
+        // Reuse the internal id for an in-place update; allocate a fresh, dense one
+        // for a new id (so `int_to_ext` stays index-addressable).
+        let internal = if known {
+            handle.ext_to_int[ext_id]
+        } else {
+            let i = handle.int_to_ext.len() as u64;
+            handle.ext_to_int.insert(ext_id.to_owned(), i);
+            handle.int_to_ext.push(ext_id.to_owned());
+            i
+        };
+        if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
+            ivf.insert(internal, vector)?;
+        }
+    } else if is_live_graph {
+        // A graph cannot update a node in place: append a new delta node under a
+        // fresh internal id and tombstone the prior copy on an update (ADR-0033).
+        let old = handle.ext_to_int.get(ext_id).copied();
+        let internal = handle.int_to_ext.len() as u64;
+        let mut pending = 0.0;
+        match &mut handle.index {
+            CollectionIndex::Vamana(Some(fresh)) => {
+                if let Some(o) = old {
+                    fresh.mark_deleted(o);
+                }
+                fresh.insert(internal, vector)?;
+                pending = fresh.pending_fraction();
+            }
+            CollectionIndex::Disk(Some(fresh)) => {
+                if let Some(o) = old {
+                    fresh.mark_deleted(o);
+                }
+                fresh.insert(internal, vector)?;
+                pending = fresh.pending_fraction();
+            }
+            _ => {}
+        }
+        handle.ext_to_int.insert(ext_id.to_owned(), internal);
+        handle.int_to_ext.push(ext_id.to_owned());
+        if pending >= GRAPH_REBUILD_PENDING_FRACTION {
+            handle.stale = true;
+        }
+    } else {
+        handle.stale = true;
+    }
+    Ok(())
+}
+
+// Tombstone one point (`ext_id`) from a built index incrementally, or mark the
+// handle stale to defer to a rebuild. A built IVF removes in place (ADR-0023), a
+// built HNSW soft-deletes (ADR-0026), and a built FreshDiskANN graph tombstones in
+// its deletion set (ADR-0033); each amortizes a rebuild when tombstones dominate.
+// The id→internal mapping is kept so a later re-insert allocates afresh. Shared by
+// the single-vector `delete` and each token row of `delete_document` (ADR-0034).
+fn index_delete_point(handle: &mut CollectionHandle, ext_id: &str) {
+    if handle.stale {
+        return;
+    }
+    let internal = handle.ext_to_int.get(ext_id).copied();
+    let live_ivf = matches!(handle.index, CollectionIndex::Ivf(Some(_)));
+    let live_hnsw = matches!(handle.index, CollectionIndex::Hnsw(_));
+    let live_graph = matches!(
+        handle.index,
+        CollectionIndex::Vamana(Some(_)) | CollectionIndex::Disk(Some(_))
+    );
+    match internal {
+        Some(internal) if live_ivf => {
+            if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
+                ivf.remove(internal);
+            }
+        }
+        Some(internal) if live_hnsw => {
+            let mut crowded = false;
+            if let CollectionIndex::Hnsw(h) = &mut handle.index {
+                h.mark_deleted(internal as u32);
+                crowded = h.deleted_fraction() >= HNSW_REBUILD_DELETED_FRACTION;
+            }
+            if crowded {
+                handle.stale = true;
+            }
+        }
+        Some(internal) if live_graph => {
+            let mut crowded = false;
+            match &mut handle.index {
+                CollectionIndex::Vamana(Some(fresh)) => {
+                    fresh.mark_deleted(internal);
+                    crowded = fresh.pending_fraction() >= GRAPH_REBUILD_PENDING_FRACTION;
+                }
+                CollectionIndex::Disk(Some(fresh)) => {
+                    fresh.mark_deleted(internal);
+                    crowded = fresh.pending_fraction() >= GRAPH_REBUILD_PENDING_FRACTION;
+                }
+                _ => {}
+            }
+            if crowded {
+                handle.stale = true;
+            }
+        }
+        _ => handle.stale = true,
+    }
 }
 
 // Rebuild a collection's index from the store's current live rows. For a
@@ -2167,6 +2190,93 @@ mod tests {
             near_origin.iter().all(|m| !deleted.contains(&m.id)),
             "a churned-out id resurfaced after reopen"
         );
+    }
+
+    #[test]
+    fn multivector_writes_are_incremental_and_match_a_rebuild() {
+        // Token rows fold into the ANN index incrementally instead of stale->rebuild
+        // (ADR-0034); the document API stays correct under interleaved
+        // upsert/delete/re-upsert with no reopen, and a reopen (the authoritative
+        // rebuild) yields the identical ranking. Docs lie on an arc of increasing
+        // angle to the query (cosine, so direction alone ranks them), making the
+        // expected order unambiguous. (Token-pool candidate generation only engages
+        // above the exact-scan threshold; the incremental token maintenance it
+        // relies on is the same code the single-vector index tests exercise.)
+        let dir = |theta: f32| vec![theta.cos(), theta.sin(), 0.0, 0.0];
+        let doc = |theta: f32| vec![dir(theta), dir(theta)];
+        for kind in [IndexKind::Ivf, IndexKind::Hnsw, IndexKind::Vamana] {
+            let tmp = tempfile::tempdir().unwrap();
+            let desc = Descriptor::new(4, Dtype::F32, DistanceMetric::Cosine)
+                .with_multivector(true)
+                .with_index(IndexSpec {
+                    kind,
+                    pq_subspaces: None,
+                });
+            let mut db = open(tmp.path());
+            db.create_collection("m", desc).unwrap();
+            // d1 is most aligned with the query (smallest angle), d10 least.
+            for i in 1..=10u32 {
+                db.upsert_document(
+                    "m",
+                    &format!("d{i}"),
+                    &doc(0.1 * i as f32),
+                    &json!({ "i": i }),
+                )
+                .unwrap();
+            }
+            let q = vec![dir(0.0)];
+            let top = |db: &mut Database| {
+                db.search_multi_vector(
+                    "m",
+                    &q,
+                    &SearchParams {
+                        k: 3,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>()
+            };
+            assert_eq!(top(&mut db), vec!["d1", "d2", "d3"], "{kind:?} initial");
+
+            // Delete the top document — gone without a reopen.
+            assert!(db.delete_document("m", "d1").unwrap());
+            assert_eq!(
+                top(&mut db),
+                vec!["d2", "d3", "d4"],
+                "{kind:?} after delete"
+            );
+
+            // Re-upsert the least-aligned doc onto the query — the update is live.
+            db.upsert_document("m", "d10", &doc(0.0), &json!({ "i": 10 }))
+                .unwrap();
+            assert_eq!(top(&mut db)[0], "d10", "{kind:?} after update");
+
+            // A new, near-aligned document is immediately findable, second only to d10.
+            db.upsert_document("m", "d11", &doc(0.05), &json!({ "i": 11 }))
+                .unwrap();
+            let r = top(&mut db);
+            assert_eq!(r[0], "d10", "{kind:?}");
+            assert_eq!(r[1], "d11", "{kind:?} new doc not ranked");
+
+            // A shorter re-upsert drops the trailing token row.
+            db.upsert_document("m", "d8", &[dir(0.8)], &json!({ "i": 8 }))
+                .unwrap();
+            let d8 = db.get_document("m", "d8", true).unwrap().unwrap();
+            assert_eq!(d8.vectors.unwrap().len(), 1, "{kind:?} trailing token kept");
+
+            // The incremental in-memory state matches an authoritative rebuild.
+            let before = top(&mut db);
+            drop(db);
+            let mut db = open(tmp.path());
+            assert_eq!(top(&mut db), before, "{kind:?} incremental != rebuild");
+            assert!(
+                db.get_document("m", "d1", false).unwrap().is_none(),
+                "{kind:?} deleted doc resurfaced"
+            );
+        }
     }
 
     // ---- hybrid (pre-filtered) search ----
