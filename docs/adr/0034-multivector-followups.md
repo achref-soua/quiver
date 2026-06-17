@@ -1,6 +1,6 @@
 # ADR-0034: Multi-vector follow-ups — incremental maintenance, native document rows, ColBERTv2/PLAID compression
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-17
 - **Deciders:** Achref Soua
 
@@ -176,7 +176,92 @@ native-row mode) additively; the `v0.7.0` document API is unchanged in behaviour
 
 ## Implementation
 
-Filled in on acceptance.
+`v0.14.0` shipped Parts A and C (and the wire/SDK surface for C); Part B is
+**deferred**, honestly, per the ship-or-defer commitment in the Decision above.
+
+### Part A — incremental multi-vector index maintenance (shipped)
+
+`upsert_document` / `delete_document` no longer mark the collection `stale` for a
+full token-pool rebuild. The per-point index dispatch was extracted into shared
+free functions `index_upsert_point` / `index_delete_point` in
+`crates/quiver-embed/src/lib.rs` (next to `rebuild_index`), used by **both** the
+single-vector `upsert` / `delete` path and the per-token-row path of the document
+API. A re-upsert tombstones the document's prior token internal ids and inserts
+the new token rows under fresh ids; a delete tombstones all of a document's token
+ids. Consolidation is the underlying index's own existing churn threshold (IVF
+rebalance, HNSW `0.2` deleted fraction, graph `GRAPH_REBUILD_PENDING_FRACTION`).
+The index stays derived and rebuilt-from-store on open, so the `kill -9` crash
+gate is untouched by construction. The exact-scan path (≤ `MULTIVECTOR_EXACT_DOC_THRESHOLD`
+= 10 000 docs) ignores the index, so incremental token maintenance is observable
+above that threshold (candidate generation); HNSW maintains incrementally even
+below it.
+
+### Part C — ColBERTv2 residual compression + PLAID pruning (shipped)
+
+`quiver-index::colbert::ColbertIndex`: coarse `kmeans` centroids over the token
+pool, each token stored as *(nearest centroid id, PQ residual code)* with the
+existing `ProductQuantizer` **trained under `Metric::L2`** for faithful residual
+reconstruction (the collection's cosine/dot metric is applied only at scoring).
+`search` does PLAID centroid pruning (score centroids first, expand only the top
+ones' token lists). It is RAM-resident and derived — in-memory `insert` plus an
+`O(1)` deletion set, rebuilt from the store on open — so no on-disk format change
+and the crash gate is untouched. Wired through a new `IndexKind::Colbert`
+(`quiver-core`, `#[non_exhaustive]` + serde snake_case), `CollectionIndex::Colbert`,
+and the build / empty / search / validate / incremental-maintenance dispatch in
+`quiver-embed`. `validate_index` rejects `colbert` on a single-vector collection.
+ColBERT candidate generation only observably engages above the 10 000-document
+exact threshold; at or below it the exact MaxSim path serves the query.
+
+The surface for C (the **C3** sub-task) names `IndexKind::Colbert` on every
+edge so a `colbert` multi-vector collection is creatable over the wire: the proto
+`IndexKind` enum (`INDEX_KIND_COLBERT`), the REST `IndexKindDto`, the gRPC
+from/to-proto maps, the MCP `create_collection` schema enum and string match, and
+the Python/TypeScript SDK index-kind enums.
+
+### Part B — native variable-stride document rows (deferred)
+
+Deferred to a later increment, recorded here rather than shipped on faith, for two
+reasons established during implementation review:
+
+1. **The payoff is locality / id-space, not work elimination.** As the Decision
+   and ADR-0028 state, candidate generation still needs a token-pool index, so
+   Part B changes only how the exact token vectors are *stored and gathered* for
+   the re-rank — it removes no work, and the shipped token-as-row path is already
+   correct and crash-safe by construction.
+2. **Its ship precondition can only be met on owner reference hardware.** The
+   Decision gates Part B on a *measured* re-rank/locality benefit. Quiver's
+   benchmark numbers are produced exclusively on documented reference hardware and
+   are never fabricated, so the measurement that would justify joining the
+   `fsync`/crash path with a variable-stride segment is an owner step. Shipping the
+   on-disk change without it would be shipping on faith — exactly what this ADR
+   committed not to do.
+
+A useful note for whoever picks Part B up: the on-disk machinery it needs already
+exists. The row-addressed segment (ADR-0020) stores payloads in a variable-length,
+offset-addressed `.pay` heap (`(pay_off, pay_len)` per row in the `.dir`,
+`mmap`-read, CRC-paged, WAL-journaled, and already covered by the `kill -9` crash
+gate). Part B is therefore a *second* variable-length column following the proven
+payload-heap pattern (plus a `count`-prefixed token matrix and the directory /
+recovery / crash-injection extensions), not a new fsync surface invented from
+scratch. It stays opt-in and the default token-as-row layout is never broken.
+
+## Verification
+
+- **Part A:** `multivector_writes_are_incremental_and_match_a_rebuild`
+  (`quiver-embed`) asserts that incremental upsert/delete across IVF/HNSW/Vamana
+  (cosine) yields, on reopen, the same results as an authoritative full rebuild.
+- **Part C:** `quiver-index` candidate-recall tests on **clustered** data with
+  4× over-fetch (random data is a degenerate worst case for any quantizer); the
+  `quiver-embed` index-loop tests cover IVF/HNSW/Vamana/Colbert; `validate_index`
+  rejects single-vector ColBERT.
+- **C3 surface:** `colbert_index_round_trip` (`quiver-server`) creates a `colbert`
+  multi-vector collection over **REST and gRPC**, reads the kind back over both
+  transports, and asserts `colbert`-without-`multivector` is rejected (400); an
+  MCP create test and Python/TypeScript SDK create-collection tests cover the rest
+  of the surface. `just verify`, `just test-py`, and `just test-ts` are green.
+- **Part B:** not shipped, so no crash-gate claim is made. The crash gate is
+  unchanged from `v0.13.0` because Parts A and C are derived and never touch the
+  `fsync` path.
 
 ## References
 
