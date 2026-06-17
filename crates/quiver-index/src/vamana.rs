@@ -16,9 +16,12 @@
 //! accessors here ([`Vamana::neighbors`], [`Vamana::vector`], [`Vamana::medoid`])
 //! exist so that layout can read the built graph.
 //!
-//! Vamana is a **batch-built** index (the medoid, the build order, and pruning
-//! all need the full set), so it is constructed with [`Vamana::build`] rather
-//! than the incremental [`crate::Index`] trait. It supports [`Metric::L2`] and
+//! Vamana is best **batch-built** ([`Vamana::build`]) when the whole set is
+//! known — the medoid, build order, and two-pass pruning settle a higher-recall
+//! graph. For streaming maintenance it also supports one-at-a-time
+//! [`Vamana::insert`] (the FreshDiskANN temporary index, ADR-0033), which a
+//! "fresh" wrapper layers over a read-only base graph. It supports
+//! [`Metric::L2`] and
 //! [`Metric::Cosine`] (cosine vectors are unit-normalized, so the graph is built
 //! on the sphere where L2 ordering matches cosine ordering); inner-product
 //! (MIPS) collections use HNSW or IVF.
@@ -87,6 +90,10 @@ pub struct Vamana {
     dim: usize,
     metric: Metric,
     r: usize,
+    // Build/insert search-list width and prune slack, kept so incremental
+    // inserts ([`Vamana::insert`]) reuse the same parameters as the batch build.
+    l_build: usize,
+    alpha: f32,
     // Prepared vectors (unit-normalized for cosine), flat: node i at [i*dim..].
     vectors: Vec<f32>,
     ids: Vec<u64>,
@@ -157,6 +164,8 @@ impl Vamana {
             dim,
             metric,
             r,
+            l_build: config.l_build.max(1),
+            alpha: config.alpha.max(1.0),
             vectors: prepared,
             ids: ids.to_vec(),
             adjacency: vec![Vec::new(); n],
@@ -195,6 +204,81 @@ impl Vamana {
             }
         }
         Ok(graph)
+    }
+
+    /// Create an empty graph that points can be added to one at a time with
+    /// [`Vamana::insert`] (the FreshDiskANN temporary index, ADR-0033). Use
+    /// [`Vamana::build`] when the whole set is known up front — the batch build
+    /// settles the graph in two passes and yields slightly higher recall.
+    ///
+    /// # Errors
+    /// Returns [`IndexError::InvalidConfig`] for [`Metric::Dot`] (unsupported;
+    /// use HNSW or IVF for inner product).
+    pub fn new(dim: usize, metric: Metric, config: VamanaConfig) -> Result<Self, IndexError> {
+        if metric == Metric::Dot {
+            return Err(IndexError::InvalidConfig(
+                "Vamana supports L2 and Cosine; use HNSW or IVF for inner product",
+            ));
+        }
+        Ok(Self {
+            dim,
+            metric,
+            r: config.r.max(1),
+            l_build: config.l_build.max(1),
+            alpha: config.alpha.max(1.0),
+            vectors: Vec::new(),
+            ids: Vec::new(),
+            adjacency: Vec::new(),
+            medoid: 0,
+        })
+    }
+
+    /// Add one point incrementally (ADR-0033): the FreshDiskANN insert — a greedy
+    /// search from the medoid for candidates, [`Vamana::robust_prune`] to pick the
+    /// new node's ≤`R` out-neighbors, then bidirectional edges with a re-prune of
+    /// any neighbor that overflows `R`. The medoid is kept as-is (the temporary
+    /// index this backs is small and consolidated often), so navigation stays
+    /// anchored at the first inserted node.
+    ///
+    /// # Errors
+    /// Returns [`IndexError::DimensionMismatch`] if `vector.len() != dim`.
+    pub fn insert(&mut self, id: u64, vector: &[f32]) -> Result<(), IndexError> {
+        if vector.len() != self.dim {
+            return Err(IndexError::DimensionMismatch {
+                expected: self.dim,
+                got: vector.len(),
+            });
+        }
+        let p = self.ids.len() as u32;
+        let prepared = prepare(self.metric, vector);
+        self.vectors.extend_from_slice(&prepared);
+        self.ids.push(id);
+        self.adjacency.push(Vec::new());
+        // The first node is the medoid and has no neighbors yet.
+        if p == 0 {
+            self.medoid = 0;
+            return Ok(());
+        }
+
+        let (_, visited) = self.greedy_search(self.vector(p), self.medoid, self.l_build);
+        let pruned = self.robust_prune(p, visited, self.alpha);
+        self.adjacency[p as usize] = pruned.clone();
+        // Add back-edges, re-pruning any neighbor that overflows `R` (mirrors the
+        // batch build's back-edge step).
+        for &j in &pruned {
+            if j == p {
+                continue;
+            }
+            let adj = &mut self.adjacency[j as usize];
+            if !adj.contains(&p) {
+                adj.push(p);
+                if adj.len() > self.r {
+                    let cand = self.adjacency[j as usize].clone();
+                    self.adjacency[j as usize] = self.robust_prune(j, cand, self.alpha);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Number of points in the graph.
@@ -559,5 +643,110 @@ mod tests {
         .unwrap();
         assert_eq!(g.len(), 1);
         assert_eq!(g.search(&[1.0, 2.0, 3.0, 4.0], 3, 10).unwrap()[0].id, 7);
+    }
+
+    #[test]
+    fn new_rejects_dot() {
+        assert!(matches!(
+            Vamana::new(4, Metric::Dot, VamanaConfig::default()),
+            Err(IndexError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn insert_into_empty_then_finds_it() {
+        let mut g = Vamana::new(4, Metric::L2, VamanaConfig::default()).unwrap();
+        assert!(g.is_empty());
+        g.insert(7, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        assert_eq!(g.len(), 1);
+        let top = g.search(&[1.0, 2.0, 3.0, 4.0], 3, 10).unwrap();
+        assert_eq!(top[0].id, 7);
+        assert!(top[0].distance < 1e-4);
+    }
+
+    #[test]
+    fn insert_dimension_mismatch_is_rejected() {
+        let mut g = Vamana::new(4, Metric::L2, VamanaConfig::default()).unwrap();
+        assert!(matches!(
+            g.insert(1, &[0.0; 3]),
+            Err(IndexError::DimensionMismatch {
+                expected: 4,
+                got: 3
+            })
+        ));
+    }
+
+    // Build the graph purely by incremental inserts and measure recall against
+    // the same brute-force ground truth the batch build is held to. A
+    // single-pass incremental graph is a touch below a two-pass batch build, so
+    // the threshold is a hair lower than `build`'s 0.95.
+    fn incremental_recall_at_k(metric: Metric) -> f64 {
+        let (dim, n, queries, k) = (32, 1000, 50, 10);
+        let mut rng = SplitMix64::new(0x1_2345_6789_u64.wrapping_add(metric_seed(metric)));
+        let data: Vec<Vec<f32>> = (0..n).map(|_| rand_vec(&mut rng, dim)).collect();
+        let mut g = Vamana::new(dim, metric, VamanaConfig::default()).unwrap();
+        for (i, v) in data.iter().enumerate() {
+            g.insert(i as u64, v).unwrap();
+        }
+        assert_eq!(g.len(), n);
+
+        let mut hits = 0usize;
+        for _ in 0..queries {
+            let q = rand_vec(&mut rng, dim);
+            let truth: HashSet<usize> = brute_force(&data, &q, k, metric).into_iter().collect();
+            let got = g.search(&q, k, 64).unwrap();
+            hits += got
+                .iter()
+                .filter(|nbr| truth.contains(&(nbr.id as usize)))
+                .count();
+        }
+        hits as f64 / (queries * k) as f64
+    }
+
+    #[test]
+    fn incremental_insert_recall_l2() {
+        let r = incremental_recall_at_k(Metric::L2);
+        assert!(r >= 0.90, "incremental L2 recall@10 was {r:.3}");
+    }
+
+    #[test]
+    fn incremental_insert_recall_cosine() {
+        let r = incremental_recall_at_k(Metric::Cosine);
+        assert!(r >= 0.90, "incremental cosine recall@10 was {r:.3}");
+    }
+
+    #[test]
+    fn incremental_insert_is_deterministic() {
+        let mut rng = SplitMix64::new(13);
+        let data: Vec<Vec<f32>> = (0..400).map(|_| rand_vec(&mut rng, 12)).collect();
+        let build = || {
+            let mut g = Vamana::new(12, Metric::L2, VamanaConfig::default()).unwrap();
+            for (i, v) in data.iter().enumerate() {
+                g.insert(i as u64, v).unwrap();
+            }
+            let q = vec![0.1f32; 12];
+            g.search(&q, 10, 50)
+                .unwrap()
+                .into_iter()
+                .map(|nbr| nbr.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(build(), build());
+    }
+
+    #[test]
+    fn incremental_out_degree_is_bounded() {
+        let mut rng = SplitMix64::new(0xB0);
+        let cfg = VamanaConfig {
+            r: 24,
+            ..VamanaConfig::default()
+        };
+        let mut g = Vamana::new(8, Metric::L2, cfg).unwrap();
+        for i in 0..500u64 {
+            g.insert(i, &rand_vec(&mut rng, 8)).unwrap();
+        }
+        for node in 0..500u32 {
+            assert!(g.neighbors(node).len() <= 24, "node {node} over-degree");
+        }
     }
 }
