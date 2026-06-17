@@ -1,6 +1,6 @@
 # ADR-0033: Graph-index incremental updates (FreshDiskANN StreamingMerge)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-17
 - **Deciders:** Achref Soua
 
@@ -177,7 +177,50 @@ with ADR-0023 and ADR-0026, and distinct from the durable-index work of ADR-0025
 
 ## Implementation
 
-Filled in on acceptance.
+Shipped for `v0.13.0`.
+
+- **`quiver-index`** gained `Vamana::new` / `Vamana::insert` (the FreshDiskANN
+  temporary-index insert: a greedy search from the medoid, `RobustPrune` for the
+  new node's ≤`R` out-neighbors, then bidirectional edges with a re-prune of any
+  neighbor that overflows `R`, reusing the batch build's primitives; `l_build` and
+  `alpha` are kept on the graph so an insert matches the build), and a `fresh`
+  module with `FreshVamana` (in-memory base) and `FreshDiskVamana` (disk base),
+  sharing one `GraphDelta` helper (an in-memory delta `Vamana` plus a
+  `HashSet<u64>` deletion set keyed by the caller's point id). A search runs a
+  live-fraction-widened beam over the base and the delta, drops deleted ids, and
+  merges the two candidate lists by `ordering_distance` (shared with the batch
+  path, so the key never drifts), keeping the best hit per id. `DiskVamana` gained
+  `dim` / `metric` accessors.
+- **`quiver-embed`** holds `FreshVamana` / `FreshDiskVamana` in `CollectionIndex`.
+  An upsert on a built graph appends to the delta under a fresh internal id
+  (tombstoning the prior copy on an update — a graph cannot update a node in
+  place); a delete records an `O(1)` tombstone. Both are size-independent. When
+  `pending_fraction` (delta + tombstones over the base size) reaches
+  `GRAPH_REBUILD_PENDING_FRACTION` (0.2) the handle is marked stale, so the next
+  access consolidates via the existing rebuild-from-store path (`rebuild_index` /
+  `build_disk_index`), reclaiming tombstones and folding in the delta.
+
+The delta is a real incremental Vamana (not a brute-force buffer), so it remains
+the faithful FreshDiskANN temporary index and generalizes to a larger delta; the
+consolidation threshold keeps it small in practice. Honest deviations, scoped for
+this increment and noted in §Scope: consolidation is a derived re-build of the
+whole base rather than an in-place on-disk merge; the delta and deletion set are
+not persisted (re-derived from the durable store on open); no eager edge repair.
+
+## Verification
+
+`quiver-index` proves incremental-insert recall holds ≥ 0.90 (vs the batch
+build's 0.95) on a 1000-vector L2/cosine set, deterministically and with bounded
+out-degree; and proves `FreshVamana`/`FreshDiskVamana` recall is preserved under
+an insert/delete stream against a brute-force ground truth over the live set
+(L2 + cosine, both the in-memory and disk bases), that no tombstoned id is ever
+returned, and that an update (tombstone-old + insert-new) returns the moved copy.
+`quiver-embed` proves a Vamana and a DiskVamana collection absorb
+insert/delete/update with no rebuild or reopen (a new point is immediately
+findable, a deleted id is never returned, an updated vector moves) and that heavy
+churn drives a consolidation with results staying correct across it and a reopen.
+The `kill -9` crash gate (`crates/quiver-core/tests/crash_recovery.rs`) is re-run
+green — it never touched the index, and by construction still does not.
 
 ## References
 
