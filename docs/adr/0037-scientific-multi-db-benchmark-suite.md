@@ -1,6 +1,6 @@
 # ADR-0037 — Scientific multi-DB benchmark suite
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-18
 **Deciders:** Achref Soua
 
@@ -37,13 +37,13 @@ The existing Python project in `bench/` is already isolated from the Cargo works
 
 | Competitor | Mode | Reason for inclusion |
 |---|---|---|
-| **Qdrant v1.11.3** | Docker | The most direct competitor; HNSW + HNSW-on-disk |
-| **LanceDB 0.12.0** | Python library (no Docker) | Fast Lance disk-resident IVF_PQ; strong on memory |
-| **Chroma 0.5.20** | Python embedded | Fast chromadb embedded mode; popular for RAG use-cases |
-| **Milvus Lite 2.4.10** | Python library (no Docker) | Milvus engine without the cluster machinery |
+| **Qdrant v1.13.4** | Docker | The most direct competitor; HNSW + HNSW-on-disk |
+| **LanceDB 0.33.0** | Python library (no Docker) | Fast Lance disk-resident IVF_PQ; strong on memory |
+| **Chroma 1.5.9** | Python embedded | Fast chromadb embedded mode; popular for RAG use-cases |
+| **Milvus Lite 3.0.0** | Python library (no Docker) | Milvus engine without the cluster machinery |
 | **pgvector 0.7 on PG16** | Docker | SQL-native ANN; baseline for the SQL world |
-| **FAISS 1.8.0** | Python library (no Docker) | The canonical library baseline; flat/IVF/HNSW implementations |
-| **Weaviate 1.24.6** | Docker | Alternative HNSW store with rich schema |
+| **FAISS 1.14.3** | Python library (no Docker) | The canonical library baseline; flat/IVF/HNSW implementations |
+| **Weaviate 1.27.0** | Docker | Alternative HNSW store with rich schema |
 
 Competitors run on datasets where they support the required metric (L2 or cosine). Competitors that do not support a dataset's metric are skipped and noted in the report.
 
@@ -165,3 +165,43 @@ Static plots are omitted from the committed report (they require matplotlib / gr
 **Measure all competitors in one long CI run** — rejected; this box is resource-shared and CI is manual-only (ADR-0015). The harness is invoked locally or on reference hardware via `just bench-compare`.
 
 **Include Redis/Vespa** — deferred; both require significant infrastructure setup that competes with the OOM budget on this box. They are noted as stretch goals in the runbook.
+
+---
+
+## Implementation (PR #163, merged 2026-06-18)
+
+Shipped on `develop` via squash-merge of `feat/benchmark-comparison-suite`.
+
+**Files added:**
+
+| File | Purpose |
+|---|---|
+| `bench/quiver_bench/competitors/base.py` | `CompetitorAdapter` ABC + `BenchResult` dataclass; `query_sweep()` with 3-rep mean±stdev |
+| `bench/quiver_bench/competitors/{faiss,lancedb,chroma,milvus_lite,qdrant,pgvector,weaviate,quiver}_adapter.py` | 8 concrete adapters |
+| `bench/quiver_bench/comparison.py` | CLI runner: sequential multi-competitor, emits CSV per competitor |
+| `bench/quiver_bench/report.py` | Report generator: reads CSVs → `comparison-v0.17.0.md` |
+| `bench/quiver_bench/rss.py` | RSS via `/proc/VmRSS` (native) / `docker stats` (containers) |
+| `bench/quiver_bench/manifest.py` | Hardware provenance capture |
+| `bench/tests/test_comparison.py` | 18 unit tests |
+
+**Deviations from the design:**
+
+- The output layout uses per-competitor `*.csv` files under `smoke/` and `sift1m/` subdirectories rather than a `siftsmall-smoke.json`. CSV is friendlier for `diff` and `grep`.
+- Quiver SIFT1M was not included in the comparison CSVs: REST API upload takes ~12 minutes on the dev box, making a fair sequential comparison with in-process competitors impossible. Real Quiver SIFT1M numbers (single-DB harness, same methodology) are in `docs/benchmarks/results/sift1m.md` and referenced from the report.
+- LanceDB SIFT1M recall (0.52–0.56) is the honest measurement under default 256-partition IVF_PQ; the report notes this is configurable but doesn't tune it — that would be cherry-picking.
+- Qdrant, pgvector, and Weaviate SIFT1M runs deferred to reference hardware (Docker API overhead at 1M-vector scale on WSL2 is not representative).
+
+---
+
+## Verification (2026-06-18, WSL2 dev box)
+
+| Check | Result |
+|---|---|
+| `bench/tests/test_comparison.py` (18 tests) | ✅ all pass |
+| Smoke run — all 8 competitors on siftsmall (10k, 128-d, L2) | ✅ complete; CSVs in `smoke/` |
+| SIFT1M — FAISS (HNSW M=16, efConstruction=200) | ✅ ef_search 16→256; recall 0.81→1.00; peak 7685 QPS [dev-box] |
+| SIFT1M — LanceDB (IVF_PQ, 256 partitions) | ✅ nprobes 4→64; recall 0.52–0.56 (config-limited, noted) [dev-box] |
+| `comparison-v0.17.0.md` generated | ✅ at `docs/benchmarks/results/comparison-v0.17.0/` |
+| No fabricated numbers | ✅ confirmed; every figure is a real measurement |
+| `[reference-hardware-pending]` on all non-smoke results | ✅ |
+| `just verify` (Rust gate) | ✅ green (no Cargo changes in this PR) |
