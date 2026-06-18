@@ -102,7 +102,7 @@ function Get-FileWithProgress {
     }
     $sw.Stop()
     $size = [Math]::Round((Get-Item $OutFile).Length / 1MB, 1)
-    Write-Host "  ${GR}[{0:N1} MB in {1:N1}s]${R}" -f $size, $sw.Elapsed.TotalSeconds
+    Write-Host ("  ${GR}[{0:N1} MB in {1:N1}s]${R}" -f $size, $sw.Elapsed.TotalSeconds)
     Write-Host "  ${GR}[${G}##################################################${GR}] 100%${R}"
 }
 
