@@ -16,7 +16,7 @@
 //! family is maintained the FreshDiskANN way (ADR-0033): the batch-built graph
 //! is a read-only base, recent inserts land in an in-memory delta graph, and
 //! deletes are tombstoned, so writes are size-independent; when the pending work
-//! grows past [`GRAPH_REBUILD_PENDING_FRACTION`] the next access consolidates by
+//! grows past a fixed fraction of the base the next access consolidates by
 //! rebuilding from the store. All indexes stay derived (rebuilt from the store
 //! on open), so the crash gate never sees an index write.
 //!
