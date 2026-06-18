@@ -3,7 +3,7 @@ name = "quiver-bench"
 version = "0.1.0"
 description = "ann-benchmarks-style harness for Quiver (SIFT1M and friends)."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "AGPL-3.0-only"
 authors = [{ name = "Achref Soua", email = "achref.soua@outlook.com" }]
 dependencies = ["quiver-client", "numpy>=1.26"]
@@ -20,6 +20,19 @@ packages = ["quiver_bench"]
 
 [dependency-groups]
 dev = ["pytest>=8"]
+# Competitor clients — install with: uv pip install --group competitors
+# These are isolated from the Cargo workspace; they never touch deny.toml.
+competitors = [
+    "faiss-cpu>=1.8",
+    "lancedb>=0.12",
+    "pyarrow>=15",
+    "chromadb>=0.5",
+    "pymilvus>=2.4",
+    "milvus-lite>=2.4",
+    "qdrant-client>=1.9",
+    "psycopg2-binary>=2.9",
+    "weaviate-client>=4.5",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
