@@ -169,25 +169,51 @@ fn gen_icons(out_dir: &str) {
     }
 }
 
-// ── colour palette (same as install scripts) ─────────────────────────────────
+// ── colour palette — exact 24-bit theme values ────────────────────────────────
 
-const BRONZE: Color = Color::Rgb(215, 135, 0);
+const BRONZE: Color = Color::Rgb(205, 127, 50);     // #CD7F32  theme CHROME
+const VERDIGRIS: Color = Color::Rgb(63, 182, 168);  // #3FB6A8  theme ACCENT
 const DARK_GRAY: Color = Color::Rgb(90, 90, 90);
 const LIGHT_GRAY: Color = Color::Rgb(180, 180, 180);
-const CYAN: Color = Color::Rgb(0, 205, 220);
-const GREEN: Color = Color::Rgb(80, 200, 80);
-const YELLOW: Color = Color::Rgb(215, 200, 0);
+const GREEN: Color = Color::Rgb(143, 179, 57);      // #8FB339  theme OK
 const WHITE: Color = Color::Rgb(230, 230, 230);
 
+/// Banner with the V as a verdigris arrowhead, matching the TUI logo and
+/// the terminal banners in demo.rs / update.rs / install scripts.
 fn logo_lines() -> Vec<Line<'static>> {
     let b = Style::default().fg(BRONZE);
+    let v = Style::default().fg(VERDIGRIS);
     vec![
-        Line::styled("    ██████╗ ██╗   ██╗██╗██╗   ██╗███████╗██████╗ ", b),
-        Line::styled("   ██╔═══██╗██║   ██║██║██║   ██║██╔════╝██╔══██╗", b),
-        Line::styled("   ██║   ██║██║   ██║██║╚██╗ ██╔╝█████╗  ██████╔╝", b),
-        Line::styled("   ██║▄▄ ██║██║   ██║██║ ╚████╔╝ ██╔══╝  ██╔══██╗", b),
-        Line::styled("   ╚██████╔╝╚██████╔╝██║  ╚██╔╝  ███████╗██║  ██║", b),
-        Line::styled("    ╚══▀▀═╝  ╚═════╝ ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝", b),
+        Line::from(vec![
+            Span::styled("    ██████╗ ██╗   ██╗██╗", b),
+            Span::styled("██╗   ██╗", v),
+            Span::styled("███████╗██████╗ ", b),
+        ]),
+        Line::from(vec![
+            Span::styled("   ██╔═══██╗██║   ██║██║", b),
+            Span::styled("██║   ██║", v),
+            Span::styled("██╔════╝██╔══██╗", b),
+        ]),
+        Line::from(vec![
+            Span::styled("   ██║   ██║██║   ██║██║", b),
+            Span::styled("╚██╗ ██╔╝", v),
+            Span::styled("█████╗  ██████╔╝", b),
+        ]),
+        Line::from(vec![
+            Span::styled("   ██║▄▄ ██║██║   ██║██║", b),
+            Span::styled(" ╚████╔╝ ", v),
+            Span::styled("██╔══╝  ██╔══██╗", b),
+        ]),
+        Line::from(vec![
+            Span::styled("   ╚██████╔╝╚██████╔╝██║", b),
+            Span::styled("  ╚██╔╝  ", v),
+            Span::styled("███████╗██║  ██║", b),
+        ]),
+        Line::from(vec![
+            Span::styled("    ╚══▀▀═╝  ╚═════╝ ╚═╝", b),
+            Span::styled("   ╚═╝   ", v),
+            Span::styled("╚══════╝╚═╝  ╚═╝", b),
+        ]),
     ]
 }
 
@@ -203,7 +229,7 @@ fn box3(top: &'static str, mid: &'static str, bot: &'static str) -> Vec<Line<'st
 fn step_line(icon: &'static str, msg: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
-        Span::styled(icon, Style::default().fg(CYAN)),
+        Span::styled(icon, Style::default().fg(VERDIGRIS)),
         Span::raw("  "),
         Span::styled(msg, Style::default().fg(WHITE)),
     ])
@@ -229,8 +255,8 @@ fn render_text_to_buf(lines: Vec<Line<'static>>, w: u16, h: u16) -> Buffer {
 fn render_installer() -> Buffer {
     let mut lines = logo_lines();
     lines.push(Line::styled(
-        "        security-first vector database  v0.17.0",
-        Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        "        security-first vector database  v0.17.1",
+        Style::default().fg(VERDIGRIS).add_modifier(Modifier::BOLD),
     ));
     lines.push(Line::raw(""));
     lines.extend(box3(
@@ -240,10 +266,10 @@ fn render_installer() -> Buffer {
     ));
     lines.push(Line::raw(""));
     lines.push(step_line("⟳", "Checking latest release..."));
-    lines.push(step_line("⬇", "Fetching v0.17.0 for linux/x86_64..."));
+    lines.push(step_line("⬇", "Fetching v0.17.1 for linux/x86_64..."));
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled("Downloading", Style::default().fg(CYAN)),
+        Span::styled("Downloading", Style::default().fg(VERDIGRIS)),
         Span::styled(" quiver-linux-x86_64 ", Style::default().fg(WHITE)),
         Span::styled("[4.2 MB in 1.8s]", Style::default().fg(DARK_GRAY)),
     ]));
@@ -267,7 +293,7 @@ fn render_installer() -> Buffer {
     ]));
     lines.push(Line::from(vec![
         Span::styled("  │  ", Style::default().fg(DARK_GRAY)),
-        Span::styled("✔  Quiver v0.17.0 installed!", Style::default().fg(GREEN)),
+        Span::styled("✔  Quiver v0.17.1 installed!", Style::default().fg(GREEN)),
         Span::styled(
             "                │",
             Style::default().fg(DARK_GRAY),
@@ -308,8 +334,8 @@ fn render_installer() -> Buffer {
 fn render_demo_start() -> Buffer {
     let mut lines = logo_lines();
     lines.push(Line::styled(
-        "        demo  ·  v0.17.0  ·  :7333",
-        Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        "        demo  ·  v0.17.1  ·  :7333",
+        Style::default().fg(VERDIGRIS).add_modifier(Modifier::BOLD),
     ));
     lines.push(Line::raw(""));
     lines.extend(box3(
@@ -320,14 +346,14 @@ fn render_demo_start() -> Buffer {
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled("⟳", Style::default().fg(CYAN)),
+        Span::styled("⟳", Style::default().fg(VERDIGRIS)),
         Span::raw("  Seeding 1000 vectors into 'demo'... "),
         Span::styled("done", Style::default().fg(GREEN)),
     ]));
     lines.push(ok_line("1000 vectors ready in 'demo'."));
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled("⟳", Style::default().fg(CYAN)),
+        Span::styled("⟳", Style::default().fg(VERDIGRIS)),
         Span::raw("  Starting server on :7333... "),
         Span::styled("done", Style::default().fg(GREEN)),
     ]));
@@ -336,7 +362,7 @@ fn render_demo_start() -> Buffer {
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled("API key  ", Style::default().fg(DARK_GRAY)),
-        Span::styled("quiver-demo", Style::default().fg(YELLOW)),
+        Span::styled("quiver-demo", Style::default().fg(VERDIGRIS)),
     ]));
     lines.push(Line::from(vec![
         Span::raw("  "),
