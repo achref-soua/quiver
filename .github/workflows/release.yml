@@ -51,6 +51,7 @@ jobs:
       - name: Generate SHA-256 checksum
         run: |
           sha256sum ${{ matrix.asset_name }} > ${{ matrix.asset_name }}.sha256
+          # Windows binary icon is embedded via build.rs (ADR-0039); no extra step needed.
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
@@ -97,4 +98,5 @@ jobs:
             dist/quiver-macos-x86_64.sha256
             dist/quiver-macos-aarch64
             dist/quiver-macos-aarch64.sha256
+            docs/assets/icon/quiver-256.png
             quiver.spdx.json
