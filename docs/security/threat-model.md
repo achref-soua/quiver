@@ -47,6 +47,10 @@ flowchart LR
 
 This precise boundary is the honest core of the security story.
 
+The most recent code-level review of these controls — including the migration
+connectors' SSRF posture and a cleartext-credential fix — is the
+[v0.17.0 audit note](./audit-0.17.0.md).
+
 ## STRIDE summary
 
 - **Spoofing** → API-key/mTLS authentication; keys hashed at rest, shown once.
