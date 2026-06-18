@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use std::env;
 use std::fs;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -41,11 +42,38 @@ fn platform() -> Result<&'static str> {
     match std::env::consts::OS {
         "linux" => Ok("linux"),
         "macos" => Ok("macos"),
+        "windows" => Ok("windows"),
         other => bail!(
-            "quiver update is not supported on {other}; \
+            "unsupported OS for self-update: {other}; \
              download manually from https://github.com/{REPO}/releases"
         ),
     }
+}
+
+fn asset_name(os: &str, arch: &str) -> String {
+    // Windows binaries carry the .exe suffix; Unix binaries do not.
+    if os == "windows" {
+        format!("quiver-{os}-{arch}.exe")
+    } else {
+        format!("quiver-{os}-{arch}")
+    }
+}
+
+fn prompt_yes_no(question: &str) -> Result<bool> {
+    if use_color() {
+        print!(
+            "  \x1b[38;2;205;127;50m?\x1b[0m  {question} \x1b[38;2;90;90;90m[Y/n]\x1b[0m: "
+        );
+    } else {
+        print!("  ? {question} [Y/n]: ");
+    }
+    let _ = io::stdout().flush();
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read answer")?;
+    let t = input.trim().to_ascii_lowercase();
+    Ok(t.is_empty() || t == "y" || t == "yes")
 }
 
 fn arch() -> Result<&'static str> {
@@ -124,12 +152,19 @@ pub fn verify_sha256(data: &[u8], checksum_line: &str) -> Result<()> {
 }
 
 /// Atomically replace `current_exe` with `new_binary`.
+///
+/// On Unix a simple rename over the running binary works because the inode
+/// stays open. On Windows you cannot overwrite a running `.exe` in place, but
+/// you *can* rename it to a new name while it is still running — the handle
+/// the OS holds is to the inode, not the path. So we rename the old binary to
+/// `<name>.exe.old`, then rename the temp file into place. The `.old` file is
+/// cleaned up on the next update or reinstall.
 fn atomic_replace(current_exe: &PathBuf, new_binary: &[u8]) -> Result<()> {
     let parent = current_exe
         .parent()
         .context("cannot determine parent directory of the current binary")?;
 
-    let tmp = parent.join(format!(".quiver-update-{}.tmp", std::process::id()));
+    let tmp = parent.join(format!("quiver-update-{}.tmp", std::process::id()));
     fs::write(&tmp, new_binary).context("failed to write updated binary to temp file")?;
 
     #[cfg(unix)]
@@ -138,14 +173,45 @@ fn atomic_replace(current_exe: &PathBuf, new_binary: &[u8]) -> Result<()> {
         let mut perms = fs::metadata(&tmp)?.permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&tmp, perms)?;
+
+        fs::rename(&tmp, current_exe).with_context(|| {
+            format!(
+                "failed to replace {} — is it write-protected?",
+                current_exe.display()
+            )
+        })?;
     }
 
-    fs::rename(&tmp, current_exe).with_context(|| {
-        format!(
-            "failed to replace {} — is it write-protected?",
-            current_exe.display()
-        )
-    })?;
+    #[cfg(windows)]
+    {
+        // Build `<stem>.exe.old` beside the current binary.
+        let mut old_name = current_exe
+            .file_name()
+            .context("current exe has no filename")?
+            .to_os_string();
+        old_name.push(".old");
+        let old_path = parent.join(old_name);
+
+        // Remove any leftover .old from a previous update attempt.
+        let _ = fs::remove_file(&old_path);
+
+        // Step 1: rename the running binary out of the way (always works on Windows).
+        fs::rename(current_exe, &old_path).with_context(|| {
+            format!(
+                "failed to rename {} — close other programs using quiver.exe and retry",
+                current_exe.display()
+            )
+        })?;
+
+        // Step 2: move the downloaded binary into place.
+        if let Err(e) = fs::rename(&tmp, current_exe) {
+            // Restore the original binary so the user is not left broken.
+            let _ = fs::rename(&old_path, current_exe);
+            return Err(e)
+                .with_context(|| format!("failed to install new binary to {}", current_exe.display()));
+        }
+        // .old file stays — harmless, cleaned up on the next update.
+    }
 
     Ok(())
 }
@@ -196,13 +262,19 @@ fn run_blocking(check_only: bool) -> Result<()> {
         return Ok(());
     }
 
+    if !prompt_yes_no(&format!("Install v{latest} now?"))? {
+        println!();
+        println!("  Skipped. Run  quiver update  any time to upgrade.");
+        return Ok(());
+    }
+
     let os = platform()?;
     let arch = arch()?;
-    let asset_name = format!("quiver-{os}-{arch}");
-    let base_url = format!("https://github.com/{REPO}/releases/download/v{latest}/{asset_name}");
+    let name = asset_name(os, arch);
+    let base_url = format!("https://github.com/{REPO}/releases/download/v{latest}/{name}");
     let checksum_url = format!("{base_url}.sha256");
 
-    step(&format!("Downloading {asset_name}..."));
+    step(&format!("Downloading {name}..."));
     let binary = fetch_bytes(&agent, &base_url)?;
 
     step("Verifying SHA-256 checksum...");
@@ -216,6 +288,11 @@ fn run_blocking(check_only: bool) -> Result<()> {
     step(&format!("Installing to {}...", current_exe.display()));
     atomic_replace(&current_exe, &binary)?;
     ok(&format!("Quiver updated to v{latest}."));
+
+    #[cfg(windows)]
+    println!(
+        "\n  \x1b[38;2;90;90;90mOpen a new terminal to use the updated binary.\x1b[0m"
+    );
 
     Ok(())
 }

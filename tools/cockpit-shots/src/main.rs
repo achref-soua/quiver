@@ -255,7 +255,7 @@ fn render_text_to_buf(lines: Vec<Line<'static>>, w: u16, h: u16) -> Buffer {
 fn render_installer() -> Buffer {
     let mut lines = logo_lines();
     lines.push(Line::styled(
-        "        security-first vector database  v0.17.1",
+        "        security-first vector database  v0.17.2",
         Style::default().fg(VERDIGRIS).add_modifier(Modifier::BOLD),
     ));
     lines.push(Line::raw(""));
@@ -266,7 +266,7 @@ fn render_installer() -> Buffer {
     ));
     lines.push(Line::raw(""));
     lines.push(step_line("⟳", "Checking latest release..."));
-    lines.push(step_line("⬇", "Fetching v0.17.1 for linux/x86_64..."));
+    lines.push(step_line("⬇", "Fetching v0.17.2 for linux/x86_64..."));
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled("Downloading", Style::default().fg(VERDIGRIS)),
@@ -293,7 +293,7 @@ fn render_installer() -> Buffer {
     ]));
     lines.push(Line::from(vec![
         Span::styled("  │  ", Style::default().fg(DARK_GRAY)),
-        Span::styled("✔  Quiver v0.17.1 installed!", Style::default().fg(GREEN)),
+        Span::styled("✔  Quiver v0.17.2 installed!", Style::default().fg(GREEN)),
         Span::styled(
             "                │",
             Style::default().fg(DARK_GRAY),
@@ -334,7 +334,7 @@ fn render_installer() -> Buffer {
 fn render_demo_start() -> Buffer {
     let mut lines = logo_lines();
     lines.push(Line::styled(
-        "        demo  ·  v0.17.1  ·  :7333",
+        "        demo  ·  v0.17.2  ·  :7333",
         Style::default().fg(VERDIGRIS).add_modifier(Modifier::BOLD),
     ));
     lines.push(Line::raw(""));
