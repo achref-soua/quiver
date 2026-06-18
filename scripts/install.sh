@@ -15,13 +15,13 @@ INSTALL_DIR="${QUIVER_INSTALL_DIR:-${HOME}/.local/bin}"
 # ── colour helpers ────────────────────────────────────────────────────────────
 # Only emit colour codes when stdout is a real terminal.
 if [ -t 1 ]; then
-  C_BRONZE='\033[38;5;172m'   # bronze/amber
-  C_GREEN='\033[1;32m'
-  C_CYAN='\033[1;36m'
-  C_YELLOW='\033[1;33m'
-  C_RED='\033[1;31m'
-  C_GRAY='\033[0;37m'
-  C_DARK='\033[0;90m'
+  C_BRONZE='\033[38;2;205;127;50m'  # #CD7F32  theme CHROME
+  C_GREEN='\033[38;2;143;179;57m'   # #8FB339  theme OK
+  C_CYAN='\033[38;2;63;182;168m'    # #3FB6A8  theme ACCENT
+  C_YELLOW='\033[38;2;215;200;0m'   # warnings
+  C_RED='\033[38;2;210;85;47m'      # theme ALERT
+  C_GRAY='\033[38;2;160;160;160m'   # mid-gray
+  C_DARK='\033[38;2;90;90;90m'      # dark gray
   C_RESET='\033[0m'
   C_BOLD='\033[1m'
 else
@@ -221,14 +221,21 @@ PLIST
   printf "${C_DARK}  └──────────────────────────────────────────────┘${C_RESET}\n"
   printf '\n'
 
-  # PATH hint
+  # ── auto-add to PATH (no manual steps) ──────────────────────────────────
   case ":${PATH}:" in
     *":${INSTALL_DIR}:"*) ;;
     *)
-      warn "${INSTALL_DIR} is not in your PATH. Add to your shell profile:"
-      printf '\n'
-      printf "  ${C_YELLOW}export PATH=\"%s:\$PATH\"${C_RESET}\n" "${INSTALL_DIR}"
-      printf '\n'
+      _added=0
+      for _rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+        if [ -f "$_rc" ] && ! grep -qF "$INSTALL_DIR" "$_rc" 2>/dev/null; then
+          printf '\n# Quiver\nexport PATH="%s:$PATH"\n' "$INSTALL_DIR" >> "$_rc"
+          _added=1
+        fi
+      done
+      if [ "$_added" = "1" ]; then
+        ok "Added ${INSTALL_DIR} to PATH in your shell profiles."
+        warn "Open a new terminal (or run: source ~/.bashrc) to use 'quiver'."
+      fi
       ;;
   esac
 
