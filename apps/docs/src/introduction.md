@@ -4,6 +4,8 @@
 approximate-nearest-neighbour search that runs on a laptop — with a retro terminal
 cockpit.
 
+![The Quiver cockpit dashboard](https://raw.githubusercontent.com/achref-soua/quiver/main/docs/assets/cockpit/dashboard.png)
+
 Quiver is a from-scratch, native-Rust vector database. It is not trying to
 out-scale Milvus or out-feature Qdrant; its defensible edge is the **combination**
 of three things, executed well:

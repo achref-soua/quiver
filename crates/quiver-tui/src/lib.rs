@@ -707,6 +707,28 @@ impl Dashboard {
     }
 }
 
+/// Render the logo banner centred on an oak background to a fresh buffer (for the
+/// README / docs logo image and the splash).
+#[must_use]
+pub fn render_logo(width: u16, height: u16) -> Buffer {
+    let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+    Block::new()
+        .style(Style::new().bg(theme::BG))
+        .render(buf.area, &mut buf);
+    let mut lines = logo::banner();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "a quiver of vectors",
+        theme::dim(),
+    )));
+    let lh = lines.len() as u16;
+    let y = height.saturating_sub(lh) / 2;
+    Paragraph::new(lines)
+        .alignment(ratatui::layout::Alignment::Center)
+        .render(Rect::new(0, y, width, lh.min(height)), &mut buf);
+    buf
+}
+
 /// Render the dashboard for `dash` to a fresh `width`×`height` buffer (used by the
 /// screenshot tool and tests; the live cockpit renders into the frame's buffer).
 #[must_use]
@@ -1129,6 +1151,13 @@ mod tests {
     fn constellation_demo_renders_a_scatter() {
         let text = buffer_text(&render_constellation_demo(110, 34));
         assert!(text.contains("constellation") && text.contains("documents"));
+    }
+
+    #[test]
+    fn logo_renders_centred_with_blocks_and_tagline() {
+        let text = buffer_text(&render_logo(60, 11));
+        assert!(text.contains('█'), "block letters");
+        assert!(text.contains("a quiver of vectors"), "tagline");
     }
 
     #[test]

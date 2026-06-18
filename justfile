@@ -40,6 +40,12 @@ doc:
 docs:
     mdbook build apps/docs
 
+# Regenerate the cockpit PNG screenshots into docs/assets/cockpit/ (dev-only tool,
+# its own workspace so its image deps stay out of the gate). Needs a monospace TTF;
+# override the default DejaVu Sans Mono with QUIVER_SHOTS_FONT.
+tui-shots:
+    cargo run --release --manifest-path tools/cockpit-shots/Cargo.toml
+
 # Dependency advisory scan — no suppressions; the tree is advisory-clean.
 audit:
     cargo audit
