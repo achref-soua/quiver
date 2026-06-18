@@ -149,6 +149,71 @@ main() {
   chmod 755 "$BINARY_TMP"
   mv "$BINARY_TMP" "${INSTALL_DIR}/quiver"
 
+  # ── icon + launcher integration ──────────────────────────────────────────
+  ICON_URL="https://github.com/${REPO}/releases/download/v${VERSION}/quiver-256.png"
+
+  if [ "$OS" = "linux" ]; then
+    ICON_DIR="${HOME}/.local/share/icons/hicolor/256x256/apps"
+    APPS_DIR="${HOME}/.local/share/applications"
+    ICON_PATH="${ICON_DIR}/quiver.png"
+    mkdir -p "$ICON_DIR" "$APPS_DIR"
+    if curl -fsSL -o "$ICON_PATH" "$ICON_URL" 2>/dev/null; then
+      # Write the .desktop file so app launchers (GNOME, KDE, etc.) pick it up.
+      cat > "${APPS_DIR}/quiver.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Quiver
+Comment=Security-first, memory-frugal vector database
+Exec=${INSTALL_DIR}/quiver demo
+Icon=quiver
+Terminal=true
+Categories=Development;Science;
+DESKTOP
+      command -v update-desktop-database > /dev/null 2>&1 \
+        && update-desktop-database "$APPS_DIR" 2>/dev/null || true
+      ok "App launcher entry created (icon + .desktop)."
+    else
+      warn "Could not fetch icon — skipping .desktop integration."
+    fi
+
+  elif [ "$OS" = "macos" ]; then
+    # On macOS, bare Mach-O binaries don't carry embedded icons.  We create a
+    # minimal .app bundle so Finder / Spotlight / the Dock can show the custom icon.
+    APP_BUNDLE="${HOME}/Applications/Quiver.app"
+    MACOS_DIR="${APP_BUNDLE}/Contents/MacOS"
+    RES_DIR="${APP_BUNDLE}/Contents/Resources"
+    mkdir -p "$MACOS_DIR" "$RES_DIR"
+    # Symlink the real binary inside the bundle (update keeps the symlink valid).
+    ln -sf "${INSTALL_DIR}/quiver" "${MACOS_DIR}/quiver"
+    # Convert the PNG icon to icns using sips + iconutil (both ship with macOS).
+    ICON_PNG="${RES_DIR}/quiver.png"
+    if curl -fsSL -o "$ICON_PNG" "$ICON_URL" 2>/dev/null && command -v sips > /dev/null 2>&1; then
+      ICONSET="${RES_DIR}/quiver.iconset"
+      mkdir -p "$ICONSET"
+      for sz in 16 32 64 128 256 512; do
+        sips -z $sz $sz "$ICON_PNG" --out "${ICONSET}/icon_${sz}x${sz}.png" > /dev/null 2>&1 || true
+      done
+      if command -v iconutil > /dev/null 2>&1; then
+        iconutil -c icns "$ICONSET" -o "${RES_DIR}/quiver.icns" 2>/dev/null \
+          && rm -rf "$ICONSET" || true
+      fi
+    fi
+    # Write a minimal Info.plist so Finder registers the bundle.
+    cat > "${APP_BUNDLE}/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>quiver</string>
+  <key>CFBundleIdentifier</key><string>io.quiver.app</string>
+  <key>CFBundleName</key><string>Quiver</string>
+  <key>CFBundleIconFile</key><string>quiver</string>
+  <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+  <key>LSUIElement</key><true/>
+</dict></plist>
+PLIST
+    ok "Quiver.app bundle created at ${APP_BUNDLE}"
+  fi
+
   printf '\n'
   printf "${C_DARK}  ┌──────────────────────────────────────────────┐${C_RESET}\n"
   printf "${C_GREEN}  │  ✔  Quiver v%-35s│${C_RESET}\n" "${VERSION} installed!"
@@ -168,6 +233,7 @@ main() {
   esac
 
   printf '  Next steps:\n'
+  printf "  ${C_BRONZE}quiver demo${C_RESET}              ${C_DARK}# zero-config: seed vectors + open cockpit${C_RESET}\n"
   printf "  ${C_BRONZE}quiver serve${C_RESET}             ${C_DARK}# start the server (gRPC + REST on :6333)${C_RESET}\n"
   printf "  ${C_BRONZE}quiver tui${C_RESET}               ${C_DARK}# open the retro cockpit${C_RESET}\n"
   printf "  ${C_BRONZE}quiver update${C_RESET}            ${C_DARK}# self-update to the latest release${C_RESET}\n"

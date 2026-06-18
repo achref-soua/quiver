@@ -15,7 +15,10 @@ use quiver_tui::{
     Activity, Dashboard, Severity, render_constellation_demo, render_dashboard, render_logo,
 };
 use ratatui::buffer::Buffer;
-use ratatui::style::Color;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Paragraph, Widget};
 
 const OAK: Rgb<u8> = Rgb([0x10, 0x0C, 0x08]);
 const PARCHMENT: Rgb<u8> = Rgb([0xE8, 0xD8, 0xB0]);
@@ -79,12 +82,282 @@ fn render_png(buf: &Buffer, font: &FontVec, out: &str) {
     println!("wrote {out}  ({}x{} cells)", area.width, area.height);
 }
 
+// ── application icon ──────────────────────────────────────────────────────────
+//
+// Faithfully replicates the 3-D verdigris arrowhead from logo.rs (ADR-0036):
+// same algorithm, same exact three-shade bevel, same open-top notch — just
+// rasterised to a square PNG rather than half-block terminal cells.
+//
+// Colors mirror theme.rs exactly:
+//   BG        #100C08  oak
+//   ACCENT    #3FB6A8  verdigris base
+//   ACCENT_HI #8EE9DC  lit left edge
+//   ACCENT_LO #216B61  shadow right facet
+
+fn build_arrowhead_grid() -> Vec<[Option<[u8; 3]>; 7]> {
+    const VW: usize = 7;
+    const SUBH: usize = 14;
+    const VC: i32 = 3;
+    const T: i32 = 2;
+
+    let accent    = [0x3F_u8, 0xB6, 0xA8];
+    let accent_hi = [0x8E_u8, 0xE9, 0xDC];
+    let accent_lo = [0x21_u8, 0x6B, 0x61];
+
+    let mut grid: Vec<[Option<[u8; 3]>; VW]> = vec![[None; VW]; SUBH];
+    for (s, row) in grid.iter_mut().enumerate() {
+        let hw = ((1.0 - s as f32 / (SUBH - 1) as f32) * 3.0).round() as i32;
+        let oel = VC - hw;
+        let oer = VC + hw;
+        for c in oel.max(0)..=oer.min(VW as i32 - 1) {
+            let from_left = c - oel;
+            let from_right = oer - c;
+            let color = if from_left < T && from_right < T {
+                accent
+            } else if from_left < T {
+                if from_left == 0 { accent_hi } else { accent }
+            } else if from_right < T {
+                accent_lo
+            } else {
+                continue; // open notch
+            };
+            row[c as usize] = Some(color);
+        }
+    }
+    grid
+}
+
+fn draw_icon(size: u32) -> RgbImage {
+    const VW: usize = 7;
+    const SUBH: usize = 14;
+    let bg = [0x10_u8, 0x0C, 0x08];
+    let grid = build_arrowhead_grid();
+
+    // The arrowhead occupies the centre 80 % of the canvas (10 % padding each side).
+    let padding = size as f32 * 0.10;
+    let draw_w = size as f32 - 2.0 * padding;
+    let draw_h = size as f32 - 2.0 * padding;
+    let cell_w = draw_w / VW as f32;
+    let cell_h = draw_h / SUBH as f32;
+
+    let mut img = RgbImage::from_pixel(size, size, Rgb(bg));
+    for y in 0..size {
+        for x in 0..size {
+            let lx = x as f32 - padding;
+            let ly = y as f32 - padding;
+            if lx < 0.0 || ly < 0.0 || lx >= draw_w || ly >= draw_h {
+                continue;
+            }
+            let col = (lx / cell_w) as usize;
+            let sub = (ly / cell_h) as usize;
+            if col < VW && sub < SUBH {
+                if let Some(color) = grid[sub][col] {
+                    img.put_pixel(x, y, Rgb(color));
+                }
+            }
+        }
+    }
+    img
+}
+
+fn gen_icons(out_dir: &str) {
+    std::fs::create_dir_all(out_dir).expect("create icon dir");
+    for size in [16u32, 32, 48, 64, 128, 256] {
+        let path = format!("{out_dir}/quiver-{size}.png");
+        draw_icon(size).save(&path).expect("save icon png");
+        println!("wrote {path}  ({size}x{size})");
+    }
+}
+
+// ── colour palette (same as install scripts) ─────────────────────────────────
+
+const BRONZE: Color = Color::Rgb(215, 135, 0);
+const DARK_GRAY: Color = Color::Rgb(90, 90, 90);
+const LIGHT_GRAY: Color = Color::Rgb(180, 180, 180);
+const CYAN: Color = Color::Rgb(0, 205, 220);
+const GREEN: Color = Color::Rgb(80, 200, 80);
+const YELLOW: Color = Color::Rgb(215, 200, 0);
+const WHITE: Color = Color::Rgb(230, 230, 230);
+
+fn logo_lines() -> Vec<Line<'static>> {
+    let b = Style::default().fg(BRONZE);
+    vec![
+        Line::styled("    ██████╗ ██╗   ██╗██╗██╗   ██╗███████╗██████╗ ", b),
+        Line::styled("   ██╔═══██╗██║   ██║██║██║   ██║██╔════╝██╔══██╗", b),
+        Line::styled("   ██║   ██║██║   ██║██║╚██╗ ██╔╝█████╗  ██████╔╝", b),
+        Line::styled("   ██║▄▄ ██║██║   ██║██║ ╚████╔╝ ██╔══╝  ██╔══██╗", b),
+        Line::styled("   ╚██████╔╝╚██████╔╝██║  ╚██╔╝  ███████╗██║  ██║", b),
+        Line::styled("    ╚══▀▀═╝  ╚═════╝ ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝", b),
+    ]
+}
+
+fn box3(top: &'static str, mid: &'static str, bot: &'static str) -> Vec<Line<'static>> {
+    let g = Style::default().fg(DARK_GRAY);
+    vec![
+        Line::styled(top, g),
+        Line::styled(mid, g),
+        Line::styled(bot, g),
+    ]
+}
+
+fn step_line(icon: &'static str, msg: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(icon, Style::default().fg(CYAN)),
+        Span::raw("  "),
+        Span::styled(msg, Style::default().fg(WHITE)),
+    ])
+}
+
+fn ok_line(msg: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled("✔", Style::default().fg(GREEN)),
+        Span::raw("  "),
+        Span::styled(msg, Style::default().fg(WHITE)),
+    ])
+}
+
+fn render_text_to_buf(lines: Vec<Line<'static>>, w: u16, h: u16) -> Buffer {
+    let rect = Rect::new(0, 0, w, h);
+    let mut buf = Buffer::empty(rect);
+    let text = Text::from(lines);
+    Paragraph::new(text).render(rect, &mut buf);
+    buf
+}
+
+fn render_installer() -> Buffer {
+    let mut lines = logo_lines();
+    lines.push(Line::styled(
+        "        security-first vector database  v0.17.0",
+        Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+    ));
+    lines.push(Line::raw(""));
+    lines.extend(box3(
+        "  ┌──────────────────────────────────────────────┐",
+        "  │  encrypted · memory-frugal · self-hostable   │",
+        "  └──────────────────────────────────────────────┘",
+    ));
+    lines.push(Line::raw(""));
+    lines.push(step_line("⟳", "Checking latest release..."));
+    lines.push(step_line("⬇", "Fetching v0.17.0 for linux/x86_64..."));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Downloading", Style::default().fg(CYAN)),
+        Span::styled(" quiver-linux-x86_64 ", Style::default().fg(WHITE)),
+        Span::styled("[4.2 MB in 1.8s]", Style::default().fg(DARK_GRAY)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("[", Style::default().fg(DARK_GRAY)),
+        Span::styled(
+            "##################################################",
+            Style::default().fg(GREEN),
+        ),
+        Span::styled("] 100%", Style::default().fg(DARK_GRAY)),
+    ]));
+    lines.push(step_line("🔒", "Verifying SHA-256 checksum..."));
+    lines.push(ok_line("Checksum verified."));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  ┌──────────────────────────────────────────────┐",
+            Style::default().fg(DARK_GRAY),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  │  ", Style::default().fg(DARK_GRAY)),
+        Span::styled("✔  Quiver v0.17.0 installed!", Style::default().fg(GREEN)),
+        Span::styled(
+            "                │",
+            Style::default().fg(DARK_GRAY),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  │  ", Style::default().fg(DARK_GRAY)),
+        Span::styled(
+            "   /home/user/.local/bin/quiver              │",
+            Style::default().fg(LIGHT_GRAY),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  └──────────────────────────────────────────────┘",
+            Style::default().fg(DARK_GRAY),
+        ),
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("  Next steps:", Style::default().fg(WHITE)));
+    for (cmd, comment) in [
+        ("quiver demo  ", "# zero-config: seed vectors + open cockpit"),
+        ("quiver serve ", "# start the server (gRPC + REST on :6333)"),
+        ("quiver tui   ", "# open the retro cockpit"),
+        ("quiver update", "# self-update to the latest release"),
+        ("quiver --help", "# all commands"),
+    ] {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(cmd, Style::default().fg(BRONZE)),
+            Span::raw("              "),
+            Span::styled(comment, Style::default().fg(DARK_GRAY)),
+        ]));
+    }
+    render_text_to_buf(lines, 72, 30)
+}
+
+fn render_demo_start() -> Buffer {
+    let mut lines = logo_lines();
+    lines.push(Line::styled(
+        "        demo  ·  v0.17.0  ·  :7333",
+        Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+    ));
+    lines.push(Line::raw(""));
+    lines.extend(box3(
+        "  ┌─────────────────────────────────────────────────┐",
+        "  │  zero config  ·  press q in the cockpit to quit │",
+        "  └─────────────────────────────────────────────────┘",
+    ));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("⟳", Style::default().fg(CYAN)),
+        Span::raw("  Seeding 1000 vectors into 'demo'... "),
+        Span::styled("done", Style::default().fg(GREEN)),
+    ]));
+    lines.push(ok_line("1000 vectors ready in 'demo'."));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("⟳", Style::default().fg(CYAN)),
+        Span::raw("  Starting server on :7333... "),
+        Span::styled("done", Style::default().fg(GREEN)),
+    ]));
+    lines.push(ok_line("Server ready — http://127.0.0.1:7333"));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("API key  ", Style::default().fg(DARK_GRAY)),
+        Span::styled("quiver-demo", Style::default().fg(YELLOW)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Python   ", Style::default().fg(DARK_GRAY)),
+        Span::styled("pip install quiver-client", Style::default().fg(WHITE)),
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  Opening cockpit — press q to quit.",
+        Style::default().fg(GREEN),
+    ));
+    render_text_to_buf(lines, 72, 22)
+}
+
 fn main() {
     let font_path = std::env::var("QUIVER_SHOTS_FONT")
         .unwrap_or_else(|_| "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf".to_owned());
     let data = std::fs::read(&font_path).expect("read the monospace font (set QUIVER_SHOTS_FONT)");
     let font = FontVec::try_from_vec(data).expect("parse the font");
     std::fs::create_dir_all("docs/assets/cockpit").expect("create docs/assets/cockpit");
+    gen_icons("docs/assets/icon");
 
     render_png(&render_logo(58, 11), &font, "docs/assets/cockpit/logo.png");
     render_png(
@@ -97,6 +370,9 @@ fn main() {
         &font,
         "docs/assets/cockpit/constellation.png",
     );
+
+    render_png(&render_installer(), &font, "docs/assets/cockpit/installer.png");
+    render_png(&render_demo_start(), &font, "docs/assets/cockpit/demo-start.png");
 
     let mut offline = Dashboard::demo();
     offline.collections.clear();
