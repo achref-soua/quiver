@@ -177,6 +177,8 @@ function Main {
         }
 
         Write-Host '  Next steps:' -ForegroundColor White
+        Write-Host '    quiver demo              ' -NoNewline -ForegroundColor DarkYellow
+        Write-Host '# zero-config: seed vectors + open cockpit' -ForegroundColor DarkGray
         Write-Host '    quiver serve             ' -NoNewline -ForegroundColor DarkYellow
         Write-Host '# start the server (gRPC + REST on :6333)' -ForegroundColor DarkGray
         Write-Host '    quiver tui               ' -NoNewline -ForegroundColor DarkYellow

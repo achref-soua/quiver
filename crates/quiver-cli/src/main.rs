@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 mod admin;
+mod demo;
 mod update;
 
 #[derive(Parser)]
@@ -63,6 +64,8 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Zero-config demo: seeds 1 000 vectors, starts the server, opens the cockpit.
+    Demo,
 }
 
 #[derive(Subcommand)]
@@ -205,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Bench => println!("quiver bench: not yet implemented"),
         Command::Update { check } => update::run(check).await?,
+        Command::Demo => demo::run().await?,
     }
     Ok(())
 }
