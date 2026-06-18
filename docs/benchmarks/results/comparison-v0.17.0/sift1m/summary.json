@@ -1,0 +1,212 @@
+[
+  {
+    "competitor": "faiss",
+    "dataset": "sift1m",
+    "param_name": "ef_search",
+    "param_value": 16,
+    "build_s": 118.3596718070039,
+    "index_disk_mb": null,
+    "rss_mb": 1183.65234375,
+    "recall_at_10": 0.8113,
+    "qps_1t": 7685.2,
+    "p50_ms": 0.117,
+    "p95_ms": 0.218,
+    "p99_ms": 0.337,
+    "recall_stdev": 0.0,
+    "qps_stdev": 213.0,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "faiss",
+    "dataset": "sift1m",
+    "param_name": "ef_search",
+    "param_value": 32,
+    "build_s": 118.3596718070039,
+    "index_disk_mb": null,
+    "rss_mb": 1226.31640625,
+    "recall_at_10": 0.9111,
+    "qps_1t": 4492.3,
+    "p50_ms": 0.206,
+    "p95_ms": 0.369,
+    "p99_ms": 0.551,
+    "recall_stdev": 0.0,
+    "qps_stdev": 177.8,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "faiss",
+    "dataset": "sift1m",
+    "param_name": "ef_search",
+    "param_value": 64,
+    "build_s": 118.3596718070039,
+    "index_disk_mb": null,
+    "rss_mb": 1228.48828125,
+    "recall_at_10": 0.9684,
+    "qps_1t": 2332.6,
+    "p50_ms": 0.4,
+    "p95_ms": 0.703,
+    "p99_ms": 0.996,
+    "recall_stdev": 0.0,
+    "qps_stdev": 121.3,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "faiss",
+    "dataset": "sift1m",
+    "param_name": "ef_search",
+    "param_value": 128,
+    "build_s": 118.3596718070039,
+    "index_disk_mb": null,
+    "rss_mb": 1230.453125,
+    "recall_at_10": 0.9911,
+    "qps_1t": 1171.8,
+    "p50_ms": 0.75,
+    "p95_ms": 1.733,
+    "p99_ms": 3.02,
+    "recall_stdev": 0.0,
+    "qps_stdev": 297.6,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "faiss",
+    "dataset": "sift1m",
+    "param_name": "ef_search",
+    "param_value": 256,
+    "build_s": 118.3596718070039,
+    "index_disk_mb": null,
+    "rss_mb": 1232.44140625,
+    "recall_at_10": 0.9977,
+    "qps_1t": 778.9,
+    "p50_ms": 1.252,
+    "p95_ms": 1.878,
+    "p99_ms": 2.513,
+    "recall_stdev": 0.0,
+    "qps_stdev": 9.3,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "lancedb",
+    "dataset": "sift1m",
+    "param_name": "nprobes",
+    "param_value": 4,
+    "build_s": 20.96107514499454,
+    "index_disk_mb": 508.5154619216919,
+    "rss_mb": 2708.20703125,
+    "recall_at_10": 0.5169,
+    "qps_1t": 276.4,
+    "p50_ms": 3.427,
+    "p95_ms": 5.191,
+    "p99_ms": 6.445,
+    "recall_stdev": 0.0,
+    "qps_stdev": 10.9,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "lancedb",
+    "dataset": "sift1m",
+    "param_name": "nprobes",
+    "param_value": 8,
+    "build_s": 20.96107514499454,
+    "index_disk_mb": 508.5154619216919,
+    "rss_mb": 2748.6796875,
+    "recall_at_10": 0.5448,
+    "qps_1t": 241.1,
+    "p50_ms": 3.768,
+    "p95_ms": 6.863,
+    "p99_ms": 11.586,
+    "recall_stdev": 0.0,
+    "qps_stdev": 29.2,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "lancedb",
+    "dataset": "sift1m",
+    "param_name": "nprobes",
+    "param_value": 16,
+    "build_s": 20.96107514499454,
+    "index_disk_mb": 508.5154619216919,
+    "rss_mb": 2261.125,
+    "recall_at_10": 0.5545,
+    "qps_1t": 248.2,
+    "p50_ms": 3.861,
+    "p95_ms": 5.316,
+    "p99_ms": 6.661,
+    "recall_stdev": 0.0,
+    "qps_stdev": 6.3,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "lancedb",
+    "dataset": "sift1m",
+    "param_name": "nprobes",
+    "param_value": 32,
+    "build_s": 20.96107514499454,
+    "index_disk_mb": 508.5154619216919,
+    "rss_mb": 2263.9296875,
+    "recall_at_10": 0.5564,
+    "qps_1t": 193.5,
+    "p50_ms": 4.892,
+    "p95_ms": 7.159,
+    "p99_ms": 9.043,
+    "recall_stdev": 0.0,
+    "qps_stdev": 5.8,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "lancedb",
+    "dataset": "sift1m",
+    "param_name": "nprobes",
+    "param_value": 64,
+    "build_s": 20.96107514499454,
+    "index_disk_mb": 508.5154619216919,
+    "rss_mb": 2263.61328125,
+    "recall_at_10": 0.5565,
+    "qps_1t": 145.5,
+    "p50_ms": 6.597,
+    "p95_ms": 8.933,
+    "p99_ms": 11.508,
+    "recall_stdev": 0.0,
+    "qps_stdev": 1.9,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  }
+]

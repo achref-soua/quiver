@@ -16,7 +16,7 @@
 //! family is maintained the FreshDiskANN way (ADR-0033): the batch-built graph
 //! is a read-only base, recent inserts land in an in-memory delta graph, and
 //! deletes are tombstoned, so writes are size-independent; when the pending work
-//! grows past [`GRAPH_REBUILD_PENDING_FRACTION`] the next access consolidates by
+//! grows past a fixed fraction of the base the next access consolidates by
 //! rebuilding from the store. All indexes stay derived (rebuilt from the store
 //! on open), so the crash gate never sees an index write.
 //!
@@ -465,6 +465,52 @@ impl Database {
         // defer to a lazy rebuild on the next search (ADR-0023/0026/0033).
         index_upsert_point(handle, id, vector)?;
         Ok(())
+    }
+
+    /// Upsert a batch of points with a single WAL `fdatasync` (ADR-0038).
+    ///
+    /// `points` is `(id, vector, payload)` tuples.  The batch is committed
+    /// atomically — all points or none (from the client's perspective).  This
+    /// is the preferred path for the REST `POST /v1/collections/{c}/points`
+    /// handler which already delivers a batch per HTTP request.
+    pub fn upsert_batch(
+        &mut self,
+        collection: &str,
+        points: &[(&str, &[f32], &serde_json::Value)],
+    ) -> Result<u64> {
+        let handle = self
+            .collections
+            .get(collection)
+            .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+        require_single_vector(handle)?;
+        let coll_id = handle.id;
+        let is_client_side = handle.descriptor.vector_encryption == VectorEncryption::ClientSide;
+
+        let payload_bytes: Vec<Vec<u8>> = points
+            .iter()
+            .map(|(_, _, p)| serde_json::to_vec(p).map_err(Error::Json))
+            .collect::<Result<_>>()?;
+
+        let records: Vec<(&str, &[f32], &[u8])> = points
+            .iter()
+            .zip(payload_bytes.iter())
+            .map(|((id, vec, _), p)| (*id, *vec, p.as_slice()))
+            .collect();
+
+        self.store.upsert_batch(coll_id, &records)?;
+
+        if is_client_side {
+            return Ok(records.len() as u64);
+        }
+
+        for (id, vector, _) in points {
+            let handle = self
+                .collections
+                .get_mut(collection)
+                .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+            index_upsert_point(handle, id, vector)?;
+        }
+        Ok(records.len() as u64)
     }
 
     /// Delete a point by id. Returns whether it existed.
@@ -1653,6 +1699,62 @@ mod tests {
         let got = db.get("items", "c").unwrap().unwrap();
         assert_eq!(got.vector, Some(vec![5.0, 5.0, 5.0, 5.0]));
         assert_eq!(got.payload, Some(json!({"color": "red"})));
+    }
+
+    #[test]
+    fn upsert_batch_produces_same_search_results_as_sequential() {
+        let tmp_seq = tempfile::tempdir().unwrap();
+        let tmp_bat = tempfile::tempdir().unwrap();
+
+        let vectors: Vec<[f32; 4]> = (0..20u32).map(|i| [i as f32, 0.0, 0.0, 0.0]).collect();
+        let ids: Vec<String> = (0..20u32).map(|i| format!("p{i}")).collect();
+        let payload = json!({});
+
+        // Sequential upserts
+        {
+            let mut db = open(tmp_seq.path());
+            db.create_collection("c", desc()).unwrap();
+            for (id, vec) in ids.iter().zip(vectors.iter()) {
+                db.upsert("c", id, vec, &payload).unwrap();
+            }
+        }
+        // Batch upsert
+        {
+            let mut db = open(tmp_bat.path());
+            db.create_collection("c", desc()).unwrap();
+            let pts: Vec<(&str, &[f32], &serde_json::Value)> = ids
+                .iter()
+                .zip(vectors.iter())
+                .map(|(id, v)| (id.as_str(), v.as_slice(), &payload))
+                .collect();
+            let n = db.upsert_batch("c", &pts).unwrap();
+            assert_eq!(n, 20);
+        }
+
+        let query = [10.0f32, 0.0, 0.0, 0.0];
+        let params = SearchParams {
+            k: 5,
+            ..Default::default()
+        };
+
+        let mut seq_db = open(tmp_seq.path());
+        let mut bat_db = open(tmp_bat.path());
+        let seq: Vec<String> = seq_db
+            .search("c", &query, &params)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        let bat: Vec<String> = bat_db
+            .search("c", &query, &params)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            seq, bat,
+            "batch and sequential produce different search results"
+        );
     }
 
     #[test]

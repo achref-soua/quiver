@@ -140,3 +140,61 @@ benchmark table with the measured numbers, and commit alongside:
 
 State plainly which metric each system wins. That honesty — real numbers,
 reproducible, losses included — is the point of this whole document.
+
+---
+
+## 9. Multi-DB comparison harness (ADR-0037)
+
+The full comparison harness (`bench/quiver_bench/comparison.py`) extends the
+single-DB harness and drives all seven competitors via a uniform interface.
+Prerequisites: Docker (for Qdrant, pgvector, Weaviate), plus the Python
+competitor clients installed in the bench venv:
+
+```bash
+# From the quiver repo root on the reference machine:
+/path/to/quiver/bench/.venv/bin/python -m pip install \
+    faiss-cpu lancedb pyarrow chromadb pymilvus milvus-lite \
+    qdrant-client psycopg2-binary weaviate-client
+```
+
+Pull the pinned competitor images:
+
+```bash
+docker pull qdrant/qdrant:v1.13.4
+docker pull pgvector/pgvector:pg16
+docker pull cr.weaviate.io/semitechnologies/weaviate:1.27.0
+```
+
+Start a Quiver server on the reference machine:
+
+```bash
+QUIVER_DATA_DIR=/tmp/quiver-ref QUIVER_API_KEY=ref-bench-key QUIVER_INSECURE=true \
+    ./target/release/quiver serve &
+```
+
+Then run the full comparison:
+
+```bash
+# In-process competitors (FAISS, LanceDB, Chroma, Milvus Lite) + Docker ones:
+just bench-compare --dataset sift1m --competitors all \
+    --quiver-url http://127.0.0.1:6333 --quiver-key ref-bench-key \
+    --out /path/to/results
+
+# Deep10M (the memory headline — 10M vectors):
+just bench-compare --dataset deep10m --competitors faiss,lancedb,qdrant,quiver \
+    --quiver-url http://127.0.0.1:6333 --quiver-key ref-bench-key \
+    --out /path/to/results
+```
+
+Generate the committed report:
+
+```bash
+just bench-report
+# Output: docs/benchmarks/results/comparison-v0.17.0/comparison-v0.17.0.md
+```
+
+Commit the CSVs, manifest.json, and the .md report to the repo. Mark every
+figure with the reference-hardware block from §0. Any figure not produced on
+dedicated, idle reference hardware **must** carry a `[dev-box]` or
+`[reference-hardware-pending]` label in the report — never remove these labels
+to make numbers look more authoritative.

@@ -13,7 +13,7 @@ use anyhow::{Context, anyhow, bail};
 use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, FieldType, FilterableField};
 use quiver_import::{
     ChromaSource, ParseOptions, PgvectorSource, QdrantSource, Source, fetch_chroma, fetch_pgvector,
-    fetch_qdrant, import_into, infer_dim, parse,
+    fetch_qdrant, import_into, infer_dim, parse, plaintext_credential_warning,
 };
 
 // Typed arguments for `quiver admin import`, decoupled from clap so the command
@@ -64,6 +64,11 @@ pub(crate) fn import(args: ImportArgs) -> anyhow::Result<usize> {
         if args.source != Source::Qdrant {
             bail!("--qdrant-url is only supported with --source qdrant");
         }
+        if let Some(warning) =
+            plaintext_credential_warning(Source::Qdrant, url, args.api_key.is_some())
+        {
+            eprintln!("warning: {warning}");
+        }
         let src = QdrantSource {
             api_key: args.api_key.clone(),
             ..QdrantSource::new(url.clone(), args.collection.clone())
@@ -72,6 +77,11 @@ pub(crate) fn import(args: ImportArgs) -> anyhow::Result<usize> {
     } else if let Some(url) = &args.chroma_url {
         if args.source != Source::Chroma {
             bail!("--chroma-url is only supported with --source chroma");
+        }
+        if let Some(warning) =
+            plaintext_credential_warning(Source::Chroma, url, args.api_key.is_some())
+        {
+            eprintln!("warning: {warning}");
         }
         let mut src = ChromaSource::new(url.clone(), args.collection.clone());
         if let Some(tenant) = &args.chroma_tenant {
@@ -90,6 +100,9 @@ pub(crate) fn import(args: ImportArgs) -> anyhow::Result<usize> {
             .table
             .clone()
             .unwrap_or_else(|| args.collection.clone());
+        if let Some(warning) = plaintext_credential_warning(Source::Pgvector, url, false) {
+            eprintln!("warning: {warning}");
+        }
         let src = PgvectorSource::new(url.clone(), table);
         fetch_pgvector(&src, &opts)?
     } else if let Some(input) = &args.input {

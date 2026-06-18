@@ -39,6 +39,7 @@ __pycache__/
 
 # --- Local data / runtime ---
 /data/
+/quiver-data/
 *.qvr
 *.wal
 

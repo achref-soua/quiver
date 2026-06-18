@@ -1,0 +1,6 @@
+competitor,dataset,param_name,param_value,build_s,index_disk_mb,rss_mb,recall_at_10,qps_1t,p50_ms,p95_ms,p99_ms,recall_stdev,qps_stdev,config,notes,error
+pgvector,siftsmall,nprobe,4,1.937086599005852,11.2265625,66.01,0.875,1260.6,0.741,1.114,1.748,0.0,59.9,{'metric': 'l2'},,
+pgvector,siftsmall,nprobe,8,1.937086599005852,11.2265625,65.81,0.965,1156.2,0.83,1.18,1.354,0.0,15.1,{'metric': 'l2'},,
+pgvector,siftsmall,nprobe,16,1.937086599005852,11.2265625,65.82,0.997,867.9,1.083,1.588,1.85,0.0,24.9,{'metric': 'l2'},,
+pgvector,siftsmall,nprobe,32,1.937086599005852,11.2265625,65.82,1.0,614.7,1.568,2.304,2.636,0.0,42.2,{'metric': 'l2'},,
+pgvector,siftsmall,nprobe,64,1.937086599005852,11.2265625,65.56,1.0,328.8,2.896,4.205,5.506,0.0,24.3,{'metric': 'l2'},,

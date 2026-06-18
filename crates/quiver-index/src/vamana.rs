@@ -234,7 +234,7 @@ impl Vamana {
     }
 
     /// Add one point incrementally (ADR-0033): the FreshDiskANN insert — a greedy
-    /// search from the medoid for candidates, [`Vamana::robust_prune`] to pick the
+    /// search from the medoid for candidates, `robust_prune` to pick the
     /// new node's ≤`R` out-neighbors, then bidirectional edges with a re-prune of
     /// any neighbor that overflows `R`. The medoid is kept as-is (the temporary
     /// index this backs is small and consolidated often), so navigation stays

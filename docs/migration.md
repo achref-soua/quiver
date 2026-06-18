@@ -150,3 +150,20 @@ QUIVER_ENCRYPTION_KEY=<same key> quiver serve   # data_dir defaults to ./data
   path. Live Chroma uses its v2 HTTP API (resolving the collection name to an id
   by listing collections); live Postgres reads `row_to_json` over the table and
   negotiates TLS per the URL's `sslmode`.
+
+## Security of live import
+
+`quiver admin import` is an **operator** command: the source URL you pass is
+trusted input you chose, not a request an attacker can influence, so fetching it
+is not server-side request forgery (see finding C1 in the
+[v0.17.0 audit note](./security/audit-0.17.0.md)). Two operational cautions still
+apply, and the CLI warns about both:
+
+- **Use TLS for credentials.** A Qdrant/Chroma API key over a plaintext
+  `http://` URL, or a Postgres password with `sslmode=disable`, travels in
+  cleartext to anyone on the path. Prefer `https://` (Qdrant/Chroma) and
+  `sslmode=require` or stronger (Postgres). The importer prints a `warning:` to
+  stderr when it detects a credential that would be sent unencrypted.
+- The SQL table name is interpolated as a **quoted identifier** (each
+  dot-separated part is double-quoted with embedded quotes doubled), so a crafted
+  `--table` cannot break out of the `SELECT`.

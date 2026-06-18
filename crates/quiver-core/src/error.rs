@@ -96,3 +96,83 @@ impl CoreError {
 
 /// Convenience alias for storage-engine results.
 pub type Result<T> = std::result::Result<T, CoreError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    // The operator-facing Display messages are produced only when an error is
+    // formatted (logged / returned to a caller), which the variant-matching tests
+    // elsewhere never trigger. Format every variant so a broken message surfaces
+    // here rather than in production logs.
+    #[test]
+    fn every_variant_formats_a_useful_message() {
+        let io = CoreError::io(
+            "/tmp/x",
+            io::Error::new(ErrorKind::PermissionDenied, "boom"),
+        );
+        assert_eq!(io.to_string(), "i/o error at /tmp/x: boom");
+
+        let bare: CoreError = io::Error::new(ErrorKind::UnexpectedEof, "eof").into();
+        assert_eq!(bare.to_string(), "i/o error: eof");
+
+        assert_eq!(
+            CoreError::BadMagic {
+                expected: 0xDEAD_BEEF,
+                found: 0x0000_0001
+            }
+            .to_string(),
+            "bad magic: expected 0xdeadbeef, found 0x00000001",
+        );
+        assert_eq!(
+            CoreError::UnsupportedVersion {
+                found: 9,
+                supported: 2
+            }
+            .to_string(),
+            "unsupported format version 9 (this build supports 2)",
+        );
+        assert_eq!(
+            CoreError::PageCorrupt {
+                page_id: 7,
+                expected: 0x0000_00ff,
+                computed: 0x0000_0100
+            }
+            .to_string(),
+            "page 7 failed crc check (header 0x000000ff, computed 0x00000100)",
+        );
+
+        assert_eq!(
+            CoreError::MalformedPage("len".into()).to_string(),
+            "malformed page: len"
+        );
+        assert_eq!(
+            CoreError::TooLarge("payload".into()).to_string(),
+            "value too large: payload"
+        );
+        assert_eq!(CoreError::NotFound("c".into()).to_string(), "not found: c");
+        assert_eq!(
+            CoreError::AlreadyExists("c".into()).to_string(),
+            "already exists: c"
+        );
+        assert_eq!(
+            CoreError::InvalidArgument("dim".into()).to_string(),
+            "invalid argument: dim",
+        );
+
+        // A real postcard failure flows through the `#[from]` conversion.
+        let de = postcard::from_bytes::<u32>(&[]).unwrap_err();
+        let err: CoreError = de.into();
+        assert!(err.to_string().starts_with("serialization error:"), "{err}");
+    }
+
+    #[test]
+    fn io_constructor_tags_the_path() {
+        let err = CoreError::io("data/seg.000", io::Error::from(ErrorKind::NotFound));
+        match err {
+            CoreError::Io { path, .. } => assert_eq!(path, PathBuf::from("data/seg.000")),
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+}

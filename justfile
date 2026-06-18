@@ -70,10 +70,34 @@ tui:
 demo:
     bash scripts/demo.sh
 
+# Real-user acceptance run: boot an encrypted server and drive every external
+# surface (REST, Python SDK across all index kinds + both encrypted modes + multi
+# -vector, CLI import, MCP). Requires uv, curl, openssl. See
+# docs/testing/manual-acceptance.md.
+acceptance:
+    bash scripts/acceptance.sh
+
 # Run the benchmark harness against a running server (requires uv). Args pass
 # through, e.g. `just bench --synthetic` or `just bench --dataset PATH`.
 bench *ARGS:
     uv run --project bench python -m quiver_bench.run {{ ARGS }}
+
+# Multi-DB comparison runner (ADR-0037). Install competitor deps first:
+#   uv pip install --project bench --group competitors
+# Run all competitors on the siftsmall smoke dataset:
+#   just bench-compare --smoke
+# Run selected competitors on SIFT1M (needs bench/datasets/sift/):
+#   just bench-compare --dataset sift1m --competitors faiss,lancedb,quiver
+bench-compare *ARGS:
+    uv run --project bench python -m quiver_bench.comparison {{ ARGS }}
+
+# Generate the comparison report from existing CSV results.
+#   just bench-report
+# Reads docs/benchmarks/results/comparison-v0.17.0/ and writes
+# docs/benchmarks/results/comparison-v0.17.0/comparison-v0.17.0.md
+bench-report:
+    uv run --project bench python -m quiver_bench.report \
+        docs/benchmarks/results/comparison-v0.17.0
 
 # Fuzz a parser target with cargo-fuzz (requires a nightly toolchain +
 # cargo-fuzz; see docs/security/fuzzing.md). Targets: filter_json, page_decode,

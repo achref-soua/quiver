@@ -1,0 +1,107 @@
+[
+  {
+    "competitor": "quiver",
+    "dataset": "siftsmall",
+    "param_name": "ef_search",
+    "param_value": 16,
+    "build_s": 1.8583055549970595,
+    "index_disk_mb": null,
+    "rss_mb": 62.6015625,
+    "recall_at_10": 0.968,
+    "qps_1t": 1190.7,
+    "p50_ms": 0.775,
+    "p95_ms": 1.065,
+    "p99_ms": 1.338,
+    "recall_stdev": 0.0,
+    "qps_stdev": 132.4,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "quiver",
+    "dataset": "siftsmall",
+    "param_name": "ef_search",
+    "param_value": 32,
+    "build_s": 1.8583055549970595,
+    "index_disk_mb": null,
+    "rss_mb": 62.6015625,
+    "recall_at_10": 0.993,
+    "qps_1t": 1256.8,
+    "p50_ms": 0.768,
+    "p95_ms": 1.037,
+    "p99_ms": 1.235,
+    "recall_stdev": 0.0,
+    "qps_stdev": 63.1,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "quiver",
+    "dataset": "siftsmall",
+    "param_name": "ef_search",
+    "param_value": 64,
+    "build_s": 1.8583055549970595,
+    "index_disk_mb": null,
+    "rss_mb": 62.6015625,
+    "recall_at_10": 0.997,
+    "qps_1t": 1160.5,
+    "p50_ms": 0.835,
+    "p95_ms": 1.081,
+    "p99_ms": 1.284,
+    "recall_stdev": 0.0,
+    "qps_stdev": 26.1,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "quiver",
+    "dataset": "siftsmall",
+    "param_name": "ef_search",
+    "param_value": 128,
+    "build_s": 1.8583055549970595,
+    "index_disk_mb": null,
+    "rss_mb": 62.6015625,
+    "recall_at_10": 1.0,
+    "qps_1t": 1010.2,
+    "p50_ms": 0.956,
+    "p95_ms": 1.338,
+    "p99_ms": 1.648,
+    "recall_stdev": 0.0,
+    "qps_stdev": 57.0,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "quiver",
+    "dataset": "siftsmall",
+    "param_name": "ef_search",
+    "param_value": 256,
+    "build_s": 1.8583055549970595,
+    "index_disk_mb": null,
+    "rss_mb": 62.6015625,
+    "recall_at_10": 1.0,
+    "qps_1t": 879.4,
+    "p50_ms": 1.12,
+    "p95_ms": 1.404,
+    "p99_ms": 1.47,
+    "recall_stdev": 0.0,
+    "qps_stdev": 18.6,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  }
+]

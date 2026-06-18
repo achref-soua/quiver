@@ -324,6 +324,69 @@ fn quote_ident(ident: &str) -> Result<String, ImportError> {
     Ok(quoted)
 }
 
+/// Flag live-import credentials that would travel in cleartext, so an operator is
+/// warned before a secret leaks to a plaintext hop.
+///
+/// The import URL is supplied by the operator on the `quiver admin import` command
+/// line — it is trusted input, not an attacker-influenced request, so fetching it
+/// is **not** SSRF (see `docs/security/audit-0.17.0.md`). What *is* worth flagging
+/// is a credential going out unencrypted: a Qdrant/Chroma API key over a plaintext
+/// `http://` URL, or a Postgres password in a URL with `sslmode=disable`. Returns
+/// a human-readable warning in that case, or `None` when nothing sensitive is
+/// exposed.
+///
+/// `has_api_key` is whether a Qdrant/Chroma key was supplied; for Postgres the
+/// password (if any) is embedded in the URL, so the flag is ignored there.
+#[must_use]
+pub fn plaintext_credential_warning(
+    source: Source,
+    url: &str,
+    has_api_key: bool,
+) -> Option<String> {
+    let lower = url.trim().to_ascii_lowercase();
+    match source {
+        Source::Qdrant | Source::Chroma => {
+            if has_api_key && lower.starts_with("http://") {
+                Some(format!(
+                    "the {source} API key will be sent in cleartext over an unencrypted http:// \
+                     connection; use an https:// URL so the key is protected in transit"
+                ))
+            } else {
+                None
+            }
+        }
+        Source::Pgvector => {
+            if url_userinfo_has_password(url) && tls_is_disabled(&lower) {
+                Some(
+                    "the Postgres password is embedded in a connection URL with sslmode=disable, \
+                     so it will be sent in cleartext; use sslmode=require (or stronger) to \
+                     encrypt the connection"
+                        .to_string(),
+                )
+            } else {
+                None
+            }
+        }
+    }
+}
+
+// True if a connection URL's userinfo (`scheme://user:password@host…`) carries a
+// password — i.e. the userinfo before the authority's `@` contains a `:`.
+fn url_userinfo_has_password(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?']).next().unwrap_or("");
+    match authority.rsplit_once('@') {
+        Some((userinfo, _host)) => userinfo.contains(':'),
+        None => false,
+    }
+}
+
+// True if a connection URL explicitly disables TLS (`sslmode=disable`). Absent or
+// `prefer` is not flagged: libpq still negotiates TLS when the server offers it.
+fn tls_is_disabled(lower: &str) -> bool {
+    lower.contains("sslmode=disable")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,6 +523,65 @@ mod tests {
         assert!(matches!(
             fetch_chroma(&src),
             Err(ImportError::Shape(Source::Chroma, _))
+        ));
+    }
+
+    #[test]
+    fn warns_on_an_api_key_over_plaintext_http() {
+        // Qdrant/Chroma key over http:// → warn; over https:// or without a key → silent.
+        assert!(plaintext_credential_warning(Source::Qdrant, "http://host:6333", true).is_some());
+        assert!(plaintext_credential_warning(Source::Chroma, "http://host:8000", true).is_some());
+        assert!(plaintext_credential_warning(Source::Qdrant, "https://host:6333", true).is_none());
+        assert!(plaintext_credential_warning(Source::Qdrant, "http://host:6333", false).is_none());
+        // Case and surrounding whitespace must not defeat the check.
+        assert!(plaintext_credential_warning(Source::Chroma, "  HTTP://Host  ", true).is_some());
+    }
+
+    #[test]
+    fn warns_on_a_postgres_password_with_tls_disabled() {
+        // Password embedded + sslmode=disable → warn.
+        assert!(
+            plaintext_credential_warning(
+                Source::Pgvector,
+                "postgresql://u:secret@host:5432/db?sslmode=disable",
+                false,
+            )
+            .is_some()
+        );
+        // Password but TLS not disabled (require, or absent → libpq negotiates) → silent.
+        assert!(
+            plaintext_credential_warning(
+                Source::Pgvector,
+                "postgresql://u:secret@host/db?sslmode=require",
+                false,
+            )
+            .is_none()
+        );
+        assert!(
+            plaintext_credential_warning(Source::Pgvector, "postgresql://u:secret@host/db", false)
+                .is_none()
+        );
+        // No password in the userinfo → nothing sensitive to leak, even with sslmode=disable.
+        assert!(
+            plaintext_credential_warning(
+                Source::Pgvector,
+                "postgresql://u@host/db?sslmode=disable",
+                false,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn url_userinfo_password_detection() {
+        assert!(url_userinfo_has_password(
+            "postgresql://user:pass@host:5432/db"
+        ));
+        assert!(!url_userinfo_has_password("postgresql://user@host/db"));
+        assert!(!url_userinfo_has_password("postgresql://host/db"));
+        // A `:` in the path or query must not be mistaken for a password.
+        assert!(!url_userinfo_has_password(
+            "postgresql://host/db?options=a:b"
         ));
     }
 

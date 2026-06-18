@@ -22,6 +22,9 @@ quiver-tui = { workspace = true }
 
 anyhow = { workspace = true }
 clap = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+ureq = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
