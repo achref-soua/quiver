@@ -7,7 +7,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.17.0"
+version = "0.17.1"
 edition = "2024"
 # MSRV: 1.88 — the minimum the dependency tree supports (ratatui 0.30's
 # `ratatui-core`/`-widgets`/`-crossterm`). Bumped from 1.85 when updating ratatui
