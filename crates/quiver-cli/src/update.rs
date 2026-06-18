@@ -4,6 +4,34 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+
+fn use_color() -> bool {
+    std::env::var("NO_COLOR").is_err() && std::env::var("TERM").map_or(true, |t| t != "dumb")
+}
+
+fn banner(mode: &str) {
+    if !use_color() {
+        println!("  QUIVER  {mode}  v{CURRENT_VERSION}");
+        return;
+    }
+    let b = "\x1b[38;2;205;127;50m"; // #CD7F32 bronze — theme CHROME
+    let v = "\x1b[38;2;63;182;168m"; // #3FB6A8 verdigris — theme ACCENT
+    let g = "\x1b[38;2;90;90;90m"; // dark gray
+    let r = "\x1b[0m";
+    println!();
+    println!("{b}    ██████╗ ██╗   ██╗██╗██╗   ██╗███████╗██████╗ {r}");
+    println!("{b}   ██╔═══██╗██║   ██║██║██║   ██║██╔════╝██╔══██╗{r}");
+    println!("{b}   ██║   ██║██║   ██║██║╚██╗ ██╔╝█████╗  ██████╔╝{r}");
+    println!("{b}   ██║▄▄ ██║██║   ██║██║ ╚████╔╝ ██╔══╝  ██╔══██╗{r}");
+    println!("{b}   ╚██████╔╝╚██████╔╝██║  ╚██╔╝  ███████╗██║  ██║{r}");
+    println!("{b}    ╚══▀▀═╝  ╚═════╝ ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝{r}");
+    println!("{v}        {mode}  ·  v{CURRENT_VERSION}{r}");
+    println!();
+    println!("{g}  ┌──────────────────────────────────────────────┐{r}");
+    println!("{g}  │  encrypted · memory-frugal · self-hostable   │{r}");
+    println!("{g}  └──────────────────────────────────────────────┘{r}");
+    println!();
+}
 use sha2::{Digest, Sha256};
 
 const REPO: &str = "achref-soua/quiver";
@@ -122,25 +150,49 @@ fn atomic_replace(current_exe: &PathBuf, new_binary: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn step(msg: &str) {
+    if use_color() {
+        println!("  \x1b[38;2;63;182;168m⟳\x1b[0m  {msg}");
+    } else {
+        println!("  > {msg}");
+    }
+}
+
+fn ok(msg: &str) {
+    if use_color() {
+        println!("  \x1b[38;2;143;179;57m✔\x1b[0m  {msg}");
+    } else {
+        println!("  ✔ {msg}");
+    }
+}
+
 fn run_blocking(check_only: bool) -> Result<()> {
+    let mode = if check_only { "update check" } else { "update" };
+    banner(mode);
+
     let agent = ureq::AgentBuilder::new().build();
 
-    print!("Checking for updates... ");
+    step("Checking latest release...");
     let latest = fetch_latest_version(&agent)?;
-    println!("latest: v{latest}  installed: v{CURRENT_VERSION}");
 
     if !is_newer(CURRENT_VERSION, &latest) {
-        println!("Quiver v{CURRENT_VERSION} is already up to date.");
+        ok(&format!(
+            "v{CURRENT_VERSION} is already the latest release."
+        ));
         return Ok(());
     }
 
-    println!("New version available: v{latest}");
+    if use_color() {
+        println!(
+            "  \x1b[38;2;205;127;50m↑\x1b[0m  v{CURRENT_VERSION} → \x1b[38;2;143;179;57mv{latest}\x1b[0m"
+        );
+    } else {
+        println!("  New version available: v{latest}");
+    }
 
     if check_only {
-        println!(
-            "Run `quiver update` (without --check) to install, \
-             or visit https://github.com/{REPO}/releases/tag/v{latest}"
-        );
+        println!();
+        println!("  Run  quiver update  to install v{latest}.");
         return Ok(());
     }
 
@@ -150,22 +202,20 @@ fn run_blocking(check_only: bool) -> Result<()> {
     let base_url = format!("https://github.com/{REPO}/releases/download/v{latest}/{asset_name}");
     let checksum_url = format!("{base_url}.sha256");
 
-    println!("Downloading {asset_name}...");
+    step(&format!("Downloading {asset_name}..."));
     let binary = fetch_bytes(&agent, &base_url)?;
 
-    println!("Downloading checksum...");
+    step("Verifying SHA-256 checksum...");
     let checksum_bytes = fetch_bytes(&agent, &checksum_url)?;
     let checksum_str =
         String::from_utf8(checksum_bytes).context("checksum file is not valid UTF-8")?;
-
-    println!("Verifying SHA-256 checksum...");
     verify_sha256(&binary, &checksum_str)?;
-    println!("Checksum OK.");
+    ok("Checksum verified.");
 
     let current_exe = env::current_exe().context("cannot determine current binary path")?;
-    println!("Installing to {}...", current_exe.display());
+    step(&format!("Installing to {}...", current_exe.display()));
     atomic_replace(&current_exe, &binary)?;
-    println!("Quiver updated to v{latest}. Run `quiver --version` to confirm.");
+    ok(&format!("Quiver updated to v{latest}."));
 
     Ok(())
 }

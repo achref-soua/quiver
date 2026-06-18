@@ -13,52 +13,61 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Ensure Unicode block characters render correctly on Windows.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
 $Repo       = 'achref-soua/quiver'
 $InstallDir = if ($env:QUIVER_INSTALL_DIR) { $env:QUIVER_INSTALL_DIR } `
               else { Join-Path $env:LOCALAPPDATA 'quiver\bin' }
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── ANSI true-color helpers ───────────────────────────────────────────────────
+# [char]27 for ESC works in both PowerShell 5.1 (.NET Framework) and 7+.
+# VT/ANSI processing is enabled by default on Windows 10 build 14393+.
 
-function Write-Color {
-    param([string]$Text, [ConsoleColor]$Color = 'White')
-    $prev = $Host.UI.RawUI.ForegroundColor
-    $Host.UI.RawUI.ForegroundColor = $Color
-    Write-Host $Text
-    $Host.UI.RawUI.ForegroundColor = $prev
-}
+$E  = [char]27
+$B  = "${E}[38;2;205;127;50m"  # bronze    #CD7F32  theme CHROME
+$V  = "${E}[38;2;63;182;168m"  # verdigris #3FB6A8  theme ACCENT
+$G  = "${E}[38;2;143;179;57m"  # green     #8FB339  theme OK
+$GR = "${E}[38;2;90;90;90m"    # dark gray
+$W  = "${E}[38;2;230;230;230m" # parchment/white
+$Y  = "${E}[38;2;215;200;0m"   # yellow    (warnings)
+$RE = "${E}[38;2;210;85;47m"   # red       theme ALERT
+$R  = "${E}[0m"                 # reset
 
-function Write-Info { param($Msg) Write-Host "  $Msg" -ForegroundColor Cyan }
-function Write-Ok   { param($Msg) Write-Host "  $Msg" -ForegroundColor Green }
-function Write-Warn { param($Msg) Write-Host "  ! $Msg" -ForegroundColor Yellow }
-function Fail       { param($Msg) Write-Host "`n  ERROR: $Msg" -ForegroundColor Red; exit 1 }
+function Write-Ok   { param($Msg) Write-Host "  ${G}✔${R}  $Msg" }
+function Write-Warn { param($Msg) Write-Host "  ${Y}!${R}  $Msg" }
+function Fail       { param($Msg) Write-Host "`n  ${RE}ERROR: $Msg${R}"; exit 1 }
 
 function Show-Logo {
     param([string]$Version = '')
     Write-Host ''
-    Write-Color '    ██████╗ ██╗   ██╗██╗██╗   ██╗███████╗██████╗ ' DarkYellow
-    Write-Color '   ██╔═══██╗██║   ██║██║██║   ██║██╔════╝██╔══██╗' DarkYellow
-    Write-Color '   ██║   ██║██║   ██║██║╚██╗ ██╔╝█████╗  ██████╔╝' Yellow
-    Write-Color '   ██║▄▄ ██║██║   ██║██║ ╚████╔╝ ██╔══╝  ██╔══██╗' Yellow
-    Write-Color '   ╚██████╔╝╚██████╔╝██║  ╚██╔╝  ███████╗██║  ██║' DarkGreen
-    Write-Color '    ╚══▀▀═╝  ╚═════╝ ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝' DarkGreen
+    Write-Host "${B}    ██████╗ ██╗   ██╗██╗██╗   ██╗███████╗██████╗ ${R}"
+    Write-Host "${B}   ██╔═══██╗██║   ██║██║██║   ██║██╔════╝██╔══██╗${R}"
+    Write-Host "${B}   ██║   ██║██║   ██║██║╚██╗ ██╔╝█████╗  ██████╔╝${R}"
+    Write-Host "${B}   ██║▄▄ ██║██║   ██║██║ ╚████╔╝ ██╔══╝  ██╔══██╗${R}"
+    Write-Host "${B}   ╚██████╔╝╚██████╔╝██║  ╚██╔╝  ███████╗██║  ██║${R}"
+    Write-Host "${B}    ╚══▀▀═╝  ╚═════╝ ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝${R}"
     if ($Version) {
-        $pad = ' ' * [Math]::Max(0, (48 - $Version.Length) / 2)
-        Write-Color "${pad}security-first vector database  v${Version}" DarkCyan
+        Write-Host "${V}        security-first vector database  v${Version}${R}"
     } else {
-        Write-Color '        security-first vector database' DarkCyan
+        Write-Host "${V}        security-first vector database${R}"
     }
     Write-Host ''
-    Write-Color '  ┌──────────────────────────────────────────────┐' DarkGray
-    Write-Color '  │  encrypted · memory-frugal · self-hostable   │' DarkGray
-    Write-Color '  └──────────────────────────────────────────────┘' DarkGray
+    Write-Host "${GR}  ┌──────────────────────────────────────────────┐${R}"
+    Write-Host "${GR}  │  encrypted · memory-frugal · self-hostable   │${R}"
+    Write-Host "${GR}  └──────────────────────────────────────────────┘${R}"
     Write-Host ''
+}
+
+function Show-Step {
+    param([string]$Icon, [string]$Msg)
+    Write-Host "  ${V}$Icon${R}  ${W}$Msg${R}"
 }
 
 # ── platform detection ────────────────────────────────────────────────────────
 
 function Get-QuiverArch {
-    # $env:PROCESSOR_ARCHITECTURE works on both PowerShell 5.1 (.NET Framework)
-    # and PowerShell 7+ (.NET Core). Values: AMD64, ARM64, x86.
     switch ($env:PROCESSOR_ARCHITECTURE) {
         'AMD64' { return 'x86_64' }
         'ARM64' { return 'aarch64' }
@@ -70,8 +79,8 @@ function Get-QuiverArch {
 
 function Confirm-Sha256 {
     param([string]$FilePath, [string]$ChecksumFilePath)
-    $checksumContent = (Get-Content -Raw $ChecksumFilePath).Trim()
-    $expected = ($checksumContent -split '\s+')[0].ToLower()
+    $content  = (Get-Content -Raw $ChecksumFilePath).Trim()
+    $expected = ($content -split '\s+')[0].ToLower()
     $actual   = (Get-FileHash -Algorithm SHA256 -Path $FilePath).Hash.ToLower()
     if ($actual -ne $expected) {
         Fail "SHA-256 mismatch.`n    expected: $expected`n    got:      $actual"
@@ -82,8 +91,8 @@ function Confirm-Sha256 {
 
 function Get-FileWithProgress {
     param([string]$Uri, [string]$OutFile, [string]$Label)
-    $ProgressPreference = 'SilentlyContinue'   # suppress PS default bar (slow on 5.1)
-    Write-Host "  Downloading $Label" -NoNewline -ForegroundColor Cyan
+    $ProgressPreference = 'SilentlyContinue'
+    Write-Host "  ${V}⬇${R}  ${W}$Label${R}" -NoNewline
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
@@ -93,18 +102,27 @@ function Get-FileWithProgress {
     }
     $sw.Stop()
     $size = [Math]::Round((Get-Item $OutFile).Length / 1MB, 1)
-    Write-Host (" [{0:N1} MB in {1:N1}s] " -f $size, $sw.Elapsed.TotalSeconds) -ForegroundColor DarkGray
-    Write-Host "  [" -NoNewline -ForegroundColor DarkGray
-    Write-Host "##################################################" -NoNewline -ForegroundColor Green
-    Write-Host "] 100%" -ForegroundColor DarkGray
+    Write-Host "  ${GR}[{0:N1} MB in {1:N1}s]${R}" -f $size, $sw.Elapsed.TotalSeconds
+    Write-Host "  ${GR}[${G}##################################################${GR}] 100%${R}"
 }
 
-# ── spinner helper ────────────────────────────────────────────────────────────
+# ── shortcut creation ─────────────────────────────────────────────────────────
+# Creates a Desktop icon and a Start Menu entry.  The icon is pulled from the
+# embedded resource in quiver.exe so Finder/Explorer and the taskbar show the
+# arrowhead logo.  Both shortcuts launch `quiver demo` inside cmd /k so the
+# window stays open while the TUI cockpit runs.
 
-function Show-Step {
-    param([string]$Icon, [string]$Msg, [ConsoleColor]$Color = 'Cyan')
-    Write-Host "  $Icon " -NoNewline -ForegroundColor $Color
-    Write-Host $Msg -ForegroundColor White
+function New-QuiverShortcut {
+    param([string]$LinkPath, [string]$ExePath)
+    $shell  = New-Object -ComObject WScript.Shell
+    $sc     = $shell.CreateShortcut($LinkPath)
+    $sc.TargetPath       = $env:ComSpec
+    $sc.Arguments        = "/k `"$ExePath`" demo"
+    $sc.WorkingDirectory = $env:USERPROFILE
+    $sc.Description      = 'Security-first, memory-frugal vector database'
+    $sc.IconLocation     = "$ExePath,0"   # resource index 0 = embedded quiver icon
+    $sc.WindowStyle      = 1              # 1 = normal window
+    $sc.Save()
 }
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -112,9 +130,8 @@ function Show-Step {
 function Main {
     $Arch = Get-QuiverArch
 
-    # ── version resolution ────────────────────────────────────────────────────
     $ProgressPreference = 'SilentlyContinue'
-    Show-Step '⟳' 'Checking latest release...' Cyan
+    Show-Step '⟳' 'Checking latest release...'
 
     $Version = ''
     if ($env:QUIVER_VERSION) {
@@ -131,7 +148,6 @@ function Main {
         if (-not $Version) { Fail 'could not determine latest version' }
     }
 
-    # Show logo with resolved version
     Show-Logo -Version $Version
 
     $Asset       = "quiver-windows-$Arch.exe"
@@ -140,18 +156,18 @@ function Main {
     $TmpDir      = Join-Path ([System.IO.Path]::GetTempPath()) "quiver-install-$(Get-Random)"
     New-Item -ItemType Directory -Path $TmpDir | Out-Null
 
-    Show-Step '⬇' "Fetching v${Version} for windows/${Arch}..." Cyan
+    Show-Step '⬇' "Fetching v${Version} for windows/${Arch}..."
 
     try {
         $BinaryTmp   = Join-Path $TmpDir $Asset
         $ChecksumTmp = Join-Path $TmpDir "$Asset.sha256"
 
-        Get-FileWithProgress -Uri $BaseUrl      -OutFile $BinaryTmp   -Label $Asset
-        Get-FileWithProgress -Uri $ChecksumUrl  -OutFile $ChecksumTmp -Label "$Asset.sha256"
+        Get-FileWithProgress -Uri $BaseUrl     -OutFile $BinaryTmp   -Label $Asset
+        Get-FileWithProgress -Uri $ChecksumUrl -OutFile $ChecksumTmp -Label "$Asset.sha256"
 
-        Show-Step '🔒' 'Verifying SHA-256 checksum...' Yellow
+        Show-Step '🔒' 'Verifying SHA-256 checksum...'
         Confirm-Sha256 -FilePath $BinaryTmp -ChecksumFilePath $ChecksumTmp
-        Show-Step '✔' 'Checksum verified.' Green
+        Write-Ok 'Checksum verified.'
 
         if (-not (Test-Path $InstallDir)) {
             New-Item -ItemType Directory -Path $InstallDir | Out-Null
@@ -159,34 +175,42 @@ function Main {
         $Dest = Join-Path $InstallDir 'quiver.exe'
         Copy-Item -Force $BinaryTmp $Dest
 
-        Write-Host ''
-        Write-Color '  ┌──────────────────────────────────────────────┐' DarkGray
-        Write-Color ("  │  ✔  Quiver v{0,-37}│" -f "$Version installed!") Green
-        Write-Color ("  │     {0,-45}│" -f $Dest) DarkGray
-        Write-Color '  └──────────────────────────────────────────────┘' DarkGray
-        Write-Host ''
-
+        # ── auto-add to PATH (no manual steps) ───────────────────────────────
         $UserPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
         if ($UserPath -notlike "*$InstallDir*") {
-            Write-Warn "$InstallDir is not in your PATH. Add it:"
-            Write-Host ''
-            Write-Host "  [Environment]::SetEnvironmentVariable('PATH', `"`$env:PATH;$InstallDir`", 'User')" -ForegroundColor DarkYellow
-            Write-Host ''
-            Write-Warn 'Restart your terminal after adding to PATH.'
-            Write-Host ''
+            [Environment]::SetEnvironmentVariable('PATH', "$UserPath;$InstallDir", 'User')
+            $env:PATH += ";$InstallDir"
+            Write-Ok "Added $InstallDir to your PATH."
+        } else {
+            Write-Ok "$InstallDir is already in your PATH."
         }
 
-        Write-Host '  Next steps:' -ForegroundColor White
-        Write-Host '    quiver demo              ' -NoNewline -ForegroundColor DarkYellow
-        Write-Host '# zero-config: seed vectors + open cockpit' -ForegroundColor DarkGray
-        Write-Host '    quiver serve             ' -NoNewline -ForegroundColor DarkYellow
-        Write-Host '# start the server (gRPC + REST on :6333)' -ForegroundColor DarkGray
-        Write-Host '    quiver tui               ' -NoNewline -ForegroundColor DarkYellow
-        Write-Host '# open the retro cockpit' -ForegroundColor DarkGray
-        Write-Host '    quiver update            ' -NoNewline -ForegroundColor DarkYellow
-        Write-Host '# self-update to the latest release' -ForegroundColor DarkGray
-        Write-Host '    quiver --help            ' -NoNewline -ForegroundColor DarkYellow
-        Write-Host '# all commands' -ForegroundColor DarkGray
+        # ── Desktop + Start Menu shortcuts ────────────────────────────────────
+        Show-Step '🖼' 'Creating Desktop and Start Menu shortcuts...'
+        try {
+            $Desktop   = [System.Environment]::GetFolderPath('Desktop')
+            $StartMenu = [System.IO.Path]::Combine(
+                [System.Environment]::GetFolderPath('StartMenu'), 'Programs')
+            New-QuiverShortcut -LinkPath (Join-Path $Desktop   'Quiver.lnk') -ExePath $Dest
+            New-QuiverShortcut -LinkPath (Join-Path $StartMenu 'Quiver.lnk') -ExePath $Dest
+            Write-Ok "Desktop icon created — double-click to launch the cockpit."
+            Write-Host "    ${GR}Tip: right-click the Desktop icon → ${W}Pin to taskbar${GR} to dock it.${R}"
+        } catch {
+            Write-Warn "Could not create shortcuts: $_"
+        }
+
+        Write-Host ''
+        Write-Host "${GR}  ┌──────────────────────────────────────────────┐${R}"
+        Write-Host ("  ${G}│  ✔  Quiver v{0,-37}│${R}" -f "$Version installed!")
+        Write-Host ("  ${GR}│     {0,-45}│${R}" -f $Dest)
+        Write-Host "${GR}  └──────────────────────────────────────────────┘${R}"
+        Write-Host ''
+
+        Write-Host "  ${W}Or from the terminal:${R}"
+        Write-Host "    ${B}quiver demo  ${R}  ${GR}# seed vectors + open cockpit${R}"
+        Write-Host "    ${B}quiver serve ${R}  ${GR}# start the server (gRPC + REST on :6333)${R}"
+        Write-Host "    ${B}quiver update${R}  ${GR}# self-update to the latest release${R}"
+        Write-Host "    ${B}quiver --help${R}  ${GR}# all commands${R}"
         Write-Host ''
 
     } finally {

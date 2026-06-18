@@ -35,7 +35,7 @@ fn colored(code: &str, text: &str) -> String {
 fn banner(version: &str) {
     println!();
     if use_color() {
-        let b = "\x1b[38;5;172m";
+        let b = "\x1b[38;2;205;127;50m"; // #CD7F32 bronze — theme CHROME
         let r = "\x1b[0m";
         println!("{b}    ██████╗ ██╗   ██╗██╗██╗   ██╗███████╗██████╗ {r}");
         println!("{b}   ██╔═══██╗██║   ██║██║██║   ██║██╔════╝██╔══██╗{r}");
@@ -43,11 +43,11 @@ fn banner(version: &str) {
         println!("{b}   ██║▄▄ ██║██║   ██║██║ ╚████╔╝ ██╔══╝  ██╔══██╗{r}");
         println!("{b}   ╚██████╔╝╚██████╔╝██║  ╚██╔╝  ███████╗██║  ██║{r}");
         println!("{b}    ╚══▀▀═╝  ╚═════╝ ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝{r}");
-        println!("\x1b[1;36m        demo  ·  v{version}  ·  :{SERVER_PORT}\x1b[0m");
+        println!("\x1b[38;2;63;182;168m        demo  ·  v{version}  ·  :{SERVER_PORT}\x1b[0m");
         println!();
-        println!("\x1b[0;90m  ┌─────────────────────────────────────────────────┐\x1b[0m");
-        println!("\x1b[0;90m  │  zero config  ·  press q in the cockpit to quit │\x1b[0m");
-        println!("\x1b[0;90m  └─────────────────────────────────────────────────┘\x1b[0m");
+        println!("\x1b[38;2;90;90;90m  ┌─────────────────────────────────────────────────┐\x1b[0m");
+        println!("\x1b[38;2;90;90;90m  │  zero config  ·  press q in the cockpit to quit │\x1b[0m");
+        println!("\x1b[38;2;90;90;90m  └─────────────────────────────────────────────────┘\x1b[0m");
     } else {
         println!("  QUIVER v{version}  demo  :{SERVER_PORT}");
         println!("  zero config | press q to quit");
@@ -56,16 +56,16 @@ fn banner(version: &str) {
 }
 
 fn step(icon: &str, msg: &str) {
-    print!("  {}  {msg} ", colored("1;36", icon));
+    print!("  {}  {msg} ", colored("38;2;63;182;168", icon));
     let _ = io::stdout().flush();
 }
 
 fn done() {
-    println!("{}", colored("1;32", "done"));
+    println!("{}", colored("38;2;143;179;57", "done"));
 }
 
 fn ok(msg: &str) {
-    println!("  {}  {msg}", colored("1;32", "✔"));
+    println!("  {}  {msg}", colored("38;2;143;179;57", "✔"));
 }
 
 // ── synthetic vectors — no rand dep ──────────────────────────────────────────
@@ -189,14 +189,17 @@ pub async fn run() -> Result<()> {
     println!();
     println!(
         "  {}  {}",
-        colored("0;90", "API key"),
-        colored("1;33", DEMO_KEY)
+        colored("38;2;90;90;90", "API key"),
+        colored("38;2;63;182;168", DEMO_KEY)
     );
-    println!("  {}  pip install quiver-client", colored("0;90", "Python"));
+    println!(
+        "  {}  pip install quiver-client",
+        colored("38;2;90;90;90", "Python")
+    );
     println!();
     println!(
         "  {}",
-        colored("1;32", "Opening cockpit — press q to quit.")
+        colored("38;2;143;179;57", "Opening cockpit — press q to quit.")
     );
     println!();
 
