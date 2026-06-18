@@ -35,6 +35,7 @@ use thiserror::Error;
 pub mod live;
 pub use live::{
     ChromaSource, PgvectorSource, QdrantSource, fetch_chroma, fetch_pgvector, fetch_qdrant,
+    plaintext_credential_warning,
 };
 
 /// A vector database whose export Quiver can import.
