@@ -155,8 +155,8 @@ QUIVER_ENCRYPTION_KEY=<same key> quiver serve   # data_dir defaults to ./data
 
 `quiver admin import` is an **operator** command: the source URL you pass is
 trusted input you chose, not a request an attacker can influence, so fetching it
-is not server-side request forgery (see the
-[threat model](./security/threat-model.md)). Two operational cautions still
+is not server-side request forgery (see finding C1 in the
+[v0.17.0 audit note](./security/audit-0.17.0.md)). Two operational cautions still
 apply, and the CLI warns about both:
 
 - **Use TLS for credentials.** A Qdrant/Chroma API key over a plaintext
