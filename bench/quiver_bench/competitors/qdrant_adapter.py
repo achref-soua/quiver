@@ -41,8 +41,8 @@ class QdrantAdapter(CompetitorAdapter):
             [
                 "docker", "run", "-d",
                 "--name", self._container,
-                "-p", f"{REST_PORT}:6333",
-                "-p", f"{GRPC_PORT}:6334",
+                "-p", f"127.0.0.1:{REST_PORT}:6333",
+                "-p", f"127.0.0.1:{GRPC_PORT}:6334",
                 QDRANT_IMAGE,
             ],
             check=True,

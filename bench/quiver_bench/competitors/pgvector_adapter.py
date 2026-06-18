@@ -7,6 +7,7 @@ Requires Docker and ``psycopg2-binary``.  Uses an IVFFlat index with
 
 from __future__ import annotations
 
+import secrets
 import subprocess
 import time
 import uuid
@@ -20,7 +21,6 @@ PGVECTOR_IMAGE = "pgvector/pgvector:pg16"
 CONTAINER_NAME = f"quiver_bench_pgvector_{uuid.uuid4().hex[:8]}"
 PG_PORT = 15432
 PG_USER = "bench"
-PG_PASS = "bench"
 PG_DB = "bench"
 TABLE = "vecs"
 
@@ -36,6 +36,7 @@ class PgvectorAdapter(CompetitorAdapter):
         self._metric = "l2"
         self._dim = 0
         self._n = 0
+        self._pg_pass = secrets.token_urlsafe(24)
 
     def start(self) -> None:
         subprocess.run(["docker", "pull", PGVECTOR_IMAGE], check=False, capture_output=True)
@@ -44,9 +45,9 @@ class PgvectorAdapter(CompetitorAdapter):
             [
                 "docker", "run", "-d",
                 "--name", self._container,
-                "-p", f"{PG_PORT}:5432",
+                "-p", f"127.0.0.1:{PG_PORT}:5432",
                 "-e", f"POSTGRES_USER={PG_USER}",
-                "-e", f"POSTGRES_PASSWORD={PG_PASS}",
+                "-e", f"POSTGRES_PASSWORD={self._pg_pass}",
                 "-e", f"POSTGRES_DB={PG_DB}",
                 PGVECTOR_IMAGE,
             ],
@@ -69,7 +70,7 @@ class PgvectorAdapter(CompetitorAdapter):
             host="127.0.0.1",
             port=PG_PORT,
             user=PG_USER,
-            password=PG_PASS,
+            password=self._pg_pass,
             dbname=PG_DB,
             connect_timeout=3,
         )

@@ -39,8 +39,8 @@ class WeaviateAdapter(CompetitorAdapter):
             [
                 "docker", "run", "-d",
                 "--name", self._container,
-                "-p", f"{HTTP_PORT}:8080",
-                "-p", f"{GRPC_PORT}:{GRPC_PORT}",
+                "-p", f"127.0.0.1:{HTTP_PORT}:8080",
+                "-p", f"127.0.0.1:{GRPC_PORT}:{GRPC_PORT}",
                 "-e", "AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true",
                 "-e", "PERSISTENCE_DATA_PATH=/var/lib/weaviate",
                 "-e", "DEFAULT_VECTORIZER_MODULE=none",
