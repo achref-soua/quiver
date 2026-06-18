@@ -1161,6 +1161,57 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_reflects_connecting_online_and_offline() {
+        let mut app = App::new(TuiOptions::default()).unwrap();
+        // Initial: connecting (not ready, not offline).
+        let d = app.dashboard();
+        assert!(!d.ready && d.offline.is_none());
+        // Online and ready, with collections and a history.
+        app.status = ConnStatus::Online { ready: true };
+        app.collections = vec![collection("a", 5), collection("b", 7)];
+        app.selected = 1;
+        app.history = vec![1, 2, 3];
+        let d = app.dashboard();
+        assert!(d.ready && d.offline.is_none());
+        assert_eq!(d.collections.len(), 2);
+        assert_eq!(d.selected, 1);
+        assert_eq!(d.history, vec![1, 2, 3]);
+        // Offline carries the error message.
+        app.status = ConnStatus::Offline("connection refused".to_owned());
+        let d = app.dashboard();
+        assert!(!d.ready);
+        assert_eq!(d.offline.as_deref(), Some("connection refused"));
+    }
+
+    #[test]
+    fn activity_log_records_with_a_stamp_and_stays_bounded() {
+        let mut app = App::new(TuiOptions::default()).unwrap();
+        assert!(app.stamp().starts_with('+'));
+        for i in 0..80 {
+            app.log(Severity::Info, format!("event {i}"));
+        }
+        assert_eq!(app.activity.len(), 64, "the activity tail is bounded");
+        assert!(app.activity.last().unwrap().message.contains("event 79"));
+        assert_eq!(app.activity[0].severity, Severity::Info);
+    }
+
+    #[test]
+    fn exit_constellation_returns_to_the_browser() {
+        let mut app = App::new(TuiOptions::default()).unwrap();
+        app.view = View::Constellation(ConstellationView {
+            collection: "c".to_owned(),
+            dim: 4,
+            points: Vec::new(),
+            vectors: Vec::new(),
+            selected: 0,
+            query_id: None,
+            error: None,
+        });
+        app.exit_constellation();
+        assert!(matches!(app.view, View::Browser));
+    }
+
+    #[test]
     fn aggregate_sums_points_across_collections() {
         let cols = vec![collection("a", 10), collection("b", 32), collection("c", 0)];
         assert_eq!(
