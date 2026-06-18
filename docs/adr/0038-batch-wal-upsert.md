@@ -1,6 +1,6 @@
 # ADR-0038 — Batch WAL sync for upsert to fix build-time bottleneck
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-18
 **Deciders:** Achref Soua
 
@@ -101,8 +101,8 @@ Simplest change, fits naturally into the existing REST handler which already pro
 ## Consequences
 
 **Positive:**
-- Build time drops from ~65s to ~2s for 10k SIFTSMALL vectors (expected: 20 fsyncs × 6.45ms = 0.13s WAL + 0.95s HNSW = ~1.1s). Measured before/after numbers will be committed with the implementation PR.
-- Quiver becomes competitive on build time: closer to Qdrant (0.9s) and faster than Weaviate (24.1s).
+- Build time drops from **65.4s → 1.86s** for 10k SIFTSMALL vectors (measured, 2026-06-18, WSL2 dev box): **35.2× speedup**. Profiling breakdown: WAL-only 64.53s → 0.77s; full HNSW 65.48s → 3.52s (release binary, pre-bench cleanup).
+- Quiver is now competitive on build time: 1.9s vs Qdrant 0.9s, Chroma 1.2s, Milvus Lite 0.8s, pgvector 1.9s; and faster than Weaviate 24.1s, LanceDB 4.4s.
 - RSS, QPS, and recall are unaffected (no algorithm change).
 
 **Negative / risks:**
@@ -113,9 +113,9 @@ Simplest change, fits naturally into the existing REST handler which already pro
 
 ## Implementation status
 
-- [ ] `Store::upsert_batch()` + unit test
-- [ ] `Database::upsert_batch()` + unit test
-- [ ] `AppState::upsert()` wired to batch path
-- [ ] `just verify` green
-- [ ] Before/after numbers committed to `docs/benchmarks/results/comparison-v0.17.0/smoke/quiver.csv`
-- [ ] ADR status → Accepted
+- [x] `Store::upsert_batch()` + unit tests (`upsert_batch_commits_all_on_sync`, `upsert_batch_dim_mismatch_writes_nothing`)
+- [x] `Database::upsert_batch()` + unit test (`upsert_batch_produces_same_search_results_as_sequential`)
+- [x] `AppState::upsert()` wired to batch path
+- [x] `just verify` green (2026-06-18)
+- [x] Before/after numbers committed to `docs/benchmarks/results/comparison-v0.17.0/smoke/quiver.csv` (65.4s → 1.86s)
+- [x] ADR status → Accepted

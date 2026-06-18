@@ -550,12 +550,11 @@ impl AppState {
         let resource = collection.clone();
         let result = self
             .run_blocking(move |db| {
-                let mut count = 0u64;
-                for point in &points {
-                    db.upsert(&collection, &point.id, &point.vector, &point.payload)?;
-                    count += 1;
-                }
-                Ok(count)
+                let records: Vec<(&str, &[f32], &serde_json::Value)> = points
+                    .iter()
+                    .map(|p| (p.id.as_str(), p.vector.as_slice(), &p.payload))
+                    .collect();
+                db.upsert_batch(&collection, &records)
             })
             .await;
         self.audit
