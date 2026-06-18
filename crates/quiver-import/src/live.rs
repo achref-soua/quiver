@@ -338,7 +338,11 @@ fn quote_ident(ident: &str) -> Result<String, ImportError> {
 /// `has_api_key` is whether a Qdrant/Chroma key was supplied; for Postgres the
 /// password (if any) is embedded in the URL, so the flag is ignored there.
 #[must_use]
-pub fn plaintext_credential_warning(source: Source, url: &str, has_api_key: bool) -> Option<String> {
+pub fn plaintext_credential_warning(
+    source: Source,
+    url: &str,
+    has_api_key: bool,
+) -> Option<String> {
     let lower = url.trim().to_ascii_lowercase();
     match source {
         Source::Qdrant | Source::Chroma => {
@@ -570,11 +574,15 @@ mod tests {
 
     #[test]
     fn url_userinfo_password_detection() {
-        assert!(url_userinfo_has_password("postgresql://user:pass@host:5432/db"));
+        assert!(url_userinfo_has_password(
+            "postgresql://user:pass@host:5432/db"
+        ));
         assert!(!url_userinfo_has_password("postgresql://user@host/db"));
         assert!(!url_userinfo_has_password("postgresql://host/db"));
         // A `:` in the path or query must not be mistaken for a password.
-        assert!(!url_userinfo_has_password("postgresql://host/db?options=a:b"));
+        assert!(!url_userinfo_has_password(
+            "postgresql://host/db?options=a:b"
+        ));
     }
 
     #[test]
