@@ -1,6 +1,6 @@
 # ADR-0036: Retro cockpit design system (Bronze Quiver theme, logo, decoration vocabulary)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-17
 - **Deciders:** Achref Soua
 
@@ -126,6 +126,45 @@ fabricated, ADR-0014 / roadmap).
   `theme` module are enough and keep control local.
 - **Fabricated/mocked screenshots** — never; the screenshots are the real render of
   real demo data, the same standard as the benchmark numbers.
+
+## Implementation
+
+Shipped in `v0.16.0` across the `quiver-tui` crate.
+
+- **`theme`** — the Bronze Quiver palette constants and semantic `Style` roles
+  (`heading`/`chrome`/`text`/`dim`/`accent`/`alert`/`ok`/`border`/`border_active`/
+  `selected`); every widget draws from it.
+- **`logo`** — the `QUIVER` wordmark with the V as a 3-D open-top arrowhead
+  (bevelled arms, a notch in the top-middle, a sharp tip), half-block rendered;
+  `banner()` for the hero and `compact()` for tight headers.
+- **`decor`** — `panel`/`panel_active`, `db_icon`, `bar`, `sparkline`, `log_line`
+  (with `Severity`), `tree`, `badge`, and `divider`.
+- **Decoupled rendering** — a public `Dashboard` data struct (with `demo()`) drives
+  the view code; `render_dashboard`, `render_constellation_demo`, and `render_logo`
+  render a screen to a ratatui `Buffer`. The live cockpit builds a `Dashboard` from
+  the polled state (tracking a point-count history and an activity log across
+  polls) and renders into the frame buffer; the screens are the logo banner hero, a
+  status panel (badge + trend sparkline), a relationships tree of the selected
+  collection, a collections table with per-row load bars, and an activity log.
+- **Screenshots** — `tools/cockpit-shots` (its own `[workspace]`, depending on
+  `quiver-tui` + `image` + `ab_glyph`) rasterises each buffer to PNG with a
+  monospace font; `just tui-shots` writes `docs/assets/cockpit/{logo,dashboard,
+  constellation,dashboard-offline}.png`, embedded in the README and the docs-site
+  introduction. The gate (`cargo`/`deny`/`audit`) never sees those dependencies.
+
+## Verification
+
+`theme`, `logo`, and `decor` are ~98–100% covered by unit tests (palette roles; the
+banner is seven rows of blocks; the arrowhead is open at the top, has a solid tip,
+and uses all three bevel shades; bar/sparkline/tree/divider/badge behaviour). The
+rebuilt views are covered by `TestBackend`-style buffer assertions over the demo
+dashboard (logo, table, tree, activity, badge, bars), the offline/empty state, the
+constellation scatter, and the logo. The dashboard state builder, the bounded
+activity log, and `exit_constellation` are unit-tested; the `fetch` path is covered
+by the live integration test (`tests/live.rs`). The remaining uncovered code is the
+async run-loop and terminal event handling, which require a live server and a
+terminal. Every committed screenshot was rendered from the real demo render and
+visually reviewed. `just verify` is green.
 
 ## References
 
