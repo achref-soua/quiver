@@ -1,0 +1,6 @@
+competitor,dataset,param_name,param_value,build_s,index_disk_mb,rss_mb,recall_at_10,qps_1t,p50_ms,p95_ms,p99_ms,recall_stdev,qps_stdev,config,notes,error
+lancedb,siftsmall,nprobes,4,4.43455650001124,5.2469329833984375,312.68359375,0.706,353.5,2.668,4.207,4.925,0.0,19.2,{'metric': 'l2'},,
+lancedb,siftsmall,nprobes,8,4.43455650001124,5.2469329833984375,313.93359375,0.75,336.6,2.825,4.307,4.702,0.0,13.5,{'metric': 'l2'},,
+lancedb,siftsmall,nprobes,16,4.43455650001124,5.2469329833984375,314.40234375,0.758,332.1,2.936,3.784,4.428,0.0,22.8,{'metric': 'l2'},,
+lancedb,siftsmall,nprobes,32,4.43455650001124,5.2469329833984375,314.40234375,0.759,277.7,3.292,4.795,6.134,0.0,19.0,{'metric': 'l2'},,
+lancedb,siftsmall,nprobes,64,4.43455650001124,5.2469329833984375,314.40234375,0.759,234.4,4.077,5.398,6.088,0.0,8.7,{'metric': 'l2'},,

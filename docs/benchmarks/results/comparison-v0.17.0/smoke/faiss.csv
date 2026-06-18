@@ -1,0 +1,6 @@
+competitor,dataset,param_name,param_value,build_s,index_disk_mb,rss_mb,recall_at_10,qps_1t,p50_ms,p95_ms,p99_ms,recall_stdev,qps_stdev,config,notes,error
+faiss,siftsmall,ef_search,16,0.1620071239885874,,65.48046875,0.966,38609.4,0.024,0.042,0.088,0.0,12211.4,{'metric': 'l2'},,
+faiss,siftsmall,ef_search,32,0.1620071239885874,,66.26171875,0.992,35427.0,0.026,0.042,0.065,0.0,4421.1,{'metric': 'l2'},,
+faiss,siftsmall,ef_search,64,0.1620071239885874,,66.41796875,0.999,22376.9,0.043,0.062,0.088,0.0,910.4,{'metric': 'l2'},,
+faiss,siftsmall,ef_search,128,0.1620071239885874,,66.41796875,1.0,13426.8,0.073,0.103,0.118,0.0,466.7,{'metric': 'l2'},,
+faiss,siftsmall,ef_search,256,0.1620071239885874,,66.41796875,1.0,6432.3,0.141,0.21,0.465,0.0,703.9,{'metric': 'l2'},,
