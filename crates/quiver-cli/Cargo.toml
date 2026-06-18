@@ -27,6 +27,10 @@ sha2 = { workspace = true }
 ureq = { workspace = true }
 tokio = { workspace = true }
 
+[build-dependencies]
+ico = { workspace = true }
+winresource = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

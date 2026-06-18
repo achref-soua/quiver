@@ -63,11 +63,15 @@ curl -fsSL https://raw.githubusercontent.com/achref-soua/quiver/main/scripts/ins
 irm https://raw.githubusercontent.com/achref-soua/quiver/main/scripts/install.ps1 | iex
 ```
 
+<img src="docs/assets/cockpit/installer.png" alt="Quiver installer output — retro logo, download progress, next steps" width="540">
+
 Both scripts detect your OS and architecture, download the pre-built binary for
 your platform from the [latest GitHub Release](https://github.com/achref-soua/quiver/releases/latest),
 verify its SHA-256 checksum before touching your disk, and install to `~/.local/bin`
-(Linux/macOS) or `%LOCALAPPDATA%\quiver\bin` (Windows). To pin a specific version,
-set `QUIVER_VERSION=0.17.0` before running.
+(Linux/macOS) or `%LOCALAPPDATA%\quiver\bin` (Windows). On Linux the installer also
+creates a `.desktop` entry and app-launcher icon. On macOS it creates a `Quiver.app`
+bundle with the custom icon so you can pin it to the Dock. The Windows binary has the
+icon embedded natively. To pin a specific version, set `QUIVER_VERSION=0.17.0` before running.
 
 Once installed, keep Quiver up to date with:
 
@@ -76,7 +80,18 @@ quiver update           # downloads, verifies, and atomically replaces the binar
 quiver update --check   # just check if a newer version exists
 ```
 
-**Quick start:**
+**Zero-config first run:**
+
+```bash
+quiver demo
+```
+
+<img src="docs/assets/cockpit/demo-start.png" alt="quiver demo output — seeds vectors, starts server, opens cockpit" width="540">
+
+Seeds 1 000 synthetic vectors, starts the REST server on `:7333`, and opens the retro
+cockpit — no config files, no env vars, no external downloads.
+
+**Full server quick start:**
 
 ```bash
 quiver serve            # gRPC + REST on :6333, encrypted by default
