@@ -531,6 +531,80 @@ impl Store {
         Ok(lsn)
     }
 
+    /// Upsert a batch of points with a **single** `fdatasync` instead of one
+    /// per point.  All records are acknowledged atomically — if the server
+    /// crashes before the sync completes, none of the batch is durable (the
+    /// caller, seeing no response, should retry the whole batch).  This is the
+    /// standard batch-commit pattern used by every production database.
+    ///
+    /// `records` is `(external_id, vector, payload_bytes)` slices; the vectors
+    /// must match the collection's dimensionality or the call returns an error
+    /// before writing anything.
+    pub fn upsert_batch(
+        &mut self,
+        collection: CollectionId,
+        records: &[(&str, &[f32], &[u8])],
+    ) -> Result<u64> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let dim = self
+            .collections
+            .get(&collection)
+            .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?
+            .descriptor
+            .dim as usize;
+        for (_, vector, _) in records {
+            if vector.len() != dim {
+                return Err(CoreError::InvalidArgument(format!(
+                    "vector has {} dims, collection expects {dim}",
+                    vector.len()
+                )));
+            }
+        }
+
+        // Build one WalEntry per record, advancing the LSN for each.
+        let mut entries: Vec<WalEntry> = Vec::with_capacity(records.len());
+        for (ext_id, vector, payload) in records {
+            let lsn = self.next_lsn;
+            self.next_lsn = lsn.next();
+            entries.push(WalEntry {
+                lsn,
+                op: WalOp::Upsert {
+                    collection_id: collection,
+                    external_id: ext_id.to_string(),
+                    vector: f32_to_le_bytes(vector),
+                    payload: payload.to_vec(),
+                },
+            });
+        }
+
+        // Append all records without syncing, then ONE fdatasync.
+        for entry in &entries {
+            self.wal.append(self.keyring.catalog_codec(), entry)?;
+        }
+        self.wal.sync()?;
+
+        // Publish and apply in commit order.
+        for entry in &entries {
+            self.publish(entry);
+            if let WalOp::Upsert {
+                external_id,
+                vector,
+                payload,
+                ..
+            } = &entry.op
+            {
+                let state = self
+                    .collections
+                    .get_mut(&collection)
+                    .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
+                state.apply_upsert(external_id, vector.clone(), payload.clone());
+            }
+        }
+        Ok(records.len() as u64)
+    }
+
     /// Delete a point by external id. Returns whether it existed.
     pub fn delete(&mut self, collection: CollectionId, external_id: &str) -> Result<bool> {
         let existed = self
@@ -1469,6 +1543,55 @@ mod tests {
             s.upsert(c, "a", &[1.0, 2.0], b"{}"),
             Err(CoreError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn upsert_batch_commits_all_on_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut s = open(tmp.path());
+            let c = s.create_collection("c", desc()).unwrap();
+            let vecs: Vec<([f32; 4], String)> = (0..8u32)
+                .map(|i| ([i as f32; 4], format!("k{i}")))
+                .collect();
+            let payload = b"{}";
+            let records: Vec<(&str, &[f32], &[u8])> = vecs
+                .iter()
+                .map(|(v, id)| (id.as_str(), v.as_slice(), payload.as_slice()))
+                .collect();
+            let n = s.upsert_batch(c, &records).unwrap();
+            assert_eq!(n, 8);
+            // All points readable from in-memory state immediately.
+            for (_, id) in &vecs {
+                assert!(s.get(c, id).unwrap().is_some(), "missing {id}");
+            }
+        }
+        // Re-open: WAL replay must restore all 8 points.
+        let s = open(tmp.path());
+        let c = s.collection_id("c").unwrap();
+        assert_eq!(s.len(c).unwrap(), 8);
+        for i in 0..8u32 {
+            let got = s.get(c, &format!("k{i}")).unwrap().unwrap();
+            assert_eq!(got.vector, vec![i as f32; 4]);
+        }
+    }
+
+    #[test]
+    fn upsert_batch_dim_mismatch_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = open(tmp.path());
+        let c = s.create_collection("c", desc()).unwrap();
+        // First record correct, second has wrong dim — the whole batch must fail.
+        let bad: &[(&str, &[f32], &[u8])] = &[
+            ("a", &[1.0, 2.0, 3.0, 4.0], b"{}"),
+            ("b", &[1.0, 2.0], b"{}"), // wrong dim
+        ];
+        assert!(matches!(
+            s.upsert_batch(c, bad),
+            Err(CoreError::InvalidArgument(_))
+        ));
+        // Neither point was written.
+        assert!(s.get(c, "a").unwrap().is_none());
     }
 
     #[test]

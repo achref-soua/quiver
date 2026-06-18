@@ -1,6 +1,6 @@
 # Quiver v0.17.0 — Multi-DB Benchmark Comparison
 
-_Generated: 2026-06-18 17:56 UTC_
+_Generated: 2026-06-18 18:56 UTC_
 
 > **Methodology:** [docs/benchmarks/methodology.md](../methodology.md) · [ADR-0037](../../adr/0037-scientific-multi-db-benchmark-suite.md)
 
@@ -73,7 +73,7 @@ _Quiver results not available — matrix requires a Quiver run._
 | milvus_lite | 3.0.0 | 0.9670 | 183 | 471 | 0.8 | 0.0 | ef_search=16 | smoke only |
 | pgvector | 0.7/pg16 | 0.9650 | 1156 | 66 | 1.9 | 11.2 | nprobe=8 | smoke only |
 | qdrant | 1.13.4 | 1.0000 | 482 | 218 | 0.9 | — | ef_search=16 | smoke only |
-| quiver | v0.17.0-dev | 0.9680 | 1233 | 61 | 65.4 | — | ef_search=16 | smoke only |
+| quiver | v0.17.0-dev | 0.9680 | 1191 | 63 | 1.9 | — | ef_search=16 | smoke only |
 | weaviate | 1.27.0 | 0.9980 | 567 | 164 | 24.1 | — | ef_search=16 | smoke only |
 
 ### Full ef/nprobe sweep
@@ -154,11 +154,11 @@ _Quiver results not available — matrix requires a Quiver run._
 
 | ef/nprobe | recall@10 | QPS (1T) | p50 (ms) | p95 (ms) | p99 (ms) | RSS (MB) |
 |---|---|---|---|---|---|---|
-| 16 | 0.9680 | 1233 | 0.74 | 1.00 | 1.31 | 61 |
-| 32 | 0.9930 | 1225 | 0.78 | 1.15 | 1.28 | 60 |
-| 64 | 0.9970 | 1156 | 0.84 | 1.11 | 1.33 | 60 |
-| 128 | 1.0000 | 974 | 0.98 | 1.38 | 1.74 | 60 |
-| 256 | 1.0000 | 769 | 1.23 | 1.71 | 2.46 | 60 |
+| 16 | 0.9680 | 1191 | 0.78 | 1.06 | 1.34 | 63 |
+| 32 | 0.9930 | 1257 | 0.77 | 1.04 | 1.24 | 63 |
+| 64 | 0.9970 | 1160 | 0.83 | 1.08 | 1.28 | 63 |
+| 128 | 1.0000 | 1010 | 0.96 | 1.34 | 1.65 | 63 |
+| 256 | 1.0000 | 879 | 1.12 | 1.40 | 1.47 | 63 |
 
 </details>
 
@@ -185,27 +185,27 @@ _Quiver results not available — matrix requires a Quiver run._
 | recall@10 | pgvector | 0.9680 | 0.9650 | ≈ tie |
 | recall@10 | qdrant | 0.9680 | 1.0000 | ❌ loss |
 | recall@10 | weaviate | 0.9680 | 0.9980 | ❌ loss |
-| QPS (1T) | chroma | 1233 | 904 | ✅ win |
-| QPS (1T) | faiss | 1233 | 38609 | ❌ loss |
-| QPS (1T) | lancedb | 1233 | 278 | ✅ win |
-| QPS (1T) | milvus_lite | 1233 | 183 | ✅ win |
-| QPS (1T) | pgvector | 1233 | 1156 | ✅ win |
-| QPS (1T) | qdrant | 1233 | 482 | ✅ win |
-| QPS (1T) | weaviate | 1233 | 567 | ✅ win |
-| RSS (MB) | chroma | 61 | 381 | ✅ win |
-| RSS (MB) | faiss | 61 | 65 | ✅ win |
-| RSS (MB) | lancedb | 61 | 314 | ✅ win |
-| RSS (MB) | milvus_lite | 61 | 471 | ✅ win |
-| RSS (MB) | pgvector | 61 | 66 | ✅ win |
-| RSS (MB) | qdrant | 61 | 218 | ✅ win |
-| RSS (MB) | weaviate | 61 | 164 | ✅ win |
-| Build (s) | chroma | 65.4 | 1.2 | ❌ loss |
-| Build (s) | faiss | 65.4 | 0.2 | ❌ loss |
-| Build (s) | lancedb | 65.4 | 4.4 | ❌ loss |
-| Build (s) | milvus_lite | 65.4 | 0.8 | ❌ loss |
-| Build (s) | pgvector | 65.4 | 1.9 | ❌ loss |
-| Build (s) | qdrant | 65.4 | 0.9 | ❌ loss |
-| Build (s) | weaviate | 65.4 | 24.1 | ❌ loss |
+| QPS (1T) | chroma | 1191 | 904 | ✅ win |
+| QPS (1T) | faiss | 1191 | 38609 | ❌ loss |
+| QPS (1T) | lancedb | 1191 | 278 | ✅ win |
+| QPS (1T) | milvus_lite | 1191 | 183 | ✅ win |
+| QPS (1T) | pgvector | 1191 | 1156 | ✅ win |
+| QPS (1T) | qdrant | 1191 | 482 | ✅ win |
+| QPS (1T) | weaviate | 1191 | 567 | ✅ win |
+| RSS (MB) | chroma | 63 | 381 | ✅ win |
+| RSS (MB) | faiss | 63 | 65 | ✅ win |
+| RSS (MB) | lancedb | 63 | 314 | ✅ win |
+| RSS (MB) | milvus_lite | 63 | 471 | ✅ win |
+| RSS (MB) | pgvector | 63 | 66 | ✅ win |
+| RSS (MB) | qdrant | 63 | 218 | ✅ win |
+| RSS (MB) | weaviate | 63 | 164 | ✅ win |
+| Build (s) | chroma | 1.9 | 1.2 | ❌ loss |
+| Build (s) | faiss | 1.9 | 0.2 | ❌ loss |
+| Build (s) | lancedb | 1.9 | 4.4 | ✅ win |
+| Build (s) | milvus_lite | 1.9 | 0.8 | ❌ loss |
+| Build (s) | pgvector | 1.9 | 1.9 | ✅ win |
+| Build (s) | qdrant | 1.9 | 0.9 | ❌ loss |
+| Build (s) | weaviate | 1.9 | 24.1 | ✅ win |
 
 ---
 
