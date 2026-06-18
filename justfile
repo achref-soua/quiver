@@ -70,6 +70,13 @@ tui:
 demo:
     bash scripts/demo.sh
 
+# Real-user acceptance run: boot an encrypted server and drive every external
+# surface (REST, Python SDK across all index kinds + both encrypted modes + multi
+# -vector, CLI import, MCP). Requires uv, curl, openssl. See
+# docs/testing/manual-acceptance.md.
+acceptance:
+    bash scripts/acceptance.sh
+
 # Run the benchmark harness against a running server (requires uv). Args pass
 # through, e.g. `just bench --synthetic` or `just bench --dataset PATH`.
 bench *ARGS:
