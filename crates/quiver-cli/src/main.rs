@@ -7,7 +7,33 @@
 
 use std::path::PathBuf;
 
+use clap::builder::styling::{AnsiColor, Color, RgbColor, Style, Styles};
 use clap::{Parser, Subcommand};
+
+/// Bronze/verdigris clap style — keeps every help screen on-theme.
+fn quiver_styles() -> Styles {
+    // 24-bit true-color via anstyle RgbColor.
+    let bronze = Style::new()
+        .fg_color(Some(Color::Rgb(RgbColor(205, 127, 50))))
+        .bold();
+    let verdigris = Style::new()
+        .fg_color(Some(Color::Rgb(RgbColor(63, 182, 168))))
+        .bold();
+    let ok_green = Style::new().fg_color(Some(Color::Rgb(RgbColor(143, 179, 57))));
+    let dark_gray = Style::new().fg_color(Some(Color::Ansi(AnsiColor::BrightBlack)));
+    Styles::styled()
+        .header(bronze)
+        .usage(bronze)
+        .literal(verdigris)
+        .placeholder(ok_green)
+        .error(
+            Style::new()
+                .fg_color(Some(Color::Rgb(RgbColor(210, 85, 47))))
+                .bold(),
+        )
+        .valid(ok_green)
+        .invalid(dark_gray)
+}
 
 mod admin;
 mod demo;
@@ -17,7 +43,8 @@ mod update;
 #[command(
     name = "quiver",
     version,
-    about = "Security-first, memory-frugal vector database"
+    about = "Security-first, memory-frugal vector database",
+    styles = quiver_styles(),
 )]
 struct Cli {
     #[command(subcommand)]

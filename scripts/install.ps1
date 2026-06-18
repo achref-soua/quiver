@@ -199,11 +199,16 @@ function Main {
             Write-Warn "Could not create shortcuts: $_"
         }
 
+        # ── adaptive success box ─────────────────────────────────────────────
+        $l1  = "  ✔  Quiver v$Version installed!"
+        $l2  = "     $Dest"
+        $w   = [Math]::Max($l1.Length, $l2.Length)
+        $bar = '─' * ($w + 2)
         Write-Host ''
-        Write-Host "${GR}  ┌──────────────────────────────────────────────┐${R}"
-        Write-Host ("  ${G}│  ✔  Quiver v{0,-37}│${R}" -f "$Version installed!")
-        Write-Host ("  ${GR}│     {0,-45}│${R}" -f $Dest)
-        Write-Host "${GR}  └──────────────────────────────────────────────┘${R}"
+        Write-Host "${GR}  ┌${bar}┐${R}"
+        Write-Host "  ${G}│ $($l1.PadRight($w)) │${R}"
+        Write-Host "  ${GR}│ $($l2.PadRight($w)) │${R}"
+        Write-Host "${GR}  └${bar}┘${R}"
         Write-Host ''
 
         Write-Host "  ${W}Or from the terminal:${R}"
