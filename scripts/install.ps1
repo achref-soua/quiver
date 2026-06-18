@@ -34,11 +34,12 @@ function Fail        { param($Msg) Write-Error "[quiver] error: $Msg"; exit 1 }
 # ── platform detection ────────────────────────────────────────────────────────
 
 function Get-QuiverArch {
-    $pa = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
-    switch ($pa) {
-        'X64'   { return 'x86_64' }
-        'Arm64' { return 'aarch64' }
-        default { Fail "unsupported architecture: $pa" }
+    # $env:PROCESSOR_ARCHITECTURE works on both PowerShell 5.1 (.NET Framework)
+    # and PowerShell 7+ (.NET Core). Values: AMD64, ARM64, x86.
+    switch ($env:PROCESSOR_ARCHITECTURE) {
+        'AMD64' { return 'x86_64' }
+        'ARM64' { return 'aarch64' }
+        default { Fail "unsupported architecture: $($env:PROCESSOR_ARCHITECTURE)" }
     }
 }
 
