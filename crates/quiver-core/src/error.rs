@@ -108,30 +108,54 @@ mod tests {
     // here rather than in production logs.
     #[test]
     fn every_variant_formats_a_useful_message() {
-        let io = CoreError::io("/tmp/x", io::Error::new(ErrorKind::PermissionDenied, "boom"));
+        let io = CoreError::io(
+            "/tmp/x",
+            io::Error::new(ErrorKind::PermissionDenied, "boom"),
+        );
         assert_eq!(io.to_string(), "i/o error at /tmp/x: boom");
 
         let bare: CoreError = io::Error::new(ErrorKind::UnexpectedEof, "eof").into();
         assert_eq!(bare.to_string(), "i/o error: eof");
 
         assert_eq!(
-            CoreError::BadMagic { expected: 0xDEAD_BEEF, found: 0x0000_0001 }.to_string(),
+            CoreError::BadMagic {
+                expected: 0xDEAD_BEEF,
+                found: 0x0000_0001
+            }
+            .to_string(),
             "bad magic: expected 0xdeadbeef, found 0x00000001",
         );
         assert_eq!(
-            CoreError::UnsupportedVersion { found: 9, supported: 2 }.to_string(),
+            CoreError::UnsupportedVersion {
+                found: 9,
+                supported: 2
+            }
+            .to_string(),
             "unsupported format version 9 (this build supports 2)",
         );
         assert_eq!(
-            CoreError::PageCorrupt { page_id: 7, expected: 0x0000_00ff, computed: 0x0000_0100 }
-                .to_string(),
+            CoreError::PageCorrupt {
+                page_id: 7,
+                expected: 0x0000_00ff,
+                computed: 0x0000_0100
+            }
+            .to_string(),
             "page 7 failed crc check (header 0x000000ff, computed 0x00000100)",
         );
 
-        assert_eq!(CoreError::MalformedPage("len".into()).to_string(), "malformed page: len");
-        assert_eq!(CoreError::TooLarge("payload".into()).to_string(), "value too large: payload");
+        assert_eq!(
+            CoreError::MalformedPage("len".into()).to_string(),
+            "malformed page: len"
+        );
+        assert_eq!(
+            CoreError::TooLarge("payload".into()).to_string(),
+            "value too large: payload"
+        );
         assert_eq!(CoreError::NotFound("c".into()).to_string(), "not found: c");
-        assert_eq!(CoreError::AlreadyExists("c".into()).to_string(), "already exists: c");
+        assert_eq!(
+            CoreError::AlreadyExists("c".into()).to_string(),
+            "already exists: c"
+        );
         assert_eq!(
             CoreError::InvalidArgument("dim".into()).to_string(),
             "invalid argument: dim",
