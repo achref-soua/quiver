@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/cockpit/logo.png" alt="QUIVER — the V is a 3-D arrowhead" width="460">
+
 # Quiver
 
 **The security-first vector database.** Client-side-encryptable, memory-frugal approximate-nearest-neighbour search that runs on a laptop — with a retro terminal cockpit.
@@ -25,7 +27,19 @@ Native-Rust vector databases already exist; Quiver is not trying to out-scale Mi
 
 We say plainly what we do **not** do: client-side payload encryption protects *payloads, not vectors* (the experimental, opt-in [DCPE mode](./docs/security/dcpe.md) addresses vectors — a published scheme that, by design, leaks the approximate distance-comparison relation and is not semantically secure); billion-scale needs a server, while a laptop comfortably serves tens-to-hundreds of millions; there is no homomorphic search in core. See the honest [threat model](./docs/security/threat-model.md).
 
-> *The name.* A quiver holds arrows, and an arrow is a vector — apt for a database of them. And in mathematics a *quiver* is a directed graph, which is exactly what an HNSW or Vamana index is. The cockpit wears that identity in amber phosphor.
+> *The name.* A quiver holds arrows, and an arrow is a vector — apt for a database of them. And in mathematics a *quiver* is a directed graph, which is exactly what an HNSW or Vamana index is. The cockpit wears that identity in **bronze** — the colour of a quiver, with the logo's V drawn as a 3-D arrowhead.
+
+## The cockpit
+
+A retro terminal cockpit ships in the box (`quiver tui`): a live dashboard in the **Bronze Quiver** theme — connection health and an `ONLINE`/`OFFLINE` badge, a collections table with per-collection load bars, a points-trend sparkline, the relationship view of the selected collection, and a severity-tagged activity log.
+
+![The Quiver cockpit dashboard](docs/assets/cockpit/dashboard.png)
+
+Press `v`/`enter` on a collection for the **constellation view** — a 2-D projection of its vector space with the query's nearest neighbour highlighted and an interactive cursor that re-queries around any point:
+
+![The Quiver constellation view](docs/assets/cockpit/constellation.png)
+
+The screenshots are generated from the *real* render of seeded demo data with `just tui-shots` (a dev-only, workspace-isolated tool), so they regenerate in one command and never go stale ([ADR-0036](./docs/adr/0036-retro-cockpit-design-system.md)).
 
 ## Architecture
 
