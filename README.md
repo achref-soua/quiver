@@ -51,10 +51,42 @@ A Cargo workspace: a from-scratch storage engine, index structures, SIMD distanc
 
 > **Full documentation** lives in the [docs site](./apps/docs) (an mdBook; build it with `just docs`, or read the chapters under [`apps/docs/src`](./apps/docs/src)) — concepts, self-hosting, every feature, the API/MCP/SDK references, the security docs, and an architecture deep dive.
 
-Pre-built binaries and container images are on the roadmap; today, build from source:
+**Install (Linux / macOS) — one command, no Rust toolchain required:**
 
 ```bash
-# prerequisites: rustup (stable), just (cargo install just), and uv
+curl -fsSL https://raw.githubusercontent.com/achref-soua/quiver/main/scripts/install.sh | sh
+```
+
+**Windows (PowerShell 5.1+):**
+
+```powershell
+irm https://raw.githubusercontent.com/achref-soua/quiver/main/scripts/install.ps1 | iex
+```
+
+Both scripts detect your OS and architecture, download the pre-built binary for
+your platform from the [latest GitHub Release](https://github.com/achref-soua/quiver/releases/latest),
+verify its SHA-256 checksum before touching your disk, and install to `~/.local/bin`
+(Linux/macOS) or `%LOCALAPPDATA%\quiver\bin` (Windows). To pin a specific version,
+set `QUIVER_VERSION=0.17.0` before running.
+
+Once installed, keep Quiver up to date with:
+
+```bash
+quiver update           # downloads, verifies, and atomically replaces the binary
+quiver update --check   # just check if a newer version exists
+```
+
+**Quick start:**
+
+```bash
+quiver serve            # gRPC + REST on :6333, encrypted by default
+quiver tui              # the retro cockpit
+quiver mcp              # MCP server (stdio) so AI agents can drive Quiver
+```
+
+**Build from source** (requires rustup stable + `just` + `uv`):
+
+```bash
 git clone https://github.com/achref-soua/quiver
 cd quiver
 just demo             # build, start an encrypted server, seed a demo collection
@@ -77,18 +109,8 @@ just verify           # the full local quality gate (lint · test · doc · deny
 cargo run -p quiver-cli -- --help
 ```
 
-```bash
-# install the `quiver` CLI from the cloned repo (a crates.io release and a
-# container image are on the roadmap — see the note below):
-cargo install --path crates/quiver-cli
-quiver serve                   # gRPC + REST, encrypted by default
-quiver tui                     # the cockpit
-quiver mcp                     # MCP server (stdio) so AI agents can drive Quiver
-```
-
 > **Heads-up:** the `quiver-cli` crate currently on crates.io is an unrelated
-> third-party project — install from this repository (above), not with
-> `cargo install quiver-cli`.
+> third-party project — use the install script above or build from source.
 
 The [MCP server](./docs/mcp.md) exposes `create_collection`, `upsert`, `search`,
 `get`, `delete`, and the multi-vector `upsert_document` / `search_multi_vector` /

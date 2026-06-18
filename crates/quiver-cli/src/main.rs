@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 mod admin;
+mod update;
 
 #[derive(Parser)]
 #[command(
@@ -56,6 +57,12 @@ enum Command {
     },
     /// Run benchmarks.
     Bench,
+    /// Check for a newer release and optionally install it.
+    Update {
+        /// Only check whether an update is available; do not download or install.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -197,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Command::Bench => println!("quiver bench: not yet implemented"),
+        Command::Update { check } => update::run(check).await?,
     }
     Ok(())
 }
