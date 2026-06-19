@@ -17,9 +17,22 @@ use crate::page::{PAGE_BODY_CAP, PAGE_SIZE, PageCodec, PageType, build_page, par
 const LEN_PREFIX: usize = 8;
 
 /// `fsync` a directory so prior file creations or renames within it are durable.
+///
+/// On Windows, `File::open` on a directory requires `FILE_FLAG_BACKUP_SEMANTICS`
+/// (0x02000000); without it the kernel returns ERROR_ACCESS_DENIED (os error 5).
+/// We skip the fsync on Windows because NTFS journals directory-entry changes
+/// atomically — the WAL and per-page CRCs already give us crash safety there.
 pub(crate) fn fsync_dir(dir: &Path) -> Result<()> {
-    let f = File::open(dir).map_err(|e| CoreError::io(dir, e))?;
-    f.sync_all().map_err(|e| CoreError::io(dir, e))
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        let f = File::open(dir).map_err(|e| CoreError::io(dir, e))?;
+        f.sync_all().map_err(|e| CoreError::io(dir, e))
+    }
 }
 
 fn paginate(body: &[u8], page_type: PageType, stamp: u64) -> Result<Vec<[u8; PAGE_SIZE]>> {

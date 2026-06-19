@@ -2995,7 +2995,7 @@ dev = [{ name = "pytest", specifier = ">=8" }]
 
 [[package]]
 name = "quiver-client"
-version = "0.16.0"
+version = "0.18.0"
 source = { directory = "../sdks/python" }
 dependencies = [
     { name = "httpx" },
@@ -3004,16 +3004,18 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "cryptography", marker = "extra == 'dcpe'", specifier = ">=42" },
+    { name = "haystack-ai", marker = "extra == 'haystack'", specifier = ">=2.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=1.0" },
     { name = "llama-index-core", marker = "extra == 'llamaindex'", specifier = ">=0.11" },
     { name = "pynacl", marker = "extra == 'encryption'", specifier = ">=1.5" },
 ]
-provides-extras = ["encryption", "dcpe", "langchain", "llamaindex"]
+provides-extras = ["encryption", "dcpe", "langchain", "llamaindex", "haystack"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "cryptography", specifier = ">=42" },
+    { name = "haystack-ai", specifier = ">=2.0" },
     { name = "langchain-core", specifier = ">=1.0" },
     { name = "llama-index-core", specifier = ">=0.11" },
     { name = "pynacl", specifier = ">=1.5" },

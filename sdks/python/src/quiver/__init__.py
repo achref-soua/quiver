@@ -64,4 +64,4 @@ __all__ = [
     "is_sealed_vector",
     "VECTOR_ENVELOPE_KEY",
 ]
-__version__ = "0.16.0"
+__version__ = "0.18.0"

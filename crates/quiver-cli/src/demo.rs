@@ -4,6 +4,8 @@
 //! One command after install: seeds 1 000 synthetic 128-d vectors, starts
 //! the REST server on :7333, and opens the TUI cockpit — no env vars, no
 //! config files, no external downloads needed.
+//!
+//! Override the data directory: `QUIVER_DEMO_DIR=/path/to/dir quiver demo`
 use std::io::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -35,19 +37,20 @@ fn colored(code: &str, text: &str) -> String {
 fn banner(version: &str) {
     println!();
     if use_color() {
-        let b = "\x1b[38;5;172m";
+        let b = "\x1b[38;2;205;127;50m"; // #CD7F32 bronze — theme CHROME
+        let v = "\x1b[38;2;63;182;168m"; // #3FB6A8 verdigris — theme ACCENT (the V arrowhead)
         let r = "\x1b[0m";
-        println!("{b}    ██████╗ ██╗   ██╗██╗██╗   ██╗███████╗██████╗ {r}");
-        println!("{b}   ██╔═══██╗██║   ██║██║██║   ██║██╔════╝██╔══██╗{r}");
-        println!("{b}   ██║   ██║██║   ██║██║╚██╗ ██╔╝█████╗  ██████╔╝{r}");
-        println!("{b}   ██║▄▄ ██║██║   ██║██║ ╚████╔╝ ██╔══╝  ██╔══██╗{r}");
-        println!("{b}   ╚██████╔╝╚██████╔╝██║  ╚██╔╝  ███████╗██║  ██║{r}");
-        println!("{b}    ╚══▀▀═╝  ╚═════╝ ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝{r}");
-        println!("\x1b[1;36m        demo  ·  v{version}  ·  :{SERVER_PORT}\x1b[0m");
+        println!("{b}    ██████╗ ██╗   ██╗██╗{r}{v}██╗   ██╗{r}{b}███████╗██████╗ {r}");
+        println!("{b}   ██╔═══██╗██║   ██║██║{r}{v}██║   ██║{r}{b}██╔════╝██╔══██╗{r}");
+        println!("{b}   ██║   ██║██║   ██║██║{r}{v}╚██╗ ██╔╝{r}{b}█████╗  ██████╔╝{r}");
+        println!("{b}   ██║▄▄ ██║██║   ██║██║{r}{v} ╚████╔╝ {r}{b}██╔══╝  ██╔══██╗{r}");
+        println!("{b}   ╚██████╔╝╚██████╔╝██║{r}{v}  ╚██╔╝  {r}{b}███████╗██║  ██║{r}");
+        println!("{b}    ╚══▀▀═╝  ╚═════╝ ╚═╝{r}{v}   ╚═╝   {r}{b}╚══════╝╚═╝  ╚═╝{r}");
+        println!("{v}        demo  ·  v{version}  ·  :{SERVER_PORT}{r}");
         println!();
-        println!("\x1b[0;90m  ┌─────────────────────────────────────────────────┐\x1b[0m");
-        println!("\x1b[0;90m  │  zero config  ·  press q in the cockpit to quit │\x1b[0m");
-        println!("\x1b[0;90m  └─────────────────────────────────────────────────┘\x1b[0m");
+        println!("\x1b[38;2;90;90;90m  ┌─────────────────────────────────────────────────┐\x1b[0m");
+        println!("\x1b[38;2;90;90;90m  │  zero config  ·  press q in the cockpit to quit │\x1b[0m");
+        println!("\x1b[38;2;90;90;90m  └─────────────────────────────────────────────────┘\x1b[0m");
     } else {
         println!("  QUIVER v{version}  demo  :{SERVER_PORT}");
         println!("  zero config | press q to quit");
@@ -56,16 +59,16 @@ fn banner(version: &str) {
 }
 
 fn step(icon: &str, msg: &str) {
-    print!("  {}  {msg} ", colored("1;36", icon));
+    print!("  {}  {msg} ", colored("38;2;63;182;168", icon));
     let _ = io::stdout().flush();
 }
 
 fn done() {
-    println!("{}", colored("1;32", "done"));
+    println!("{}", colored("38;2;143;179;57", "done"));
 }
 
 fn ok(msg: &str) {
-    println!("  {}  {msg}", colored("1;32", "✔"));
+    println!("  {}  {msg}", colored("38;2;143;179;57", "✔"));
 }
 
 // ── synthetic vectors — no rand dep ──────────────────────────────────────────
@@ -85,9 +88,13 @@ fn synthetic_vector(point_index: usize, dim: usize) -> Vec<f32> {
         .collect()
 }
 
-// ── demo data directory — no dirs dep ────────────────────────────────────────
+// ── demo data directory ───────────────────────────────────────────────────────
+// Override with QUIVER_DEMO_DIR if the default location is not writable.
 
 fn demo_data_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("QUIVER_DEMO_DIR") {
+        return PathBuf::from(d);
+    }
     #[cfg(windows)]
     {
         std::env::var_os("LOCALAPPDATA")
@@ -108,10 +115,35 @@ fn demo_data_dir() -> PathBuf {
 
 // ── seeding ───────────────────────────────────────────────────────────────────
 
-fn seed_demo(data_dir: &Path) -> Result<bool> {
-    use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype};
+fn open_db(data_dir: &Path) -> Result<quiver_embed::Database> {
+    use quiver_embed::Database;
 
-    let mut db = Database::open(data_dir).context("failed to open demo database")?;
+    // First attempt.
+    if let Ok(db) = Database::open(data_dir) {
+        return Ok(db);
+    }
+
+    // On Windows, a stale WAL lock from a previous crash (or a brief antivirus
+    // scan hold) can make the first open fail.  Clear the directory and retry
+    // once — demo data is synthetic so it is safe to regenerate.
+    let _ = std::fs::remove_dir_all(data_dir);
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("cannot create demo data dir {}", data_dir.display()))?;
+
+    Database::open(data_dir).with_context(|| {
+        format!(
+            "cannot open demo database at {}.\n  \
+             Set QUIVER_DEMO_DIR=<path> to use a different location, or\n  \
+             on Windows add quiver.exe to Windows Security exclusions.",
+            data_dir.display()
+        )
+    })
+}
+
+fn seed_demo(data_dir: &Path) -> Result<bool> {
+    use quiver_embed::{Descriptor, DistanceMetric, Dtype};
+
+    let mut db = open_db(data_dir)?;
 
     if db.collection_names().iter().any(|n| n == DEMO_COLLECTION) {
         return Ok(false); // already seeded
@@ -189,14 +221,17 @@ pub async fn run() -> Result<()> {
     println!();
     println!(
         "  {}  {}",
-        colored("0;90", "API key"),
-        colored("1;33", DEMO_KEY)
+        colored("38;2;90;90;90", "API key"),
+        colored("38;2;63;182;168", DEMO_KEY)
     );
-    println!("  {}  pip install quiver-client", colored("0;90", "Python"));
+    println!(
+        "  {}  pip install quiver-client",
+        colored("38;2;90;90;90", "Python")
+    );
     println!();
     println!(
         "  {}",
-        colored("1;32", "Opening cockpit — press q to quit.")
+        colored("38;2;143;179;57", "Opening cockpit — press q to quit.")
     );
     println!();
 
