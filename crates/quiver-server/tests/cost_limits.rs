@@ -49,6 +49,7 @@ async fn over_limit_requests_are_rejected_with_400() {
             max_payload_bytes: 32,
             max_batch_size: 2,
             max_request_body_bytes: 1 << 20,
+            max_sparse_terms: 8,
         },
         ..Default::default()
     };

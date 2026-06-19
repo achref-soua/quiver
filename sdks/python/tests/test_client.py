@@ -332,3 +332,35 @@ def test_delete_by_filter_pages_until_empty():
     assert total == 3
     assert fetch.call_count == 2
     assert delete.call_count == 2
+
+
+@respx.mock
+def test_hybrid_search_sends_dense_and_sparse_body():
+    from quiver import SparseVector
+
+    route = respx.post(f"{BASE}/v1/collections/kb/query/hybrid").mock(
+        return_value=httpx.Response(200, json={"matches": [{"id": "x", "score": 0.5}]})
+    )
+    with Client(BASE) as q:
+        hits = q.hybrid_search(
+            "kb",
+            vector=[0.1, 0.2],
+            sparse=SparseVector(indices=[3, 7], values=[1.0, 2.0]),
+            k=5,
+            filter={"eq": {"field": "t", "value": 1}},
+            rrf_k0=42.0,
+        )
+    assert hits == [Match(id="x", score=0.5)]
+    body = json.loads(route.calls.last.request.content)
+    assert body["vector"] == [0.1, 0.2]
+    assert body["sparse_indices"] == [3, 7] and body["sparse_values"] == [1.0, 2.0]
+    assert body["k"] == 5 and body["rrf_k0"] == 42.0
+    assert body["filter"] == {"eq": {"field": "t", "value": 1}}
+
+
+def test_hybrid_search_requires_a_query():
+    with Client(BASE) as q:
+        import pytest as _pytest
+
+        with _pytest.raises(ValueError):
+            q.hybrid_search("kb")

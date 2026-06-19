@@ -17,6 +17,7 @@
 # Features
 
 - [Indexing & memory frugality](features/indexing.md)
+- [Hybrid (dense + sparse) search](features/hybrid-search.md)
 - [Multi-vector / late interaction](features/multi-vector.md)
 - [Encrypted vector search](features/encrypted-search.md)
 - [Migration importers](features/migration.md)
