@@ -1,0 +1,6 @@
+competitor,dataset,param_name,param_value,build_s,index_disk_mb,rss_mb,recall_at_10,qps_1t,qps_nt,concurrency,p50_ms,p95_ms,p99_ms,recall_stdev,qps_stdev,config,notes,error
+milvus_server,gist1m,ef_search,16,172.9843009900069,,6682.624,0.9313,40.7,,1,21.096,43.728,58.23,0.0005,7.3,{'metric': 'l2'},,
+milvus_server,gist1m,ef_search,32,172.9843009900069,,6706.176,0.9516,42.1,,1,21.244,42.868,49.517,0.0001,11.5,{'metric': 'l2'},,
+milvus_server,gist1m,ef_search,64,172.9843009900069,,6544.384,0.9644,38.4,,1,22.766,41.236,47.066,0.0009,4.8,{'metric': 'l2'},,
+milvus_server,gist1m,ef_search,128,172.9843009900069,,6884.352,0.9703,45.0,,1,20.524,36.113,41.021,0.0004,3.9,{'metric': 'l2'},,
+milvus_server,gist1m,ef_search,256,172.9843009900069,,6796.288,0.9757,31.0,,1,28.714,52.854,60.933,0.0015,5.2,{'metric': 'l2'},,

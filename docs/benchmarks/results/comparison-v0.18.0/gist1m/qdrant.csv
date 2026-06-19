@@ -1,0 +1,6 @@
+competitor,dataset,param_name,param_value,build_s,index_disk_mb,rss_mb,recall_at_10,qps_1t,qps_nt,concurrency,p50_ms,p95_ms,p99_ms,recall_stdev,qps_stdev,config,notes,error
+qdrant,gist1m,ef_search,16,863.0528766479983,,1213.44,0.7125,111.5,,1,14.993,75.055,88.246,0.0062,134.5,{'metric': 'l2'},,
+qdrant,gist1m,ef_search,32,863.0528766479983,,401.0,0.8217,225.5,,1,4.264,5.823,6.775,0.0,4.8,{'metric': 'l2'},,
+qdrant,gist1m,ef_search,64,863.0528766479983,,387.0,0.9007,186.7,,1,5.198,6.972,8.087,0.0,1.7,{'metric': 'l2'},,
+qdrant,gist1m,ef_search,128,863.0528766479983,,386.6,0.9511,146.3,,1,6.751,8.695,9.795,0.0,1.4,{'metric': 'l2'},,
+qdrant,gist1m,ef_search,256,863.0528766479983,,386.4,0.9784,109.4,,1,9.138,11.422,12.645,0.0,0.2,{'metric': 'l2'},,

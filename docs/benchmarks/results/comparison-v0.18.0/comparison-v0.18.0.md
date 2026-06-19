@@ -1,6 +1,6 @@
 # Quiver v0.18.0 — Multi-DB Benchmark Comparison
 
-_Generated: 2026-06-19 10:30 UTC_
+_Generated: 2026-06-19 15:02 UTC_
 
 > **Methodology:** [docs/benchmarks/methodology.md](../methodology.md) · [ADR-0037](../../adr/0037-scientific-multi-db-benchmark-suite.md)
 
@@ -19,6 +19,118 @@ _Generated: 2026-06-19 10:30 UTC_
 | Python | 3.12.13 |
 
 > This benchmark ran on a WSL2 dev box (resource-shared). QPS and RSS numbers are labelled accordingly. See docs/benchmarks/reference-hardware-runbook.md for the procedure to produce official headline numbers on dedicated hardware.
+
+## Dataset: GIST1M `[reference-hardware-pending]`
+
+### Operating point: recall@10 ≥ 0.95 (or best achieved)
+
+| Competitor | Version | recall@10 | QPS (1T) | QPS (NT) | RSS (MB) | Build (s) | Index (MB) | ef/nprobe | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| chroma | 1.5.9 | 0.7869 | 394 | — | 8155 | 485.8 | — | ef_search=16 | dev-box · indicative |
+| faiss | 1.14.3 | 0.9202 | 393 | — | 7532 | 549.1 | — | ef_search=256 | dev-box · indicative |
+| milvus_server | v2.5.4 (server) | 0.9516 | 42 | — | 6706 | 173.0 | — | ef_search=32 | dev-box · indicative |
+| qdrant | 1.13.4 | 0.9511 | 146 | — | 387 | 863.1 | — | ef_search=128 | dev-box · indicative |
+| quiver | v0.18.0-dev | 0.9247 | 182 | — | 8005 | 3056.6 | — | ef_search=256 | dev-box · indicative |
+| weaviate | 1.27.0 | 0.8244 | 236 | — | 8414 | 2874.2 | — | ef_search=16 | dev-box · indicative |
+
+### Full ef/nprobe sweep
+
+<details><summary>chroma</summary>
+
+| ef/nprobe | recall@10 | QPS (1T) | p50 (ms) | p95 (ms) | p99 (ms) | RSS (MB) |
+|---|---|---|---|---|---|---|
+| 16 | 0.7869 | 394 | 2.40 | 3.69 | 4.45 | 8155 |
+| 32 | 0.7869 | 389 | 2.43 | 3.82 | 4.76 | 8157 |
+| 64 | 0.7869 | 394 | 2.36 | 3.93 | 5.08 | 8158 |
+| 128 | 0.7869 | 401 | 2.35 | 3.67 | 4.64 | 8158 |
+| 256 | 0.7869 | 398 | 2.37 | 3.72 | 4.63 | 8158 |
+
+</details>
+
+<details><summary>faiss</summary>
+
+| ef/nprobe | recall@10 | QPS (1T) | p50 (ms) | p95 (ms) | p99 (ms) | RSS (MB) |
+|---|---|---|---|---|---|---|
+| 16 | 0.4926 | 3324 | 0.28 | 0.47 | 0.65 | 7523 |
+| 32 | 0.6394 | 2062 | 0.45 | 0.72 | 1.31 | 7529 |
+| 64 | 0.7595 | 1268 | 0.76 | 1.11 | 1.54 | 7532 |
+| 128 | 0.8581 | 708 | 1.39 | 1.95 | 2.69 | 7532 |
+| 256 | 0.9202 | 393 | 2.50 | 3.52 | 4.54 | 7532 |
+
+</details>
+
+<details><summary>milvus_server</summary>
+
+| ef/nprobe | recall@10 | QPS (1T) | p50 (ms) | p95 (ms) | p99 (ms) | RSS (MB) |
+|---|---|---|---|---|---|---|
+| 16 | 0.9313 | 41 | 21.10 | 43.73 | 58.23 | 6683 |
+| 32 | 0.9516 | 42 | 21.24 | 42.87 | 49.52 | 6706 |
+| 64 | 0.9644 | 38 | 22.77 | 41.24 | 47.07 | 6544 |
+| 128 | 0.9703 | 45 | 20.52 | 36.11 | 41.02 | 6884 |
+| 256 | 0.9757 | 31 | 28.71 | 52.85 | 60.93 | 6796 |
+
+</details>
+
+<details><summary>qdrant</summary>
+
+| ef/nprobe | recall@10 | QPS (1T) | p50 (ms) | p95 (ms) | p99 (ms) | RSS (MB) |
+|---|---|---|---|---|---|---|
+| 16 | 0.7125 | 112 | 14.99 | 75.06 | 88.25 | 1213 |
+| 32 | 0.8217 | 226 | 4.26 | 5.82 | 6.78 | 401 |
+| 64 | 0.9007 | 187 | 5.20 | 6.97 | 8.09 | 387 |
+| 128 | 0.9511 | 146 | 6.75 | 8.70 | 9.79 | 387 |
+| 256 | 0.9784 | 109 | 9.14 | 11.42 | 12.64 | 386 |
+
+</details>
+
+<details><summary>quiver</summary>
+
+| ef/nprobe | recall@10 | QPS (1T) | p50 (ms) | p95 (ms) | p99 (ms) | RSS (MB) |
+|---|---|---|---|---|---|---|
+| 16 | 0.4838 | 598 | 1.56 | 2.47 | 3.35 | 8005 |
+| 32 | 0.6242 | 517 | 1.80 | 3.02 | 3.92 | 8005 |
+| 64 | 0.7489 | 417 | 2.27 | 3.36 | 4.39 | 8005 |
+| 128 | 0.8557 | 288 | 3.32 | 5.05 | 6.28 | 8005 |
+| 256 | 0.9247 | 182 | 5.30 | 7.69 | 9.50 | 8005 |
+
+</details>
+
+<details><summary>weaviate</summary>
+
+| ef/nprobe | recall@10 | QPS (1T) | p50 (ms) | p95 (ms) | p99 (ms) | RSS (MB) |
+|---|---|---|---|---|---|---|
+| 16 | 0.8244 | 236 | 4.06 | 6.75 | 8.97 | 8414 |
+| 32 | 0.8244 | 260 | 3.63 | 5.49 | 6.63 | 8633 |
+| 64 | 0.8244 | 268 | 3.59 | 5.15 | 6.40 | 8629 |
+| 128 | 0.8244 | 266 | 3.60 | 5.18 | 6.39 | 8629 |
+| 256 | 0.8244 | 267 | 3.60 | 5.24 | 6.64 | 8629 |
+
+</details>
+
+### Wins / ties / losses (Quiver vs field)
+
+| Metric | vs competitor | Quiver | Competitor | Verdict |
+|---|---|---|---|---|
+| recall@10 | chroma | 0.9247 | 0.7869 | ✅ win |
+| recall@10 | faiss | 0.9247 | 0.9202 | ≈ tie |
+| recall@10 | milvus_server | 0.9247 | 0.9516 | ❌ loss |
+| recall@10 | qdrant | 0.9247 | 0.9511 | ❌ loss |
+| recall@10 | weaviate | 0.9247 | 0.8244 | ✅ win |
+| QPS (1T) | chroma | 182 | 394 | ❌ loss |
+| QPS (1T) | faiss | 182 | 393 | ❌ loss |
+| QPS (1T) | milvus_server | 182 | 42 | ✅ win |
+| QPS (1T) | qdrant | 182 | 146 | ✅ win |
+| QPS (1T) | weaviate | 182 | 236 | ❌ loss |
+| RSS (MB) | chroma | 8005 | 8155 | ≈ tie |
+| RSS (MB) | faiss | 8005 | 7532 | ❌ loss |
+| RSS (MB) | milvus_server | 8005 | 6706 | ❌ loss |
+| RSS (MB) | qdrant | 8005 | 387 | ❌ loss |
+| RSS (MB) | weaviate | 8005 | 8414 | ✅ win |
+| Build (s) | chroma | 3056.6 | 485.8 | ❌ loss |
+| Build (s) | faiss | 3056.6 | 549.1 | ❌ loss |
+| Build (s) | milvus_server | 3056.6 | 173.0 | ❌ loss |
+| Build (s) | qdrant | 3056.6 | 863.1 | ❌ loss |
+| Build (s) | weaviate | 3056.6 | 2874.2 | ❌ loss |
 
 ## Dataset: SIFT1M `[reference-hardware-pending]`
 

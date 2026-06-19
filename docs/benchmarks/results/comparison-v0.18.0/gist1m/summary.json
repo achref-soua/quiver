@@ -1,0 +1,117 @@
+[
+  {
+    "competitor": "chroma",
+    "dataset": "gist1m",
+    "param_name": "ef_search",
+    "param_value": 16,
+    "build_s": 485.76920720899943,
+    "index_disk_mb": null,
+    "rss_mb": 8154.85546875,
+    "recall_at_10": 0.7869,
+    "qps_1t": 394.3,
+    "qps_nt": null,
+    "concurrency": 1,
+    "p50_ms": 2.399,
+    "p95_ms": 3.693,
+    "p99_ms": 4.448,
+    "recall_stdev": 0.0,
+    "qps_stdev": 3.8,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "chroma",
+    "dataset": "gist1m",
+    "param_name": "ef_search",
+    "param_value": 32,
+    "build_s": 485.76920720899943,
+    "index_disk_mb": null,
+    "rss_mb": 8156.90234375,
+    "recall_at_10": 0.7869,
+    "qps_1t": 389.3,
+    "qps_nt": null,
+    "concurrency": 1,
+    "p50_ms": 2.428,
+    "p95_ms": 3.817,
+    "p99_ms": 4.76,
+    "recall_stdev": 0.0,
+    "qps_stdev": 16.5,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "chroma",
+    "dataset": "gist1m",
+    "param_name": "ef_search",
+    "param_value": 64,
+    "build_s": 485.76920720899943,
+    "index_disk_mb": null,
+    "rss_mb": 8157.99609375,
+    "recall_at_10": 0.7869,
+    "qps_1t": 394.1,
+    "qps_nt": null,
+    "concurrency": 1,
+    "p50_ms": 2.358,
+    "p95_ms": 3.928,
+    "p99_ms": 5.076,
+    "recall_stdev": 0.0,
+    "qps_stdev": 32.4,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "chroma",
+    "dataset": "gist1m",
+    "param_name": "ef_search",
+    "param_value": 128,
+    "build_s": 485.76920720899943,
+    "index_disk_mb": null,
+    "rss_mb": 8157.99609375,
+    "recall_at_10": 0.7869,
+    "qps_1t": 400.8,
+    "qps_nt": null,
+    "concurrency": 1,
+    "p50_ms": 2.349,
+    "p95_ms": 3.665,
+    "p99_ms": 4.637,
+    "recall_stdev": 0.0,
+    "qps_stdev": 13.1,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "chroma",
+    "dataset": "gist1m",
+    "param_name": "ef_search",
+    "param_value": 256,
+    "build_s": 485.76920720899943,
+    "index_disk_mb": null,
+    "rss_mb": 8157.99609375,
+    "recall_at_10": 0.7869,
+    "qps_1t": 397.5,
+    "qps_nt": null,
+    "concurrency": 1,
+    "p50_ms": 2.366,
+    "p95_ms": 3.719,
+    "p99_ms": 4.633,
+    "recall_stdev": 0.0,
+    "qps_stdev": 12.3,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  }
+]

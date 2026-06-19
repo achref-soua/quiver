@@ -205,6 +205,19 @@ Quiver is **second only to FAISS** on both throughput and tail latency at this r
 
 The honesty that makes the table trustworthy: this is an **in-memory HNSW** comparison for *every* system, so RSS here is full-vectors-in-RAM — Quiver's memory-frugality wedge is its **disk-resident path** (only PQ codes resident; ~32× less RAM, see [`disk-path.md`](./docs/benchmarks/results/disk-path.md)), **not** this table. ¹ FAISS/Chroma/LanceDB run in-process so their RSS includes the Python harness + the resident 512 MB dataset (inflated; only Quiver/Milvus/Qdrant/Weaviate report the isolated DB). ² Quiver's "build" is the **REST-upload** path (1M batched POSTs); a bulk-ingest endpoint is a follow-up and it does not reflect engine speed. ³ Qdrant mmaps vectors to disk by default. ⁴ LanceDB's IVF-PQ config doesn't reach 0.95 recall in this sweep (shown at its best). Numbers are **dev-box, indicative** — comparative standings on the identical box are real (per the [methodology](./docs/benchmarks/methodology.md)); **absolute** RSS and the 10M disk path are reference-hardware-pending; we never fabricate. Milvus is benchmarked as the **server** (Docker), not the in-process Lite build.
 
+**GIST1M** (1M × 960, L2) is the harder, higher-dimensional test. Same box, each system at its most efficient config reaching recall@10 ≥ 0.95, or its best point at `ef_search ≤ 256` (960-d needs a wide beam, so most plateau below 0.95 in this sweep):
+
+| System | recall@10 | QPS (1T) | p95 (ms) | RSS (MB) | ef/nprobe |
+|---|---:|---:|---:|---:|---:|
+| **Quiver v0.18** | **0.925** | 182 | 7.7 | 8005 | 256 |
+| FAISS 1.14 | 0.920 | **393** | 3.5 | 7532 ¹ | 256 |
+| Qdrant 1.13 | 0.951 | 146 | 8.7 | **387** ³ | 128 |
+| Milvus 2.5 (server) | 0.952 | 42 | 42.9 | 6706 | 32 |
+| Weaviate 1.27 | 0.824 | 236 | 6.8 | 8414 | 16 ⁵ |
+| Chroma 1.5 | 0.787 | 394 | 3.7 | 8155 ¹ | 16 ⁵ |
+
+On 960-d, **Quiver matches FAISS on recall (0.925 vs 0.920)** and lands mid-pack on throughput — faster than Qdrant and Milvus-server, behind FAISS/Chroma/Weaviate; the two that clear 0.95 here (Qdrant, Milvus) pay for it in latency/QPS. ⁵ Chroma and Weaviate plateau well below 0.95 — their `ef_search` does not widen recall in this config. **LanceDB did not complete** GIST1M: building a 960-d/1M IVF-PQ index in-process exceeds this box's memory (an honest DNF, not a fabricated row). Same RSS caveats as above (¹ in-process = inflated; ³ Qdrant disk-backed; Quiver's in-memory HNSW holds vectors in RAM — the disk path is the memory wedge). Full sweeps + the wins/losses matrix: [`comparison-v0.18.0`](./docs/benchmarks/results/comparison-v0.18.0/comparison-v0.18.0.md).
+
 The per-collection **recall ↔ latency ↔ memory** knobs — quantizers (scalar/product/binary), the disk-resident DiskANN path, and IVF — are documented with a tradeoff table in [`docs/benchmarks/quantization-tradeoffs.md`](./docs/benchmarks/quantization-tradeoffs.md).
 
 Every index supports **incremental updates**, so streaming workloads avoid an `O(N)` rebuild on each write. The **IVF** index applies inserts, in-place updates, and deletes to the live index with SpFresh-style LIRE rebalancing (cell split/merge) ([ADR-0023](./docs/adr/0023-incremental-in-place-updates.md)); **HNSW** soft-deletes in `O(1)` with an amortized rebuild ([ADR-0026](./docs/adr/0026-hnsw-incremental-delete.md)); and the **Vamana / disk-resident graph** family uses **FreshDiskANN's StreamingMerge** — a read-only base graph plus a small in-memory delta graph and an `O(1)` deletion set, consolidated by a derived rebuild past a churn threshold ([ADR-0033](./docs/adr/0033-graph-incremental-freshdiskann.md)). All indexes stay derived and the disk artifact keeps its write-once contract, so the `kill -9` crash gate is untouched.
