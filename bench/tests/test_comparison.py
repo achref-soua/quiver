@@ -79,6 +79,29 @@ def test_stub_adapter_recall():
     assert results[0].recall_at_10 == pytest.approx(1.0, abs=0.01)
     assert results[0].rss_mb == pytest.approx(42.0)
     assert results[0].qps_1t > 0
+    # Single-thread by default: no saturated-QPS pass.
+    assert results[0].qps_nt is None
+    assert results[0].concurrency == 1
+
+
+def test_concurrent_pass_populates_qps_nt():
+    ds = datasets.synthetic(n=200, dim=8, queries=40, k=10)
+    adapter = _PerfectAdapter(ds.base)
+    adapter.build(ds.base, "l2")
+    results = adapter.query_sweep(
+        ds.queries, ds.ground_truth, k=10, params=[32], reps=1, concurrency=4
+    )
+    assert results[0].concurrency == 4
+    assert results[0].qps_nt is not None and results[0].qps_nt > 0
+    # Recall is unchanged by the concurrent pass.
+    assert results[0].recall_at_10 == pytest.approx(1.0, abs=0.01)
+
+
+def test_query_concurrent_returns_positive_qps():
+    ds = datasets.synthetic(n=100, dim=8, queries=30, k=5)
+    adapter = _PerfectAdapter(ds.base)
+    qps = adapter.query_concurrent(ds.queries, k=5, param=32, workers=4)
+    assert qps > 0
 
 
 # ── Report helpers ────────────────────────────────────────────────────────────

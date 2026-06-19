@@ -1,6 +1,6 @@
 # ADR-0041 — Deep, large-data benchmark dimensions
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-19
 **Deciders:** Achref Soua
 

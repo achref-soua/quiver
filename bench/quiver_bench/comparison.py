@@ -73,9 +73,26 @@ def _load_dataset(name: str, datasets_dir: Path) -> datasets.Dataset:
                 "Download from http://corpus-texmex.irisa.fr/ and extract to bench/datasets/sift/"
             )
         return datasets.load_sift(d, k=K)
+    if name == "gist1m":
+        # GIST1M (1M x 960, L2) — downloaded on demand (~2.6 GB) and cached.
+        return datasets.load_sift(datasets.ensure_texmex("gist", datasets_dir), k=K)
+    if name == "deep1m":
+        # Deep1M (96-d, L2) has no clean public `.fvecs` source we bundle, so it is
+        # loaded only if the operator has placed it at bench/datasets/deep/. We do
+        # NOT fabricate it: absent files mean the run is reference-hardware-pending.
+        d = datasets_dir / "deep"
+        if not sorted(d.glob("*_base.fvecs")):
+            raise FileNotFoundError(
+                f"Deep1M not found at {d}. Place deep_base.fvecs / deep_query.fvecs "
+                "(+ deep_groundtruth.ivecs) there to run it; otherwise it stays "
+                "reference-hardware-pending (we never fabricate a dataset)."
+            )
+        return datasets.load_sift(d, k=K)
     if name == "synthetic":
         return datasets.synthetic(n=2000, dim=16, queries=50, k=K)
-    raise ValueError(f"Unknown dataset: {name!r}. Use siftsmall, sift1m, or synthetic.")
+    raise ValueError(
+        f"Unknown dataset: {name!r}. Use siftsmall, sift1m, gist1m, deep1m, or synthetic."
+    )
 
 
 def run_one(
@@ -85,6 +102,7 @@ def run_one(
     out_dir: Path,
     ef_sweep: list[int],
     dry_run: bool = False,
+    concurrency: int = 1,
 ) -> list[BenchResult] | None:
     """Run a single competitor and write its CSV; returns results or None on failure."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -105,7 +123,9 @@ def run_one(
 
         if not dry_run:
             sweep = ef_sweep if adapter.param_name == "ef_search" else DEFAULT_NPROBE_SWEEP
-            results = adapter.query_sweep(ds.queries, ds.ground_truth, K, sweep, reps=3)
+            results = adapter.query_sweep(
+                ds.queries, ds.ground_truth, K, sweep, reps=3, concurrency=concurrency
+            )
             for r in results:
                 r.dataset = dataset_name
                 r.build_s = build_s
@@ -150,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--dataset",
         default="siftsmall",
-        choices=["siftsmall", "sift1m", "synthetic"],
+        choices=["siftsmall", "sift1m", "gist1m", "deep1m", "synthetic"],
         help="Dataset to use (default: siftsmall smoke run)",
     )
     p.add_argument("--smoke", action="store_true", help="Alias for --dataset siftsmall")
@@ -169,6 +189,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--datasets-dir", type=Path, default=Path("bench/datasets"))
     p.add_argument("--ef", default="16,32,64,128,256", help="ef_search sweep (comma-separated)")
+    p.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Concurrent client threads for the saturated-QPS pass (1 = single-thread only)",
+    )
     p.add_argument("--dry-run", action="store_true", help="Start/stop each adapter but skip query sweep")
     args = p.parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -215,7 +241,15 @@ def main(argv: list[str] | None = None) -> int:
         adapter = all_adapters[name]
         log.info("=== %s ===", name)
         t0 = time.perf_counter()
-        results = run_one(adapter, ds, dataset_name, out_dir, ef_sweep, dry_run=args.dry_run)
+        results = run_one(
+            adapter,
+            ds,
+            dataset_name,
+            out_dir,
+            ef_sweep,
+            dry_run=args.dry_run,
+            concurrency=args.concurrency,
+        )
         elapsed = time.perf_counter() - t0
         if results:
             all_results.extend(results)

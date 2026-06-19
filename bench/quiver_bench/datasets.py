@@ -9,10 +9,20 @@ int32 (`.ivecs`) values.
 
 from __future__ import annotations
 
+import tarfile
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+# The TEXMEX corpus (http://corpus-texmex.irisa.fr/) publishes SIFT and GIST as
+# gzipped tars of `.fvecs`/`.ivecs` files. SIFT1M ships with the repo; GIST1M is
+# downloaded on demand because it is ~2.6 GB.
+TEXMEX_URLS = {
+    "sift": "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz",
+    "gist": "ftp://ftp.irisa.fr/local/texmex/corpus/gist.tar.gz",
+}
 
 
 @dataclass
@@ -84,6 +94,35 @@ def synthetic(*, n: int, dim: int, queries: int, k: int = 10, seed: int = 42) ->
     base = rng.standard_normal((n, dim), dtype=np.float32)
     query = rng.standard_normal((queries, dim), dtype=np.float32)
     return Dataset(base=base, queries=query, ground_truth=brute_force_l2(base, query, k))
+
+
+def ensure_texmex(name: str, datasets_dir: Path) -> Path:
+    """Return the directory for a TEXMEX dataset (``sift`` or ``gist``), downloading
+    and extracting it under ``datasets_dir`` if the ``*_base.fvecs`` is absent.
+
+    The download is large (GIST1M ≈ 2.6 GB); it is fetched once and cached. We do
+    not pin a checksum — TEXMEX does not publish one — so the cache is trusted
+    after a successful extract. Never used as a source of *fabricated* numbers.
+    """
+    if name not in TEXMEX_URLS:
+        raise ValueError(f"no TEXMEX URL for {name!r}; known: {sorted(TEXMEX_URLS)}")
+    dest = datasets_dir / name
+    if sorted(dest.glob("*_base.fvecs")):
+        return dest
+    datasets_dir.mkdir(parents=True, exist_ok=True)
+    archive = datasets_dir / f"{name}.tar.gz"
+    if not archive.exists():
+        url = TEXMEX_URLS[name]
+        print(f"downloading {name} from {url} (large; one-time) ...")
+        urllib.request.urlretrieve(url, archive)  # noqa: S310 - trusted TEXMEX host
+    print(f"extracting {archive} ...")
+    with tarfile.open(archive) as tar:
+        tar.extractall(datasets_dir, filter="data")
+    if not sorted(dest.glob("*_base.fvecs")):
+        raise FileNotFoundError(
+            f"{name} extracted to {datasets_dir} but no *_base.fvecs under {dest}"
+        )
+    return dest
 
 
 def _one(directory: Path, pattern: str) -> Path:
