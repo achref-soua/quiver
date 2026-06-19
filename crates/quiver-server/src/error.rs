@@ -23,6 +23,11 @@ pub enum Error {
     /// (RBAC, ADR-0011). The message is generic so it leaks no resource names.
     #[error("{0}")]
     Forbidden(String),
+    /// The request exceeds a configured cost limit or is otherwise malformed at
+    /// the server edge (ADR-0040). The message names the offending field, its
+    /// value, and the cap. Returned as HTTP 400 / gRPC `InvalidArgument`.
+    #[error("{0}")]
+    BadRequest(String),
     /// Invalid or insecure configuration.
     #[error("configuration error: {0}")]
     Config(String),
@@ -46,6 +51,7 @@ impl Error {
                 (StatusCode::CONFLICT, tonic::Code::AlreadyExists)
             }
             Error::Forbidden(_) => (StatusCode::FORBIDDEN, tonic::Code::PermissionDenied),
+            Error::BadRequest(_) => (StatusCode::BAD_REQUEST, tonic::Code::InvalidArgument),
             Error::Engine(EngineError::Core(CoreError::InvalidArgument(_)))
             | Error::Engine(EngineError::Index(_))
             | Error::Engine(EngineError::Unsupported(_))

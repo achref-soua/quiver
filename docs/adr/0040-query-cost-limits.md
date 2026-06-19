@@ -1,6 +1,6 @@
 # ADR-0040 — Query cost limits
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-19
 **Deciders:** Achref Soua
 

@@ -108,6 +108,7 @@ async fn server_stores_opaque_vectors_and_the_client_ranks() {
         leader_url: None,
         leader_api_key: None,
         insecure: true,
+        limits: quiver_server::Limits::default(),
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

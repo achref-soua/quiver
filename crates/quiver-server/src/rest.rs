@@ -2,7 +2,7 @@
 //! The REST surface (axum): the JSON mirror of the gRPC contract
 //! (`docs/api/rest-grpc.md`).
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::{self, Next};
@@ -25,6 +25,8 @@ use crate::{
 /// Build the REST router: open `/healthz`, `/readyz`, `/metrics`; the `/v1` API
 /// behind API-key auth.
 pub(crate) fn router(state: AppState) -> Router {
+    // Reject an oversized request body before it is buffered or parsed (ADR-0040).
+    let max_body = state.limits.max_request_body_bytes;
     let api = Router::new()
         .route(
             "/v1/collections",
@@ -50,6 +52,7 @@ pub(crate) fn router(state: AppState) -> Router {
             post(search_multi_vector),
         )
         .layer(middleware::from_fn_with_state(state.clone(), auth))
+        .layer(DefaultBodyLimit::max(max_body))
         .with_state(state);
 
     Router::new()

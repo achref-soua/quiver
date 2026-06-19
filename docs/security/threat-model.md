@@ -14,7 +14,7 @@ Security is Quiver's foundation, not a feature. This document states what we def
 | # | Adversary | Primary defense |
 |---|---|---|
 | A1 | Network attacker (MITM) | TLS 1.3 (`rustls`); optional mTLS |
-| A2 | Malicious / compromised **client** | AuthN (API key / mTLS), RBAC scopes, tenant isolation, rate & cost limits |
+| A2 | Malicious / compromised **client** | AuthN (API key / mTLS), RBAC scopes, tenant isolation, query cost limits (ADR-0040) |
 | A3 | Thief of **disk / backups** (data at rest) | Envelope encryption-at-rest (AEAD); crypto-shredding |
 | A4 | Curious / compromised **server operator** (payloads) | **Client-side payload encryption** — server stores ciphertext it cannot read |
 | A5 | Another **tenant** | Isolation enforced at the data-access layer; default-deny RBAC |
@@ -57,7 +57,7 @@ connectors' SSRF posture and a cleartext-credential fix — is the
 - **Tampering** → AEAD integrity on every page; append-only audit log (optionally hash-chained).
 - **Repudiation** → audit log records actor, action, resource, time.
 - **Information disclosure** → the encryption layers above; tenant isolation; sanitized errors (no internal paths/secrets); secrets never logged.
-- **Denial of service** → per-key/tenant rate limits; query **cost limits** (caps on `k`, `ef`, result size, concurrent queries); connection limits; request timeouts.
+- **Denial of service** → query **cost limits** enforced at the op layer (caps on `k`, `ef_search`, `fetch` limit, vector dimension, payload size, upsert batch size, and HTTP request body size — ADR-0040), rejected with 400 / `InvalidArgument` so one oversized request cannot exhaust the single-writer engine. *Deferred (stated, not claimed):* per-key/tenant rate limits, concurrent-query caps, and a work-cancelling query timeout (not achievable under the current `spawn_blocking` model without cooperative cancellation).
 - **Elevation of privilege** → default-deny RBAC scopes; tenant isolation at the data layer; no anonymous writes; no default credentials.
 
 ## Crypto-shredding

@@ -61,6 +61,7 @@ async fn multivector_round_trip() {
         leader_url: None,
         leader_api_key: None,
         insecure: false,
+        limits: quiver_server::Limits::default(),
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;
@@ -258,6 +259,7 @@ async fn colbert_index_round_trip() {
         leader_url: None,
         leader_api_key: None,
         insecure: false,
+        limits: quiver_server::Limits::default(),
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

@@ -113,12 +113,21 @@ or a SHA-256 fingerprint, never the key). Test:
 `crates/quiver-server/tests/audit.rs` asserts no key secret ever appears in the
 log file.
 
-### C8 — DoS via query cost: bounded
+### C8 — DoS via query cost: gap at v0.17.0, fixed in ADR-0040
 
-Query cost limits cap `k`, `ef_search`, and result sizes; the client-side mode's
-`candidate_limit` bounds the fetch. Dependency-supply-chain risk is gated by
-`cargo deny` + `cargo audit` (no suppressions; `deny.toml` `ignore = []`), run as
-part of `just verify`.
+**Correction.** This entry originally claimed query cost limits cap `k`,
+`ef_search`, and result sizes. At v0.17.0 that was not true — the server passed
+`k` and `ef_search` to the search path unbounded, and the declared dimension,
+payload size, and upsert batch size were uncapped. This was the one code/docs
+coherence gap later recorded in `docs/analysis/state-of-quiver-v0.17.md`, and the
+authenticated query-cost DoS behind it. **ADR-0040 closes it:** per-request caps
+(`k`, `ef_search`, `fetch` limit, vector dimension, payload size, batch size, and
+HTTP request body size) are now enforced at the shared op layer and rejected with
+400 / `InvalidArgument`; the client-side mode's `candidate_limit` already bounded
+its fetch. Still deferred (and now stated as such, not claimed): per-key rate
+limiting and a work-cancelling query timeout. Dependency-supply-chain risk is
+gated by `cargo deny` + `cargo audit` (no suppressions; `deny.toml` `ignore = []`),
+run as part of `just verify`.
 
 ## Residual risks (unchanged, documented honestly)
 
