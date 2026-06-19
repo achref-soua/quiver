@@ -21,6 +21,7 @@ from .client import (
     Point,
     QuiverError,
 )
+from .async_client import AsyncClient
 from .dcpe import DcpeCipher, DcpeError, EncryptedVector
 from .encryption import ENVELOPE_KEY, PayloadCipher, PayloadError, is_sealed
 from .vector import (
@@ -35,6 +36,7 @@ from .vector import (
 
 __all__ = [
     "Client",
+    "AsyncClient",
     "Point",
     "Match",
     "Document",

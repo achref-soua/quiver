@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence, Union
 
 import httpx
 
@@ -386,6 +386,72 @@ class Client:
             )
             for m in matches
         ]
+
+    # --- ergonomic helpers (RAG/agentic) ---
+
+    def upsert_iter(
+        self,
+        collection: str,
+        points: Iterable[PointInput],
+        *,
+        batch: int = 500,
+        on_progress: Optional["Callable[[int], None]"] = None,
+    ) -> int:
+        """Upsert a large iterable in server-friendly batches; returns the total.
+
+        ``batch`` must stay within the server's ``max_batch_size`` (ADR-0040,
+        default 1000). ``on_progress`` is called with the running total after each
+        batch — handy for a progress bar over a big corpus load.
+        """
+        total = 0
+        chunk: list[PointInput] = []
+        for p in points:
+            chunk.append(p)
+            if len(chunk) >= batch:
+                total += self.upsert(collection, chunk)
+                chunk = []
+                if on_progress is not None:
+                    on_progress(total)
+        if chunk:
+            total += self.upsert(collection, chunk)
+            if on_progress is not None:
+                on_progress(total)
+        return total
+
+    def scroll(
+        self,
+        collection: str,
+        *,
+        filter: Optional[Mapping[str, Any]] = None,
+        batch: int = 500,
+        with_payload: bool = True,
+        with_vector: bool = False,
+    ) -> "Iterator[Match]":
+        """Yield points (for export / re-embedding). The REST ``fetch`` is
+        limit-bounded without a server cursor, so this yields up to ``batch``
+        points; narrow with ``filter`` for large collections (a server-side
+        scroll cursor is a follow-up)."""
+        yield from self.fetch(
+            collection,
+            filter=filter,
+            limit=batch,
+            with_payload=with_payload,
+            with_vector=with_vector,
+        )
+
+    def delete_by_filter(
+        self, collection: str, filter: Mapping[str, Any], *, batch: int = 500
+    ) -> int:
+        """Delete every point matching ``filter`` (paged by ``batch``); returns the
+        number deleted. Useful for GDPR erasure and re-indexing."""
+        total = 0
+        while True:
+            ids = [m.id for m in self.fetch(collection, filter=filter, limit=batch)]
+            if not ids:
+                return total
+            total += self.delete_points(collection, ids)
+            if len(ids) < batch:
+                return total
 
     # --- health ---
 
