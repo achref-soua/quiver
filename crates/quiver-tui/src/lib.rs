@@ -273,12 +273,35 @@ fn splitmix64(state: &mut u64) -> u64 {
 struct Aggregate {
     collections: usize,
     total_points: u64,
+    /// Collections whose vectors are client-side / DCPE encrypted.
+    encrypted: usize,
+    /// Compact index-kind breakdown, e.g. `hnsw·3 ivf·1 disk·1`.
+    indexes: String,
 }
 
 fn aggregate(collections: &[Collection]) -> Aggregate {
+    let encrypted = collections
+        .iter()
+        .filter(|c| c.vector_encryption.as_deref().is_some_and(|e| e != "none"))
+        .count();
+    // Count by index kind in a stable order for a deterministic summary line.
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for c in collections {
+        let kind = c.index.as_deref().unwrap_or("hnsw");
+        // Shorten `disk_vamana` to `disk` so the line stays inside the panel.
+        let short = kind.strip_suffix("_vamana").unwrap_or(kind);
+        *counts.entry(short).or_insert(0) += 1;
+    }
+    let indexes = counts
+        .iter()
+        .map(|(k, n)| format!("{k}·{n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     Aggregate {
         collections: collections.len(),
         total_points: collections.iter().map(|c| c.count).sum(),
+        encrypted,
+        indexes,
     }
 }
 
@@ -905,8 +928,11 @@ fn demo_constellation_view() -> ConstellationView {
 // The dashboard hero: the QUIVER logo banner (the V is a 3-D arrowhead) in a
 // rounded frame titled with the tagline and the server URL.
 fn banner_header(url: &str) -> Paragraph<'static> {
+    // The release version rides beside the wordmark in the panel title; the live
+    // server URL is right-aligned.
+    let title = format!("the cockpit · v{}", env!("CARGO_PKG_VERSION"));
     Paragraph::new(logo::banner()).block(
-        decor::panel("the cockpit")
+        decor::panel(&title)
             .title(Line::from(Span::styled(format!(" {url} "), theme::accent())).right_aligned()),
     )
 }
@@ -932,9 +958,16 @@ fn status_panel(dash: &Dashboard) -> Paragraph<'static> {
         Line::from(decor::badge(badge_label, style)),
         Line::from(""),
         kv("collections", &agg.collections.to_string()),
-        kv("points", &agg.total_points.to_string()),
+        kv("points", &group_thousands(agg.total_points)),
+        kv(
+            "encrypted",
+            &format!("{} / {}", agg.encrypted, agg.collections),
+        ),
         kv("refreshed", &dash.refreshed),
     ];
+    if !agg.indexes.is_empty() {
+        lines.push(kv("indexes", &agg.indexes));
+    }
     if !dash.history.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("trend        ", theme::dim()),
@@ -1064,6 +1097,20 @@ fn truncate(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+// Group a number with thin separators for readability, e.g. 1437395 → "1 437 395".
+fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let bytes = digits.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(*b as char);
+    }
+    out
 }
 
 fn footer() -> Paragraph<'static> {
@@ -1219,6 +1266,8 @@ mod tests {
             Aggregate {
                 collections: 3,
                 total_points: 42,
+                encrypted: 0,
+                indexes: "hnsw·3".to_owned(),
             }
         );
         assert_eq!(
@@ -1226,8 +1275,23 @@ mod tests {
             Aggregate {
                 collections: 0,
                 total_points: 0,
+                encrypted: 0,
+                indexes: String::new(),
             }
         );
+    }
+
+    #[test]
+    fn aggregate_counts_encryption_and_index_kinds() {
+        let mut a = collection("a", 1);
+        a.index = Some("disk_vamana".to_owned());
+        a.vector_encryption = Some("dcpe".to_owned());
+        let mut b = collection("b", 2);
+        b.index = Some("ivf".to_owned());
+        b.vector_encryption = Some("none".to_owned());
+        let agg = aggregate(&[a, b]);
+        assert_eq!(agg.encrypted, 1, "only the dcpe collection counts");
+        assert_eq!(agg.indexes, "disk·1 ivf·1", "disk_vamana is shortened");
     }
 
     #[test]
