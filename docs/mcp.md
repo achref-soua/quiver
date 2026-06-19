@@ -24,6 +24,7 @@ launched by an MCP-capable client (e.g. an agent runtime) as a subprocess.
 | Tool | Arguments | Purpose |
 |---|---|---|
 | `list_collections` | — | List collections |
+| `collection_info` | `collection` | Inspect one collection: dim, metric, index, filterable fields, multivector flag, vector-encryption mode, and live point count |
 | `create_collection` | `name`, `dim`, `metric` (`l2`\|`cosine`\|`dot`), `index` (`hnsw`\|`vamana`\|`disk_vamana`\|`ivf`), `pq_subspaces?`, `filterable?` (`[{path, field_type: keyword\|numeric}]`), `multivector?`, `vector_encryption?` (`none`\|`dcpe`\|`client_side`) | Create a collection (pick the index, incl. the memory-frugal `disk_vamana`; declare `filterable` fields for hybrid pre-filtered search; set `multivector` for late-interaction / ColBERT; set `vector_encryption` for client-side vector encryption — `dcpe` (experimental, server ranks, L2-only, ADR-0031) or `client_side` (semantically secure opaque AEAD, server does not rank, ADR-0032)) |
 | `upsert` | `collection`, `id`, `vector`, `payload?` | Insert/replace a point |
 | `search` | `collection`, `vector`, `k?`, `filter?` | k-NN with an optional payload filter |

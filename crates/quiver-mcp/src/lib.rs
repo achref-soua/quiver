@@ -8,8 +8,9 @@
 //! is separated from the stdio loop ([`serve`]) so it is unit-testable without
 //! real pipes.
 //!
-//! Tools: `list_collections`, `create_collection`, `upsert`, `search`, `get`,
-//! `delete`. The database is opened secure-by-default (encryption-at-rest on
+//! Tools: `list_collections`, `create_collection`, `collection_info`, `upsert`,
+//! `search`, `fetch`, `get`, `delete`, and the multi-vector document tools. The
+//! database is opened secure-by-default (encryption-at-rest on
 //! unless explicitly insecure) through the same envelope key-ring as the network
 //! server and `quiver admin`, so a data directory is interchangeable between them.
 
@@ -287,6 +288,27 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
                 format!("document '{doc_id}' was not present in '{collection}'")
             })
         }
+        "collection_info" => {
+            let collection = want_str(args, "collection")?;
+            let Some(descriptor) = db.descriptor(collection).cloned() else {
+                return Err(format!("collection '{collection}' not found"));
+            };
+            let count = if descriptor.multivector {
+                db.document_count(collection).map_err(|e| e.to_string())?
+            } else {
+                db.len(collection).map_err(|e| e.to_string())?
+            };
+            to_text(&json!({
+                "name": collection,
+                "dim": descriptor.dim,
+                "metric": serde_json::to_value(descriptor.metric).map_err(|e| e.to_string())?,
+                "index": serde_json::to_value(descriptor.index).map_err(|e| e.to_string())?,
+                "filterable": serde_json::to_value(&descriptor.filterable).map_err(|e| e.to_string())?,
+                "multivector": descriptor.multivector,
+                "vector_encryption": serde_json::to_value(descriptor.vector_encryption).map_err(|e| e.to_string())?,
+                "count": count,
+            }))
+        }
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -442,6 +464,15 @@ pub fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": { "collection": collection_arg, "id": { "type": "string" } },
                 "required": ["collection", "id"]
+            }
+        },
+        {
+            "name": "collection_info",
+            "description": "Inspect one collection: dimension, metric, index, declared filterable fields, multivector flag, vector-encryption mode, and live point count. Lets an agent reason about a collection's shape before upserting or searching.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "collection": collection_arg },
+                "required": ["collection"]
             }
         }
     ])
@@ -642,9 +673,42 @@ mod tests {
             "search",
             "get",
             "delete",
+            "collection_info",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
+    }
+
+    #[test]
+    fn collection_info_reports_shape_and_count() {
+        let (_t, mut db) = db();
+        call(
+            &mut db,
+            "create_collection",
+            json!({
+                "name": "kb", "dim": 3, "metric": "cosine", "index": "hnsw",
+                "filterable": [{"path": "lang", "field_type": "keyword"}]
+            }),
+        );
+        call(
+            &mut db,
+            "upsert",
+            json!({"collection":"kb","id":"a","vector":[1.0,0.0,0.0]}),
+        );
+        let resp = call(&mut db, "collection_info", json!({"collection":"kb"}));
+        assert_eq!(resp["result"]["isError"], false);
+        let info: Value = serde_json::from_str(&result_text(&resp)).unwrap();
+        assert_eq!(info["name"], "kb");
+        assert_eq!(info["dim"], 3);
+        assert_eq!(info["count"], 1);
+        assert_eq!(info["multivector"], false);
+        assert_eq!(info["filterable"][0]["path"], "lang");
+        // index + vector_encryption serialise to their snake_case strings.
+        assert_eq!(info["index"]["kind"], "hnsw");
+        assert_eq!(info["vector_encryption"], "none");
+        // An unknown collection is reported as an error result, not a panic.
+        let missing = call(&mut db, "collection_info", json!({"collection":"nope"}));
+        assert_eq!(missing["result"]["isError"], true);
     }
 
     #[test]
