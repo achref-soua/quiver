@@ -179,13 +179,29 @@ A **LangChain** `VectorStore` adapter ships in `quiver.langchain` (`pip install 
 
 **Client-side payload encryption** (ADR-0012): seal payload fields with a key the server never sees, so it stores and returns only ciphertext, while cleartext sibling fields stay server-filterable. The `PayloadCipher` helper ships in both SDKs (`quiver.encryption` / `quiver-client/encryption`) and a Rust reference (`quiver_crypto::payload`), sharing one XChaCha20-Poly1305 envelope byte-for-byte. The trust boundary is honest — it protects payloads, not vectors — and proven by a test that runs a server with at-rest encryption off and shows the sealed field never appears in plaintext over the API or on disk.
 
-An `ann-benchmarks`-style harness lives in [`bench/`](./bench). On **SIFT1M** (1M × 128, L2), in-memory HNSW (`M=16`, `efC=200`), recall@10 vs exact ground truth:
+An `ann-benchmarks`-style harness lives in [`bench/`](./bench). On **SIFT1M** (1M × 128, L2), in-memory HNSW (`M=16`, `efC=200`), Quiver's own recall ↔ throughput ↔ latency curve:
 
 | `ef_search` | 16 | 32 | 64 | 128 | 256 |
 |---|---|---|---|---|---|
 | **recall@10** | 0.794 | 0.898 | 0.960 | 0.987 | 0.996 |
+| **QPS** (1 thread) | 1150 | 1032 | 870 | 673 | 508 |
+| **p95 latency** (ms) | 1.1 | 1.2 | 1.5 | 1.9 | 2.7 |
 
-Recall is a property of the index and the data (host-independent), so these figures stand; reproduce with `cargo run --release --example sift_recall` ([details](./docs/benchmarks/results/sift1m.md)). **Throughput, memory (RSS — the headline metric), and the head-to-head vs Qdrant/LanceDB are reference-hardware-pending**: per the [methodology](./docs/benchmarks/methodology.md) those require identical dedicated hardware, this shared dev box is not a source for them, and we never fabricate.
+**Head-to-head on SIFT1M**, every system on the *same* box (i7-12700H · 20 threads · 15.5 GB), peak single-thread QPS at **recall@10 ≥ 0.95** (full method, sweeps, and the wins/losses matrix: [`comparison-v0.18.0`](./docs/benchmarks/results/comparison-v0.18.0/comparison-v0.18.0.md)):
+
+| System | recall@10 | QPS (1T) | p95 (ms) | RSS (MB) | build |
+|---|---:|---:|---:|---:|---:|
+| FAISS 1.14 | 0.968 | **2900** | 0.5 | 1234 ¹ | 110 s |
+| **Quiver v0.18** | 0.960 | **870** | **1.5** | 1617 | ≈14 min ² |
+| Chroma 1.5 | 0.977 | 743 | 2.1 | 3534 ¹ | 202 s |
+| Milvus 2.5 (server) | 0.987 | 522 | 2.8 | 1254 | 31 s |
+| Weaviate 1.27 | 0.983 | 506 | 2.6 | 2161 | 40 min |
+| Qdrant 1.13 | 0.993 | 337 | 5.7 | **259** ³ | 118 s |
+| LanceDB 0.33 | 0.557 ⁴ | 159 | 7.8 | 2255 ¹ | 19 s |
+
+Quiver is **second only to FAISS** on both throughput and tail latency at this recall bar, with recall on par with the field — a strong result for the in-memory path.
+
+The honesty that makes the table trustworthy: this is an **in-memory HNSW** comparison for *every* system, so RSS here is full-vectors-in-RAM — Quiver's memory-frugality wedge is its **disk-resident path** (only PQ codes resident; ~32× less RAM, see [`disk-path.md`](./docs/benchmarks/results/disk-path.md)), **not** this table. ¹ FAISS/Chroma/LanceDB run in-process so their RSS includes the Python harness + the resident 512 MB dataset (inflated; only Quiver/Milvus/Qdrant/Weaviate report the isolated DB). ² Quiver's "build" is the **REST-upload** path (1M batched POSTs); a bulk-ingest endpoint is a follow-up and it does not reflect engine speed. ³ Qdrant mmaps vectors to disk by default. ⁴ LanceDB's IVF-PQ config doesn't reach 0.95 recall in this sweep (shown at its best). Numbers are **dev-box, indicative** — comparative standings on the identical box are real (per the [methodology](./docs/benchmarks/methodology.md)); **absolute** RSS and the 10M disk path are reference-hardware-pending; we never fabricate. Milvus is benchmarked as the **server** (Docker), not the in-process Lite build.
 
 The per-collection **recall ↔ latency ↔ memory** knobs — quantizers (scalar/product/binary), the disk-resident DiskANN path, and IVF — are documented with a tradeoff table in [`docs/benchmarks/quantization-tradeoffs.md`](./docs/benchmarks/quantization-tradeoffs.md).
 

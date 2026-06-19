@@ -42,6 +42,39 @@ def native_rss_mb(pid: int | None = None) -> float | None:
         return None
 
 
+def pid_listening_on(port: int) -> int | None:
+    """Best-effort PID of the process LISTENing on TCP *port* on localhost.
+
+    Lets an adapter measure a separately-started server's RSS (e.g. the Quiver
+    daemon) rather than the client process. Uses psutil, falling back to ``ss``.
+    """
+    try:
+        import psutil  # type: ignore[import]
+
+        for conn in psutil.net_connections(kind="tcp"):
+            if (
+                conn.status == psutil.CONN_LISTEN
+                and conn.laddr
+                and conn.laddr.port == port
+                and conn.pid
+            ):
+                return conn.pid
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        out = subprocess.check_output(
+            ["ss", "-ltnp"], stderr=subprocess.DEVNULL, timeout=5
+        ).decode()
+        for line in out.splitlines():
+            if f":{port} " in line:
+                m = re.search(r"pid=(\d+)", line)
+                if m:
+                    return int(m.group(1))
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def docker_rss_mb(container: str) -> float | None:
     """Return RSS in MB for a running Docker *container* name/id.
 

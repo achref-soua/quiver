@@ -102,8 +102,13 @@ class QuiverAdapter(CompetitorAdapter):
         return [int(h.id) for h in hits]
 
     def sample_rss(self) -> float | None:
-        from ..rss import native_rss_mb
+        from urllib.parse import urlparse
 
-        # Sample our own process RSS (the Python client process).
-        # Quiver server RSS is harder to capture without its PID.
-        return native_rss_mb()
+        from ..rss import native_rss_mb, pid_listening_on
+
+        # Measure the Quiver *server* process (found by the port it listens on),
+        # not this Python client — the client holds the dataset and would report a
+        # meaningless figure for Quiver's headline memory metric.
+        port = urlparse(self._url).port or 6333
+        pid = pid_listening_on(port)
+        return native_rss_mb(pid) if pid is not None else None
