@@ -28,6 +28,7 @@ agent's memory is sealed on disk:
 | Tool | What it does |
 |---|---|
 | `list_collections` | Enumerate collections |
+| `collection_info` | Inspect one collection's shape — dim, metric, index, filterable fields, multivector, encryption, count |
 | `create_collection` | Create one (`dim`, `metric`, `index`, `filterable`, `multivector`, `vector_encryption`) |
 | `upsert` | Insert/replace a point (`id`, `vector`, `payload`) |
 | `search` | k-NN with an optional payload `filter` |
