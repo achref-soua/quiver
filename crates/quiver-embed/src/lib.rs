@@ -54,6 +54,7 @@ pub use quiver_core::{
     VectorEncryption,
 };
 pub use quiver_query::Filter;
+pub use quiver_query::{DEFAULT_RRF_K0, SPARSE_KEY, SparseVector, rrf_fuse};
 
 /// Errors returned by the embeddable database.
 #[derive(Debug, Error)]
@@ -157,6 +158,13 @@ impl Default for SearchParams {
 // How many extra candidates to pull before post-filtering, so a filtered query
 // still has enough survivors to fill `k`.
 const FILTER_OVERFETCH: usize = 8;
+
+// Hybrid search (ADR-0043) pulls `k * RRF_CANDIDATE_FACTOR` (at least
+// `MIN_RRF_CANDIDATES`) candidates from each side before Reciprocal Rank Fusion,
+// so a document ranked outside the top `k` on one side can still surface via the
+// other.
+const RRF_CANDIDATE_FACTOR: usize = 10;
+const MIN_RRF_CANDIDATES: usize = 100;
 
 // Selectivity threshold for the hybrid planner. When a payload filter decomposes
 // into secondary-index predicates that narrow a query to at most this many live
@@ -693,6 +701,175 @@ impl Database {
             });
         }
         Ok(out)
+    }
+
+    /// Hybrid search (ADR-0043): fuse a dense ANN ranking and a sparse
+    /// inverted-index ranking with Reciprocal Rank Fusion. Either query may be
+    /// `None` (giving pure dense or pure sparse search through the same path); at
+    /// least one is required. The same payload `filter` is re-checked on both
+    /// sides, so results stay exact. `rrf_k0` is the RRF rank-bias constant
+    /// ([`DEFAULT_RRF_K0`]).
+    pub fn hybrid_search(
+        &mut self,
+        collection: &str,
+        dense_query: Option<&[f32]>,
+        sparse_query: Option<&SparseVector>,
+        params: &SearchParams,
+        rrf_k0: f32,
+    ) -> Result<Vec<Match>> {
+        require_single_vector(self.handle(collection)?)?;
+        require_server_searchable(self.handle(collection)?)?;
+        if dense_query.is_none() && sparse_query.is_none() {
+            return Err(Error::Unsupported(
+                "hybrid_search requires a dense query, a sparse query, or both",
+            ));
+        }
+        if self.handle(collection)?.stale {
+            let store = &self.store;
+            let handle = self
+                .collections
+                .get_mut(collection)
+                .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+            rebuild_index(store, handle)?;
+        }
+        let handle = self.handle(collection)?;
+
+        // Pull a deep-enough candidate list from each side so the fusion is
+        // meaningful, then RRF down to `k`.
+        let depth = params
+            .k
+            .saturating_mul(RRF_CANDIDATE_FACTOR)
+            .max(MIN_RRF_CANDIDATES);
+        let filter = params.filter.as_ref();
+        let mut lists: Vec<Vec<String>> = Vec::new();
+        if let Some(q) = dense_query {
+            lists.push(self.dense_ranked_ids(handle, q, depth, params.ef_search, filter)?);
+        }
+        if let Some(sp) = sparse_query {
+            lists.push(self.sparse_ranked_ids(handle.id, sp, depth, filter)?);
+        }
+        let fused = rrf_fuse(&lists, rrf_k0, params.k);
+
+        let mut out = Vec::with_capacity(fused.len());
+        for (ext_id, score) in fused {
+            let record = if params.with_payload || params.with_vector {
+                self.store.get(handle.id, &ext_id)?
+            } else {
+                None
+            };
+            let payload = match (&record, params.with_payload) {
+                (Some(r), true) => Some(serde_json::from_slice(&r.payload)?),
+                _ => None,
+            };
+            out.push(Match {
+                id: ext_id,
+                score,
+                payload,
+                vector: if params.with_vector {
+                    record.map(|r| r.vector)
+                } else {
+                    None
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    // Dense candidates as a ranked list of external ids (the filter re-checked),
+    // for hybrid fusion.
+    fn dense_ranked_ids(
+        &self,
+        handle: &CollectionHandle,
+        query: &[f32],
+        depth: usize,
+        ef_search: usize,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<String>> {
+        let raw = handle.index.search(query, depth, ef_search.max(depth))?;
+        let mut ids = Vec::new();
+        for neighbor in raw {
+            let Some(ext_id) = handle.int_to_ext.get(neighbor.id as usize) else {
+                continue;
+            };
+            if !self.passes_filter(handle.id, ext_id, filter)? {
+                continue;
+            }
+            ids.push(ext_id.clone());
+            if ids.len() >= depth {
+                break;
+            }
+        }
+        Ok(ids)
+    }
+
+    // Sparse candidates as a ranked list of external ids: scan the live store,
+    // score each point's `__quiver_sparse__` vector by dot-product against the
+    // query, re-check the filter, and return the top `depth` by score. Scanning
+    // the store (rather than a cached index) keeps results correct under the
+    // incremental upsert/delete path (ADR-0026); a derived inverted index is a
+    // documented optimization follow-up (ADR-0043).
+    fn sparse_ranked_ids(
+        &self,
+        cid: CollectionId,
+        query: &SparseVector,
+        depth: usize,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<String>> {
+        let qmap: HashMap<u32, f32> = query
+            .indices
+            .iter()
+            .copied()
+            .zip(query.values.iter().copied())
+            .collect();
+        let mut scored: Vec<(f32, String)> = Vec::new();
+        for (ext_id, record) in self.store.scan(cid)? {
+            if record.payload.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(&record.payload) else {
+                continue;
+            };
+            if let Some(filter) = filter
+                && !filter.matches(&value)
+            {
+                continue;
+            }
+            let Some(raw) = value.get(SPARSE_KEY) else {
+                continue;
+            };
+            let Ok(sv) = serde_json::from_value::<SparseVector>(raw.clone()) else {
+                continue;
+            };
+            let mut score = 0.0f32;
+            for (dim, weight) in sv.indices.iter().zip(sv.values.iter()) {
+                if let Some(qw) = qmap.get(dim) {
+                    score += qw * weight;
+                }
+            }
+            if score > 0.0 {
+                scored.push((score, ext_id));
+            }
+        }
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        Ok(scored.into_iter().take(depth).map(|(_, id)| id).collect())
+    }
+
+    // Re-check a payload filter against a row (loading its payload). `None` filter
+    // always passes.
+    fn passes_filter(
+        &self,
+        cid: CollectionId,
+        ext_id: &str,
+        filter: Option<&Filter>,
+    ) -> Result<bool> {
+        let Some(filter) = filter else {
+            return Ok(true);
+        };
+        let value: Value = match self.store.get(cid, ext_id)? {
+            Some(r) => serde_json::from_slice(&r.payload)?,
+            None => Value::Null,
+        };
+        Ok(filter.matches(&value))
     }
 
     // Exactly score `candidates` (a superset of the filter's matches that the
@@ -1661,6 +1838,78 @@ mod tests {
 
     fn open(dir: &Path) -> Database {
         Database::open(dir).unwrap()
+    }
+
+    #[test]
+    fn hybrid_search_fuses_dense_and_sparse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("kb", desc()).unwrap();
+        // "a" is the nearest dense neighbour of the query; "b" shares the query's
+        // sparse terms; "c" is good on neither.
+        db.upsert(
+            "kb",
+            "a",
+            &[1.0, 0.0, 0.0, 0.0],
+            &json!({ "__quiver_sparse__": { "indices": [100], "values": [0.1] } }),
+        )
+        .unwrap();
+        db.upsert(
+            "kb",
+            "b",
+            &[0.0, 1.0, 0.0, 0.0],
+            &json!({ "__quiver_sparse__": { "indices": [1, 2], "values": [5.0, 5.0] } }),
+        )
+        .unwrap();
+        db.upsert(
+            "kb",
+            "c",
+            &[0.0, 0.0, 0.0, 1.0],
+            &json!({ "__quiver_sparse__": { "indices": [9], "values": [1.0] } }),
+        )
+        .unwrap();
+
+        let dense_q = [1.0, 0.0, 0.0, 0.0];
+        let sparse_q = SparseVector {
+            indices: vec![1, 2],
+            values: vec![1.0, 1.0],
+        };
+        let params = SearchParams {
+            k: 3,
+            ..SearchParams::default()
+        };
+
+        // Hybrid: "a" (dense) and "b" (sparse) both rank above "c" (neither).
+        let hits = db
+            .hybrid_search(
+                "kb",
+                Some(&dense_q),
+                Some(&sparse_q),
+                &params,
+                DEFAULT_RRF_K0,
+            )
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"a") && ids.contains(&"b"), "got {ids:?}");
+        assert_eq!(ids[2], "c", "c is worst on both sides; got {ids:?}");
+
+        // Pure sparse: only "b" shares the query's terms.
+        let sparse_only = db
+            .hybrid_search("kb", None, Some(&sparse_q), &params, DEFAULT_RRF_K0)
+            .unwrap();
+        assert_eq!(sparse_only[0].id, "b");
+
+        // Pure dense: "a" is nearest.
+        let dense_only = db
+            .hybrid_search("kb", Some(&dense_q), None, &params, DEFAULT_RRF_K0)
+            .unwrap();
+        assert_eq!(dense_only[0].id, "a");
+
+        // Neither query is an error.
+        assert!(
+            db.hybrid_search("kb", None, None, &params, DEFAULT_RRF_K0)
+                .is_err()
+        );
     }
 
     #[test]
