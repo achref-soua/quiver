@@ -113,6 +113,40 @@ coverage:
 release:
     cargo build --workspace --release
 
+# Build + upload release assets locally when hosted CI is unavailable
+# (e.g. the Actions billing lock — ADR-0044). Builds every target this machine's
+# toolchain supports, checksums each, and uploads them to the tag's *existing*
+# GitHub release. Linux→Windows needs the x86_64-pc-windows-gnu target + mingw
+# (`rustup target add x86_64-pc-windows-gnu` + `apt install gcc-mingw-w64-x86-64`).
+# Usage: just release-local v0.18.1
+release-local TAG:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tag="{{TAG}}"
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: TAG must look like v0.18.1"; exit 1; }
+    dist="$(mktemp -d)"; trap 'rm -rf "$dist"' EXIT
+    assets=()
+    build_one() {
+      local target="$1" asset="$2" bin="$3"
+      if ! rustup target list --installed | grep -qx "$target"; then
+        echo "  skip $asset — rust target $target not installed"; return; fi
+      echo "  building $asset ($target)…"
+      if ! cargo build --release -p quiver-cli --target "$target" >/dev/null 2>&1; then
+        echo "  skip $asset — build failed (missing linker/toolchain for $target)"; return; fi
+      cp "target/$target/release/$bin" "$dist/$asset"
+      ( cd "$dist" && sha256sum "$asset" > "$asset.sha256" )
+      assets+=("$dist/$asset" "$dist/$asset.sha256")
+      echo "  ✔ $asset"
+    }
+    build_one x86_64-unknown-linux-gnu  quiver-linux-x86_64       quiver
+    build_one aarch64-unknown-linux-gnu quiver-linux-aarch64      quiver
+    build_one x86_64-pc-windows-gnu     quiver-windows-x86_64.exe quiver.exe
+    if [[ ${#assets[@]} -eq 0 ]]; then echo "error: no targets could be built on this host"; exit 1; fi
+    cp docs/assets/icon/quiver-256.png "$dist/quiver-256.png"; assets+=("$dist/quiver-256.png")
+    echo "uploading to release $tag:"; printf '  %s\n' "${assets[@]##*/}"
+    gh release upload "$tag" "${assets[@]}" --clobber
+    echo "done — verify at https://github.com/achref-soua/quiver/releases/tag/$tag"
+
 # Build the container image.
 docker:
     docker build -f infra/docker/Dockerfile -t quiver:dev .

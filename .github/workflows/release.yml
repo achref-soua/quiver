@@ -1,10 +1,25 @@
-# Manual-only by design (ADR-0015): dispatched with a tag at a release boundary.
+# Release builds publish every supported platform binary automatically.
+#
+# Trigger: pushing a SemVer tag (`vMAJOR.MINOR.PATCH`) builds Linux (x86_64 +
+# aarch64), macOS (x86_64 + aarch64), and Windows (x86_64) binaries, each with a
+# SHA-256 checksum, then attaches them to the GitHub release for that tag. These
+# are exactly what `scripts/install.sh`, `install.ps1`, and `quiver update`
+# download — asset names must stay `quiver-<os>-<arch>[.exe]` + `.sha256` (the
+# names are derived in crates/quiver-cli/src/update.rs).
+#
+# `workflow_dispatch` is kept as a manual fallback to (re)build assets for an
+# existing tag without re-tagging. The manual-by-design stance for the *test*
+# gates still holds (ADR-0015); release publishing is automated on tag push
+# (ADR-0044).
 name: release
 on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.17.0)"
+        description: "Release tag to (re)build assets for (e.g. v0.18.1)"
         required: true
 
 permissions:
@@ -30,6 +45,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             asset_name: quiver-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: quiver-windows-x86_64.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -44,14 +62,16 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p quiver-cli --target ${{ matrix.target }}
 
-      - name: Rename binary
+      - name: Package binary + checksum
+        # Git Bash on the Windows runner provides cp + sha256sum, so one step
+        # covers every platform. The Windows binary embeds the icon via build.rs
+        # (winresource, ADR-0039); the .exe suffix is the only per-OS difference.
+        shell: bash
         run: |
-          cp target/${{ matrix.target }}/release/quiver ${{ matrix.asset_name }}
-
-      - name: Generate SHA-256 checksum
-        run: |
-          sha256sum ${{ matrix.asset_name }} > ${{ matrix.asset_name }}.sha256
-          # Windows binary icon is embedded via build.rs (ADR-0039); no extra step needed.
+          bin="quiver"
+          [[ "${{ matrix.asset_name }}" == *.exe ]] && bin="quiver.exe"
+          cp "target/${{ matrix.target }}/release/${bin}" "${{ matrix.asset_name }}"
+          sha256sum "${{ matrix.asset_name }}" > "${{ matrix.asset_name }}.sha256"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
@@ -81,13 +101,23 @@ jobs:
           format: spdx-json
           output-file: quiver.spdx.json
 
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        # Tag push → github.ref_name; manual dispatch → the supplied input.
+        # Passed through env (never interpolated into the script body) per the
+        # GitHub Actions injection-safety guidance.
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
       - name: List release assets
         run: ls -lh dist/
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag }}
+          tag_name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
           files: |
             dist/quiver-linux-x86_64
@@ -98,5 +128,7 @@ jobs:
             dist/quiver-macos-x86_64.sha256
             dist/quiver-macos-aarch64
             dist/quiver-macos-aarch64.sha256
+            dist/quiver-windows-x86_64.exe
+            dist/quiver-windows-x86_64.exe.sha256
             docs/assets/icon/quiver-256.png
             quiver.spdx.json
