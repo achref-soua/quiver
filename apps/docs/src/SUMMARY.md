@@ -8,6 +8,12 @@
 - [Quickstart](quickstart.md)
 - [Self-hosting & configuration](self-hosting.md)
 
+# Guides
+
+- [RAG with Quiver](guides/rag.md)
+- [Agentic patterns (MCP)](guides/agentic.md)
+- [Tuning for RAG](guides/tuning.md)
+
 # Features
 
 - [Indexing & memory frugality](features/indexing.md)

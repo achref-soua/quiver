@@ -175,7 +175,9 @@ await q.upsert("items", [{ id: "a", vector: [0.1, 0.2, 0.3], payload: { tag: "x"
 const hits = await q.search("items", [0.1, 0.2, 0.3], { k: 5 });
 ```
 
-A **LangChain** `VectorStore` adapter ships in `quiver.langchain` (`pip install "./sdks/python[langchain]"`), and a **LlamaIndex** `VectorStore` in `quiver.llamaindex` (`pip install "./sdks/python[llamaindex]"`) — so any Quiver index, including the memory-frugal disk path, backs a LangChain or LlamaIndex retriever. The LlamaIndex adapter maps `MetadataFilters` onto Quiver's hybrid pre-filter.
+A **LangChain** `VectorStore` adapter ships in `quiver.langchain` (`pip install "./sdks/python[langchain]"`), and a **LlamaIndex** `VectorStore` in `quiver.llamaindex` (`pip install "./sdks/python[llamaindex]"`) — so any Quiver index, including the memory-frugal disk path, backs a LangChain or LlamaIndex retriever. The LlamaIndex adapter maps `MetadataFilters` onto Quiver's hybrid pre-filter. A synchronous `Client` and an async `AsyncClient` share one contract, with batched-upsert/scan/delete-by-filter helpers for ingestion and erasure.
+
+**Using Quiver in RAG / agents.** End-to-end guides — [RAG](./apps/docs/src/guides/rag.md) (chunk → embed → filtered search → rerank → answer), [agentic patterns over MCP](./apps/docs/src/guides/agentic.md), and [tuning for RAG](./apps/docs/src/guides/tuning.md) (index/quantizer/recall-RAM) — plus a runnable [`examples/rag/quickstart.py`](./examples/rag/quickstart.py) that needs no API key.
 
 **Client-side payload encryption** (ADR-0012): seal payload fields with a key the server never sees, so it stores and returns only ciphertext, while cleartext sibling fields stay server-filterable. The `PayloadCipher` helper ships in both SDKs (`quiver.encryption` / `quiver-client/encryption`) and a Rust reference (`quiver_crypto::payload`), sharing one XChaCha20-Poly1305 envelope byte-for-byte. The trust boundary is honest — it protects payloads, not vectors — and proven by a test that runs a server with at-rest encryption off and shows the sealed field never appears in plaintext over the API or on disk.
 
