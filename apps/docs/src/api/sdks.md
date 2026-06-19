@@ -18,10 +18,14 @@ with Client("http://127.0.0.1:6333", api_key="…") as q:
     hits = q.search("items", [0.1, 0.2, 0.3], k=5)
 ```
 
-**LangChain** and **LlamaIndex** adapters ship as extras
-(`pip install "./sdks/python[langchain]"` / `[llamaindex]`), so any Quiver index —
-including the memory-frugal disk path — backs a retriever, with metadata filters
-mapped onto Quiver's hybrid pre-filter.
+**LangChain**, **LlamaIndex**, and **Haystack** adapters ship as extras
+(`pip install "./sdks/python[langchain]"` / `[llamaindex]` / `[haystack]`), so any
+Quiver index — including the memory-frugal disk path — backs a retriever or
+`DocumentStore`, with metadata filters mapped onto Quiver's exact pre-filter.
+
+A synchronous `Client` and an async `AsyncClient` share one contract (with
+`upsert_iter` / `scroll` / `delete_by_filter` helpers), and `quiver.rerank` is a
+model-agnostic helper for the retrieve → rerank step of a RAG pipeline.
 
 ## TypeScript
 
