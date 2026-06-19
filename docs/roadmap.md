@@ -2,6 +2,9 @@
 
 Quiver is built phase by phase. A phase is not "done" until its Definition of Done (DoD) is met, tested, documented, and merged. Each phase boundary opens a release PR `develop` → `main` and tags a SemVer release.
 
+> For a current capability / coherence / security / readiness snapshot and the gap matrix the
+> post-launch phases close against, see [State of Quiver](analysis/state-of-quiver-v0.17.md).
+
 ## Gates
 
 - **Plan gate** — the owner approves the build plan before any work. *(passed)*

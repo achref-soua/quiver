@@ -45,7 +45,7 @@ The screenshots are generated from the *real* render of seeded demo data with `j
 
 A Cargo workspace: a from-scratch storage engine, index structures, SIMD distance kernels, and query planner, with a thin gRPC/REST shell and a TUI client. One binary runs the server, the cockpit, and the MCP server.
 
-→ [System context](./docs/architecture/c4-context.md) · [Container view](./docs/architecture/c4-container.md) · [Overview & crate map](./docs/architecture/overview.md) · [ADRs](./docs/adr)
+→ [System context](./docs/architecture/c4-context.md) · [Container view](./docs/architecture/c4-container.md) · [Overview & crate map](./docs/architecture/overview.md) · [ADRs](./docs/adr) · [State of Quiver (assessment)](./docs/analysis/state-of-quiver-v0.17.md)
 
 ## Quickstart
 
