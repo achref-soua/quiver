@@ -93,11 +93,11 @@ bench-compare *ARGS:
 
 # Generate the comparison report from existing CSV results.
 #   just bench-report
-# Reads docs/benchmarks/results/comparison-v0.17.0/ and writes
-# docs/benchmarks/results/comparison-v0.17.0/comparison-v0.17.0.md
+# Reads docs/benchmarks/results/comparison-v0.18.0/ and writes
+# docs/benchmarks/results/comparison-v0.18.0/comparison-v0.18.0.md
 bench-report:
     uv run --project bench python -m quiver_bench.report \
-        docs/benchmarks/results/comparison-v0.17.0
+        docs/benchmarks/results/comparison-v0.18.0
 
 # Fuzz a parser target with cargo-fuzz (requires a nightly toolchain +
 # cargo-fuzz; see docs/security/fuzzing.md). Targets: filter_json, page_decode,

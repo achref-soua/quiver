@@ -127,9 +127,12 @@ def generate(result_dir: Path) -> str:
 
     lines: list[str] = []
 
+    # Version label derived from the result directory (e.g. comparison-v0.18.0).
+    version = result_dir.name.replace("comparison-", "") or "dev"
+
     # Header
     lines += [
-        "# Quiver v0.17.0 — Multi-DB Benchmark Comparison",
+        f"# Quiver {version} — Multi-DB Benchmark Comparison",
         "",
         f"_Generated: {datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_",
         "",
@@ -207,12 +210,15 @@ def generate(result_dir: Path) -> str:
                     "lancedb": "0.33.0",
                     "chroma": "1.5.9",
                     "milvus_lite": "3.0.0",
+                    "milvus_server": "v2.5.4 (server)",
                     "qdrant": "1.13.4",
                     "pgvector": "0.7/pg16",
                     "weaviate": "1.27.0",
                 }
                 ver = versions.get(comp_name, "?")
-                note = "[reference-hardware-pending]" if not is_smoke else "smoke only"
+                # Comparative numbers on the identical box are real (R6); only
+                # absolute RSS and the 10M disk path are VM-distorted (R5).
+                note = "smoke only" if is_smoke else "dev-box · indicative"
                 param = f"{row.get('param_name','ef')}={row.get('param_value','?')}"
                 lines.append(
                     f"| {comp_name} | {ver} "
@@ -257,21 +263,28 @@ def generate(result_dir: Path) -> str:
     lines += [
         "---",
         "",
-        "## Reference-hardware-pending figures",
+        "## How to read these numbers (honesty)",
         "",
-        "The following results require reproduction on dedicated, otherwise-idle hardware "
-        "(see [`docs/benchmarks/reference-hardware-runbook.md`](../reference-hardware-runbook.md), "
-        "§9 for the full multi-DB procedure):",
+        "This run is on a **resource-shared WSL2 dev box** (specs in the manifest above). Per the "
+        "risk register: comparisons run on the *identical* box under identical conditions are a fair, "
+        "real result (R6) — so the **recall, QPS, and latency standings above stand**. Two things a VM "
+        "distorts (R5) are **not** to be read as official headlines:",
         "",
-        "- **Quiver SIFT1M** — uploading 1M vectors through the REST API takes ~12 minutes "
-        "on this shared dev box; the comparison harness therefore skipped the Quiver SIFT1M run. "
-        "Real measured numbers (recall@10 vs QPS at `ef_search` 16–256, HNSW, L2) are in "
-        "[`docs/benchmarks/results/sift1m.md`](./sift1m.md) (single-DB harness, same methodology). "
-        "A full cross-competitor Quiver run at SIFT1M requires the reference hardware setup.",
-        "- **SIFT1M Docker competitors** (Qdrant, pgvector, Weaviate) — Docker API overhead "
-        "at 1M-vector scale requires a dedicated machine and is not run here.",
-        "- **GloVe-100** (cosine metric, ~1.2M vectors).",
-        "- **Deep10M** (disk-path, 10M vectors — the memory-frugality headline).",
+        "- **Absolute RSS.** Only the *isolated* systems are comparable: Quiver, Qdrant, Weaviate, and "
+        "Milvus **server** report the DB process/container RSS. FAISS, LanceDB, and Chroma run "
+        "in-process, so their RSS includes the Python harness **and the resident 512 MB dataset** — "
+        "inflated, not directly comparable. This SIFT1M table is an **in-memory HNSW** comparison for "
+        "every system; Quiver's memory-frugality wedge is its **disk-resident DiskVamana path** "
+        "(holds only PQ codes in RAM), measured separately in "
+        "[`docs/benchmarks/results/disk-path.md`](./disk-path.md) — not this table.",
+        "- **Build time.** Quiver's build is the **REST-upload** path (1M points in batched POSTs); "
+        "competitors using in-process or bulk insert are faster. A bulk-ingest endpoint is a known "
+        "follow-up; it does not reflect engine speed.",
+        "",
+        "Pending on dedicated, otherwise-idle reference hardware (runbook "
+        "[`§9`](../reference-hardware-runbook.md)): **GIST1M** (960-d), **Deep10M** (the disk-path "
+        "memory headline), and the official absolute-RSS table. Milvus is benchmarked as the **server** "
+        "(Docker), not the in-process Lite build, which is not performance-representative.",
         "",
     ]
 
@@ -281,7 +294,7 @@ def generate(result_dir: Path) -> str:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="quiver_bench.report")
     p.add_argument("result_dir", type=Path, nargs="?",
-                   default=Path("docs/benchmarks/results/comparison-v0.17.0"))
+                   default=Path("docs/benchmarks/results/comparison-v0.18.0"))
     args = p.parse_args(sys.argv[1:] if argv is None else argv)
 
     if not args.result_dir.exists():
@@ -289,7 +302,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     report = generate(args.result_dir)
-    out = args.result_dir / "comparison-v0.17.0.md"
+    # The report filename mirrors the result directory (e.g. comparison-v0.18.0.md).
+    out = args.result_dir / f"{args.result_dir.name}.md"
     out.write_text(report)
     print(f"Report written to {out}")
     return 0
