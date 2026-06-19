@@ -292,3 +292,43 @@ def test_multivector_documents_roundtrip():
     assert up_body["documents"][0]["vectors"] == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
     assert json.loads(search.calls.last.request.content)["query"] == [[0.0, 0.0, 1.0]]
     assert delete.calls.call_count == 1
+
+
+@respx.mock
+def test_upsert_iter_batches_and_reports_progress():
+    sizes: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        n = len(json.loads(request.content)["points"])
+        sizes.append(n)
+        return httpx.Response(200, json={"upserted": n})
+
+    respx.post(f"{BASE}/v1/collections/items/points").mock(side_effect=handler)
+    progress: list[int] = []
+    with Client(BASE) as q:
+        pts = [{"id": str(i), "vector": [float(i)]} for i in range(5)]
+        total = q.upsert_iter("items", pts, batch=2, on_progress=progress.append)
+    assert total == 5
+    assert sizes == [2, 2, 1]
+    assert progress == [2, 4, 5]
+
+
+@respx.mock
+def test_delete_by_filter_pages_until_empty():
+    fetch = respx.post(f"{BASE}/v1/collections/items/fetch").mock(
+        side_effect=[
+            httpx.Response(200, json={"points": [{"id": "a"}, {"id": "b"}]}),
+            httpx.Response(200, json={"points": [{"id": "c"}]}),
+        ]
+    )
+    delete = respx.delete(f"{BASE}/v1/collections/items/points").mock(
+        side_effect=[
+            httpx.Response(200, json={"deleted": 2}),
+            httpx.Response(200, json={"deleted": 1}),
+        ]
+    )
+    with Client(BASE) as q:
+        total = q.delete_by_filter("items", {"eq": {"field": "t", "value": 1}}, batch=2)
+    assert total == 3
+    assert fetch.call_count == 2
+    assert delete.call_count == 2
