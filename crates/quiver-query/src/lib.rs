@@ -15,6 +15,9 @@ use std::cmp::Ordering;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod sparse;
+pub use sparse::{DEFAULT_RRF_K0, SPARSE_KEY, SparseVector, rrf_fuse};
+
 /// A predicate over a point's JSON payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
