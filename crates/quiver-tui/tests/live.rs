@@ -36,6 +36,7 @@ async fn cockpit_reads_live_server_snapshot() {
         leader_url: None,
         leader_api_key: None,
         insecure: true,
+        limits: quiver_server::Limits::default(),
     };
     tokio::spawn(async move {
         let _ = serve(config, rest, grpc).await;

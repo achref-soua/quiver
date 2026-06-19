@@ -94,6 +94,7 @@ async fn server_cannot_read_client_encrypted_payload() {
         leader_url: None,
         leader_api_key: None,
         insecure: true,
+        limits: quiver_server::Limits::default(),
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

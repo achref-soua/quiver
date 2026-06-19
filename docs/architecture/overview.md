@@ -25,7 +25,7 @@ The core (storage, indexes, kernels, query planner, on-disk format, wire protoco
 | `quiver-query` | Query planner; hybrid filtered search (vector + metadata predicate + optional BM25); top-k merge & re-rank | — |
 | `quiver-proto` | Wire types: gRPC service (`tonic`/`prost`), REST DTOs, OpenAPI generation | `tonic`, `prost`, `serde` |
 | `quiver-embed` | Embeddable in-process database handle — the clean Rust API over core+index+query+crypto | — |
-| `quiver-server` | The daemon: `axum` REST + `tonic` gRPC, auth, RBAC, audit, rate limiting, config, observability | `axum`, `tonic`, `tokio`, `tracing` |
+| `quiver-server` | The daemon: `axum` REST + `tonic` gRPC, auth, RBAC, audit, query cost limits (ADR-0040), config, observability | `axum`, `tonic`, `tokio`, `tracing` |
 | `quiver-tui` | The `ratatui` cockpit (API client; works local or remote) | `ratatui`, `crossterm` |
 | `quiver-mcp` | MCP server exposing Quiver as agent tools | MCP SDK / `rmcp` |
 | `quiver-cli` | Single binary entrypoint: `serve`, `tui`, `mcp`, `admin`, `bench` | `clap` |
@@ -60,13 +60,13 @@ Domain logic lives in the lower crates (`core`/`index`/`query`/`crypto`); framew
 ## Operating modes
 
 - **Embedded library** — `quiver_embed::Database::open(path, config)?` gives an in-process handle: no network, no auth surface, encryption-at-rest still on. For tests, notebooks, and apps that want a local vector store.
-- **Server** — `quiver serve` exposes gRPC + REST with auth, RBAC, multi-tenant namespaces, audit, rate limiting, and observability. The TUI and MCP server are API clients of it.
+- **Server** — `quiver serve` exposes gRPC + REST with auth, RBAC, multi-tenant namespaces, audit, query cost limits (ADR-0040), and observability. The TUI and MCP server are API clients of it.
 
 Both ship in one static binary; `quiver-server` is a thin network/policy shell over `quiver-embed`.
 
 ## Request lifecycles
 
-**Write (upsert):** client → server (TLS terminate → authenticate → authorize scope → rate-limit → idempotency check) → `quiver-embed` → `quiver-core` appends a WAL record (encrypted, checksummed) and stages the vector + payload into the active segment → `quiver-index` inserts the vector into the live index → ack after WAL `fsync` (durability boundary). Payload secondary indexes updated transactionally with the segment.
+**Write (upsert):** client → server (TLS terminate → authenticate → authorize scope → cost-limit check → idempotency check) → `quiver-embed` → `quiver-core` appends a WAL record (encrypted, checksummed) and stages the vector + payload into the active segment → `quiver-index` inserts the vector into the live index → ack after WAL `fsync` (durability boundary). Payload secondary indexes updated transactionally with the segment.
 
 **Query (top-k + filter):** client → server (authn/z) → `quiver-query` plans the filter strategy (pre-filter via metadata bitmap when selective; post-filter otherwise) → `quiver-index` runs ANN search (HNSW/Vamana/IVF), using `quiver-simd` kernels on quantized vectors → candidate set re-ranked with exact distances against full-precision vectors fetched & decrypted from `quiver-core` → top-k assembled (payloads decrypted at rest; returned as-is if client-side-encrypted) → response with a cursor for pagination.
 

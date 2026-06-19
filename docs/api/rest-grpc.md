@@ -1,6 +1,6 @@
 # gRPC & REST Surface
 
-The concrete API. The gRPC service in `quiver-proto` is the source of truth; REST + OpenAPI 3.1 are generated to match (ADR-0018). Both run on the same `quiver-server` (gRPC on HTTP/2, REST on HTTP/1.1+2), behind the same auth, RBAC, rate-limit, and audit middleware.
+The concrete API. The gRPC service in `quiver-proto` is the source of truth; REST + OpenAPI 3.1 are generated to match (ADR-0018). Both run on the same `quiver-server` (gRPC on HTTP/2, REST on HTTP/1.1+2), behind the same auth, RBAC, cost-limit (ADR-0040), and audit middleware.
 
 ## gRPC service (representative sketch)
 
@@ -82,7 +82,7 @@ REST bodies are JSON; vectors are JSON arrays (or base64 for `int8`/`binary`). E
 
 - **Auth:** `Authorization: Bearer <api-key>` (REST) / metadata `authorization` (gRPC), or mTLS client cert. Default-deny; scopes checked per resource (ADR-0011).
 - **Idempotency:** `Idempotency-Key` header / field on all mutations (see [`wire-protocol.md`](wire-protocol.md)).
-- **Limits:** per-key/tenant rate limits and query cost caps (`k`, `ef`, result size, concurrency); `RateLimit-*` headers; `resource_exhausted` / HTTP 429 on breach.
+- **Limits:** query cost caps — `k`, `ef_search`, `fetch` limit, vector dimension, payload size, upsert batch size, and HTTP request body size (ADR-0040) — rejected with HTTP 400 / gRPC `InvalidArgument` when exceeded. Configure with `QUIVER_MAX_*` (see `.env.example`). Per-key/tenant rate limits (and `RateLimit-*` headers / 429) are a later phase.
 - **Pagination:** opaque `next_cursor` (forward-only).
 
 ## OpenAPI & SDKs

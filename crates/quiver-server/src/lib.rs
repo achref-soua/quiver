@@ -19,8 +19,10 @@
 //! — and a non-loopback bind requires it; setting a client CA additionally
 //! requires mutual TLS. Mutating and administrative operations, and every
 //! access-control denial, are recorded to an append-only audit log (ADR-0011,
-//! the `audit` module) when `audit_log` is set. Per-tenant engine partitioning
-//! and rate limiting are later phases. Design: `docs/api/rest-grpc.md`.
+//! the `audit` module) when `audit_log` is set. Per-request cost limits bound
+//! the work any single authenticated request can demand (ADR-0040, the
+//! [`Limits`] type); per-tenant engine partitioning and per-key rate limiting
+//! are later phases. Design: `docs/api/rest-grpc.md`.
 
 mod audit;
 mod auth;
@@ -57,6 +59,164 @@ pub use error::Error;
 
 use audit::{AuditLog, Outcome};
 use auth::Principal;
+
+/// Per-request cost limits (ADR-0040). Each cap bounds the work a single
+/// authenticated request can demand, so one oversized request cannot exhaust the
+/// node under the single-writer model (ADR-0006). Over-limit requests are
+/// **rejected** with HTTP 400 / gRPC `InvalidArgument` rather than silently
+/// clamped — a truncated `k` or `ef_search` would return surprising, lower-quality
+/// results with no signal. Defaults are generous; raise a cap with a `[limits]`
+/// table in `quiver.toml` or the matching `QUIVER_MAX_*` environment variable.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Limits {
+    /// Maximum `k` (top-k) for `search` / `search_multi_vector`.
+    pub max_k: usize,
+    /// Maximum search beam width (`ef_search`).
+    pub max_ef_search: usize,
+    /// Maximum `fetch` page size.
+    pub max_fetch_limit: usize,
+    /// Maximum vector dimension: the declared collection dimension at creation
+    /// and the length of any query vector (per token, for multi-vector).
+    pub max_vector_dim: usize,
+    /// Maximum serialized-JSON payload size per point, in bytes.
+    pub max_payload_bytes: usize,
+    /// Maximum number of points / documents in a single upsert request.
+    pub max_batch_size: usize,
+    /// Maximum HTTP request body size, in bytes (enforced by the REST layer via
+    /// axum's `DefaultBodyLimit`; gRPC is bounded by tonic's decode limit).
+    pub max_request_body_bytes: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_k: 10_000,
+            max_ef_search: 4_096,
+            max_fetch_limit: 10_000,
+            max_vector_dim: 8_192,
+            max_payload_bytes: 65_536,
+            max_batch_size: 1_000,
+            max_request_body_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+impl Limits {
+    // Apply `QUIVER_MAX_*` overrides after figment extraction (ADR-0013 env
+    // layer). The flat env keys do not nest under figment's `limits` table, so
+    // they are read explicitly here; a malformed value is a hard config error.
+    fn apply_env_overrides(&mut self) -> Result<(), Error> {
+        let slots: [(&str, &mut usize); 7] = [
+            ("QUIVER_MAX_K", &mut self.max_k),
+            ("QUIVER_MAX_EF_SEARCH", &mut self.max_ef_search),
+            ("QUIVER_MAX_FETCH_LIMIT", &mut self.max_fetch_limit),
+            ("QUIVER_MAX_VECTOR_DIM", &mut self.max_vector_dim),
+            ("QUIVER_MAX_PAYLOAD_BYTES", &mut self.max_payload_bytes),
+            ("QUIVER_MAX_BATCH_SIZE", &mut self.max_batch_size),
+            (
+                "QUIVER_MAX_REQUEST_BODY_BYTES",
+                &mut self.max_request_body_bytes,
+            ),
+        ];
+        for (key, slot) in slots {
+            if let Ok(raw) = std::env::var(key) {
+                *slot = raw.parse().map_err(|_| {
+                    Error::Config(format!("{key} must be a positive integer, got {raw:?}"))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    // Reject a zero cap (a `0` limit would refuse every request).
+    fn validate(&self) -> Result<(), Error> {
+        let named = [
+            ("max_k", self.max_k),
+            ("max_ef_search", self.max_ef_search),
+            ("max_fetch_limit", self.max_fetch_limit),
+            ("max_vector_dim", self.max_vector_dim),
+            ("max_payload_bytes", self.max_payload_bytes),
+            ("max_batch_size", self.max_batch_size),
+            ("max_request_body_bytes", self.max_request_body_bytes),
+        ];
+        if let Some((name, _)) = named.into_iter().find(|&(_, v)| v == 0) {
+            return Err(Error::Config(format!(
+                "limits.{name} must be greater than zero"
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_search(&self, k: usize, ef_search: usize) -> Result<(), Error> {
+        if k > self.max_k {
+            return Err(Error::BadRequest(format!(
+                "k ({k}) exceeds the maximum of {} (raise QUIVER_MAX_K)",
+                self.max_k
+            )));
+        }
+        if ef_search > self.max_ef_search {
+            return Err(Error::BadRequest(format!(
+                "ef_search ({ef_search}) exceeds the maximum of {} (raise QUIVER_MAX_EF_SEARCH)",
+                self.max_ef_search
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_fetch(&self, limit: usize) -> Result<(), Error> {
+        if limit > self.max_fetch_limit {
+            return Err(Error::BadRequest(format!(
+                "limit ({limit}) exceeds the maximum of {} (raise QUIVER_MAX_FETCH_LIMIT)",
+                self.max_fetch_limit
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_dim(&self, dim: usize) -> Result<(), Error> {
+        if dim > self.max_vector_dim {
+            return Err(Error::BadRequest(format!(
+                "dimension ({dim}) exceeds the maximum of {} (raise QUIVER_MAX_VECTOR_DIM)",
+                self.max_vector_dim
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_vector_len(&self, len: usize) -> Result<(), Error> {
+        if len > self.max_vector_dim {
+            return Err(Error::BadRequest(format!(
+                "vector length ({len}) exceeds the maximum of {} (raise QUIVER_MAX_VECTOR_DIM)",
+                self.max_vector_dim
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_batch(&self, n: usize) -> Result<(), Error> {
+        if n > self.max_batch_size {
+            return Err(Error::BadRequest(format!(
+                "batch of {n} exceeds the maximum of {} (raise QUIVER_MAX_BATCH_SIZE)",
+                self.max_batch_size
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_payload(&self, payload: &Value) -> Result<(), Error> {
+        let size = serde_json::to_vec(payload)
+            .map(|v| v.len())
+            .map_err(|e| Error::Internal(format!("payload serialization: {e}")))?;
+        if size > self.max_payload_bytes {
+            return Err(Error::BadRequest(format!(
+                "payload of {size} bytes exceeds the maximum of {} (raise QUIVER_MAX_PAYLOAD_BYTES)",
+                self.max_payload_bytes
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// Server configuration, layered defaults → `quiver.toml` → `QUIVER_*` env and
 /// validated at startup (ADR-0013).
@@ -122,6 +282,9 @@ pub struct Config {
     /// non-loopback bind without TLS). For local development only; never the
     /// default.
     pub insecure: bool,
+    /// Per-request cost limits (ADR-0040). Set with a `[limits]` table in
+    /// `quiver.toml` or the `QUIVER_MAX_*` environment variables.
+    pub limits: Limits,
 }
 
 impl Default for Config {
@@ -140,6 +303,7 @@ impl Default for Config {
             leader_url: None,
             leader_api_key: None,
             insecure: false,
+            limits: Limits::default(),
         }
     }
 }
@@ -148,11 +312,15 @@ impl Config {
     /// Load configuration from defaults, an optional `quiver.toml`, and
     /// `QUIVER_*` environment variables.
     pub fn load() -> Result<Self, Error> {
-        Figment::from(Serialized::defaults(Config::default()))
+        let mut config: Config = Figment::from(Serialized::defaults(Config::default()))
             .merge(Toml::file("quiver.toml"))
             .merge(Env::prefixed("QUIVER_"))
             .extract()
-            .map_err(|e| Error::Config(e.to_string()))
+            .map_err(|e| Error::Config(e.to_string()))?;
+        // The flat `QUIVER_MAX_*` env keys do not nest under the `limits` table
+        // figment builds, so apply them explicitly (ADR-0040).
+        config.limits.apply_env_overrides()?;
+        Ok(config)
     }
 
     /// Reject insecure configurations unless explicitly opted out (ADR-0013):
@@ -203,6 +371,8 @@ impl Config {
                     .to_owned(),
             ));
         }
+        // Reject a nonsensical cost limit (a `0` cap would refuse every request).
+        self.limits.validate()?;
         Ok(())
     }
 
@@ -272,6 +442,9 @@ pub(crate) struct AppState {
     // True on a replication follower: external writes are refused; the engine's
     // state is owned by the stream it applies from the leader (ADR-0030).
     read_only: bool,
+    // Per-request cost limits, enforced at this op layer so both transports are
+    // covered by one implementation (ADR-0040).
+    limits: Limits,
 }
 
 /// A collection's metadata.
@@ -426,6 +599,7 @@ impl AppState {
     ) -> Result<CollectionInfo, Error> {
         self.ensure_writable("create_collection")?;
         self.authorize(principal, Action::Admin, "create_collection", &name)?;
+        self.limits.check_dim(dim as usize)?;
         let descriptor = Descriptor::new(dim, Dtype::F32, metric)
             .with_index(index)
             .with_filterable(filterable.clone())
@@ -547,6 +721,11 @@ impl AppState {
     ) -> Result<u64, Error> {
         self.ensure_writable("upsert")?;
         self.authorize(principal, Action::Write, "upsert", &collection)?;
+        self.limits.check_batch(points.len())?;
+        for p in &points {
+            self.limits.check_vector_len(p.vector.len())?;
+            self.limits.check_payload(&p.payload)?;
+        }
         let resource = collection.clone();
         let result = self
             .run_blocking(move |db| {
@@ -628,6 +807,8 @@ impl AppState {
         with_vector: bool,
     ) -> Result<Vec<MatchOut>, Error> {
         self.authorize(principal, Action::Read, "search", &collection)?;
+        self.limits.check_search(k, ef_search)?;
+        self.limits.check_vector_len(vector.len())?;
         self.run_blocking(move |db| {
             let params = SearchParams {
                 k,
@@ -660,6 +841,7 @@ impl AppState {
         with_vector: bool,
     ) -> Result<Vec<MatchOut>, Error> {
         self.authorize(principal, Action::Read, "fetch", &collection)?;
+        self.limits.check_fetch(limit)?;
         self.run_blocking(move |db| {
             let matches = db.fetch(
                 &collection,
@@ -689,6 +871,13 @@ impl AppState {
     ) -> Result<u64, Error> {
         self.ensure_writable("upsert_documents")?;
         self.authorize(principal, Action::Write, "upsert_documents", &collection)?;
+        self.limits.check_batch(documents.len())?;
+        for doc in &documents {
+            self.limits.check_payload(&doc.payload)?;
+            for token in &doc.vectors {
+                self.limits.check_vector_len(token.len())?;
+            }
+        }
         let resource = collection.clone();
         let result = self
             .run_blocking(move |db| {
@@ -751,6 +940,10 @@ impl AppState {
         with_vector: bool,
     ) -> Result<Vec<DocumentMatchOut>, Error> {
         self.authorize(principal, Action::Read, "search_multi_vector", &collection)?;
+        self.limits.check_search(k, ef_search)?;
+        for token in &query {
+            self.limits.check_vector_len(token.len())?;
+        }
         self.run_blocking(move |db| {
             let params = SearchParams {
                 k,
@@ -822,6 +1015,7 @@ pub async fn serve(
         audit,
         replication_tx,
         read_only: config.leader_url.is_some(),
+        limits: config.limits,
     };
 
     // A follower continuously applies the leader's committed-op stream (ADR-0030).

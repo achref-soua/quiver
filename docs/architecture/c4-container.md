@@ -8,7 +8,7 @@ flowchart TB
 
   subgraph bin["quiver — single static binary"]
     api["<b>API layer</b><br/>axum REST + tonic gRPC<br/>(quiver-server / quiver-proto)"]
-    authz["<b>Policy</b><br/>auth · RBAC · audit ·<br/>rate-limit · idempotency<br/>(quiver-server)"]
+    authz["<b>Policy</b><br/>auth · RBAC · audit ·<br/>cost-limit · idempotency<br/>(quiver-server)"]
     embed["<b>DB handle</b><br/>(quiver-embed)"]
     query["<b>Query engine</b><br/>plan · filter · merge · re-rank<br/>(quiver-query)"]
     index["<b>Index engine</b><br/>HNSW · Vamana · IVF · quantization<br/>(quiver-index)"]
