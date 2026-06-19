@@ -60,6 +60,6 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0038](0038-batch-wal-upsert.md) | Batch WAL sync for upsert (build-time bottleneck fix) | Accepted | 5 |
 | [0039](0039-one-command-install.md) | One-command install and self-update (`quiver update`) | Proposed | 5 |
 | [0040](0040-query-cost-limits.md) | Query cost limits (caps on `k`, `ef_search`, dimension, payload, batch) | Accepted | 5 |
-| [0041](0041-deep-benchmark.md) | Deep, large-data benchmark dimensions (SIFT1M, concurrency, Pareto, quantization curve) | Proposed | 5 |
+| [0041](0041-deep-benchmark.md) | Deep, large-data benchmark dimensions (SIFT1M, concurrency, Pareto, quantization curve) | Accepted | 5 |
 
 Phase-0 ADRs (0001–0018) are Accepted; Phase-2 decisions span 0019–0022; Phase-4 decisions begin at 0023. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.

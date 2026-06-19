@@ -193,16 +193,16 @@ def generate(result_dir: Path) -> str:
             lines += [
                 f"### Operating point: recall@10 ≥ {RECALL_TARGET} (or best achieved)",
                 "",
-                "| Competitor | Version | recall@10 | QPS (1T) | RSS (MB) | Build (s) | Index (MB) | ef/nprobe | Notes |",
-                "|---|---|---|---|---|---|---|---|---|",
+                "| Competitor | Version | recall@10 | QPS (1T) | QPS (NT) | RSS (MB) | Build (s) | Index (MB) | ef/nprobe | Notes |",
+                "|---|---|---|---|---|---|---|---|---|---|",
             ]
             for comp_name, row in sorted(best_rows.items()):
                 if row is None:
-                    lines.append(f"| {comp_name} | — | error | — | — | — | — | — | failed |")
+                    lines.append(f"| {comp_name} | — | error | — | — | — | — | — | — | failed |")
                     continue
                 # Find the adapter version from the CSV (not stored — use a known map)
                 versions = {
-                    "quiver": "v0.17.0-dev",
+                    "quiver": "v0.18.0-dev",
                     "faiss": "1.14.3",
                     "lancedb": "0.33.0",
                     "chroma": "1.5.9",
@@ -218,6 +218,7 @@ def generate(result_dir: Path) -> str:
                     f"| {comp_name} | {ver} "
                     f"| {_fmt_or(row.get('recall_at_10'), '.4f')} "
                     f"| {_fmt_or(row.get('qps_1t'), '.0f')} "
+                    f"| {_fmt_or(row.get('qps_nt'), '.0f')} "
                     f"| {_fmt_or(row.get('rss_mb'), '.0f')} "
                     f"| {_fmt_or(row.get('build_s'), '.1f')} "
                     f"| {_fmt_or(row.get('index_disk_mb'), '.1f')} "

@@ -38,6 +38,9 @@ class BenchResult:
     # Query quality + throughput (mean over reps)
     recall_at_10: float = 0.0
     qps_1t: float = 0.0
+    # Saturated throughput from the concurrent driver (None = not measured).
+    qps_nt: float | None = None
+    concurrency: int = 1
     p50_ms: float = 0.0
     p95_ms: float = 0.0
     p99_ms: float = 0.0
@@ -97,6 +100,21 @@ class CompetitorAdapter(ABC):
         """Sample the system's current RSS in MB. Override in subclasses."""
         return None
 
+    def query_concurrent(
+        self, queries: "import numpy; numpy.ndarray", k: int, param: int, workers: int
+    ) -> float:
+        """Saturated QPS: run every query from a thread pool of ``workers`` and
+        return total queries / wall-clock seconds. Each adapter's ``query_one``
+        must be safe to call from multiple threads (HTTP clients and read-only
+        index search generally are; documented per adapter otherwise)."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda q: self.query_one(q, k, param), queries))
+        wall = time.perf_counter() - t0
+        return len(queries) / wall if wall > 0 else 0.0
+
     def query_sweep(
         self,
         queries: "import numpy; numpy.ndarray",
@@ -104,8 +122,13 @@ class CompetitorAdapter(ABC):
         k: int,
         params: Sequence[int],
         reps: int = 3,
+        concurrency: int = 1,
     ) -> list[BenchResult]:
-        """Run the full ef/nprobe sweep and return one BenchResult per param."""
+        """Run the full ef/nprobe sweep and return one BenchResult per param.
+
+        When ``concurrency > 1``, each operating point also gets a saturated-QPS
+        pass (``qps_nt``) from ``query_concurrent``; single-thread QPS is always
+        measured."""
         from ..metrics import mean_recall_at_k, percentile
 
         results = []
@@ -138,6 +161,12 @@ class CompetitorAdapter(ABC):
             recall_stdev = statistics.stdev(rep_recalls) if len(rep_recalls) > 1 else 0.0
             qps_stdev = statistics.stdev(rep_qps) if len(rep_qps) > 1 else 0.0
 
+            qps_nt = (
+                round(self.query_concurrent(queries, k, param, concurrency), 1)
+                if concurrency > 1
+                else None
+            )
+
             results.append(
                 BenchResult(
                     competitor=self.name,
@@ -147,6 +176,8 @@ class CompetitorAdapter(ABC):
                     rss_mb=rss,
                     recall_at_10=round(recall_mean, 4),
                     qps_1t=round(qps_mean, 1),
+                    qps_nt=qps_nt,
+                    concurrency=concurrency,
                     p50_ms=round(percentile(all_latencies, 50), 3),
                     p95_ms=round(percentile(all_latencies, 95), 3),
                     p99_ms=round(percentile(all_latencies, 99), 3),

@@ -45,6 +45,26 @@ Recall@10 is scored against the dataset's exact ground truth. Sweeping `ef`
 traces the recall–QPS curve. RSS (the memory headline) is captured separately on
 the reference host per the methodology.
 
+## Larger datasets and deeper dimensions (ADR-0041)
+
+The multi-DB comparison runner accepts larger datasets and a concurrent
+(saturated-QPS) pass:
+
+```bash
+# GIST1M (1M x 960, L2) — downloaded + cached on first use (~2.6 GB)
+uv run --project bench python -m quiver_bench.comparison \
+  --dataset gist1m --competitors all --concurrency 16 \
+  --out docs/benchmarks/results/comparison-v0.18.0
+
+# Deep1M (96-d, L2) runs only if you place deep_base.fvecs / deep_query.fvecs
+# (+ deep_groundtruth.ivecs) under bench/datasets/deep/ — it is never fabricated.
+```
+
+`--concurrency N` adds a saturated multi-thread QPS measurement (`qps_nt`)
+alongside single-thread QPS at each operating point. Comparative numbers on the
+identical box are publishable; absolute RSS and the 10M disk path stay
+reference-hardware-pending (see the methodology).
+
 ## Development
 
 ```bash
