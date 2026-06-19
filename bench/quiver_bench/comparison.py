@@ -42,6 +42,7 @@ def _all_adapters(quiver_url: str, quiver_key: str | None) -> dict[str, Competit
     from .competitors.faiss_adapter import FaissAdapter
     from .competitors.lancedb_adapter import LanceDBAdapter
     from .competitors.milvus_lite_adapter import MilvusLiteAdapter
+    from .competitors.milvus_server_adapter import MilvusServerAdapter
     from .competitors.pgvector_adapter import PgvectorAdapter
     from .competitors.qdrant_adapter import QdrantAdapter
     from .competitors.quiver_adapter import QuiverAdapter
@@ -53,6 +54,7 @@ def _all_adapters(quiver_url: str, quiver_key: str | None) -> dict[str, Competit
         "lancedb": LanceDBAdapter(),
         "chroma": ChromaAdapter(),
         "milvus_lite": MilvusLiteAdapter(),
+        "milvus_server": MilvusServerAdapter(),
         "qdrant": QdrantAdapter(),
         "pgvector": PgvectorAdapter(),
         "weaviate": WeaviateAdapter(),
