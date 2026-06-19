@@ -21,6 +21,7 @@ __all__ = [
     "Client",
     "Point",
     "Match",
+    "SparseVector",
     "CollectionInfo",
     "FilterableField",
     "QuiverError",
@@ -49,6 +50,16 @@ class Point:
     id: str
     vector: Sequence[float]
     payload: Optional[Any] = None
+
+
+@dataclass
+class SparseVector:
+    """A sparse query/point vector for hybrid search (ADR-0043): parallel
+    ``indices`` (dimension ids) and ``values`` (weights), e.g. from SPLADE/BGE-M3
+    or lexical term weights."""
+
+    indices: Sequence[int]
+    values: Sequence[float]
 
 
 @dataclass
@@ -257,6 +268,49 @@ class Client:
         if filter is not None:
             body["filter"] = filter
         matches = self._send("POST", f"/v1/collections/{collection}/query", body).json()["matches"]
+        return [
+            Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
+            for m in matches
+        ]
+
+    def hybrid_search(
+        self,
+        collection: str,
+        *,
+        vector: Optional[Sequence[float]] = None,
+        sparse: Optional[SparseVector] = None,
+        k: int = 10,
+        filter: Optional[Mapping[str, Any]] = None,
+        ef_search: int = 64,
+        rrf_k0: float = 60.0,
+        with_payload: bool = True,
+        with_vector: bool = False,
+    ) -> list[Match]:
+        """Hybrid (dense + sparse) search, fused by Reciprocal Rank Fusion (ADR-0043).
+
+        Provide a dense ``vector``, a ``sparse`` vector, or both (at least one is
+        required). The same payload ``filter`` is applied to both sides; ``rrf_k0``
+        is the RRF rank-bias constant. Returns matches ordered most-relevant-first.
+        """
+        if vector is None and sparse is None:
+            raise ValueError("hybrid_search requires a dense vector, a sparse vector, or both")
+        body: dict[str, Any] = {
+            "k": k,
+            "ef_search": ef_search,
+            "rrf_k0": rrf_k0,
+            "with_payload": with_payload,
+            "with_vector": with_vector,
+        }
+        if vector is not None:
+            body["vector"] = list(vector)
+        if sparse is not None:
+            body["sparse_indices"] = [int(i) for i in sparse.indices]
+            body["sparse_values"] = [float(v) for v in sparse.values]
+        if filter is not None:
+            body["filter"] = filter
+        matches = self._send(
+            "POST", f"/v1/collections/{collection}/query/hybrid", body
+        ).json()["matches"]
         return [
             Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
             for m in matches

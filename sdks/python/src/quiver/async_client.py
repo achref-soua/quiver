@@ -25,6 +25,7 @@ from .client import (
     Match,
     PointInput,
     QuiverError,
+    SparseVector,
     _client_side_score,
     _collection,
     _document_dict,
@@ -164,6 +165,44 @@ class AsyncClient:
         if filter is not None:
             body["filter"] = filter
         resp = await self._send("POST", f"/v1/collections/{collection}/query", body)
+        return [
+            Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
+            for m in resp.json()["matches"]
+        ]
+
+    async def hybrid_search(
+        self,
+        collection: str,
+        *,
+        vector: Optional[Sequence[float]] = None,
+        sparse: Optional[SparseVector] = None,
+        k: int = 10,
+        filter: Optional[Mapping[str, Any]] = None,
+        ef_search: int = 64,
+        rrf_k0: float = 60.0,
+        with_payload: bool = True,
+        with_vector: bool = False,
+    ) -> list[Match]:
+        """Hybrid (dense + sparse) search fused by Reciprocal Rank Fusion (ADR-0043).
+
+        Provide a dense ``vector``, a ``sparse`` vector, or both (≥1 required)."""
+        if vector is None and sparse is None:
+            raise ValueError("hybrid_search requires a dense vector, a sparse vector, or both")
+        body: dict[str, Any] = {
+            "k": k,
+            "ef_search": ef_search,
+            "rrf_k0": rrf_k0,
+            "with_payload": with_payload,
+            "with_vector": with_vector,
+        }
+        if vector is not None:
+            body["vector"] = list(vector)
+        if sparse is not None:
+            body["sparse_indices"] = [int(i) for i in sparse.indices]
+            body["sparse_values"] = [float(v) for v in sparse.values]
+        if filter is not None:
+            body["filter"] = filter
+        resp = await self._send("POST", f"/v1/collections/{collection}/query/hybrid", body)
         return [
             Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
             for m in resp.json()["matches"]

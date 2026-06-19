@@ -50,7 +50,7 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use quiver_crypto::AeadCodec;
 use quiver_embed::{
     Database, Descriptor, DistanceMetric, Dtype, FilterableField, IndexSpec, SearchParams,
-    VectorEncryption, WalEntry, WalOp,
+    SparseVector, VectorEncryption, WalEntry, WalOp,
 };
 use quiver_query::Filter;
 
@@ -86,6 +86,9 @@ pub struct Limits {
     /// Maximum HTTP request body size, in bytes (enforced by the REST layer via
     /// axum's `DefaultBodyLimit`; gRPC is bounded by tonic's decode limit).
     pub max_request_body_bytes: usize,
+    /// Maximum number of non-zero terms in a hybrid-search sparse query (ADR-0043),
+    /// bounding the posting-list scan.
+    pub max_sparse_terms: usize,
 }
 
 impl Default for Limits {
@@ -98,6 +101,7 @@ impl Default for Limits {
             max_payload_bytes: 65_536,
             max_batch_size: 1_000,
             max_request_body_bytes: 32 * 1024 * 1024,
+            max_sparse_terms: 4_096,
         }
     }
 }
@@ -107,7 +111,7 @@ impl Limits {
     // layer). The flat env keys do not nest under figment's `limits` table, so
     // they are read explicitly here; a malformed value is a hard config error.
     fn apply_env_overrides(&mut self) -> Result<(), Error> {
-        let slots: [(&str, &mut usize); 7] = [
+        let slots: [(&str, &mut usize); 8] = [
             ("QUIVER_MAX_K", &mut self.max_k),
             ("QUIVER_MAX_EF_SEARCH", &mut self.max_ef_search),
             ("QUIVER_MAX_FETCH_LIMIT", &mut self.max_fetch_limit),
@@ -118,6 +122,7 @@ impl Limits {
                 "QUIVER_MAX_REQUEST_BODY_BYTES",
                 &mut self.max_request_body_bytes,
             ),
+            ("QUIVER_MAX_SPARSE_TERMS", &mut self.max_sparse_terms),
         ];
         for (key, slot) in slots {
             if let Ok(raw) = std::env::var(key) {
@@ -139,6 +144,7 @@ impl Limits {
             ("max_payload_bytes", self.max_payload_bytes),
             ("max_batch_size", self.max_batch_size),
             ("max_request_body_bytes", self.max_request_body_bytes),
+            ("max_sparse_terms", self.max_sparse_terms),
         ];
         if let Some((name, _)) = named.into_iter().find(|&(_, v)| v == 0) {
             return Err(Error::Config(format!(
@@ -159,6 +165,16 @@ impl Limits {
             return Err(Error::BadRequest(format!(
                 "ef_search ({ef_search}) exceeds the maximum of {} (raise QUIVER_MAX_EF_SEARCH)",
                 self.max_ef_search
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_sparse_terms(&self, n: usize) -> Result<(), Error> {
+        if n > self.max_sparse_terms {
+            return Err(Error::BadRequest(format!(
+                "sparse query has {n} terms, exceeding the maximum of {} (raise QUIVER_MAX_SPARSE_TERMS)",
+                self.max_sparse_terms
             )));
         }
         Ok(())
@@ -818,6 +834,59 @@ impl AppState {
                 with_vector,
             };
             let matches = db.search(&collection, &vector, &params)?;
+            Ok(matches
+                .into_iter()
+                .map(|m| MatchOut {
+                    id: m.id,
+                    score: m.score,
+                    payload: m.payload,
+                    vector: m.vector,
+                })
+                .collect())
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn hybrid_search(
+        &self,
+        principal: &Principal,
+        collection: String,
+        dense: Option<Vec<f32>>,
+        sparse: Option<(Vec<u32>, Vec<f32>)>,
+        k: usize,
+        filter: Option<Filter>,
+        ef_search: usize,
+        rrf_k0: f32,
+        with_payload: bool,
+        with_vector: bool,
+    ) -> Result<Vec<MatchOut>, Error> {
+        self.authorize(principal, Action::Read, "hybrid_search", &collection)?;
+        self.limits.check_search(k, ef_search)?;
+        if let Some(v) = &dense {
+            self.limits.check_vector_len(v.len())?;
+        }
+        if let Some((indices, values)) = &sparse {
+            self.limits.check_sparse_terms(indices.len())?;
+            if indices.len() != values.len() {
+                return Err(Error::BadRequest(format!(
+                    "sparse query indices ({}) and values ({}) length mismatch",
+                    indices.len(),
+                    values.len()
+                )));
+            }
+        }
+        self.run_blocking(move |db| {
+            let params = SearchParams {
+                k,
+                filter,
+                ef_search,
+                with_payload,
+                with_vector,
+            };
+            let sv = sparse.map(|(indices, values)| SparseVector { indices, values });
+            let matches =
+                db.hybrid_search(&collection, dense.as_deref(), sv.as_ref(), &params, rrf_k0)?;
             Ok(matches
                 .into_iter()
                 .map(|m| MatchOut {

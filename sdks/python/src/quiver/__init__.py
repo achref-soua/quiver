@@ -20,6 +20,7 @@ from .client import (
     Match,
     Point,
     QuiverError,
+    SparseVector,
 )
 from .async_client import AsyncClient
 from .dcpe import DcpeCipher, DcpeError, EncryptedVector
@@ -39,6 +40,7 @@ __all__ = [
     "AsyncClient",
     "Point",
     "Match",
+    "SparseVector",
     "Document",
     "DocumentMatch",
     "CollectionInfo",

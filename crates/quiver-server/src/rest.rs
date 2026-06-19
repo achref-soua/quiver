@@ -42,6 +42,7 @@ pub(crate) fn router(state: AppState) -> Router {
         )
         .route("/v1/collections/{name}/points/{id}", get(get_point))
         .route("/v1/collections/{name}/query", post(search))
+        .route("/v1/collections/{name}/query/hybrid", post(hybrid_search))
         .route("/v1/collections/{name}/fetch", post(fetch))
         .route(
             "/v1/collections/{name}/documents",
@@ -488,6 +489,69 @@ async fn search(
             body.k,
             body.filter,
             body.ef_search,
+            body.with_payload,
+            body.with_vector,
+        )
+        .await?;
+    Ok(Json(SearchResponse {
+        matches: matches.into_iter().map(MatchDto::from).collect(),
+    }))
+}
+
+fn default_rrf_k0() -> f32 {
+    quiver_embed::DEFAULT_RRF_K0
+}
+
+#[derive(Deserialize)]
+struct HybridSearchBody {
+    /// Dense query vector (omit for pure-sparse search).
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+    /// Sparse query vector — parallel `sparse_indices` / `sparse_values` (omit for
+    /// pure-dense search). At least one of `vector` / `sparse_indices` is required.
+    #[serde(default)]
+    sparse_indices: Option<Vec<u32>>,
+    #[serde(default)]
+    sparse_values: Option<Vec<f32>>,
+    #[serde(default = "default_k")]
+    k: usize,
+    #[serde(default)]
+    filter: Option<Filter>,
+    #[serde(default = "default_ef")]
+    ef_search: usize,
+    #[serde(default = "default_rrf_k0")]
+    rrf_k0: f32,
+    #[serde(default = "default_true")]
+    with_payload: bool,
+    #[serde(default)]
+    with_vector: bool,
+}
+
+async fn hybrid_search(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(name): Path<String>,
+    Json(body): Json<HybridSearchBody>,
+) -> Result<Json<SearchResponse>, Error> {
+    let sparse = match (body.sparse_indices, body.sparse_values) {
+        (Some(indices), Some(values)) => Some((indices, values)),
+        (None, None) => None,
+        _ => {
+            return Err(Error::BadRequest(
+                "sparse_indices and sparse_values must be provided together".to_owned(),
+            ));
+        }
+    };
+    let matches = state
+        .hybrid_search(
+            &principal,
+            name,
+            body.vector,
+            sparse,
+            body.k,
+            body.filter,
+            body.ef_search,
+            body.rrf_k0,
             body.with_payload,
             body.with_vector,
         )

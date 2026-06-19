@@ -113,6 +113,14 @@ Then hand the assembled context plus the question to your LLM as grounding. For
 paragraph/token-level retrieval (ColBERT-style late interaction), see
 [multi-vector](../features/multi-vector.md).
 
+## Hybrid retrieval
+
+For queries with rare terms, exact matches, or out-of-domain phrasing, fuse the
+dense embedding with a **sparse** signal (SPLADE/BGE-M3 or lexical weights) via
+`hybrid_search` — see **[Hybrid search](../features/hybrid-search.md)**. Store the
+sparse vector under `__quiver_sparse__` and pass both to the query; Quiver fuses
+the two rankings with Reciprocal Rank Fusion.
+
 ## Where to go next
 
 - **[Tuning for RAG](tuning.md)** — choosing the index and quantizer for your

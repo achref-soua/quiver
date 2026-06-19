@@ -101,3 +101,22 @@ def test_async_client_exported():
     from quiver import AsyncClient as AC
 
     assert AC is AsyncClient
+
+
+@respx.mock
+def test_async_hybrid_search_sparse_only():
+    from quiver import SparseVector
+
+    route = respx.post(f"{BASE}/v1/collections/kb/query/hybrid").mock(
+        return_value=httpx.Response(200, json={"matches": [{"id": "b", "score": 1.0}]})
+    )
+
+    async def run():
+        async with AsyncClient(BASE) as q:
+            return await q.hybrid_search("kb", sparse=SparseVector(indices=[1], values=[1.0]), k=3)
+
+    hits = asyncio.run(run())
+    assert hits[0].id == "b"
+    body = json.loads(route.calls.last.request.content)
+    assert "vector" not in body
+    assert body["sparse_indices"] == [1]
