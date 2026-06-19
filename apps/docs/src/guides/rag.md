@@ -97,16 +97,20 @@ context = "\n\n".join(h.payload["text"] for h in hits)
 ## 5. Rerank (optional) and answer
 
 `search` already returns exact-reranked nearest neighbours. For higher precision,
-re-score the top-k with a cross-encoder before trimming to the few chunks you
-feed the LLM:
+over-fetch and re-score the top-k with a cross-encoder before trimming to the few
+chunks you feed the LLM. The `quiver.rerank` helper handles the extract → score →
+sort → truncate step (you bring the scorer):
 
 ```python
 # pip install sentence-transformers
 from sentence_transformers import CrossEncoder
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-scored = sorted(zip(reranker.predict([(question, h.payload["text"]) for h in hits]), hits),
-                key=lambda p: p[0], reverse=True)
-top = [h for _, h in scored[:4]]
+from quiver import rerank
+
+ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+hits = q.search("kb", embed(question), k=50)          # over-fetch
+top = rerank(question, hits, lambda query, texts: ce.predict([(query, t) for t in texts]),
+             key="text", top_k=4)                      # best-first RerankResults
+context = "\n\n".join(r.match.payload["text"] for r in top)
 ```
 
 Then hand the assembled context plus the question to your LLM as grounding. For

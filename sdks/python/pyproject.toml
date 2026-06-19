@@ -22,6 +22,9 @@ langchain = ["langchain-core>=1.0"]
 # The LlamaIndex VectorStore adapter (quiver.llamaindex). Install with
 # `pip install quiver-client[llamaindex]`.
 llamaindex = ["llama-index-core>=0.11"]
+# The Haystack DocumentStore + retriever (quiver.haystack). Install with
+# `pip install quiver-client[haystack]`.
+haystack = ["haystack-ai>=2.0"]
 
 [project.urls]
 Repository = "https://github.com/achref-soua/quiver"
@@ -41,6 +44,7 @@ dev = [
     "cryptography>=42",
     "langchain-core>=1.0",
     "llama-index-core>=0.11",
+    "haystack-ai>=2.0",
 ]
 
 [tool.pytest.ini_options]

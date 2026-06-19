@@ -23,6 +23,7 @@ from .client import (
     SparseVector,
 )
 from .async_client import AsyncClient
+from .rerank import RerankResult, rerank
 from .dcpe import DcpeCipher, DcpeError, EncryptedVector
 from .encryption import ENVELOPE_KEY, PayloadCipher, PayloadError, is_sealed
 from .vector import (
@@ -41,6 +42,8 @@ __all__ = [
     "Point",
     "Match",
     "SparseVector",
+    "rerank",
+    "RerankResult",
     "Document",
     "DocumentMatch",
     "CollectionInfo",
