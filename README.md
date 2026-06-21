@@ -155,7 +155,7 @@ All developer tasks run through [`just`](./justfile):
 | `just coverage` | HTML coverage report |
 | `just docker` | build the container image |
 
-CI workflows exist under [`.github/workflows`](.github/workflows) but are **manual-only** (`workflow_dispatch`) by design — the authoritative gate is local `just verify` ([ADR-0015](./docs/adr/0015-ci-policy.md)).
+The `ci` (fmt · clippy · test · doc) and `security` (deny · audit · gitleaks) workflows under [`.github/workflows`](.github/workflows) run automatically on every pull request and on pushes to `main`/`develop`; the heavier `build` workflow stays manual (`workflow_dispatch`). Local `just verify` runs the same steps as the fast pre-commit gate, so the two never drift ([ADR-0015](./docs/adr/0015-ci-policy.md)).
 
 ## SDK & benchmarks
 

@@ -14,13 +14,13 @@ just verify                   # must pass before you push
 
 ## The quality gate
 
-CI workflows under `.github/workflows` are **manual-only** (`workflow_dispatch`) by design ([ADR-0015](./docs/adr/0015-ci-policy.md)) — they do not run automatically on push or PR. The authoritative gate is therefore **local**:
+The `ci` and `security` workflows under `.github/workflows` run automatically on every pull request and on pushes to `main`/`develop` ([ADR-0015](./docs/adr/0015-ci-policy.md)); the heavier `build` workflow stays manual (`workflow_dispatch`). Run the same checks **locally** as your fast pre-commit gate:
 
 ```bash
 just verify   # cargo fmt --check · clippy -D warnings · test · doc · cargo deny · cargo audit
 ```
 
-Run it before every push. The manual workflows run the same steps, so there is no drift.
+Run it before every push. CI runs the same steps, so there is no drift.
 
 ## Workflow
 
