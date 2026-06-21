@@ -41,6 +41,12 @@ Press `v`/`enter` on a collection for the **constellation view** — a 2-D proje
 
 The screenshots are generated from the *real* render of seeded demo data with `just tui-shots` (a dev-only, workspace-isolated tool), so they regenerate in one command and never go stale ([ADR-0036](./docs/adr/0036-retro-cockpit-design-system.md)).
 
+## 📖 Field guide — *Quiver, Explained*
+
+A complete, **beginner-to-expert** walkthrough of how Quiver works — embeddings and approximate-nearest-neighbour search from first principles, the engine block by block (SIMD kernels, HNSW / Vamana-DiskANN / IVF, quantization, hybrid search), durability and the `kill -9` crash gate, the security model (envelope encryption, crypto-shredding, encrypted vectors), and the benchmark results with the verdict on Quiver's value. Written for people who know nothing about vector databases *and* engineers who want the depth — illustrated with diagrams and charts, typeset in the Bronze Quiver theme.
+
+> **→ [Read the PDF field guide](./docs/quiver-explained.pdf)** &nbsp;·&nbsp; 33 pages, fully illustrated &nbsp;·&nbsp; also available as [Markdown](./docs/quiver-explained.md)
+
 ## Architecture
 
 A Cargo workspace: a from-scratch storage engine, index structures, SIMD distance kernels, and query planner, with a thin gRPC/REST shell and a TUI client. One binary runs the server, the cockpit, and the MCP server.
