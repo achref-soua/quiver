@@ -1,10 +1,19 @@
-# Manual-only by design (ADR-0015). Mirrors the `just deny` / `just audit` gate.
+# Runs automatically on pull requests and on pushes to main/develop, with a
+# manual `workflow_dispatch` fallback. Mirrors the `just deny` / `just audit`
+# gate (ADR-0015).
 name: security
 on:
+  pull_request:
+  push:
+    branches: [main, develop]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   supply-chain:

@@ -1,24 +1,26 @@
-# ADR-0015: CI policy — manual-only workflows + local verify gate
+# ADR-0015: CI policy — automatic PR checks + local verify gate
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-06-22)
 - **Date:** 2026-06-13
 - **Deciders:** Achref Soua
 
 ## Context
 
-The project ships complete CI/CD workflows (build, test, lint, fuzz, benchmark, security scan, release) as evidence of engineering competence. However, for this repository we deliberately do not want workflows consuming Actions minutes or sending automated email on every push/PR. We still need an authoritative, reproducible quality gate.
+The project ships complete CI/CD workflows (build, test, lint, fuzz, benchmark, security scan, release) as evidence of engineering competence. Originally — while the account's Actions were billing-constrained — we deliberately ran nothing automatically and relied solely on a local gate. The repository is now public (Actions minutes are free for public repositories), so running the gates automatically on every PR costs nothing and gives reviewers real status checks. We still want one authoritative, reproducible gate that does not drift from CI.
 
 ## Decision
 
-- **All** GitHub Actions workflows are triggered by **`on: workflow_dispatch` only** — no `push`, `pull_request`, or `schedule` triggers.
-- The **authoritative gate is local**: `just verify` runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, the full test suite, `cargo audit`, `cargo deny check`, and a docs build. It is run before every merge.
-- `CONTRIBUTING.md` documents that workflows are manual by design and that `just verify` is the gate.
+- The **correctness gates run automatically**: `ci` (fmt · clippy · test · doc) and `security` (cargo-deny · cargo-audit · gitleaks) trigger on **`pull_request`** and on **`push` to `main`/`develop`**, with `workflow_dispatch` kept as a manual fallback.
+- The **heavy `build` workflow** (release binary + Docker image build/scan) stays **`workflow_dispatch`-only** — it is an artifact check, not a correctness gate, and is too slow to run per PR.
+- **`release`** is **tag-triggered** (`v*.*.*`) plus `workflow_dispatch` (ADR-0044).
+- The **local `just verify`** (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, the full test suite, `cargo audit`, `cargo deny check`, docs build) remains the **fast pre-commit gate** and runs the *same* steps as CI, so the two never drift.
 
 ## Consequences
 
-- **+** Zero ambient CI cost/noise; the workflows still exist, are correct, and can be dispatched on demand.
-- **−** Branch protection cannot require *green CI status checks* (nothing runs automatically on a PR). Protection is therefore configured as **PR-required + no-direct-push + linear-history + no-force-push/deletions**, without required status checks. Reviewers rely on the documented, reproducible local gate.
-- Contributors must run `just verify` locally; the `justfile` makes this a single command, and the same steps are what the manual workflows run, so there is no drift.
+- **+** Every PR gets real, green/red status checks; reviewers no longer have to take the local gate on faith. Zero cost on the public repo.
+- **+** Branch protection *can* now require green CI status checks (the `ci` and `security` jobs) in addition to PR-required + no-direct-push + linear-history + no-force-push/deletions. Enabling required checks is a follow-up ruleset change.
+- **−** Some redundancy between the local gate and CI — accepted, because the local gate is the fast feedback loop and CI is the enforced source of truth.
+- Concurrency groups cancel superseded in-progress runs so a busy PR does not pile up jobs.
 
 ## Alternatives considered
 

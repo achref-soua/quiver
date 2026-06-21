@@ -1,10 +1,19 @@
-# Manual-only by design (ADR-0015): the authoritative gate is local `just verify`.
+# Runs automatically on pull requests and on pushes to main/develop, with a
+# manual `workflow_dispatch` fallback. Mirrors the local `just verify` gate,
+# which stays the fast pre-commit check (ADR-0015).
 name: ci
 on:
+  pull_request:
+  push:
+    branches: [main, develop]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
