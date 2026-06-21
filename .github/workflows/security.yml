@@ -21,6 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gitleaks diffs the PR/push commit range, so it needs full history
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
