@@ -58,13 +58,20 @@ pub(crate) fn router(state: AppState) -> Router {
         )
         .route("/v1/snapshot", post(snapshot))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
+        // Outermost so it times the whole request, including a 401/429; runs after
+        // routing, so the matched-path template is available (ADR-0054).
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_metrics,
+        ))
         .layer(DefaultBodyLimit::max(max_body))
-        .with_state(state);
+        .with_state(state.clone());
 
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        .layer(Extension(state.metrics.clone()))
         .merge(api)
 }
 
@@ -90,7 +97,10 @@ async fn auth(State(state): State<AppState>, mut request: Request, next: Next) -
                     RateDecision::Limited {
                         retry_after_secs,
                         limit,
-                    } => return rate_limited_response(retry_after_secs, limit),
+                    } => {
+                        state.metrics.incr_rate_limited();
+                        return rate_limited_response(retry_after_secs, limit);
+                    }
                     RateDecision::Allowed(s) => Some(s),
                 }
             } else {
@@ -104,6 +114,7 @@ async fn auth(State(state): State<AppState>, mut request: Request, next: Next) -
             response
         }
         None => {
+            state.metrics.incr_auth_failure();
             let body = json!({
                 "type": "about:blank",
                 "title": "Unauthorized",
@@ -155,10 +166,26 @@ async fn readyz() -> &'static str {
     "ready"
 }
 
-async fn metrics() -> &'static str {
-    // A Prometheus exposition endpoint is wired with the observability work;
-    // for now this is a stable, scrapable placeholder.
-    "# quiver metrics\n"
+async fn metrics(Extension(metrics): Extension<std::sync::Arc<crate::metrics::Metrics>>) -> String {
+    metrics.render()
+}
+
+/// Time every routed request and record it by `(method, matched-route-template,
+/// status)` into the metrics registry (ADR-0054). The matched template — not the
+/// concrete path — is the label, so it is bounded and never leaks ids.
+async fn record_metrics(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let method = request.method().as_str().to_owned();
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_else(|| request.uri().path().to_owned());
+    let start = std::time::Instant::now();
+    let response = next.run(request).await;
+    state
+        .metrics
+        .observe_request(&method, &route, response.status().as_u16(), start.elapsed());
+    response
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]

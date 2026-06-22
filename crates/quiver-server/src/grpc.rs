@@ -44,10 +44,10 @@ impl QuiverService {
                     .or_else(|| value.strip_prefix("bearer "))
                     .unwrap_or(value)
             });
-        let principal = self
-            .state
-            .authenticate(presented)
-            .ok_or_else(|| Status::unauthenticated("missing or invalid API key"))?;
+        let principal = self.state.authenticate(presented).ok_or_else(|| {
+            self.state.metrics.incr_auth_failure();
+            Status::unauthenticated("missing or invalid API key")
+        })?;
         // Per-key rate limit (ADR-0049), enforced at the single auth choke point so
         // every RPC is covered. gRPC has no RateLimit header; the status is the
         // signal (with the retry delay in its message).
@@ -56,6 +56,7 @@ impl QuiverService {
                 retry_after_secs, ..
             } = self.state.rate_limit(principal.actor())
         {
+            self.state.metrics.incr_rate_limited();
             return Err(Status::resource_exhausted(format!(
                 "rate limit exceeded for this API key; retry after {retry_after_secs}s"
             )));
