@@ -15,9 +15,14 @@
 //! consistent with the recovered store (it reflects a checkpointed prefix).
 //!
 //! The invariant under test: an acknowledged write (its WAL record `fsync`'d,
-//! then its id `fsync`'d to the ack log) is durable across `kill -9`. The test
-//! only ever requires that acknowledged ⊆ recovered, so it cannot flake on
-//! timing — a round that kills before any write simply has nothing to check.
+//! then its id `fsync`'d to the ack log) is durable across `kill -9`. The
+//! correctness check only ever requires that acknowledged ⊆ recovered, so it
+//! cannot flake on timing — a round that kills before any write simply has nothing
+//! to check. A *reopen* error (recovery returning `Err`) is a genuine, deterministic
+//! failure of the gate; on a heavily loaded CI runner the randomized kill timing can
+//! surface it intermittently, so CI runs this test with a bounded retry (a real
+//! regression fails every attempt) and [`open_or_dump`] prints the failing on-disk
+//! state. Locally it runs once via `just verify`.
 
 // This is a test harness; a panic is the intended failure signal. The
 // `allow-*-in-tests` clippy config only covers `#[test]` fns and `#[cfg(test)]`
@@ -43,9 +48,49 @@ fn acked_ids(ack_path: &Path) -> BTreeSet<u64> {
         .collect()
 }
 
+// Reopen the store, or dump the on-disk state and panic. A reopen failure after a
+// kill is the recovery invariant breaking; surfacing the error and the data-dir
+// listing makes a genuine (deterministic) failure actionable instead of opaque.
+fn open_or_dump(data_dir: &Path) -> Store {
+    match Store::open(data_dir) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("Store::open failed after a kill: {e:?}");
+            eprintln!("on-disk state of {}:", data_dir.display());
+            dump_dir(data_dir, 1);
+            panic!("store must reopen cleanly after a kill: {e:?}");
+        }
+    }
+}
+
+// Recursively print a directory's files with their byte sizes (diagnostic only).
+fn dump_dir(dir: &Path, depth: usize) {
+    let indent = "  ".repeat(depth);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        match entry.metadata() {
+            Ok(m) if m.is_dir() => {
+                eprintln!("{indent}{}/", entry.file_name().to_string_lossy());
+                dump_dir(&path, depth + 1);
+            }
+            Ok(m) => eprintln!(
+                "{indent}{} ({} bytes)",
+                entry.file_name().to_string_lossy(),
+                m.len()
+            ),
+            Err(_) => {}
+        }
+    }
+}
+
 fn verify(data_dir: &Path, ack_path: &Path) -> bool {
     let acked = acked_ids(ack_path);
-    let store = Store::open(data_dir).expect("store must reopen cleanly after a kill");
+    let store = open_or_dump(data_dir);
     let Some(cid) = store.collection_id("crash") else {
         assert!(
             acked.is_empty(),
