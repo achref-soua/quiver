@@ -4,20 +4,22 @@
 //! Turns text into term ids so a tokenized string *is* a [`SparseVector`] whose
 //! values are term frequencies, reusing the sparse machinery of ADR-0043/0045. The
 //! pipeline is deterministic — Unicode-aware splitting on non-alphanumeric
-//! boundaries, lowercasing, a small English stop-word filter, and a **light plural
-//! stemmer** — so the same text always produces the same terms, and ingest and
-//! query tokenize identically.
+//! boundaries, lowercasing, a small English stop-word filter, and **Snowball
+//! (Porter2) stemming** — so the same text always produces the same terms, and
+//! ingest and query tokenize identically.
 //!
-//! Two deliberate, documented ceilings (each with a clean upgrade path):
+//! The stemmer is the Snowball English (Porter2) algorithm via `rust-stemmers`
+//! (ADR-0048), which conflates morphological variants — `connection` /
+//! `connected` / `connecting` → `connect`, `ponies` → `poni` — so a query term
+//! matches inflected document terms. Because ingest and query share the same
+//! stemmer the conflation is consistent on both sides. (It superseded the original
+//! dependency-free plural-only S-stemmer of ADR-0046, behind the same [`tokens`]
+//! seam.)
 //!
-//! - The stemmer is a consistency-only plural normalizer (an S-stemmer variant),
-//!   *not* a full Snowball/Porter implementation. It conflates `cats`→`cat`,
-//!   `boxes`→`box`, `ponies`→`pony`; it is not linguistically exact, but because
-//!   ingest and query share it, conflation is consistent. Swap in `rust-stemmers`
-//!   behind [`tokens`] if a measured retrieval gain justifies the dependency.
-//! - Term ids are a 32-bit FNV-1a hash of the token, so distinct tokens can in
-//!   principle collide. For realistic vocabularies this is negligible (and
-//!   learned-sparse vocabularies already collide by construction).
+//! One remaining, documented ceiling: term ids are a 32-bit FNV-1a hash of the
+//! token, so distinct tokens can in principle collide. For realistic vocabularies
+//! this is negligible (and learned-sparse vocabularies already collide by
+//! construction).
 
 use std::collections::HashMap;
 
@@ -75,7 +77,7 @@ fn push_term(out: &mut Vec<String>, raw: &str) {
     if STOP_WORDS.contains(&raw) {
         return;
     }
-    let stemmed = stem_plural(raw);
+    let stemmed = stem(raw);
     // Re-check the stop list after stemming (e.g. a stemmed form could land on one).
     if stemmed.is_empty() || STOP_WORDS.contains(&stemmed.as_str()) {
         return;
@@ -83,23 +85,19 @@ fn push_term(out: &mut Vec<String>, raw: &str) {
     out.push(stemmed);
 }
 
-// A light, consistency-only plural stemmer (ADR-0046). Not linguistically exact;
-// it conflates common plurals with their singular so query and document terms
-// match. Only applied to tokens long enough that stripping is safe.
-fn stem_plural(token: &str) -> String {
-    let len = token.len();
-    if token.ends_with("ies") && len > 4 {
-        // ponies -> pony, berries -> berry
-        format!("{}y", &token[..len - 3])
-    } else if token.ends_with("es") && len > 3 {
-        // boxes -> box, dishes -> dish
-        token[..len - 2].to_owned()
-    } else if token.ends_with('s') && !token.ends_with("ss") && !token.ends_with("us") && len > 3 {
-        // cats -> cat
-        token[..len - 1].to_owned()
-    } else {
-        token.to_owned()
-    }
+thread_local! {
+    // The Snowball (Porter2) English stemmer (ADR-0048). `Stemmer` holds no
+    // per-call state and `stem` is a pure function; we cache one per thread to
+    // avoid re-creating it on every token. Stemming is the seam ADR-0046 reserved.
+    static STEMMER: rust_stemmers::Stemmer =
+        rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English);
+}
+
+// Reduce a token to its Snowball (Porter2) stem so morphological variants conflate
+// (`connection`/`connected`/`connecting` → `connect`, `ponies` → `poni`). Ingest
+// and query share this, so the conflation is consistent on both sides (ADR-0048).
+fn stem(token: &str) -> String {
+    STEMMER.with(|s| s.stem(token).into_owned())
 }
 
 /// Tokenize `text` into a term-frequency [`SparseVector`]: dimension ids are token
@@ -156,18 +154,20 @@ mod tests {
     }
 
     #[test]
-    fn plural_stemmer_conflates_consistently() {
-        assert_eq!(stem_plural("cats"), "cat");
-        assert_eq!(stem_plural("boxes"), "box");
-        assert_eq!(stem_plural("ponies"), "pony");
-        // Guards: short words and -ss/-us are left alone.
-        assert_eq!(stem_plural("is"), "is");
-        assert_eq!(stem_plural("class"), "class");
-        assert_eq!(stem_plural("bus"), "bus");
-        assert_eq!(stem_plural("cat"), "cat");
-        // Query and document forms conflate.
+    fn snowball_stemmer_conflates_morphological_variants() {
+        // Plurals and verb inflections reduce to a shared stem (ADR-0048).
+        assert_eq!(stem("cats"), "cat");
+        assert_eq!(stem("connecting"), "connect");
+        assert_eq!(stem("connected"), "connect");
+        assert_eq!(stem("connection"), "connect");
+        // A root is left at (or near) itself, never emptied.
+        assert_eq!(stem("cat"), "cat");
+        assert!(!stem("is").is_empty());
+        // The point of stemming: query and document forms conflate to one term, so
+        // a search for "connect" matches a document about "connections".
+        assert_eq!(tokens("connections")[0], tokens("connect")[0]);
+        assert_eq!(tokens("running")[0], tokens("run")[0]);
         assert_eq!(tokens("cats")[0], tokens("cat")[0]);
-        assert_eq!(tokens("boxes")[0], tokens("box")[0]);
     }
 
     #[test]
