@@ -89,6 +89,11 @@ pub struct Limits {
     /// Maximum number of non-zero terms in a hybrid-search sparse query (ADR-0043),
     /// bounding the posting-list scan.
     pub max_sparse_terms: usize,
+    /// Maximum number of points in a single bulk upsert (`POST …/points:bulk`,
+    /// ADR-0045). Larger than `max_batch_size` because the bulk path defers index
+    /// maintenance to one rebuild; the request is still bounded by
+    /// `max_request_body_bytes`, so raise that too for very large bulk loads.
+    pub max_bulk_batch_size: usize,
 }
 
 impl Default for Limits {
@@ -102,6 +107,7 @@ impl Default for Limits {
             max_batch_size: 1_000,
             max_request_body_bytes: 32 * 1024 * 1024,
             max_sparse_terms: 4_096,
+            max_bulk_batch_size: 50_000,
         }
     }
 }
@@ -111,7 +117,7 @@ impl Limits {
     // layer). The flat env keys do not nest under figment's `limits` table, so
     // they are read explicitly here; a malformed value is a hard config error.
     fn apply_env_overrides(&mut self) -> Result<(), Error> {
-        let slots: [(&str, &mut usize); 8] = [
+        let slots: [(&str, &mut usize); 9] = [
             ("QUIVER_MAX_K", &mut self.max_k),
             ("QUIVER_MAX_EF_SEARCH", &mut self.max_ef_search),
             ("QUIVER_MAX_FETCH_LIMIT", &mut self.max_fetch_limit),
@@ -123,6 +129,7 @@ impl Limits {
                 &mut self.max_request_body_bytes,
             ),
             ("QUIVER_MAX_SPARSE_TERMS", &mut self.max_sparse_terms),
+            ("QUIVER_MAX_BULK_BATCH_SIZE", &mut self.max_bulk_batch_size),
         ];
         for (key, slot) in slots {
             if let Ok(raw) = std::env::var(key) {
@@ -145,6 +152,7 @@ impl Limits {
             ("max_batch_size", self.max_batch_size),
             ("max_request_body_bytes", self.max_request_body_bytes),
             ("max_sparse_terms", self.max_sparse_terms),
+            ("max_bulk_batch_size", self.max_bulk_batch_size),
         ];
         if let Some((name, _)) = named.into_iter().find(|&(_, v)| v == 0) {
             return Err(Error::Config(format!(
@@ -215,6 +223,16 @@ impl Limits {
             return Err(Error::BadRequest(format!(
                 "batch of {n} exceeds the maximum of {} (raise QUIVER_MAX_BATCH_SIZE)",
                 self.max_batch_size
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_bulk_batch(&self, n: usize) -> Result<(), Error> {
+        if n > self.max_bulk_batch_size {
+            return Err(Error::BadRequest(format!(
+                "bulk batch of {n} exceeds the maximum of {} (raise QUIVER_MAX_BULK_BATCH_SIZE)",
+                self.max_bulk_batch_size
             )));
         }
         Ok(())
@@ -754,6 +772,40 @@ impl AppState {
             .await;
         self.audit
             .record(principal.actor(), "upsert", &resource, Outcome::of(&result));
+        result
+    }
+
+    // Bulk upsert for a load-then-query workload (ADR-0045): one WAL fsync plus a
+    // single deferred index-build pass, with the larger `max_bulk_batch_size` cap.
+    pub(crate) async fn upsert_bulk(
+        &self,
+        principal: &Principal,
+        collection: String,
+        points: Vec<PointIn>,
+    ) -> Result<u64, Error> {
+        self.ensure_writable("upsert")?;
+        self.authorize(principal, Action::Write, "upsert", &collection)?;
+        self.limits.check_bulk_batch(points.len())?;
+        for p in &points {
+            self.limits.check_vector_len(p.vector.len())?;
+            self.limits.check_payload(&p.payload)?;
+        }
+        let resource = collection.clone();
+        let result = self
+            .run_blocking(move |db| {
+                let records: Vec<(&str, &[f32], &serde_json::Value)> = points
+                    .iter()
+                    .map(|p| (p.id.as_str(), p.vector.as_slice(), &p.payload))
+                    .collect();
+                db.upsert_bulk(&collection, &records)
+            })
+            .await;
+        self.audit.record(
+            principal.actor(),
+            "upsert_bulk",
+            &resource,
+            Outcome::of(&result),
+        );
         result
     }
 

@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod sparse;
+pub mod sparse_index;
 pub use sparse::{DEFAULT_RRF_K0, SPARSE_KEY, SparseVector, rrf_fuse};
+pub use sparse_index::SparseInvertedIndex;
 
 /// A predicate over a point's JSON payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
