@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use quiver_proto::v1::{self, quiver_client::QuiverClient};
 use quiver_server::{Config, serve};
 use tokio::net::TcpListener;
 
@@ -113,6 +114,113 @@ async fn hybrid_search_over_rest_fuses_dense_and_sparse() {
         .await
         .unwrap();
     assert_eq!(empty.status(), 400);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn hybrid_search_over_grpc_fuses_dense_and_sparse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rest_addr = rest_listener.local_addr().unwrap();
+    let grpc_addr = grpc_listener.local_addr().unwrap();
+    let config = Config {
+        data_dir: tmp.path().to_path_buf(),
+        rest_addr,
+        grpc_addr,
+        insecure: true,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move {
+        let _ = serve(config, rest_listener, grpc_listener).await;
+    });
+    let http = reqwest::Client::new();
+    let base = format!("http://{rest_addr}");
+    wait_ready(&http, &base).await;
+
+    // Seed the same collection over REST (create + upsert with sparse payloads).
+    http.post(format!("{base}/v1/collections"))
+        .json(&serde_json::json!({"name": "kb", "dim": 4, "metric": "l2"}))
+        .send()
+        .await
+        .unwrap();
+    http.post(format!("{base}/v1/collections/kb/points"))
+        .json(&serde_json::json!({"points": [
+            {"id": "a", "vector": [1.0, 0.0, 0.0, 0.0], "payload": {"__quiver_sparse__": {"indices": [100], "values": [0.1]}}},
+            {"id": "b", "vector": [0.0, 1.0, 0.0, 0.0], "payload": {"__quiver_sparse__": {"indices": [1, 2], "values": [5.0, 5.0]}}},
+            {"id": "c", "vector": [0.0, 0.0, 0.0, 1.0], "payload": {"__quiver_sparse__": {"indices": [9], "values": [1.0]}}}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+
+    let mut client = QuiverClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .unwrap();
+
+    // Hybrid over gRPC: "a" (dense) and "b" (sparse) rank above "c".
+    let resp = client
+        .hybrid_search(tonic::Request::new(v1::HybridSearchRequest {
+            collection: "kb".to_owned(),
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            sparse: Some(v1::SparseVector {
+                indices: vec![1, 2],
+                values: vec![1.0, 1.0],
+            }),
+            filter: Vec::new(),
+            k: 3,
+            ef_search: 0,
+            rrf_k0: 0.0,
+            with_payload: false,
+            with_vector: false,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let ids: Vec<String> = resp.matches.iter().map(|m| m.id.clone()).collect();
+    assert!(
+        ids.contains(&"a".to_owned()) && ids.contains(&"b".to_owned()),
+        "got {ids:?}"
+    );
+    assert_eq!(ids.last().unwrap(), "c", "c matches neither; got {ids:?}");
+
+    // Pure sparse over gRPC: only "b" shares the query's terms.
+    let sparse_only = client
+        .hybrid_search(tonic::Request::new(v1::HybridSearchRequest {
+            collection: "kb".to_owned(),
+            vector: Vec::new(),
+            sparse: Some(v1::SparseVector {
+                indices: vec![1, 2],
+                values: vec![1.0, 1.0],
+            }),
+            filter: Vec::new(),
+            k: 3,
+            ef_search: 0,
+            rrf_k0: 0.0,
+            with_payload: false,
+            with_vector: false,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(sparse_only.matches[0].id, "b");
+
+    // Neither query is an error.
+    let empty = client
+        .hybrid_search(tonic::Request::new(v1::HybridSearchRequest {
+            collection: "kb".to_owned(),
+            vector: Vec::new(),
+            sparse: None,
+            filter: Vec::new(),
+            k: 3,
+            ef_search: 0,
+            rrf_k0: 0.0,
+            with_payload: false,
+            with_vector: false,
+        }))
+        .await;
+    assert!(empty.is_err(), "neither dense nor sparse must be an error");
 
     server.abort();
 }
