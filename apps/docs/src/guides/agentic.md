@@ -29,7 +29,10 @@ agent's memory is sealed on disk:
 |---|---|
 | `list_collections` | Enumerate collections |
 | `collection_info` | Inspect one collection's shape — dim, metric, index, filterable fields, multivector, encryption, count |
+| `database_stats` | A whole-database overview in one call — collection count, total points, a per-collection summary, and snapshot status (`manifest_version`, `disk_bytes`) |
 | `create_collection` | Create one (`dim`, `metric`, `index`, `filterable`, `multivector`, `vector_encryption`) |
+| `delete_collection` | Drop an entire collection and all its points (reports whether it existed) |
+| `snapshot` | Take a consistent online backup of the whole database into a server-local directory (ADR-0050) |
 | `upsert` | Insert/replace a point (`id`, `vector`, `payload`) |
 | `search` | k-NN with an optional payload `filter` |
 | `fetch` | List points by filter without ranking |

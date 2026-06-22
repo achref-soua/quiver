@@ -176,6 +176,7 @@ class AsyncClient:
         *,
         vector: Optional[Sequence[float]] = None,
         sparse: Optional[SparseVector] = None,
+        query_text: Optional[str] = None,
         k: int = 10,
         filter: Optional[Mapping[str, Any]] = None,
         ef_search: int = 64,
@@ -183,11 +184,14 @@ class AsyncClient:
         with_payload: bool = True,
         with_vector: bool = False,
     ) -> list[Match]:
-        """Hybrid (dense + sparse) search fused by Reciprocal Rank Fusion (ADR-0043).
+        """Hybrid search fused by Reciprocal Rank Fusion (ADR-0043/0046).
 
-        Provide a dense ``vector``, a ``sparse`` vector, or both (≥1 required)."""
-        if vector is None and sparse is None:
-            raise ValueError("hybrid_search requires a dense vector, a sparse vector, or both")
+        Provide a dense ``vector``, a ``sparse`` vector, and/or a full-text
+        ``query_text`` (BM25); at least one is required."""
+        if vector is None and sparse is None and query_text is None:
+            raise ValueError(
+                "hybrid_search requires a dense vector, a sparse vector, or a text query"
+            )
         body: dict[str, Any] = {
             "k": k,
             "ef_search": ef_search,
@@ -197,12 +201,58 @@ class AsyncClient:
         }
         if vector is not None:
             body["vector"] = list(vector)
+        if query_text is not None:
+            body["query_text"] = query_text
         if sparse is not None:
             body["sparse_indices"] = [int(i) for i in sparse.indices]
             body["sparse_values"] = [float(v) for v in sparse.values]
         if filter is not None:
             body["filter"] = filter
         resp = await self._send("POST", f"/v1/collections/{collection}/query/hybrid", body)
+        return [
+            Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
+            for m in resp.json()["matches"]
+        ]
+
+    async def upsert_text(self, collection: str, points: Iterable[Mapping[str, Any]]) -> int:
+        """Embed each point's text server-side and upsert it (ADR-0047). See
+        :meth:`Client.upsert_text`."""
+        body = {
+            "points": [
+                {"id": p["id"], "text": p["text"], **({"payload": p["payload"]} if p.get("payload") is not None else {})}
+                for p in points
+            ]
+        }
+        resp = await self._send("POST", f"/v1/collections/{collection}/points:text", body)
+        return int(resp.json()["upserted"])
+
+    async def search_text(
+        self,
+        collection: str,
+        text: str,
+        *,
+        k: int = 10,
+        filter: Optional[Mapping[str, Any]] = None,
+        ef_search: int = 64,
+        rrf_k0: float = 60.0,
+        with_payload: bool = True,
+        with_vector: bool = False,
+        rerank: bool = False,
+    ) -> list[Match]:
+        """Embed ``text`` server-side and search dense ⊕ BM25, optionally reranking
+        (ADR-0047). See :meth:`Client.search_text`."""
+        body: dict[str, Any] = {
+            "text": text,
+            "k": k,
+            "ef_search": ef_search,
+            "rrf_k0": rrf_k0,
+            "with_payload": with_payload,
+            "with_vector": with_vector,
+            "rerank": rerank,
+        }
+        if filter is not None:
+            body["filter"] = filter
+        resp = await self._send("POST", f"/v1/collections/{collection}/query/text", body)
         return [
             Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
             for m in resp.json()["matches"]
@@ -230,6 +280,13 @@ class AsyncClient:
             Match(id=p["id"], score=0.0, payload=p.get("payload"), vector=p.get("vector"))
             for p in resp.json()["points"]
         ]
+
+    async def snapshot(self, destination: str) -> dict[str, Any]:
+        """Take a consistent online snapshot of the whole database into a
+        server-local ``destination`` directory (ADR-0050); admin-only. See
+        :meth:`Client.snapshot`."""
+        resp = await self._send("POST", "/v1/snapshot", {"destination": destination})
+        return dict(resp.json())
 
     async def search_client_side(
         self,

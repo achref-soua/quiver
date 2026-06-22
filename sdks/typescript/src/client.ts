@@ -41,6 +41,13 @@ export interface Match {
   vector?: number[];
 }
 
+/** What a {@link QuiverClient.snapshot} captured (ADR-0050). */
+export interface SnapshotInfo {
+  manifestVersion: number;
+  files: number;
+  bytes: number;
+}
+
 /** A multi-vector (late-interaction / ColBERT) document: an id, its set of token
  * vectors, and an optional payload. */
 export interface Document {
@@ -143,10 +150,12 @@ export interface SparseVector {
 /** Options for {@link Client.hybridSearch}. Provide `vector`, `sparse`, or both;
  * at least one is required. */
 export interface HybridSearchOptions {
-  /** Dense query vector (omit for pure-sparse search). */
+  /** Dense query vector (omit for pure-sparse/text search). */
   vector?: number[];
-  /** Sparse query vector (omit for pure-dense search). */
+  /** Sparse query vector (omit for pure-dense/text search). */
   sparse?: SparseVector;
+  /** Full-text query, tokenized server-side and scored by BM25 (ADR-0046). */
+  queryText?: string;
   k?: number;
   /** A Quiver payload filter expression (applied on both sides). */
   filter?: unknown;
@@ -155,6 +164,28 @@ export interface HybridSearchOptions {
   rrfK0?: number;
   withPayload?: boolean;
   withVector?: boolean;
+}
+
+/** A text point for {@link Client.upsertText} (ADR-0047): the server embeds
+ * `text` with the collection's configured provider and indexes it for BM25. */
+export interface TextPoint {
+  id: string;
+  text: string;
+  payload?: unknown;
+}
+
+/** Options for {@link Client.searchText} (ADR-0047). */
+export interface SearchTextOptions {
+  k?: number;
+  /** A Quiver payload filter expression. */
+  filter?: unknown;
+  efSearch?: number;
+  /** RRF rank-bias constant (default 60). */
+  rrfK0?: number;
+  withPayload?: boolean;
+  withVector?: boolean;
+  /** Opt-in: rerank the candidate pool with the collection's rerank provider. */
+  rerank?: boolean;
 }
 
 /** Options for {@link Client.fetch}. */
@@ -295,12 +326,15 @@ export class Client {
     }));
   }
 
-  /** Hybrid (dense + sparse) search fused with Reciprocal Rank Fusion (ADR-0043).
-   * Provide a dense `vector`, a `sparse` query vector, or both — at least one is
-   * required. The same payload `filter` is applied on both sides. */
+  /** Hybrid search fused with Reciprocal Rank Fusion (ADR-0043/0046). Provide a
+   * dense `vector`, a `sparse` query vector, and/or a full-text `queryText` (scored
+   * by BM25) — at least one is required. The same payload `filter` applies to every
+   * side. */
   async hybridSearch(collection: string, opts: HybridSearchOptions = {}): Promise<Match[]> {
-    if (opts.vector === undefined && opts.sparse === undefined) {
-      throw new QuiverError("hybridSearch requires a dense vector, a sparse vector, or both");
+    if (opts.vector === undefined && opts.sparse === undefined && opts.queryText === undefined) {
+      throw new QuiverError(
+        "hybridSearch requires a dense vector, a sparse vector, or a text query",
+      );
     }
     const body: Record<string, unknown> = {
       k: opts.k ?? 10,
@@ -310,6 +344,7 @@ export class Client {
       with_vector: opts.withVector ?? false,
     };
     if (opts.vector !== undefined) body["vector"] = opts.vector;
+    if (opts.queryText !== undefined) body["query_text"] = opts.queryText;
     if (opts.sparse !== undefined) {
       body["sparse_indices"] = opts.sparse.indices;
       body["sparse_values"] = opts.sparse.values;
@@ -318,6 +353,56 @@ export class Client {
     const res = (await this.#json(
       "POST",
       `/v1/collections/${encodeURIComponent(collection)}/query/hybrid`,
+      body,
+    )) as { matches?: Match[] };
+    return (res.matches ?? []).map((m) => ({
+      id: m.id,
+      score: m.score,
+      payload: m.payload,
+      vector: m.vector,
+    }));
+  }
+
+  /** Embed each point's `text` server-side and upsert it (ADR-0047); the text is
+   * also indexed for BM25. Requires an `[embedding.<collection>]` provider on the
+   * server. Resolves to the number upserted. */
+  async upsertText(collection: string, points: TextPoint[]): Promise<number> {
+    const body = {
+      points: points.map((p) => ({
+        id: p.id,
+        text: p.text,
+        ...(p.payload !== undefined ? { payload: p.payload } : {}),
+      })),
+    };
+    const res = (await this.#json(
+      "POST",
+      `/v1/collections/${encodeURIComponent(collection)}/points:text`,
+      body,
+    )) as { upserted?: number };
+    return Number(res.upserted ?? 0);
+  }
+
+  /** Embed `text` server-side and search dense ⊕ BM25, optionally reranking the
+   * candidate pool in one call (ADR-0047). Requires an `[embedding.<collection>]`
+   * provider (and a `[rerank.<collection>]` provider for `rerank: true`). */
+  async searchText(
+    collection: string,
+    text: string,
+    opts: SearchTextOptions = {},
+  ): Promise<Match[]> {
+    const body: Record<string, unknown> = {
+      text,
+      k: opts.k ?? 10,
+      ef_search: opts.efSearch ?? 64,
+      rrf_k0: opts.rrfK0 ?? 60,
+      with_payload: opts.withPayload ?? true,
+      with_vector: opts.withVector ?? false,
+      rerank: opts.rerank ?? false,
+    };
+    if (opts.filter !== undefined) body["filter"] = opts.filter;
+    const res = (await this.#json(
+      "POST",
+      `/v1/collections/${encodeURIComponent(collection)}/query/text`,
       body,
     )) as { matches?: Match[] };
     return (res.matches ?? []).map((m) => ({
@@ -352,6 +437,22 @@ export class Client {
       payload: p.payload,
       vector: p.vector,
     }));
+  }
+
+  /** Take a consistent online snapshot (backup) of the whole database into a
+   * server-local directory, which must not already exist (ADR-0050); admin-only.
+   * Resolves to the captured manifest version and the file/byte counts. */
+  async snapshot(destination: string): Promise<SnapshotInfo> {
+    const res = (await this.#json("POST", "/v1/snapshot", { destination })) as {
+      manifest_version?: number;
+      files?: number;
+      bytes?: number;
+    };
+    return {
+      manifestVersion: Number(res.manifest_version ?? 0),
+      files: Number(res.files ?? 0),
+      bytes: Number(res.bytes ?? 0),
+    };
   }
 
   /** Nearest-neighbour search over a `client_side`-encrypted collection (ADR-0032),

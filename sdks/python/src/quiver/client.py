@@ -30,6 +30,12 @@ __all__ = [
 DEFAULT_BASE_URL = "http://127.0.0.1:6333"
 DEFAULT_TIMEOUT = 30.0
 
+#: Reserved payload key carrying a point's full-text field (ADR-0046). A point
+#: with a string under this key is tokenized into a BM25 term-frequency vector at
+#: ingest, so it is searchable by ``query_text`` / hybrid ``dense ⊕ BM25`` — no
+#: client-side sparse vectors required.
+TEXT_KEY = "__quiver_text__"
+
 
 class QuiverError(RuntimeError):
     """An error from the Quiver server or the transport.
@@ -279,6 +285,7 @@ class Client:
         *,
         vector: Optional[Sequence[float]] = None,
         sparse: Optional[SparseVector] = None,
+        query_text: Optional[str] = None,
         k: int = 10,
         filter: Optional[Mapping[str, Any]] = None,
         ef_search: int = 64,
@@ -286,14 +293,17 @@ class Client:
         with_payload: bool = True,
         with_vector: bool = False,
     ) -> list[Match]:
-        """Hybrid (dense + sparse) search, fused by Reciprocal Rank Fusion (ADR-0043).
+        """Hybrid search fused by Reciprocal Rank Fusion (ADR-0043/0046).
 
-        Provide a dense ``vector``, a ``sparse`` vector, or both (at least one is
-        required). The same payload ``filter`` is applied to both sides; ``rrf_k0``
-        is the RRF rank-bias constant. Returns matches ordered most-relevant-first.
+        Provide a dense ``vector``, a ``sparse`` vector, and/or a full-text
+        ``query_text`` (tokenized server-side and scored by BM25); at least one is
+        required. The same payload ``filter`` applies to every side; ``rrf_k0`` is
+        the RRF rank-bias constant. Returns matches ordered most-relevant-first.
         """
-        if vector is None and sparse is None:
-            raise ValueError("hybrid_search requires a dense vector, a sparse vector, or both")
+        if vector is None and sparse is None and query_text is None:
+            raise ValueError(
+                "hybrid_search requires a dense vector, a sparse vector, or a text query"
+            )
         body: dict[str, Any] = {
             "k": k,
             "ef_search": ef_search,
@@ -303,6 +313,8 @@ class Client:
         }
         if vector is not None:
             body["vector"] = list(vector)
+        if query_text is not None:
+            body["query_text"] = query_text
         if sparse is not None:
             body["sparse_indices"] = [int(i) for i in sparse.indices]
             body["sparse_values"] = [float(v) for v in sparse.values]
@@ -310,6 +322,63 @@ class Client:
             body["filter"] = filter
         matches = self._send(
             "POST", f"/v1/collections/{collection}/query/hybrid", body
+        ).json()["matches"]
+        return [
+            Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
+            for m in matches
+        ]
+
+    def upsert_text(self, collection: str, points: Iterable[Mapping[str, Any]]) -> int:
+        """Embed each point's text server-side and upsert it (ADR-0047).
+
+        Each point is a mapping with ``id`` and ``text`` (and an optional
+        ``payload``); the server embeds the text with the collection's configured
+        provider and also indexes it for BM25. Requires an ``[embedding.<collection>]``
+        provider on the server. Returns the number upserted.
+        """
+        body = {
+            "points": [
+                {"id": p["id"], "text": p["text"], **({"payload": p["payload"]} if p.get("payload") is not None else {})}
+                for p in points
+            ]
+        }
+        return int(
+            self._send(
+                "POST", f"/v1/collections/{collection}/points:text", body
+            ).json()["upserted"]
+        )
+
+    def search_text(
+        self,
+        collection: str,
+        text: str,
+        *,
+        k: int = 10,
+        filter: Optional[Mapping[str, Any]] = None,
+        ef_search: int = 64,
+        rrf_k0: float = 60.0,
+        with_payload: bool = True,
+        with_vector: bool = False,
+        rerank: bool = False,
+    ) -> list[Match]:
+        """Embed ``text`` server-side and search dense ⊕ BM25, optionally reranking
+        the candidate pool in one call (ADR-0047). Requires an
+        ``[embedding.<collection>]`` provider (and, for ``rerank=True``, a
+        ``[rerank.<collection>]`` provider). Returns matches most-relevant-first.
+        """
+        body: dict[str, Any] = {
+            "text": text,
+            "k": k,
+            "ef_search": ef_search,
+            "rrf_k0": rrf_k0,
+            "with_payload": with_payload,
+            "with_vector": with_vector,
+            "rerank": rerank,
+        }
+        if filter is not None:
+            body["filter"] = filter
+        matches = self._send(
+            "POST", f"/v1/collections/{collection}/query/text", body
         ).json()["matches"]
         return [
             Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
@@ -348,6 +417,16 @@ class Client:
             Match(id=p["id"], score=0.0, payload=p.get("payload"), vector=p.get("vector"))
             for p in points
         ]
+
+    def snapshot(self, destination: str) -> dict[str, Any]:
+        """Take a consistent online snapshot (backup) of the whole database into a
+        server-local ``destination`` directory, which must not already exist
+        (ADR-0050); admin-only. Returns the captured ``manifest_version`` and the
+        ``files`` / ``bytes`` counts.
+        """
+        return dict(
+            self._send("POST", "/v1/snapshot", {"destination": destination}).json()
+        )
 
     def search_client_side(
         self,

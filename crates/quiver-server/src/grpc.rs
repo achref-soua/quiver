@@ -18,7 +18,10 @@ use quiver_proto::v1::{
 use quiver_query::Filter;
 
 use crate::auth::Principal;
-use crate::{AppState, CollectionInfo, DocumentIn, DocumentMatchOut, MatchOut, PointIn, PointOut};
+use crate::{
+    AppState, CollectionInfo, DocumentIn, DocumentMatchOut, MatchOut, PointIn, PointOut,
+    TextPointIn,
+};
 
 /// Build the gRPC service over the shared state.
 pub(crate) fn service(state: AppState) -> QuiverServer<QuiverService> {
@@ -41,9 +44,24 @@ impl QuiverService {
                     .or_else(|| value.strip_prefix("bearer "))
                     .unwrap_or(value)
             });
-        self.state
-            .authenticate(presented)
-            .ok_or_else(|| Status::unauthenticated("missing or invalid API key"))
+        let principal = self.state.authenticate(presented).ok_or_else(|| {
+            self.state.metrics.incr_auth_failure();
+            Status::unauthenticated("missing or invalid API key")
+        })?;
+        // Per-key rate limit (ADR-0049), enforced at the single auth choke point so
+        // every RPC is covered. gRPC has no RateLimit header; the status is the
+        // signal (with the retry delay in its message).
+        if self.state.rate_limit_enabled()
+            && let crate::RateDecision::Limited {
+                retry_after_secs, ..
+            } = self.state.rate_limit(principal.actor())
+        {
+            self.state.metrics.incr_rate_limited();
+            return Err(Status::resource_exhausted(format!(
+                "rate limit exceeded for this API key; retry after {retry_after_secs}s"
+            )));
+        }
+        Ok(principal)
     }
 }
 
@@ -386,6 +404,54 @@ impl Quiver for QuiverService {
         Ok(Response::new(v1::UpsertResponse { upserted }))
     }
 
+    async fn upsert_stream(
+        &self,
+        request: Request<tonic::Streaming<v1::UpsertRequest>>,
+    ) -> Result<Response<v1::UpsertResponse>, Status> {
+        let principal = self.authenticate(&request)?;
+        let mut stream = request.into_inner();
+        // The whole stream is one bulk load: collection comes from the first
+        // chunk; later chunks must agree. Buffer points, then a single
+        // `upsert_bulk` (one fsync + one index build). ponytail: the server
+        // buffers the full stream before the build; a chunked flush is the
+        // upgrade path if a stream ever outgrows memory — bounded here by the
+        // bulk-batch cap so it cannot OOM the node.
+        let max = self.state.limits.max_bulk_batch_size;
+        let mut collection: Option<String> = None;
+        let mut points: Vec<PointIn> = Vec::new();
+        while let Some(chunk) = stream.message().await? {
+            match &collection {
+                None => collection = Some(chunk.collection),
+                Some(c) if !chunk.collection.is_empty() && &chunk.collection != c => {
+                    return Err(Status::invalid_argument(
+                        "every chunk in an upsert stream must target the same collection",
+                    ));
+                }
+                Some(_) => {}
+            }
+            for point in chunk.points {
+                points.push(PointIn {
+                    id: point.id,
+                    vector: point.vector,
+                    payload: parse_payload(&point.payload)?,
+                });
+            }
+            if points.len() > max {
+                return Err(Status::invalid_argument(format!(
+                    "upsert stream exceeds the bulk batch cap of {max} points"
+                )));
+            }
+        }
+        let collection = collection
+            .ok_or_else(|| Status::invalid_argument("upsert stream contained no chunks"))?;
+        let upserted = self
+            .state
+            .upsert_bulk(&principal, collection, points)
+            .await
+            .map_err(|e| e.to_status())?;
+        Ok(Response::new(v1::UpsertResponse { upserted }))
+    }
+
     async fn delete_points(
         &self,
         request: Request<v1::DeletePointsRequest>,
@@ -489,12 +555,81 @@ impl Quiver for QuiverService {
                 req.collection,
                 dense,
                 sparse,
+                (!req.query_text.is_empty()).then_some(req.query_text),
                 k,
                 filter,
                 ef_search,
                 rrf_k0,
                 req.with_payload,
                 req.with_vector,
+            )
+            .await
+            .map_err(|e| e.to_status())?;
+        Ok(Response::new(v1::SearchResponse {
+            matches: matches.into_iter().map(match_to_proto).collect(),
+        }))
+    }
+
+    async fn upsert_text(
+        &self,
+        request: Request<v1::UpsertTextRequest>,
+    ) -> Result<Response<v1::UpsertResponse>, Status> {
+        let principal = self.authenticate(&request)?;
+        let req = request.into_inner();
+        let mut points = Vec::with_capacity(req.points.len());
+        for point in req.points {
+            points.push(TextPointIn {
+                id: point.id,
+                text: point.text,
+                payload: parse_payload(&point.payload)?,
+            });
+        }
+        let upserted = self
+            .state
+            .upsert_text(&principal, req.collection, points)
+            .await
+            .map_err(|e| e.to_status())?;
+        Ok(Response::new(v1::UpsertResponse { upserted }))
+    }
+
+    async fn search_text(
+        &self,
+        request: Request<v1::SearchTextRequest>,
+    ) -> Result<Response<v1::SearchResponse>, Status> {
+        let principal = self.authenticate(&request)?;
+        let req = request.into_inner();
+        let filter: Option<Filter> = if req.filter.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_slice(&req.filter)
+                    .map_err(|e| Status::invalid_argument(format!("invalid filter json: {e}")))?,
+            )
+        };
+        let k = if req.k == 0 { 10 } else { req.k as usize };
+        let ef_search = if req.ef_search == 0 {
+            64
+        } else {
+            req.ef_search as usize
+        };
+        let rrf_k0 = if req.rrf_k0 == 0.0 {
+            DEFAULT_RRF_K0
+        } else {
+            req.rrf_k0
+        };
+        let matches = self
+            .state
+            .search_text(
+                &principal,
+                req.collection,
+                req.text,
+                k,
+                filter,
+                ef_search,
+                rrf_k0,
+                req.with_payload,
+                req.with_vector,
+                req.rerank,
             )
             .await
             .map_err(|e| e.to_status())?;

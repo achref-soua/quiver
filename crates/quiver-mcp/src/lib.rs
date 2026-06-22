@@ -8,10 +8,12 @@
 //! is separated from the stdio loop ([`serve`]) so it is unit-testable without
 //! real pipes.
 //!
-//! Tools: `list_collections`, `create_collection`, `collection_info`, `upsert`,
-//! `search`, `hybrid_search`, `fetch`, `get`, `delete`, and the multi-vector
-//! document tools. The
-//! database is opened secure-by-default (encryption-at-rest on
+//! Tools: `list_collections`, `create_collection`, `collection_info`,
+//! `database_stats`, `delete_collection`, `snapshot`, `upsert`, `search`,
+//! `hybrid_search`, `fetch`, `get`, `delete`, and the multi-vector document
+//! tools — enough for an agent to *operate* the database (inspect, manage, back
+//! up, clean up), not just query it.
+//! The database is opened secure-by-default (encryption-at-rest on
 //! unless explicitly insecure) through the same envelope key-ring as the network
 //! server and `quiver admin`, so a data directory is interchangeable between them.
 
@@ -234,6 +236,10 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
                 .get("rrf_k0")
                 .and_then(Value::as_f64)
                 .map_or(DEFAULT_RRF_K0, |x| x as f32);
+            let query_text = args
+                .get("query_text")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let params = SearchParams {
                 k,
                 filter,
@@ -244,6 +250,7 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
                     collection,
                     dense.as_deref(),
                     sparse.as_ref(),
+                    query_text.as_deref(),
                     &params,
                     rrf_k0,
                 )
@@ -344,27 +351,70 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
         }
         "collection_info" => {
             let collection = want_str(args, "collection")?;
-            let Some(descriptor) = db.descriptor(collection).cloned() else {
-                return Err(format!("collection '{collection}' not found"));
-            };
-            let count = if descriptor.multivector {
-                db.document_count(collection).map_err(|e| e.to_string())?
-            } else {
-                db.len(collection).map_err(|e| e.to_string())?
-            };
+            to_text(&collection_summary(db, collection)?)
+        }
+        "delete_collection" => {
+            let collection = want_str(args, "collection")?;
+            let existed = db.drop_collection(collection).map_err(|e| e.to_string())?;
+            to_text(&json!({ "collection": collection, "existed": existed }))
+        }
+        "database_stats" => {
+            let names = db.collection_names();
+            let mut collections = Vec::with_capacity(names.len());
+            let mut total_points: u64 = 0;
+            for name in &names {
+                let summary = collection_summary(db, name)?;
+                total_points += summary["count"].as_u64().unwrap_or(0);
+                collections.push(summary);
+            }
             to_text(&json!({
-                "name": collection,
-                "dim": descriptor.dim,
-                "metric": serde_json::to_value(descriptor.metric).map_err(|e| e.to_string())?,
-                "index": serde_json::to_value(descriptor.index).map_err(|e| e.to_string())?,
-                "filterable": serde_json::to_value(&descriptor.filterable).map_err(|e| e.to_string())?,
-                "multivector": descriptor.multivector,
-                "vector_encryption": serde_json::to_value(descriptor.vector_encryption).map_err(|e| e.to_string())?,
-                "count": count,
+                "collection_count": names.len(),
+                "total_points": total_points,
+                // Snapshot-relevant status (ADR-0050): the catalog generation a
+                // snapshot would capture and the data directory's on-disk size.
+                "manifest_version": db.manifest_version(),
+                "disk_bytes": db.disk_usage_bytes(),
+                "collections": collections,
+            }))
+        }
+        "snapshot" => {
+            let destination = want_str(args, "destination")?;
+            let info = db
+                .snapshot(std::path::Path::new(destination))
+                .map_err(|e| e.to_string())?;
+            to_text(&json!({
+                "destination": destination,
+                "manifest_version": info.manifest_version,
+                "files": info.files,
+                "bytes": info.bytes,
             }))
         }
         other => Err(format!("unknown tool: {other}")),
     }
+}
+
+/// A one-collection summary — shape, index, encryption, and live point/document
+/// count — shared by the `collection_info` and `database_stats` tools so an agent
+/// sees an identical view either way. Errors if the collection does not exist.
+fn collection_summary(db: &Database, collection: &str) -> Result<Value, String> {
+    let Some(descriptor) = db.descriptor(collection).cloned() else {
+        return Err(format!("collection '{collection}' not found"));
+    };
+    let count = if descriptor.multivector {
+        db.document_count(collection).map_err(|e| e.to_string())?
+    } else {
+        db.len(collection).map_err(|e| e.to_string())?
+    };
+    Ok(json!({
+        "name": collection,
+        "dim": descriptor.dim,
+        "metric": serde_json::to_value(descriptor.metric).map_err(|e| e.to_string())?,
+        "index": serde_json::to_value(descriptor.index).map_err(|e| e.to_string())?,
+        "filterable": serde_json::to_value(&descriptor.filterable).map_err(|e| e.to_string())?,
+        "multivector": descriptor.multivector,
+        "vector_encryption": serde_json::to_value(descriptor.vector_encryption).map_err(|e| e.to_string())?,
+        "count": count,
+    }))
 }
 
 /// The advertised tool catalog, each with a JSON-Schema for its arguments.
@@ -454,14 +504,15 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "hybrid_search",
-            "description": "Hybrid (dense + sparse) search fused with Reciprocal Rank Fusion (ADR-0043/0045). Provide a dense 'vector', a sparse query ('sparse_indices' + 'sparse_values', parallel arrays), or both; at least one is required. Honours the same payload filter on both sides.",
+            "description": "Hybrid search fused with Reciprocal Rank Fusion (ADR-0043/0045/0046). Provide a dense 'vector', a sparse query ('sparse_indices' + 'sparse_values', parallel arrays), and/or a full-text 'query_text' (tokenized and scored by BM25); at least one is required. Honours the same payload filter on every side.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "collection": collection_arg,
-                    "vector": { "type": "array", "items": { "type": "number" }, "description": "Dense query vector (omit for pure-sparse search)" },
+                    "vector": { "type": "array", "items": { "type": "number" }, "description": "Dense query vector (omit for pure-sparse/text search)" },
                     "sparse_indices": { "type": "array", "items": { "type": "integer" }, "description": "Sparse query dimension ids (parallel to sparse_values)" },
                     "sparse_values": { "type": "array", "items": { "type": "number" }, "description": "Sparse query weights (parallel to sparse_indices)" },
+                    "query_text": { "type": "string", "description": "Full-text query, scored by BM25 over the inverted index (ADR-0046)" },
                     "k": { "type": "integer", "default": 10 },
                     "filter": { "type": "object", "description": "Quiver payload filter tree" },
                     "rrf_k0": { "type": "number", "description": "RRF rank-bias constant (default 60)" }
@@ -544,6 +595,31 @@ pub fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": { "collection": collection_arg },
                 "required": ["collection"]
+            }
+        },
+        {
+            "name": "delete_collection",
+            "description": "Delete an entire collection and all of its points/documents. Returns whether it existed. Irreversible — an agent managing collections uses this to clean up.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "collection": collection_arg },
+                "required": ["collection"]
+            }
+        },
+        {
+            "name": "database_stats",
+            "description": "A whole-database overview for operating the instance: the number of collections, the total live point count, a per-collection summary (dimension, metric, index, multivector flag, encryption mode, count), and snapshot status (manifest_version, on-disk disk_bytes). One call to see everything, instead of collection_info per collection.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "snapshot",
+            "description": "Take a consistent online snapshot (backup) of the whole database into a server-local directory, which must not already exist. Returns the manifest version captured and the file/byte counts. Restore by pointing a Quiver instance at the snapshot directory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "destination": { "type": "string", "description": "Server-local destination directory; must not already exist" }
+                },
+                "required": ["destination"]
             }
         }
     ])
@@ -746,6 +822,9 @@ mod tests {
             "get",
             "delete",
             "collection_info",
+            "delete_collection",
+            "database_stats",
+            "snapshot",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -781,6 +860,94 @@ mod tests {
         // An unknown collection is reported as an error result, not a panic.
         let missing = call(&mut db, "collection_info", json!({"collection":"nope"}));
         assert_eq!(missing["result"]["isError"], true);
+    }
+
+    #[test]
+    fn delete_collection_drops_and_reports_existence() {
+        let (_t, mut db) = db();
+        call(&mut db, "create_collection", json!({"name":"tmp","dim":2}));
+        let dropped = call(&mut db, "delete_collection", json!({"collection":"tmp"}));
+        assert_eq!(dropped["result"]["isError"], false);
+        let info: Value = serde_json::from_str(&result_text(&dropped)).unwrap();
+        assert_eq!(info["existed"], true);
+        // It is gone now, and a second delete reports it never existed.
+        assert!(!db.collection_names().contains(&"tmp".to_owned()));
+        let again = call(&mut db, "delete_collection", json!({"collection":"tmp"}));
+        let info: Value = serde_json::from_str(&result_text(&again)).unwrap();
+        assert_eq!(info["existed"], false);
+    }
+
+    #[test]
+    fn database_stats_summarises_every_collection() {
+        let (_t, mut db) = db();
+        call(&mut db, "create_collection", json!({"name":"a","dim":2}));
+        call(&mut db, "create_collection", json!({"name":"b","dim":3}));
+        call(
+            &mut db,
+            "upsert",
+            json!({"collection":"a","id":"1","vector":[1.0,0.0]}),
+        );
+        call(
+            &mut db,
+            "upsert",
+            json!({"collection":"a","id":"2","vector":[0.0,1.0]}),
+        );
+        call(
+            &mut db,
+            "upsert",
+            json!({"collection":"b","id":"1","vector":[1.0,0.0,0.0]}),
+        );
+        let resp = call(&mut db, "database_stats", json!({}));
+        assert_eq!(resp["result"]["isError"], false);
+        let stats: Value = serde_json::from_str(&result_text(&resp)).unwrap();
+        assert_eq!(stats["collection_count"], 2);
+        assert_eq!(stats["total_points"], 3);
+        // Each collection's summary matches its collection_info shape.
+        let by_name: std::collections::HashMap<String, &Value> = stats["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["name"].as_str().unwrap().to_owned(), c))
+            .collect();
+        assert_eq!(by_name["a"]["count"], 2);
+        assert_eq!(by_name["a"]["dim"], 2);
+        assert_eq!(by_name["b"]["count"], 1);
+        // Snapshot status is present and sane.
+        assert!(stats["manifest_version"].is_u64());
+        assert!(stats["disk_bytes"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn snapshot_writes_a_restorable_copy() {
+        let (_t, mut db) = db();
+        call(&mut db, "create_collection", json!({"name":"kb","dim":2}));
+        call(
+            &mut db,
+            "upsert",
+            json!({"collection":"kb","id":"a","vector":[1.0,0.0]}),
+        );
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("snap");
+        let resp = call(
+            &mut db,
+            "snapshot",
+            json!({ "destination": dest.to_str().unwrap() }),
+        );
+        assert_eq!(resp["result"]["isError"], false);
+        let info: Value = serde_json::from_str(&result_text(&resp)).unwrap();
+        assert!(info["files"].as_u64().unwrap() > 0);
+
+        // The snapshot opens as an identical database.
+        let restored = Database::open(&dest).unwrap();
+        assert_eq!(restored.len("kb").unwrap(), 1);
+
+        // Snapshotting onto the existing directory is reported as an error.
+        let again = call(
+            &mut db,
+            "snapshot",
+            json!({ "destination": dest.to_str().unwrap() }),
+        );
+        assert_eq!(again["result"]["isError"], true);
     }
 
     #[test]
@@ -883,6 +1050,40 @@ mod tests {
             json!({"collection":"kb","sparse_indices":[1],"k":2}),
         );
         assert_eq!(r["result"]["isError"], true);
+    }
+
+    #[test]
+    fn hybrid_search_tool_supports_full_text_query() {
+        let (_t, mut db) = db();
+        call(
+            &mut db,
+            "create_collection",
+            json!({"name":"docs","dim":4,"metric":"l2"}),
+        );
+        call(
+            &mut db,
+            "upsert",
+            json!({"collection":"docs","id":"cat","vector":[0.0,0.0,0.0,0.0],"payload":{"__quiver_text__":"the quick brown cat"}}),
+        );
+        call(
+            &mut db,
+            "upsert",
+            json!({"collection":"docs","id":"dog","vector":[0.0,0.0,0.0,0.0],"payload":{"__quiver_text__":"a lazy dog sleeps"}}),
+        );
+        let r = call(
+            &mut db,
+            "hybrid_search",
+            json!({"collection":"docs","query_text":"cats","k":5}),
+        );
+        assert_eq!(r["result"]["isError"], false);
+        let parsed: Value = serde_json::from_str(&result_text(&r)).unwrap();
+        let ids: Vec<&str> = parsed["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["cat"], "BM25 over MCP ranks the cat doc");
     }
 
     const ENC_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";

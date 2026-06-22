@@ -117,18 +117,40 @@ Then hand the assembled context plus the question to your LLM as grounding. For
 paragraph/token-level retrieval (ColBERT-style late interaction), see
 [multi-vector](../features/multi-vector.md).
 
+## Skip the embedding step (let Quiver embed)
+
+Steps 2–5 assume you run the embedding model. If you'd rather not, configure a
+**server-side embedding provider** (OpenAI / Cohere / Ollama / any
+OpenAI-compatible endpoint) per collection and use `upsert_text` / `search_text`:
+Quiver embeds the text for the dense side, indexes it for BM25, and (optionally)
+reranks — all server-side, in one call each. The engine stays model-agnostic;
+this is an opt-in edge convenience. Full setup and the provider table are in
+**[Server-side embedding & reranking](../features/embedding.md)**.
+
+```python
+q.upsert_text("kb", [{"id": "1", "text": chunk, "payload": {"source": "manual"}}])
+hits = q.search_text("kb", "how do refunds work?", k=5, rerank=True)   # embed + BM25 + rerank
+```
+
 ## Hybrid retrieval
 
 For queries with rare terms, exact matches, or out-of-domain phrasing, fuse the
-dense embedding with a **sparse** signal (SPLADE/BGE-M3 or lexical weights) via
-`hybrid_search` — see **[Hybrid search](../features/hybrid-search.md)**. Store the
-sparse vector under `__quiver_sparse__` and pass both to the query; Quiver fuses
-the two rankings with Reciprocal Rank Fusion.
+dense embedding with a **lexical** signal. The easiest path is **full-text**: give
+each point a `__quiver_text__` string (or use `upsert_text`, which fills it for
+you) and pass `query_text` to `hybrid_search` — Quiver tokenizes and scores it
+with BM25, fused with the dense ranking via Reciprocal Rank Fusion. For
+learned-sparse vectors (SPLADE/BGE-M3) store them under `__quiver_sparse__`
+instead. See **[Hybrid search](../features/hybrid-search.md)**.
+
+```python
+hits = q.hybrid_search("kb", vector=embed(query), query_text=query, k=10)  # dense ⊕ BM25
+```
 
 ## Where to go next
 
 - **[Tuning for RAG](tuning.md)** — choosing the index and quantizer for your
   recall ↔ latency ↔ RAM budget (including the memory-frugal disk path).
 - **[Agentic patterns](agentic.md)** — let an LLM agent drive Quiver over MCP.
-- **LangChain / LlamaIndex / Haystack** — Quiver ships vector-store adapters; see
+- **LangChain / LlamaIndex / Haystack** — Quiver ships vector-store adapters; pass
+  `hybrid=True` for `dense ⊕ BM25` retrieval out of the box. See
   [SDKs](../api/sdks.md).

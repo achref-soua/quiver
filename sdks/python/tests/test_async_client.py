@@ -120,3 +120,18 @@ def test_async_hybrid_search_sparse_only():
     body = json.loads(route.calls.last.request.content)
     assert "vector" not in body
     assert body["sparse_indices"] == [1]
+
+
+@respx.mock
+def test_async_snapshot_posts_destination():
+    route = respx.post(f"{BASE}/v1/snapshot").mock(
+        return_value=httpx.Response(200, json={"manifest_version": 1, "files": 4, "bytes": 99})
+    )
+
+    async def run():
+        async with AsyncClient(BASE) as q:
+            return await q.snapshot("/snap")
+
+    info = asyncio.run(run())
+    assert info["files"] == 4
+    assert json.loads(route.calls.last.request.content)["destination"] == "/snap"

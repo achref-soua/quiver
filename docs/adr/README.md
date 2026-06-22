@@ -65,5 +65,14 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0043](0043-hybrid-sparse-search.md) | Hybrid (dense + sparse) search with RRF fusion | Proposed | 5 |
 | [0044](0044-automated-release-assets.md) | Automated, tag-triggered multi-platform release assets (Windows job added) | Accepted | 5 |
 | [0045](0045-hybrid-everywhere-and-fast-ingest.md) | Hybrid everywhere + fast ingest (sparse inverted index, gRPC/MCP/TS parity, bulk upsert) | Accepted | 5 |
+| [0046](0046-bm25-full-text.md) | BM25 / full-text over the sparse path (tokenizer + BM25 scoring, `text`/`query_text`) | Accepted | 5 |
+| [0047](0047-server-side-embedding-and-rerank-hooks.md) | Server-side embedding & reranking hooks (provider-agnostic, opt-in per collection) | Accepted | 5 |
+| [0048](0048-snowball-stemmer.md) | Snowball (Porter2) stemmer for BM25 tokenization | Accepted | 5 |
+| [0049](0049-per-key-rate-limiting.md) | Per-key rate limiting (token bucket, RateLimit headers, 429) | Accepted | 5 |
+| [0050](0050-snapshot-and-restore.md) | Online snapshot & restore (consistent whole-dir copy, REST + MCP) | Accepted | 5 |
+| [0051](0051-distributed-sharded-mode.md) | Distributed / sharded mode (hash sharding, scatter-gather, per-shard Raft) — design only | Proposed | 5 |
+| [0052](0052-gpu-acceleration.md) | GPU-accelerated build & search (behind the index trait, feature-gated) — design only | Proposed | 5 |
+| [0053](0053-lock-free-mvcc-reads.md) | Lock-free MVCC reads (versioned snapshots, epoch reclamation) — design only | Proposed | 5 |
+| [0054](0054-prometheus-metrics-and-tracing.md) | Prometheus `/metrics` (real counters/histograms) + request tracing spans + Grafana dashboard | Accepted | 5 |
 
 Phase-0 ADRs (0001–0018) are Accepted; Phase-2 decisions span 0019–0022; Phase-4 decisions begin at 0023. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.

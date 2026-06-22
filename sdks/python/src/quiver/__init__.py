@@ -12,6 +12,7 @@ Example::
 """
 
 from .client import (
+    TEXT_KEY,
     Client,
     CollectionInfo,
     Document,
@@ -42,6 +43,7 @@ __all__ = [
     "Point",
     "Match",
     "SparseVector",
+    "TEXT_KEY",
     "rerank",
     "RerankResult",
     "Document",

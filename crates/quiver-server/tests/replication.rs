@@ -68,6 +68,9 @@ fn base_config(
         leader_api_key: None,
         insecure: true,
         limits: quiver_server::Limits::default(),
+        embedding: Default::default(),
+        rerank: Default::default(),
+        rate_limit: Default::default(),
     }
 }
 
@@ -96,6 +99,9 @@ async fn replicate_streams_a_snapshot_then_the_live_tail() {
         leader_api_key: None,
         insecure: true,
         limits: quiver_server::Limits::default(),
+        embedding: Default::default(),
+        rerank: Default::default(),
+        rate_limit: Default::default(),
     };
     tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

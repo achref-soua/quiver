@@ -20,6 +20,7 @@ use quiver_query::Filter;
 use crate::auth::Principal;
 use crate::{
     AppState, CollectionInfo, DocumentIn, DocumentMatchOut, Error, MatchOut, PointIn, PointOut,
+    RateDecision, RateLimitSnapshot, TextPointIn,
 };
 
 /// Build the REST router: open `/healthz`, `/readyz`, `/metrics`; the `/v1` API
@@ -41,9 +42,11 @@ pub(crate) fn router(state: AppState) -> Router {
             post(upsert).delete(delete_points),
         )
         .route("/v1/collections/{name}/points:bulk", post(upsert_bulk))
+        .route("/v1/collections/{name}/points:text", post(upsert_text))
         .route("/v1/collections/{name}/points/{id}", get(get_point))
         .route("/v1/collections/{name}/query", post(search))
         .route("/v1/collections/{name}/query/hybrid", post(hybrid_search))
+        .route("/v1/collections/{name}/query/text", post(search_text))
         .route("/v1/collections/{name}/fetch", post(fetch))
         .route(
             "/v1/collections/{name}/documents",
@@ -53,14 +56,22 @@ pub(crate) fn router(state: AppState) -> Router {
             "/v1/collections/{name}/documents/query",
             post(search_multi_vector),
         )
+        .route("/v1/snapshot", post(snapshot))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
+        // Outermost so it times the whole request, including a 401/429; runs after
+        // routing, so the matched-path template is available (ADR-0054).
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_metrics,
+        ))
         .layer(DefaultBodyLimit::max(max_body))
-        .with_state(state);
+        .with_state(state.clone());
 
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        .layer(Extension(state.metrics.clone()))
         .merge(api)
 }
 
@@ -78,10 +89,32 @@ async fn auth(State(state): State<AppState>, mut request: Request, next: Next) -
     match state.authenticate(presented.as_deref()) {
         // The caller's scope rides the request; each op authorizes against it.
         Some(principal) => {
+            // Per-key rate limit (ADR-0049): consume a token before the handler
+            // runs; 429 if the key is over its rate, else carry the snapshot to the
+            // response headers.
+            let snapshot = if state.rate_limit_enabled() {
+                match state.rate_limit(principal.actor()) {
+                    RateDecision::Limited {
+                        retry_after_secs,
+                        limit,
+                    } => {
+                        state.metrics.incr_rate_limited();
+                        return rate_limited_response(retry_after_secs, limit);
+                    }
+                    RateDecision::Allowed(s) => Some(s),
+                }
+            } else {
+                None
+            };
             request.extensions_mut().insert(principal);
-            next.run(request).await
+            let mut response = next.run(request).await;
+            if let Some(s) = snapshot {
+                set_rate_limit_headers(response.headers_mut(), s);
+            }
+            response
         }
         None => {
+            state.metrics.incr_auth_failure();
             let body = json!({
                 "type": "about:blank",
                 "title": "Unauthorized",
@@ -93,6 +126,38 @@ async fn auth(State(state): State<AppState>, mut request: Request, next: Next) -
     }
 }
 
+// Attach the standard `RateLimit-*` headers (ADR-0049) to a response.
+fn set_rate_limit_headers(headers: &mut axum::http::HeaderMap, s: RateLimitSnapshot) {
+    use axum::http::HeaderValue;
+    headers.insert("RateLimit-Limit", HeaderValue::from(s.limit));
+    headers.insert("RateLimit-Remaining", HeaderValue::from(s.remaining));
+    headers.insert("RateLimit-Reset", HeaderValue::from(s.reset_secs));
+}
+
+// A 429 with `Retry-After` and the `RateLimit-*` headers for a key over its rate.
+fn rate_limited_response(retry_after_secs: u64, limit: u32) -> Response {
+    let body = json!({
+        "type": "about:blank",
+        "title": "Too Many Requests",
+        "status": 429,
+        "detail": "rate limit exceeded for this API key; retry after the indicated delay",
+    });
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+    set_rate_limit_headers(
+        response.headers_mut(),
+        RateLimitSnapshot {
+            limit,
+            remaining: 0,
+            reset_secs: retry_after_secs,
+        },
+    );
+    use axum::http::HeaderValue;
+    response
+        .headers_mut()
+        .insert("Retry-After", HeaderValue::from(retry_after_secs));
+    response
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -101,10 +166,26 @@ async fn readyz() -> &'static str {
     "ready"
 }
 
-async fn metrics() -> &'static str {
-    // A Prometheus exposition endpoint is wired with the observability work;
-    // for now this is a stable, scrapable placeholder.
-    "# quiver metrics\n"
+async fn metrics(Extension(metrics): Extension<std::sync::Arc<crate::metrics::Metrics>>) -> String {
+    metrics.render()
+}
+
+/// Time every routed request and record it by `(method, matched-route-template,
+/// status)` into the metrics registry (ADR-0054). The matched template — not the
+/// concrete path — is the label, so it is bounded and never leaks ids.
+async fn record_metrics(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let method = request.method().as_str().to_owned();
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_else(|| request.uri().path().to_owned());
+    let start = std::time::Instant::now();
+    let response = next.run(request).await;
+    state
+        .metrics
+        .observe_request(&method, &route, response.status().as_u16(), start.elapsed());
+    response
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -397,6 +478,57 @@ async fn upsert_bulk(
     Ok(Json(UpsertResponse { upserted }))
 }
 
+/// `POST /v1/snapshot` — take a consistent online snapshot of the whole database
+/// into a server-local directory (ADR-0050). Admin-only.
+#[derive(Deserialize)]
+struct SnapshotBody {
+    /// Server-local destination directory; must not already exist.
+    destination: String,
+}
+
+async fn snapshot(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<SnapshotBody>,
+) -> Result<Json<quiver_embed::SnapshotInfo>, Error> {
+    let info = state.snapshot(&principal, body.destination).await?;
+    Ok(Json(info))
+}
+
+#[derive(Deserialize)]
+struct TextPointDto {
+    id: String,
+    text: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+#[derive(Deserialize)]
+struct UpsertTextBody {
+    points: Vec<TextPointDto>,
+}
+
+/// Embed each point's `text` server-side and upsert it (ADR-0047). Requires an
+/// `[embedding.<collection>]` provider; the text is also indexed for BM25.
+async fn upsert_text(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(name): Path<String>,
+    Json(body): Json<UpsertTextBody>,
+) -> Result<Json<UpsertResponse>, Error> {
+    let points = body
+        .points
+        .into_iter()
+        .map(|p| TextPointIn {
+            id: p.id,
+            text: p.text,
+            payload: p.payload,
+        })
+        .collect();
+    let upserted = state.upsert_text(&principal, name, points).await?;
+    Ok(Json(UpsertResponse { upserted }))
+}
+
 #[derive(Deserialize)]
 struct DeletePointsBody {
     ids: Vec<String>,
@@ -536,6 +668,10 @@ struct HybridSearchBody {
     sparse_indices: Option<Vec<u32>>,
     #[serde(default)]
     sparse_values: Option<Vec<f32>>,
+    /// Full-text query — tokenized server-side and scored by BM25 over the inverted
+    /// index (ADR-0046). Omit for non-lexical search.
+    #[serde(default)]
+    query_text: Option<String>,
     #[serde(default = "default_k")]
     k: usize,
     #[serde(default)]
@@ -571,12 +707,63 @@ async fn hybrid_search(
             name,
             body.vector,
             sparse,
+            body.query_text,
             body.k,
             body.filter,
             body.ef_search,
             body.rrf_k0,
             body.with_payload,
             body.with_vector,
+        )
+        .await?;
+    Ok(Json(SearchResponse {
+        matches: matches.into_iter().map(MatchDto::from).collect(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct SearchTextBody {
+    /// The query text — embedded server-side with the collection's provider and
+    /// also scored by BM25 over the inverted index (ADR-0046/0047).
+    text: String,
+    #[serde(default = "default_k")]
+    k: usize,
+    #[serde(default)]
+    filter: Option<Filter>,
+    #[serde(default = "default_ef")]
+    ef_search: usize,
+    #[serde(default = "default_rrf_k0")]
+    rrf_k0: f32,
+    #[serde(default = "default_true")]
+    with_payload: bool,
+    #[serde(default)]
+    with_vector: bool,
+    /// Opt-in: rerank the candidate pool with the collection's `[rerank.<name>]`
+    /// provider and return the top-`k` reordered (ADR-0047).
+    #[serde(default)]
+    rerank: bool,
+}
+
+/// Text-in search: embed the query, run dense (⊕ BM25) retrieval, optionally
+/// rerank — all in one call (ADR-0047). Requires an `[embedding.<collection>]`.
+async fn search_text(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(name): Path<String>,
+    Json(body): Json<SearchTextBody>,
+) -> Result<Json<SearchResponse>, Error> {
+    let matches = state
+        .search_text(
+            &principal,
+            name,
+            body.text,
+            body.k,
+            body.filter,
+            body.ef_search,
+            body.rrf_k0,
+            body.with_payload,
+            body.with_vector,
+            body.rerank,
         )
         .await?;
     Ok(Json(SearchResponse {

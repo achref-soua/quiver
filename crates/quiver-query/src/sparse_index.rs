@@ -42,9 +42,19 @@ pub struct SparseInvertedIndex {
     slot_of: HashMap<String, u32>,
     /// Freed slots, reused before the backing vectors grow.
     free: Vec<u32>,
+    /// `slot → document length` (the sum of the slot's term weights), for BM25
+    /// length normalization (ADR-0046). `0.0` for a freed slot.
+    doclen: Vec<f32>,
+    /// Running sum of all live document lengths, so `avgdl` is O(1) (ADR-0046).
+    total_len: f64,
     /// Number of live documents.
     len: usize,
 }
+
+/// The conventional BM25 term-frequency saturation parameter (Robertson et al.).
+pub const BM25_K1: f32 = 1.2;
+/// The conventional BM25 length-normalization parameter.
+pub const BM25_B: f32 = 0.75;
 
 impl SparseInvertedIndex {
     /// An empty index.
@@ -79,18 +89,26 @@ impl SparseInvertedIndex {
             }
             None => self.allocate(ext_id),
         };
+        // Drop the slot's prior contribution to the running length total (0 for a
+        // fresh or reused slot).
+        self.total_len -= self.doclen[slot as usize] as f64;
         // De-duplicate dims (last weight wins) so `dims_of` stays unique and a
         // malformed input can't leave a stale posting after the next cleanup.
         let mut weights: HashMap<u32, f32> = HashMap::with_capacity(sv.indices.len());
         for (&dim, &w) in sv.indices.iter().zip(sv.values.iter()) {
             weights.insert(dim, w);
         }
+        // Document length for BM25 = the sum of the term weights (term frequencies
+        // for a tokenized text; unused by the dot-product path).
+        let dl: f32 = weights.values().copied().sum();
         let mut dims = Vec::with_capacity(weights.len());
         for (dim, w) in weights {
             self.postings.entry(dim).or_default().insert(slot, w);
             dims.push(dim);
         }
         self.dims_of[slot as usize] = dims;
+        self.doclen[slot as usize] = dl;
+        self.total_len += dl as f64;
     }
 
     /// Remove `ext_id` and free its slot. Returns whether it was present.
@@ -99,6 +117,8 @@ impl SparseInvertedIndex {
             return false;
         };
         self.clear_postings(slot);
+        self.total_len -= self.doclen[slot as usize] as f64;
+        self.doclen[slot as usize] = 0.0;
         self.dims_of[slot as usize] = Vec::new();
         self.ext_of[slot as usize] = String::new();
         self.free.push(slot);
@@ -134,6 +154,51 @@ impl SparseInvertedIndex {
         out
     }
 
+    /// Score documents against `query_terms` (term ids) with **Okapi BM25**
+    /// (ADR-0046), treating each document's stored weights as term frequencies and
+    /// using the index's own corpus statistics — document frequency (posting-list
+    /// length), document count, and average document length. `k1`/`b` are the usual
+    /// BM25 parameters ([`BM25_K1`], [`BM25_B`]). Duplicate query terms count once.
+    /// Returns `(ext_id, score)` for documents with a positive score, sorted by
+    /// score descending then id ascending. Uses the Lucene-style **smoothed IDF**
+    /// `ln(1 + (N − df + 0.5)/(df + 0.5))`, which is always non-negative, so even a
+    /// term in most of the corpus contributes a small positive amount (no negative
+    /// scores to clamp).
+    pub fn bm25_search(&self, query_terms: &[u32], k1: f32, b: f32) -> Vec<(String, f32)> {
+        if self.len == 0 {
+            return Vec::new();
+        }
+        let n = self.len as f64;
+        let avgdl = (self.total_len / n).max(f64::MIN_POSITIVE);
+        let (k1, b) = (k1 as f64, b as f64);
+        let mut scores: HashMap<u32, f32> = HashMap::new();
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for &term in query_terms {
+            if !seen.insert(term) {
+                continue; // a repeated query term scores once
+            }
+            let Some(plist) = self.postings.get(&term) else {
+                continue;
+            };
+            let df = plist.len() as f64;
+            let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+            for (&slot, &tf) in plist {
+                let tf = tf as f64;
+                let dl = self.doclen[slot as usize] as f64;
+                let denom = tf + k1 * (1.0 - b + b * (dl / avgdl));
+                let contribution = idf * (tf * (k1 + 1.0)) / denom;
+                *scores.entry(slot).or_insert(0.0) += contribution as f32;
+            }
+        }
+        let mut out: Vec<(String, f32)> = scores
+            .into_iter()
+            .filter(|&(_, score)| score > 0.0)
+            .map(|(slot, score)| (self.ext_of[slot as usize].clone(), score))
+            .collect();
+        out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
     // Allocate a slot for a brand-new id, reusing a freed one when available.
     fn allocate(&mut self, ext_id: &str) -> u32 {
         let slot = match self.free.pop() {
@@ -145,6 +210,7 @@ impl SparseInvertedIndex {
                 let slot = self.ext_of.len() as u32;
                 self.ext_of.push(ext_id.to_owned());
                 self.dims_of.push(Vec::new());
+                self.doclen.push(0.0);
                 slot
             }
         };
@@ -300,6 +366,65 @@ mod tests {
         let mut idx = SparseInvertedIndex::new();
         idx.upsert("a", &sv(&[1], &[1.0]));
         assert!(format!("{idx:?}").contains("SparseInvertedIndex"));
+    }
+
+    #[test]
+    fn bm25_ranks_by_term_frequency() {
+        let mut idx = SparseInvertedIndex::new();
+        idx.upsert("hi", &sv(&[1], &[3.0])); // term 1, tf 3
+        idx.upsert("lo", &sv(&[1], &[1.0])); // term 1, tf 1
+        idx.upsert("other", &sv(&[2], &[5.0])); // does not contain term 1
+        let res = idx.bm25_search(&[1], BM25_K1, BM25_B);
+        assert_eq!(ids(&res), vec!["hi", "lo"], "other lacks the term");
+        assert!(res[0].1 > res[1].1);
+    }
+
+    #[test]
+    fn bm25_rewards_shorter_documents_at_equal_term_frequency() {
+        let mut idx = SparseInvertedIndex::new();
+        idx.upsert("short", &sv(&[1], &[2.0])); // length 2
+        idx.upsert("long", &sv(&[1, 2], &[2.0, 8.0])); // same tf for term 1, length 10
+        let res = idx.bm25_search(&[1], BM25_K1, BM25_B);
+        assert_eq!(
+            res[0].0, "short",
+            "length normalization favours the shorter doc"
+        );
+    }
+
+    #[test]
+    fn bm25_empty_index_and_unknown_terms_score_nothing() {
+        assert!(
+            SparseInvertedIndex::new()
+                .bm25_search(&[1], BM25_K1, BM25_B)
+                .is_empty()
+        );
+        let mut idx = SparseInvertedIndex::new();
+        idx.upsert("a", &sv(&[1], &[1.0]));
+        assert!(idx.bm25_search(&[999], BM25_K1, BM25_B).is_empty());
+    }
+
+    #[test]
+    fn bm25_deduplicates_query_terms() {
+        let mut idx = SparseInvertedIndex::new();
+        idx.upsert("a", &sv(&[1], &[1.0]));
+        idx.upsert("b", &sv(&[1, 2], &[1.0, 1.0]));
+        let once = idx.bm25_search(&[1], BM25_K1, BM25_B);
+        let twice = idx.bm25_search(&[1, 1, 1], BM25_K1, BM25_B);
+        assert_eq!(once, twice, "a repeated query term scores once");
+    }
+
+    #[test]
+    fn bm25_tracks_document_length_through_update_and_delete() {
+        let mut idx = SparseInvertedIndex::new();
+        idx.upsert("a", &sv(&[1, 2], &[1.0, 2.0])); // length 3
+        assert_eq!(idx.total_len, 3.0);
+        idx.upsert("a", &sv(&[1], &[5.0])); // update → length 5
+        assert_eq!(idx.total_len, 5.0);
+        idx.upsert("b", &sv(&[1], &[2.0])); // +2 → 7
+        assert_eq!(idx.total_len, 7.0);
+        assert!(idx.remove("a")); // −5 → 2
+        assert_eq!(idx.total_len, 2.0);
+        assert_eq!(idx.doclen[idx.slot_of["b"] as usize], 2.0);
     }
 
     #[test]
