@@ -21,14 +21,16 @@
 //! access-control denial, are recorded to an append-only audit log (ADR-0011,
 //! the `audit` module) when `audit_log` is set. Per-request cost limits bound
 //! the work any single authenticated request can demand (ADR-0040, the
-//! [`Limits`] type); per-tenant engine partitioning and per-key rate limiting
-//! are later phases. Design: `docs/api/rest-grpc.md`.
+//! [`Limits`] type), and an opt-in per-key token-bucket rate limiter bounds the
+//! request *rate* (ADR-0049, the [`RateLimiter`] type); per-tenant engine
+//! partitioning is a later phase. Design: `docs/api/rest-grpc.md`.
 
 mod audit;
 mod auth;
 mod embed_provider;
 mod error;
 mod grpc;
+mod rate_limit;
 mod replication;
 mod rest;
 
@@ -62,6 +64,7 @@ pub use embed_provider::{
     RerankProvider,
 };
 pub use error::Error;
+pub use rate_limit::{RateDecision, RateLimitConfig, RateLimitSnapshot, RateLimiter};
 
 use audit::{AuditLog, Outcome};
 use auth::Principal;
@@ -337,6 +340,11 @@ pub struct Config {
     /// retrieve→rerank stage of `search_text`.
     #[serde(default)]
     pub rerank: HashMap<String, RerankConfig>,
+    /// Opt-in per-key rate limiting (ADR-0049). Set a `[rate_limit]` table in
+    /// `quiver.toml` or the `QUIVER_RATE_LIMIT_*` env vars;
+    /// `requests_per_second = 0` (the default) disables it.
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 impl Default for Config {
@@ -358,6 +366,7 @@ impl Default for Config {
             limits: Limits::default(),
             embedding: HashMap::new(),
             rerank: HashMap::new(),
+            rate_limit: RateLimitConfig::default(),
         }
     }
 }
@@ -374,6 +383,11 @@ impl Config {
         // The flat `QUIVER_MAX_*` env keys do not nest under the `limits` table
         // figment builds, so apply them explicitly (ADR-0040).
         config.limits.apply_env_overrides()?;
+        // Same for the flat `QUIVER_RATE_LIMIT_*` keys (ADR-0049).
+        config
+            .rate_limit
+            .apply_env_overrides()
+            .map_err(Error::Config)?;
         Ok(config)
     }
 
@@ -503,6 +517,8 @@ pub(crate) struct AppState {
     // collection (ADR-0047). Empty on the common path; `search_text`/`upsert_text`
     // require a configured embedder for the target collection.
     embed: Arc<EmbedRegistry>,
+    // Opt-in per-key token-bucket rate limiter (ADR-0049). A no-op when disabled.
+    rate_limiter: Arc<RateLimiter>,
 }
 
 /// A collection's metadata.
@@ -585,6 +601,19 @@ impl AppState {
     /// which admits any caller as an all-collections admin.
     pub(crate) fn authenticate(&self, presented: Option<&str>) -> Option<Principal> {
         auth::authenticate(&self.keys, presented)
+    }
+
+    /// Consume one rate-limit token for `actor` (ADR-0049). A no-op `Allowed` when
+    /// rate limiting is disabled. Both transports call this at their auth choke
+    /// point so the limiter is enforced by one implementation.
+    pub(crate) fn rate_limit(&self, actor: &str) -> RateDecision {
+        self.rate_limiter.check(actor)
+    }
+
+    /// Whether the per-key rate limiter is active (lets a transport skip the work
+    /// entirely on the common, disabled path).
+    pub(crate) fn rate_limit_enabled(&self) -> bool {
+        self.rate_limiter.enabled()
     }
 
     async fn run_blocking<T, F>(&self, f: F) -> Result<T, Error>
@@ -1358,6 +1387,7 @@ pub async fn serve(
         read_only: config.leader_url.is_some(),
         limits: config.limits,
         embed: Arc::new(embed),
+        rate_limiter: Arc::new(RateLimiter::new(config.rate_limit)),
     };
 
     // A follower continuously applies the leader's committed-op stream (ADR-0030).
