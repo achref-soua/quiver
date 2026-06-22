@@ -20,6 +20,7 @@ use quiver_query::Filter;
 use crate::auth::Principal;
 use crate::{
     AppState, CollectionInfo, DocumentIn, DocumentMatchOut, Error, MatchOut, PointIn, PointOut,
+    TextPointIn,
 };
 
 /// Build the REST router: open `/healthz`, `/readyz`, `/metrics`; the `/v1` API
@@ -41,9 +42,11 @@ pub(crate) fn router(state: AppState) -> Router {
             post(upsert).delete(delete_points),
         )
         .route("/v1/collections/{name}/points:bulk", post(upsert_bulk))
+        .route("/v1/collections/{name}/points:text", post(upsert_text))
         .route("/v1/collections/{name}/points/{id}", get(get_point))
         .route("/v1/collections/{name}/query", post(search))
         .route("/v1/collections/{name}/query/hybrid", post(hybrid_search))
+        .route("/v1/collections/{name}/query/text", post(search_text))
         .route("/v1/collections/{name}/fetch", post(fetch))
         .route(
             "/v1/collections/{name}/documents",
@@ -398,6 +401,40 @@ async fn upsert_bulk(
 }
 
 #[derive(Deserialize)]
+struct TextPointDto {
+    id: String,
+    text: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+#[derive(Deserialize)]
+struct UpsertTextBody {
+    points: Vec<TextPointDto>,
+}
+
+/// Embed each point's `text` server-side and upsert it (ADR-0047). Requires an
+/// `[embedding.<collection>]` provider; the text is also indexed for BM25.
+async fn upsert_text(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(name): Path<String>,
+    Json(body): Json<UpsertTextBody>,
+) -> Result<Json<UpsertResponse>, Error> {
+    let points = body
+        .points
+        .into_iter()
+        .map(|p| TextPointIn {
+            id: p.id,
+            text: p.text,
+            payload: p.payload,
+        })
+        .collect();
+    let upserted = state.upsert_text(&principal, name, points).await?;
+    Ok(Json(UpsertResponse { upserted }))
+}
+
+#[derive(Deserialize)]
 struct DeletePointsBody {
     ids: Vec<String>,
 }
@@ -582,6 +619,56 @@ async fn hybrid_search(
             body.rrf_k0,
             body.with_payload,
             body.with_vector,
+        )
+        .await?;
+    Ok(Json(SearchResponse {
+        matches: matches.into_iter().map(MatchDto::from).collect(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct SearchTextBody {
+    /// The query text — embedded server-side with the collection's provider and
+    /// also scored by BM25 over the inverted index (ADR-0046/0047).
+    text: String,
+    #[serde(default = "default_k")]
+    k: usize,
+    #[serde(default)]
+    filter: Option<Filter>,
+    #[serde(default = "default_ef")]
+    ef_search: usize,
+    #[serde(default = "default_rrf_k0")]
+    rrf_k0: f32,
+    #[serde(default = "default_true")]
+    with_payload: bool,
+    #[serde(default)]
+    with_vector: bool,
+    /// Opt-in: rerank the candidate pool with the collection's `[rerank.<name>]`
+    /// provider and return the top-`k` reordered (ADR-0047).
+    #[serde(default)]
+    rerank: bool,
+}
+
+/// Text-in search: embed the query, run dense (⊕ BM25) retrieval, optionally
+/// rerank — all in one call (ADR-0047). Requires an `[embedding.<collection>]`.
+async fn search_text(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(name): Path<String>,
+    Json(body): Json<SearchTextBody>,
+) -> Result<Json<SearchResponse>, Error> {
+    let matches = state
+        .search_text(
+            &principal,
+            name,
+            body.text,
+            body.k,
+            body.filter,
+            body.ef_search,
+            body.rrf_k0,
+            body.with_payload,
+            body.with_vector,
+            body.rerank,
         )
         .await?;
     Ok(Json(SearchResponse {

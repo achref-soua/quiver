@@ -37,6 +37,12 @@ pub enum Error {
     /// An unexpected internal failure (lock poisoned, task panicked, …).
     #[error("internal error: {0}")]
     Internal(String),
+    /// A configured upstream provider (server-side embedding or reranking,
+    /// ADR-0047) failed or returned a malformed response. Returned as HTTP 502 /
+    /// gRPC `Unavailable`. The message carries no secrets (only env-var *names*
+    /// and provider transport/parse detail), so it is shown to the client.
+    #[error("{0}")]
+    Upstream(String),
 }
 
 impl Error {
@@ -52,6 +58,7 @@ impl Error {
             }
             Error::Forbidden(_) => (StatusCode::FORBIDDEN, tonic::Code::PermissionDenied),
             Error::BadRequest(_) => (StatusCode::BAD_REQUEST, tonic::Code::InvalidArgument),
+            Error::Upstream(_) => (StatusCode::BAD_GATEWAY, tonic::Code::Unavailable),
             Error::Engine(EngineError::Core(CoreError::InvalidArgument(_)))
             | Error::Engine(EngineError::Index(_))
             | Error::Engine(EngineError::Unsupported(_))
@@ -65,7 +72,9 @@ impl Error {
     // A client-safe message: the detail for 4xx, a generic line for 5xx.
     fn client_message(&self) -> String {
         let (status, _) = self.category();
-        if status.is_server_error() {
+        // 5xx detail is sanitized, except an upstream-provider failure whose
+        // message is client-safe and actionable (no secrets — names only).
+        if status.is_server_error() && !matches!(self, Error::Upstream(_)) {
             "internal error".to_owned()
         } else {
             self.to_string()

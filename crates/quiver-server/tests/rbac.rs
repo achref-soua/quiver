@@ -79,6 +79,8 @@ async fn scoped_keys_deny_over_scope_and_cross_namespace() {
         leader_api_key: None,
         insecure: false,
         limits: quiver_server::Limits::default(),
+        embedding: Default::default(),
+        rerank: Default::default(),
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;
