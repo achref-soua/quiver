@@ -174,6 +174,7 @@ async fn hybrid_search_over_grpc_fuses_dense_and_sparse() {
             rrf_k0: 0.0,
             with_payload: false,
             with_vector: false,
+            query_text: String::new(),
         }))
         .await
         .unwrap()
@@ -200,6 +201,7 @@ async fn hybrid_search_over_grpc_fuses_dense_and_sparse() {
             rrf_k0: 0.0,
             with_payload: false,
             with_vector: false,
+            query_text: String::new(),
         }))
         .await
         .unwrap()
@@ -218,6 +220,7 @@ async fn hybrid_search_over_grpc_fuses_dense_and_sparse() {
             rrf_k0: 0.0,
             with_payload: false,
             with_vector: false,
+            query_text: String::new(),
         }))
         .await;
     assert!(empty.is_err(), "neither dense nor sparse must be an error");
@@ -280,6 +283,69 @@ async fn full_text_search_over_rest_uses_bm25() {
         ids,
         vec!["cat".to_owned()],
         "only the cat doc matches; got {ids:?}"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn full_text_search_over_grpc_uses_bm25() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rest_addr = rest_listener.local_addr().unwrap();
+    let grpc_addr = grpc_listener.local_addr().unwrap();
+    let config = Config {
+        data_dir: tmp.path().to_path_buf(),
+        rest_addr,
+        grpc_addr,
+        insecure: true,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move {
+        let _ = serve(config, rest_listener, grpc_listener).await;
+    });
+    let http = reqwest::Client::new();
+    let base = format!("http://{rest_addr}");
+    wait_ready(&http, &base).await;
+    http.post(format!("{base}/v1/collections"))
+        .json(&serde_json::json!({"name": "docs", "dim": 4, "metric": "l2"}))
+        .send()
+        .await
+        .unwrap();
+    http.post(format!("{base}/v1/collections/docs/points"))
+        .json(&serde_json::json!({"points": [
+            {"id": "cat", "vector": [0.0, 0.0, 0.0, 0.0], "payload": {"__quiver_text__": "the quick brown cat"}},
+            {"id": "dog", "vector": [0.0, 0.0, 0.0, 0.0], "payload": {"__quiver_text__": "a lazy dog sleeps"}}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+
+    let mut client = QuiverClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .unwrap();
+    let resp = client
+        .hybrid_search(tonic::Request::new(v1::HybridSearchRequest {
+            collection: "docs".to_owned(),
+            vector: Vec::new(),
+            sparse: None,
+            filter: Vec::new(),
+            k: 5,
+            ef_search: 0,
+            rrf_k0: 0.0,
+            with_payload: false,
+            with_vector: false,
+            query_text: "cats".to_owned(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let ids: Vec<String> = resp.matches.iter().map(|m| m.id.clone()).collect();
+    assert_eq!(
+        ids,
+        vec!["cat".to_owned()],
+        "BM25 over gRPC ranks the cat doc"
     );
 
     server.abort();

@@ -143,10 +143,12 @@ export interface SparseVector {
 /** Options for {@link Client.hybridSearch}. Provide `vector`, `sparse`, or both;
  * at least one is required. */
 export interface HybridSearchOptions {
-  /** Dense query vector (omit for pure-sparse search). */
+  /** Dense query vector (omit for pure-sparse/text search). */
   vector?: number[];
-  /** Sparse query vector (omit for pure-dense search). */
+  /** Sparse query vector (omit for pure-dense/text search). */
   sparse?: SparseVector;
+  /** Full-text query, tokenized server-side and scored by BM25 (ADR-0046). */
+  queryText?: string;
   k?: number;
   /** A Quiver payload filter expression (applied on both sides). */
   filter?: unknown;
@@ -295,12 +297,15 @@ export class Client {
     }));
   }
 
-  /** Hybrid (dense + sparse) search fused with Reciprocal Rank Fusion (ADR-0043).
-   * Provide a dense `vector`, a `sparse` query vector, or both — at least one is
-   * required. The same payload `filter` is applied on both sides. */
+  /** Hybrid search fused with Reciprocal Rank Fusion (ADR-0043/0046). Provide a
+   * dense `vector`, a `sparse` query vector, and/or a full-text `queryText` (scored
+   * by BM25) — at least one is required. The same payload `filter` applies to every
+   * side. */
   async hybridSearch(collection: string, opts: HybridSearchOptions = {}): Promise<Match[]> {
-    if (opts.vector === undefined && opts.sparse === undefined) {
-      throw new QuiverError("hybridSearch requires a dense vector, a sparse vector, or both");
+    if (opts.vector === undefined && opts.sparse === undefined && opts.queryText === undefined) {
+      throw new QuiverError(
+        "hybridSearch requires a dense vector, a sparse vector, or a text query",
+      );
     }
     const body: Record<string, unknown> = {
       k: opts.k ?? 10,
@@ -310,6 +315,7 @@ export class Client {
       with_vector: opts.withVector ?? false,
     };
     if (opts.vector !== undefined) body["vector"] = opts.vector;
+    if (opts.queryText !== undefined) body["query_text"] = opts.queryText;
     if (opts.sparse !== undefined) {
       body["sparse_indices"] = opts.sparse.indices;
       body["sparse_values"] = opts.sparse.values;

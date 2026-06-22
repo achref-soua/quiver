@@ -234,6 +234,10 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
                 .get("rrf_k0")
                 .and_then(Value::as_f64)
                 .map_or(DEFAULT_RRF_K0, |x| x as f32);
+            let query_text = args
+                .get("query_text")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let params = SearchParams {
                 k,
                 filter,
@@ -244,8 +248,7 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
                     collection,
                     dense.as_deref(),
                     sparse.as_ref(),
-                    // `query_text` (full-text BM25) parity comes in the ADR-0046 follow-up.
-                    None,
+                    query_text.as_deref(),
                     &params,
                     rrf_k0,
                 )
@@ -456,14 +459,15 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "hybrid_search",
-            "description": "Hybrid (dense + sparse) search fused with Reciprocal Rank Fusion (ADR-0043/0045). Provide a dense 'vector', a sparse query ('sparse_indices' + 'sparse_values', parallel arrays), or both; at least one is required. Honours the same payload filter on both sides.",
+            "description": "Hybrid search fused with Reciprocal Rank Fusion (ADR-0043/0045/0046). Provide a dense 'vector', a sparse query ('sparse_indices' + 'sparse_values', parallel arrays), and/or a full-text 'query_text' (tokenized and scored by BM25); at least one is required. Honours the same payload filter on every side.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "collection": collection_arg,
-                    "vector": { "type": "array", "items": { "type": "number" }, "description": "Dense query vector (omit for pure-sparse search)" },
+                    "vector": { "type": "array", "items": { "type": "number" }, "description": "Dense query vector (omit for pure-sparse/text search)" },
                     "sparse_indices": { "type": "array", "items": { "type": "integer" }, "description": "Sparse query dimension ids (parallel to sparse_values)" },
                     "sparse_values": { "type": "array", "items": { "type": "number" }, "description": "Sparse query weights (parallel to sparse_indices)" },
+                    "query_text": { "type": "string", "description": "Full-text query, scored by BM25 over the inverted index (ADR-0046)" },
                     "k": { "type": "integer", "default": 10 },
                     "filter": { "type": "object", "description": "Quiver payload filter tree" },
                     "rrf_k0": { "type": "number", "description": "RRF rank-bias constant (default 60)" }
@@ -885,6 +889,40 @@ mod tests {
             json!({"collection":"kb","sparse_indices":[1],"k":2}),
         );
         assert_eq!(r["result"]["isError"], true);
+    }
+
+    #[test]
+    fn hybrid_search_tool_supports_full_text_query() {
+        let (_t, mut db) = db();
+        call(
+            &mut db,
+            "create_collection",
+            json!({"name":"docs","dim":4,"metric":"l2"}),
+        );
+        call(
+            &mut db,
+            "upsert",
+            json!({"collection":"docs","id":"cat","vector":[0.0,0.0,0.0,0.0],"payload":{"__quiver_text__":"the quick brown cat"}}),
+        );
+        call(
+            &mut db,
+            "upsert",
+            json!({"collection":"docs","id":"dog","vector":[0.0,0.0,0.0,0.0],"payload":{"__quiver_text__":"a lazy dog sleeps"}}),
+        );
+        let r = call(
+            &mut db,
+            "hybrid_search",
+            json!({"collection":"docs","query_text":"cats","k":5}),
+        );
+        assert_eq!(r["result"]["isError"], false);
+        let parsed: Value = serde_json::from_str(&result_text(&r)).unwrap();
+        let ids: Vec<&str> = parsed["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["cat"], "BM25 over MCP ranks the cat doc");
     }
 
     const ENC_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";

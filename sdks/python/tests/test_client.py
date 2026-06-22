@@ -358,6 +358,19 @@ def test_hybrid_search_sends_dense_and_sparse_body():
     assert body["filter"] == {"eq": {"field": "t", "value": 1}}
 
 
+@respx.mock
+def test_hybrid_search_sends_query_text_for_bm25():
+    route = respx.post(f"{BASE}/v1/collections/docs/query/hybrid").mock(
+        return_value=httpx.Response(200, json={"matches": [{"id": "cat", "score": 1.2}]})
+    )
+    with Client(BASE) as q:
+        hits = q.hybrid_search("docs", query_text="cats", k=5)
+    assert hits == [Match(id="cat", score=1.2)]
+    body = json.loads(route.calls.last.request.content)
+    assert body["query_text"] == "cats"
+    assert "vector" not in body
+
+
 def test_hybrid_search_requires_a_query():
     with Client(BASE) as q:
         import pytest as _pytest
