@@ -17,6 +17,10 @@ service Quiver {
   rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse);
 
   rpc Upsert(UpsertRequest) returns (UpsertResponse);
+  // Client-streaming bulk upsert (ADR-0045 fast-follow): stream chunks of points
+  // for a single collection; the server buffers the stream and performs one bulk
+  // load (a single WAL fsync + one index build), returning the total upserted.
+  rpc UpsertStream(stream UpsertRequest) returns (UpsertResponse);
   rpc DeletePoints(DeletePointsRequest) returns (DeletePointsResponse);
   rpc GetPoints(GetPointsRequest) returns (GetPointsResponse);
 

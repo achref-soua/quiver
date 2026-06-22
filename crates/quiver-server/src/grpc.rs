@@ -403,6 +403,54 @@ impl Quiver for QuiverService {
         Ok(Response::new(v1::UpsertResponse { upserted }))
     }
 
+    async fn upsert_stream(
+        &self,
+        request: Request<tonic::Streaming<v1::UpsertRequest>>,
+    ) -> Result<Response<v1::UpsertResponse>, Status> {
+        let principal = self.authenticate(&request)?;
+        let mut stream = request.into_inner();
+        // The whole stream is one bulk load: collection comes from the first
+        // chunk; later chunks must agree. Buffer points, then a single
+        // `upsert_bulk` (one fsync + one index build). ponytail: the server
+        // buffers the full stream before the build; a chunked flush is the
+        // upgrade path if a stream ever outgrows memory — bounded here by the
+        // bulk-batch cap so it cannot OOM the node.
+        let max = self.state.limits.max_bulk_batch_size;
+        let mut collection: Option<String> = None;
+        let mut points: Vec<PointIn> = Vec::new();
+        while let Some(chunk) = stream.message().await? {
+            match &collection {
+                None => collection = Some(chunk.collection),
+                Some(c) if !chunk.collection.is_empty() && &chunk.collection != c => {
+                    return Err(Status::invalid_argument(
+                        "every chunk in an upsert stream must target the same collection",
+                    ));
+                }
+                Some(_) => {}
+            }
+            for point in chunk.points {
+                points.push(PointIn {
+                    id: point.id,
+                    vector: point.vector,
+                    payload: parse_payload(&point.payload)?,
+                });
+            }
+            if points.len() > max {
+                return Err(Status::invalid_argument(format!(
+                    "upsert stream exceeds the bulk batch cap of {max} points"
+                )));
+            }
+        }
+        let collection = collection
+            .ok_or_else(|| Status::invalid_argument("upsert stream contained no chunks"))?;
+        let upserted = self
+            .state
+            .upsert_bulk(&principal, collection, points)
+            .await
+            .map_err(|e| e.to_status())?;
+        Ok(Response::new(v1::UpsertResponse { upserted }))
+    }
+
     async fn delete_points(
         &self,
         request: Request<v1::DeletePointsRequest>,
