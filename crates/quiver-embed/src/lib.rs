@@ -54,7 +54,7 @@ pub use quiver_core::{
     VectorEncryption,
 };
 pub use quiver_query::Filter;
-pub use quiver_query::{DEFAULT_RRF_K0, SPARSE_KEY, SparseVector, rrf_fuse};
+pub use quiver_query::{DEFAULT_RRF_K0, SPARSE_KEY, SparseInvertedIndex, SparseVector, rrf_fuse};
 
 /// Errors returned by the embeddable database.
 #[derive(Debug, Error)]
@@ -258,6 +258,19 @@ struct CollectionHandle {
     // single-vector collection. Maintained eagerly on document writes and rebuilt
     // authoritatively from the store on open / rebuild; never persisted (ADR-0028).
     docs: Option<BTreeMap<String, u32>>,
+    // Derived inverted index over the collection's `__quiver_sparse__` payloads,
+    // for the sparse half of hybrid search (ADR-0045). `Some` for a single-vector,
+    // server-searchable collection; `None` for multi-vector and client-side-encrypted
+    // collections (which never run hybrid search) — and as a backstop, when `None`
+    // the sparse ranking falls back to a full store scan. Built on rebuild from the
+    // store and maintained incrementally on upsert/delete; never persisted.
+    sparse: Option<SparseInvertedIndex>,
+}
+
+// Whether a collection should carry a derived sparse inverted index: only
+// single-vector, server-searchable collections run hybrid search (ADR-0045).
+fn uses_sparse_index(descriptor: &Descriptor) -> bool {
+    !descriptor.multivector && descriptor.vector_encryption != VectorEncryption::ClientSide
 }
 
 /// An in-process Quiver database over one data directory.
@@ -307,6 +320,8 @@ impl Database {
                 ext_to_int: HashMap::new(),
                 stale: true,
                 docs: None,
+                // Populated by `load_index` / `rebuild_index` from the store.
+                sparse: None,
             };
             load_index(&store, &mut handle)?;
             collections.insert(name, handle);
@@ -321,6 +336,10 @@ impl Database {
         let id = self.store.create_collection(name, descriptor.clone())?;
         let index = empty_index(&descriptor);
         let docs = descriptor.multivector.then(BTreeMap::new);
+        // A fresh single-vector collection starts with an empty inverted index
+        // maintained incrementally from the first upsert (an empty index allocates
+        // nothing until a sparse vector arrives).
+        let sparse = uses_sparse_index(&descriptor).then(SparseInvertedIndex::new);
         self.collections.insert(
             name.to_owned(),
             CollectionHandle {
@@ -331,6 +350,7 @@ impl Database {
                 ext_to_int: HashMap::new(),
                 stale: false,
                 docs,
+                sparse,
             },
         );
         Ok(())
@@ -400,6 +420,8 @@ impl Database {
             {
                 let docs = descriptor.multivector.then(BTreeMap::new);
                 let index = empty_index(&descriptor);
+                // Replicated writes mark the handle stale, so the next read rebuilds
+                // the inverted index from the replicated store.
                 self.collections.insert(
                     name,
                     CollectionHandle {
@@ -410,6 +432,7 @@ impl Database {
                         ext_to_int: HashMap::new(),
                         stale: false,
                         docs,
+                        sparse: None,
                     },
                 );
             }
@@ -472,6 +495,8 @@ impl Database {
         // Maintain the in-memory index in place where the kind allows it, else
         // defer to a lazy rebuild on the next search (ADR-0023/0026/0033).
         index_upsert_point(handle, id, vector)?;
+        // Keep the derived sparse inverted index in step (ADR-0045).
+        sparse_index_upsert_point(handle, id, payload);
         Ok(())
     }
 
@@ -511,13 +536,59 @@ impl Database {
             return Ok(records.len() as u64);
         }
 
-        for (id, vector, _) in points {
+        for (id, vector, payload) in points {
             let handle = self
                 .collections
                 .get_mut(collection)
                 .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
             index_upsert_point(handle, id, vector)?;
+            sparse_index_upsert_point(handle, id, payload);
         }
+        Ok(records.len() as u64)
+    }
+
+    /// Upsert a large batch for a bulk load, deferring all index work to a single
+    /// rebuild pass (ADR-0045).
+    ///
+    /// Like [`upsert_batch`](Self::upsert_batch) the points are committed with one
+    /// WAL `fdatasync`, but instead of folding each point into the in-memory index
+    /// one at a time, the collection's index is marked **stale** so the next search
+    /// rebuilds it in a single pass over the whole collection — far cheaper for a
+    /// fresh load (one k-means for IVF, one graph build for Vamana, one inverted-index
+    /// scan) than N incremental inserts. Prefer `upsert_batch` for steady-state
+    /// writes where query-after-write latency matters.
+    pub fn upsert_bulk(
+        &mut self,
+        collection: &str,
+        points: &[(&str, &[f32], &serde_json::Value)],
+    ) -> Result<u64> {
+        let handle = self
+            .collections
+            .get_mut(collection)
+            .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+        require_single_vector(handle)?;
+        let coll_id = handle.id;
+
+        let payload_bytes: Vec<Vec<u8>> = points
+            .iter()
+            .map(|(_, _, p)| serde_json::to_vec(p).map_err(Error::Json))
+            .collect::<Result<_>>()?;
+        let records: Vec<(&str, &[f32], &[u8])> = points
+            .iter()
+            .zip(payload_bytes.iter())
+            .map(|((id, vec, _), p)| (*id, *vec, p.as_slice()))
+            .collect();
+
+        self.store.upsert_batch(coll_id, &records)?;
+
+        // Defer the dense and sparse index maintenance to a single rebuild on the
+        // next read (a client-side-encrypted collection has no index to rebuild, but
+        // marking it stale is harmless — its rebuild produces the same no-op index).
+        let handle = self
+            .collections
+            .get_mut(collection)
+            .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+        handle.stale = true;
         Ok(records.len() as u64)
     }
 
@@ -543,6 +614,8 @@ impl Database {
         // kept so a later re-insert allocates afresh — a removed or soft-deleted
         // internal is simply never returned by the index.
         index_delete_point(handle, id);
+        // Drop the point from the derived sparse inverted index too (ADR-0045).
+        sparse_index_delete_point(handle, id);
         Ok(true)
     }
 
@@ -746,7 +819,7 @@ impl Database {
             lists.push(self.dense_ranked_ids(handle, q, depth, params.ef_search, filter)?);
         }
         if let Some(sp) = sparse_query {
-            lists.push(self.sparse_ranked_ids(handle.id, sp, depth, filter)?);
+            lists.push(self.sparse_ranked_ids(handle, sp, depth, filter)?);
         }
         let fused = rrf_fuse(&lists, rrf_k0, params.k);
 
@@ -802,13 +875,39 @@ impl Database {
         Ok(ids)
     }
 
-    // Sparse candidates as a ranked list of external ids: scan the live store,
-    // score each point's `__quiver_sparse__` vector by dot-product against the
-    // query, re-check the filter, and return the top `depth` by score. Scanning
-    // the store (rather than a cached index) keeps results correct under the
-    // incremental upsert/delete path (ADR-0026); a derived inverted index is a
-    // documented optimization follow-up (ADR-0043).
+    // Sparse candidates as a ranked list of external ids. With the derived inverted
+    // index present (the common case), score only the query's nonzero dimensions via
+    // the posting lists, then re-check the filter on the ranked ids until `depth` are
+    // filled — so low-scored rows never load a payload (ADR-0045). When the index is
+    // absent (a not-yet-rebuilt or client-side collection), fall back to the full
+    // store scan, which stays correct under the incremental upsert/delete path.
     fn sparse_ranked_ids(
+        &self,
+        handle: &CollectionHandle,
+        query: &SparseVector,
+        depth: usize,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<String>> {
+        if let Some(idx) = handle.sparse.as_ref() {
+            let mut ids = Vec::new();
+            for (ext_id, _score) in idx.search(query) {
+                if !self.passes_filter(handle.id, &ext_id, filter)? {
+                    continue;
+                }
+                ids.push(ext_id);
+                if ids.len() >= depth {
+                    break;
+                }
+            }
+            return Ok(ids);
+        }
+        self.sparse_ranked_ids_by_scan(handle.id, query, depth, filter)
+    }
+
+    // The store-scan fallback for [`sparse_ranked_ids`]: load every row, score its
+    // `__quiver_sparse__` vector by dot product against the query, re-check the
+    // filter, and return the top `depth`. O(N-rows), but correct without an index.
+    fn sparse_ranked_ids_by_scan(
         &self,
         cid: CollectionId,
         query: &SparseVector,
@@ -1675,11 +1774,20 @@ fn rebuild_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
     let mut ext_to_int = HashMap::new();
     let mut flat: Vec<f32> = Vec::new();
     let mut docs: BTreeMap<String, u32> = BTreeMap::new();
+    // Rebuild the derived sparse inverted index from the same scan (ADR-0045); only
+    // single-vector, server-searchable collections carry one, and only non-empty
+    // payloads are parsed, so non-sparse collections pay nothing here.
+    let mut sparse = uses_sparse_index(&handle.descriptor).then(SparseInvertedIndex::new);
     for (ext_id, record) in store.scan(handle.id)? {
         let internal = int_to_ext.len() as u64;
         flat.extend_from_slice(&record.vector);
         if multivector && let Some((doc, _)) = parse_token_id(&ext_id) {
             *docs.entry(doc.to_owned()).or_insert(0) += 1;
+        }
+        if let Some(idx) = sparse.as_mut()
+            && let Some(sv) = sparse_vector_from_payload(&record.payload)
+        {
+            idx.upsert(&ext_id, &sv);
         }
         ext_to_int.insert(ext_id.clone(), internal);
         int_to_ext.push(ext_id);
@@ -1692,8 +1800,55 @@ fn rebuild_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
     handle.int_to_ext = int_to_ext;
     handle.ext_to_int = ext_to_int;
     handle.docs = multivector.then_some(docs);
+    handle.sparse = sparse;
     handle.stale = false;
     Ok(())
+}
+
+// Extract a point's sparse vector from its serialized payload, if it carries one
+// under `__quiver_sparse__` and the value deserializes. An empty payload or a
+// missing/malformed sparse vector yields `None`.
+fn sparse_vector_from_payload(payload: &[u8]) -> Option<SparseVector> {
+    if payload.is_empty() {
+        return None;
+    }
+    let value = serde_json::from_slice::<Value>(payload).ok()?;
+    sparse_vector_from_value(&value)
+}
+
+// As [`sparse_vector_from_payload`] but over an already-parsed payload `Value`
+// (the upsert path has the payload before it is serialized).
+fn sparse_vector_from_value(payload: &Value) -> Option<SparseVector> {
+    let raw = payload.get(SPARSE_KEY)?;
+    serde_json::from_value::<SparseVector>(raw.clone()).ok()
+}
+
+// Maintain the derived sparse inverted index for one point write (ADR-0045): index
+// the point's sparse vector, or drop any prior entry when the new payload no longer
+// carries one (an update that removed it). A no-op when the collection has no
+// inverted index, or when a rebuild is pending — the rebuild repopulates the index
+// authoritatively from the store, exactly as it does the dense index.
+fn sparse_index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, payload: &Value) {
+    if handle.stale {
+        return;
+    }
+    let Some(idx) = handle.sparse.as_mut() else {
+        return;
+    };
+    match sparse_vector_from_value(payload) {
+        Some(sv) => idx.upsert(ext_id, &sv),
+        None => {
+            idx.remove(ext_id);
+        }
+    }
+}
+
+// Drop one point from the derived sparse inverted index. A no-op when the
+// collection has no inverted index.
+fn sparse_index_delete_point(handle: &mut CollectionHandle, ext_id: &str) {
+    if let Some(idx) = handle.sparse.as_mut() {
+        idx.remove(ext_id);
+    }
 }
 
 // The set of live external ids guaranteed to contain every row the `filter`
@@ -1912,6 +2067,172 @@ mod tests {
         );
     }
 
+    // Pure-sparse hybrid result ids, in fused order.
+    fn sparse_ids(db: &mut Database, q: &SparseVector) -> Vec<String> {
+        let params = SearchParams {
+            k: 10,
+            ..SearchParams::default()
+        };
+        db.hybrid_search("kb", None, Some(q), &params, DEFAULT_RRF_K0)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect()
+    }
+
+    #[test]
+    fn sparse_index_equals_the_store_scan_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("kb", desc()).unwrap();
+        let z = [0.0f32, 0.0, 0.0, 0.0];
+        for (id, dims, vals) in [
+            ("a", vec![1u32, 2], vec![5.0f32, 1.0]),
+            ("b", vec![2u32, 3], vec![3.0f32, 4.0]),
+            ("c", vec![1u32, 3], vec![2.0f32, 2.0]),
+            ("d", vec![9u32], vec![1.0f32]), // shares no query term
+        ] {
+            db.upsert(
+                "kb",
+                id,
+                &z,
+                &json!({ "__quiver_sparse__": { "indices": dims, "values": vals } }),
+            )
+            .unwrap();
+        }
+        let q = SparseVector {
+            indices: vec![1, 2, 3],
+            values: vec![1.0, 1.0, 1.0],
+        };
+
+        // The derived index is present and used.
+        assert!(db.collections.get("kb").unwrap().sparse.is_some());
+        let via_index = sparse_ids(&mut db, &q);
+        assert!(!via_index.contains(&"d".to_owned()), "d shares no term");
+
+        // Drop the index (not stale, so no rebuild) → the store-scan fallback runs
+        // and must return the identical ranking.
+        db.collections.get_mut("kb").unwrap().sparse = None;
+        let via_scan = sparse_ids(&mut db, &q);
+        assert_eq!(via_index, via_scan);
+    }
+
+    #[test]
+    fn sparse_index_reflects_updates_and_deletes_like_a_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("kb", desc()).unwrap();
+        let z = [0.0f32, 0.0, 0.0, 0.0];
+        db.upsert(
+            "kb",
+            "a",
+            &z,
+            &json!({ "__quiver_sparse__": { "indices": [1, 2], "values": [5.0, 5.0] } }),
+        )
+        .unwrap();
+        db.upsert(
+            "kb",
+            "b",
+            &z,
+            &json!({ "__quiver_sparse__": { "indices": [2], "values": [3.0] } }),
+        )
+        .unwrap();
+        db.upsert(
+            "kb",
+            "c",
+            &z,
+            &json!({ "__quiver_sparse__": { "indices": [1], "values": [9.0] } }),
+        )
+        .unwrap();
+        // Update "a" onto a disjoint term; delete "b".
+        db.upsert(
+            "kb",
+            "a",
+            &z,
+            &json!({ "__quiver_sparse__": { "indices": [7], "values": [1.0] } }),
+        )
+        .unwrap();
+        assert!(db.delete("kb", "b").unwrap());
+
+        let q = SparseVector {
+            indices: vec![1, 2],
+            values: vec![1.0, 1.0],
+        };
+        // Only "c" still shares a query term ("a" moved to 7, "b" is gone).
+        let incremental = sparse_ids(&mut db, &q);
+        assert_eq!(incremental, vec!["c".to_owned()]);
+
+        // A full rebuild from the store must agree with the incremental state.
+        db.collections.get_mut("kb").unwrap().stale = true;
+        let rebuilt = sparse_ids(&mut db, &q);
+        assert_eq!(incremental, rebuilt);
+    }
+
+    #[test]
+    fn sparse_index_is_rebuilt_on_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut db = open(tmp.path());
+            db.create_collection("kb", desc()).unwrap();
+            db.upsert(
+                "kb",
+                "a",
+                &[0.0, 0.0, 0.0, 0.0],
+                &json!({ "__quiver_sparse__": { "indices": [1], "values": [1.0] } }),
+            )
+            .unwrap();
+        }
+        let mut db = open(tmp.path());
+        assert!(db.collections.get("kb").unwrap().sparse.is_some());
+        let q = SparseVector {
+            indices: vec![1],
+            values: vec![1.0],
+        };
+        assert_eq!(sparse_ids(&mut db, &q), vec!["a".to_owned()]);
+    }
+
+    #[test]
+    fn hybrid_sparse_honours_the_payload_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("kb", desc()).unwrap();
+        let z = [0.0f32, 0.0, 0.0, 0.0];
+        db.upsert(
+            "kb",
+            "a",
+            &z,
+            &json!({ "lang": "en", "__quiver_sparse__": { "indices": [1], "values": [5.0] } }),
+        )
+        .unwrap();
+        db.upsert(
+            "kb",
+            "b",
+            &z,
+            &json!({ "lang": "fr", "__quiver_sparse__": { "indices": [1], "values": [9.0] } }),
+        )
+        .unwrap();
+        let q = SparseVector {
+            indices: vec![1],
+            values: vec![1.0],
+        };
+        let params = SearchParams {
+            k: 10,
+            filter: Some(Filter::Eq {
+                field: "lang".to_owned(),
+                value: json!("en"),
+            }),
+            ..SearchParams::default()
+        };
+        let hits: Vec<String> = db
+            .hybrid_search("kb", None, Some(&q), &params, DEFAULT_RRF_K0)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        // "b" scores higher but is filtered out by lang == "en".
+        assert_eq!(hits, vec!["a".to_owned()]);
+    }
+
     #[test]
     fn create_upsert_search_get_end_to_end() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2004,6 +2325,60 @@ mod tests {
             seq, bat,
             "batch and sequential produce different search results"
         );
+    }
+
+    #[test]
+    fn upsert_bulk_defers_the_index_then_searches_correctly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("c", desc()).unwrap();
+        let vectors: Vec<[f32; 4]> = (0..20u32).map(|i| [i as f32, 0.0, 0.0, 0.0]).collect();
+        let ids: Vec<String> = (0..20u32).map(|i| format!("p{i}")).collect();
+        // Give one point a sparse vector so the deferred rebuild also rebuilds the
+        // inverted index.
+        let plain = json!({});
+        let sparse_payload = json!({ "__quiver_sparse__": { "indices": [7], "values": [1.0] } });
+        let pts: Vec<(&str, &[f32], &serde_json::Value)> = ids
+            .iter()
+            .zip(vectors.iter())
+            .map(|(id, v)| {
+                let payload = if id == "p3" { &sparse_payload } else { &plain };
+                (id.as_str(), v.as_slice(), payload)
+            })
+            .collect();
+        let n = db.upsert_bulk("c", &pts).unwrap();
+        assert_eq!(n, 20);
+
+        // The bulk path defers index maintenance: the handle is stale until a read.
+        assert!(db.collections.get("c").unwrap().stale);
+
+        // Dense search triggers the single rebuild and returns the nearest points.
+        let query = [10.0f32, 0.0, 0.0, 0.0];
+        let params = SearchParams {
+            k: 5,
+            ..Default::default()
+        };
+        let hits: Vec<String> = db
+            .search("c", &query, &params)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(hits[0], "p10", "nearest to 10 is p10; got {hits:?}");
+        assert!(!db.collections.get("c").unwrap().stale, "rebuilt on read");
+
+        // The sparse vector loaded via the bulk path is searchable after the rebuild.
+        let q = SparseVector {
+            indices: vec![7],
+            values: vec![1.0],
+        };
+        let sparse_hits: Vec<String> = db
+            .hybrid_search("c", None, Some(&q), &params, DEFAULT_RRF_K0)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(sparse_hits, vec!["p3".to_owned()]);
     }
 
     #[test]

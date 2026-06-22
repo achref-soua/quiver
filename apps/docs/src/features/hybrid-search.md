@@ -54,18 +54,34 @@ hits = q.hybrid_search(
 )
 ```
 
-Over REST: `POST /v1/collections/{name}/query/hybrid` with
-`{ "vector": [...], "sparse_indices": [...], "sparse_values": [...], "k": 10,
-"filter": {...}, "rrf_k0": 60 }`.
+Hybrid search is reachable from every surface (ADR-0045):
+
+- **REST:** `POST /v1/collections/{name}/query/hybrid` with
+  `{ "vector": [...], "sparse_indices": [...], "sparse_values": [...], "k": 10,
+  "filter": {...}, "rrf_k0": 60 }`.
+- **gRPC:** the `HybridSearch` RPC (`HybridSearchRequest` with a dense `vector`, a
+  `sparse` `SparseVector`, `filter`, `k`, `ef_search`, `rrf_k0`).
+- **MCP:** the `hybrid_search` tool (`vector`, `sparse_indices`/`sparse_values`,
+  `k`, `filter`, `rrf_k0`).
+- **SDKs:** `hybrid_search` (Python) and `hybridSearch` (TypeScript).
+
+## Performance: the derived inverted index
+
+The sparse side is served by an in-memory **inverted index** (`dim → {doc → weight}`,
+ADR-0045): a query scores only the documents that share one of its nonzero terms,
+rather than scanning every row. The index is **derived** — built from the store
+when a collection's index is (re)built and maintained incrementally on
+upsert/delete — so there is no on-disk format change and the `kill -9` crash gate is
+untouched. A collection with no sparse vectors carries no index, and a not-yet-built
+or client-side collection falls back to a correct full store scan.
 
 ## Limits and scope
 
 - The sparse query's term count is bounded by `QUIVER_MAX_SPARSE_TERMS` (default
   4096), alongside the other [query cost limits](../security/threat-model.md).
-- The sparse side currently scans the live store, which keeps results correct
-  under incremental upsert/delete; a derived inverted index, gRPC/MCP/TypeScript
-  parity, and a built-in BM25 tokenizer (which produces sparse vectors, reusing
-  this machinery) are tracked follow-ups (ADR-0043).
+- A built-in **BM25 tokenizer** — which would *produce* sparse term-weight vectors
+  from a text field, reusing all of this machinery — is the remaining tracked
+  follow-up (ADR-0045, slated for a later release).
 
 See the [RAG guide](../guides/rag.md) for where hybrid retrieval fits in a
 pipeline.

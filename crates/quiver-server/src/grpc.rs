@@ -8,7 +8,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use quiver_embed::{
-    DistanceMetric, FieldType, FilterableField, IndexKind, IndexSpec, VectorEncryption, WalOp,
+    DEFAULT_RRF_K0, DistanceMetric, FieldType, FilterableField, IndexKind, IndexSpec,
+    VectorEncryption, WalOp,
 };
 use quiver_proto::v1::{
     self,
@@ -444,6 +445,54 @@ impl Quiver for QuiverService {
                 k,
                 filter,
                 ef_search,
+                req.with_payload,
+                req.with_vector,
+            )
+            .await
+            .map_err(|e| e.to_status())?;
+        Ok(Response::new(v1::SearchResponse {
+            matches: matches.into_iter().map(match_to_proto).collect(),
+        }))
+    }
+
+    async fn hybrid_search(
+        &self,
+        request: Request<v1::HybridSearchRequest>,
+    ) -> Result<Response<v1::SearchResponse>, Status> {
+        let principal = self.authenticate(&request)?;
+        let req = request.into_inner();
+        let filter: Option<Filter> = if req.filter.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_slice(&req.filter)
+                    .map_err(|e| Status::invalid_argument(format!("invalid filter json: {e}")))?,
+            )
+        };
+        let dense = (!req.vector.is_empty()).then_some(req.vector);
+        let sparse = req.sparse.map(|s| (s.indices, s.values));
+        let k = if req.k == 0 { 10 } else { req.k as usize };
+        let ef_search = if req.ef_search == 0 {
+            64
+        } else {
+            req.ef_search as usize
+        };
+        let rrf_k0 = if req.rrf_k0 == 0.0 {
+            DEFAULT_RRF_K0
+        } else {
+            req.rrf_k0
+        };
+        let matches = self
+            .state
+            .hybrid_search(
+                &principal,
+                req.collection,
+                dense,
+                sparse,
+                k,
+                filter,
+                ef_search,
+                rrf_k0,
                 req.with_payload,
                 req.with_vector,
             )

@@ -117,6 +117,49 @@ describe("Quiver TypeScript client", () => {
     expect(hits[0]!.id).toBe("a");
   });
 
+  it("hybridSearch sends dense + sparse and the rrf constant, and parses matches", async () => {
+    let path: string | undefined;
+    let body: Record<string, unknown> | undefined;
+    const fetch = mockFetch(async (p, _method, init) => {
+      path = p;
+      body = parseBody(init);
+      return json({
+        matches: [
+          { id: "a", score: 0.5 },
+          { id: "b", score: 0.4 },
+        ],
+      });
+    });
+    const hits = await new Client("http://x", { fetch }).hybridSearch("kb", {
+      vector: [1, 0, 0, 0],
+      sparse: { indices: [1, 2], values: [5, 5] },
+      k: 2,
+      rrfK0: 60,
+    });
+    expect(path).toBe("/v1/collections/kb/query/hybrid");
+    expect(body?.["vector"]).toEqual([1, 0, 0, 0]);
+    expect(body?.["sparse_indices"]).toEqual([1, 2]);
+    expect(body?.["sparse_values"]).toEqual([5, 5]);
+    expect(body?.["rrf_k0"]).toBe(60);
+    expect(hits.map((m) => m.id)).toEqual(["a", "b"]);
+  });
+
+  it("hybridSearch works pure-sparse and rejects an empty query", async () => {
+    let body: Record<string, unknown> | undefined;
+    const fetch = mockFetch(async (_path, _method, init) => {
+      body = parseBody(init);
+      return json({ matches: [{ id: "b", score: 0.4 }] });
+    });
+    const client = new Client("http://x", { fetch });
+    const hits = await client.hybridSearch("kb", {
+      sparse: { indices: [1, 2], values: [1, 1] },
+    });
+    expect(body?.["vector"]).toBeUndefined();
+    expect(body?.["sparse_indices"]).toEqual([1, 2]);
+    expect(hits[0]!.id).toBe("b");
+    await expect(client.hybridSearch("kb", {})).rejects.toThrow(/dense vector, a sparse vector/);
+  });
+
   it("getPoint returns null on 404", async () => {
     const fetch = mockFetch(async () => new Response("", { status: 404 }));
     const m = await new Client("http://x", { fetch }).getPoint("items", "nope");

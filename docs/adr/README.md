@@ -64,5 +64,6 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0042](0042-rag-ergonomics.md) | RAG/agentic ergonomics (async SDK, Haystack, MCP introspection) + usage docs | Proposed | 5 |
 | [0043](0043-hybrid-sparse-search.md) | Hybrid (dense + sparse) search with RRF fusion | Proposed | 5 |
 | [0044](0044-automated-release-assets.md) | Automated, tag-triggered multi-platform release assets (Windows job added) | Accepted | 5 |
+| [0045](0045-hybrid-everywhere-and-fast-ingest.md) | Hybrid everywhere + fast ingest (sparse inverted index, gRPC/MCP/TS parity, bulk upsert) | Accepted | 5 |
 
 Phase-0 ADRs (0001–0018) are Accepted; Phase-2 decisions span 0019–0022; Phase-4 decisions begin at 0023. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.
