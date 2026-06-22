@@ -1,6 +1,6 @@
 # ADR-0048 — Snowball (Porter2) stemmer for BM25 tokenization
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-22
 **Deciders:** Achref Soua
 

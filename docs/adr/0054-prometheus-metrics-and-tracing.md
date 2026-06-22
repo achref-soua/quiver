@@ -1,6 +1,6 @@
 # ADR-0054: Prometheus `/metrics` and request tracing
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-23
 - **Deciders:** Achref Soua
 
@@ -73,3 +73,11 @@ implementation.
   CI cannot verify and most self-hosters don't run; kept as an opt-in layer.
 - **Concrete path as the label** — rejected: unbounded cardinality and an
   id-leak; the matched template is bounded and safe.
+
+## Implementation
+
+`crates/quiver-server/src/metrics.rs` — a dependency-free registry rendered as Prometheus text on `GET /metrics`. A REST middleware records per-(method, matched-route) request/error counters + a latency histogram; both transports' auth choke points record `quiver_auth_failures_total` / `quiver_rate_limited_total`. Engine ops carry `#[tracing::instrument]` spans. Grafana dashboard in `infra/grafana/`.
+
+## Verification
+
+Unit tests (render shape, cumulative+monotonic buckets, `+Inf` = count, security counters) and e2e (`/metrics` shows the matched-route counter + histogram families; an unauthenticated request increments the auth-failure counter).

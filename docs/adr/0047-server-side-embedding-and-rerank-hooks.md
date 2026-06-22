@@ -1,6 +1,6 @@
 # ADR-0047 — Server-side embedding & reranking hooks (provider-agnostic)
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-22
 **Deciders:** Achref Soua
 

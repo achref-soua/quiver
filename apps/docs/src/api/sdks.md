@@ -1,4 +1,4 @@
-# Python & TypeScript SDKs
+# Python, TypeScript & Go SDKs
 
 Both SDKs are thin, idiomatic clients over the [REST API](rest-grpc.md). They are
 unpublished today — install from the repository — and a publish to PyPI/npm is a
@@ -57,6 +57,29 @@ const hits = await q.search("items", [0.1, 0.2, 0.3], { k: 5 });
 The TypeScript client mirrors the same surface: `hybridSearch` (dense ⊕
 sparse/BM25) and, with a [server-side provider](../features/embedding.md),
 `upsertText` / `searchText` (`{ rerank: true }` to reorder in one call).
+
+## Go
+
+Install from [`sdks/go`](https://github.com/achref-soua/quiver/tree/main/sdks/go)
+(`github.com/achref-soua/quiver/sdks/go`), **standard-library only**:
+
+```go
+import quiver "github.com/achref-soua/quiver/sdks/go"
+
+c := quiver.New("http://127.0.0.1:8080", quiver.WithAPIKey("…"))
+c.CreateCollection(ctx, "items", 3, &quiver.CreateCollectionOptions{Metric: "cosine"})
+c.Upsert(ctx, "items", []quiver.Point{{ID: "a", Vector: []float32{0.1, 0.2, 0.3}}})
+hits, _ := c.HybridSearch(ctx, "items", &quiver.HybridOptions{QueryText: "hello"})
+```
+
+The Go client mirrors the same surface — `Search`, `HybridSearch`, `UpsertText` /
+`SearchText`, `Fetch`, and `Snapshot`. Non-2xx responses return a typed
+`*quiver.APIError`.
+
+## Snapshots
+
+All three clients expose `snapshot(destination)` — a consistent online backup of
+the whole database (admin-scoped). See [Snapshots & backup](../features/snapshot.md).
 
 ## Client-side encryption helpers
 
