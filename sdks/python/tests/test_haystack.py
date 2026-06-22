@@ -38,6 +38,10 @@ class FakeClient:
         self.searched = {"vector": vector, **kwargs}
         return [Match(id="a", score=0.9, payload={"content": "hi", "meta": {"y": 2024}})]
 
+    def hybrid_search(self, collection: str, **kwargs: Any) -> list[Match]:
+        self.hybrid = kwargs
+        return [Match(id="h", score=0.8, payload={"content": "hi", "meta": {"y": 2024}})]
+
     def fetch(self, collection: str, **kwargs: Any) -> list[Match]:
         self.fetched = kwargs
         return [Match(id="b", score=0.0, payload={"content": "yo", "meta": {}}, vector=[0.1, 0.2, 0.3])]
@@ -71,6 +75,24 @@ def test_retriever_component_runs():
     store = QuiverDocumentStore(c, "docs")
     out = QuiverEmbeddingRetriever(store, top_k=3).run(query_embedding=[0.0, 0.0, 0.0])
     assert [d.id for d in out["documents"]] == ["a"]
+
+
+def test_hybrid_store_indexes_content_and_fuses_bm25():
+    from quiver.client import TEXT_KEY
+
+    c = FakeClient()
+    store = QuiverDocumentStore(c, "docs", hybrid=True)
+    store.write_documents([Document(content="quick brown fox", meta={"y": 1}, embedding=[0.1, 0.2, 0.3])])
+    # Hybrid write co-populates the reserved BM25 key with the content.
+    assert c.upserted[0].payload[TEXT_KEY] == "quick brown fox"
+
+    # Plain embedding retrieval still uses dense search…
+    QuiverEmbeddingRetriever(store).run(query_embedding=[0.0, 0.0, 0.0])
+    assert c.searched  # dense path taken when no query_text
+    # …but passing query_text routes through hybrid_search for dense ⊕ BM25.
+    out = QuiverEmbeddingRetriever(store).run(query_embedding=[0.0, 0.0, 0.0], query_text="quick fox")
+    assert c.hybrid["query_text"] == "quick fox"
+    assert [d.id for d in out["documents"]] == ["h"]
 
 
 def test_filter_documents_uses_fetch():

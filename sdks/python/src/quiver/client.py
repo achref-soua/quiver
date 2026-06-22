@@ -30,6 +30,12 @@ __all__ = [
 DEFAULT_BASE_URL = "http://127.0.0.1:6333"
 DEFAULT_TIMEOUT = 30.0
 
+#: Reserved payload key carrying a point's full-text field (ADR-0046). A point
+#: with a string under this key is tokenized into a BM25 term-frequency vector at
+#: ingest, so it is searchable by ``query_text`` / hybrid ``dense ⊕ BM25`` — no
+#: client-side sparse vectors required.
+TEXT_KEY = "__quiver_text__"
+
 
 class QuiverError(RuntimeError):
     """An error from the Quiver server or the transport.
