@@ -1,6 +1,6 @@
 # ADR-0049 — Per-key rate limiting (token bucket, RateLimit headers, 429)
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-22
 **Deciders:** Achref Soua
 

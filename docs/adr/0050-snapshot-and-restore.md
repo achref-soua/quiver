@@ -1,6 +1,6 @@
 # ADR-0050: Online snapshot & restore
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-22
 - **Deciders:** Achref Soua
 
@@ -84,3 +84,11 @@ unaffected.
   simpler and safer.
 - **Filesystem/LVM snapshots** — out of scope and not portable across deploy
   targets; the engine-level copy works anywhere.
+
+## Implementation
+
+`Database::snapshot(dest)` (quiver-embed) holds the writer lock, `checkpoint()`s, then byte-copies the data directory; `restore_snapshot(src, dest)` copies a snapshot into a fresh directory. Exposed as REST `POST /v1/snapshot` (admin), the MCP `snapshot` tool + `database_stats` status, and `snapshot()` in the Go / Python / TypeScript SDKs.
+
+## Verification
+
+embed unit tests (snapshot→open reproduces the DB incl. a post-snapshot write that must not appear; refuses an existing dest; restore roundtrip + guards), a REST e2e (snapshot opens as an identical DB; second snapshot → 409), an MCP test, and SDK tests.
