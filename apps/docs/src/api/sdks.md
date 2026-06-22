@@ -18,14 +18,27 @@ with Client("http://127.0.0.1:6333", api_key="…") as q:
     hits = q.search("items", [0.1, 0.2, 0.3], k=5)
 ```
 
+Beyond `search`, the client exposes `hybrid_search` (dense ⊕ sparse/BM25 via
+`vector` / `sparse` / `query_text`, fused with RRF) and — when the server has a
+[provider configured](../features/embedding.md) — `upsert_text` / `search_text`
+(`search_text(..., rerank=True)` for retrieve→rerank in one call):
+
+```python
+q.upsert_text("kb", [{"id": "1", "text": "Quiver is a vector database"}])
+hits = q.search_text("kb", "what is quiver?", k=5, rerank=True)
+q.hybrid_search("kb", vector=embed(query), query_text=query, k=10)   # dense ⊕ BM25
+```
+
 **LangChain**, **LlamaIndex**, and **Haystack** adapters ship as extras
 (`pip install "./sdks/python[langchain]"` / `[llamaindex]` / `[haystack]`), so any
 Quiver index — including the memory-frugal disk path — backs a retriever or
-`DocumentStore`, with metadata filters mapped onto Quiver's exact pre-filter.
+`DocumentStore`, with metadata filters mapped onto Quiver's exact pre-filter. Pass
+`hybrid=True` to any of them for `dense ⊕ BM25` retrieval.
 
 A synchronous `Client` and an async `AsyncClient` share one contract (with
-`upsert_iter` / `scroll` / `delete_by_filter` helpers), and `quiver.rerank` is a
-model-agnostic helper for the retrieve → rerank step of a RAG pipeline.
+`upsert_iter` / `scroll` / `delete_by_filter` and `upsert_text` / `search_text`
+helpers), and `quiver.rerank` is a model-agnostic client-side helper for the
+retrieve → rerank step of a RAG pipeline.
 
 ## TypeScript
 
@@ -40,6 +53,10 @@ await q.createCollection("items", 3, { metric: "cosine", index: "disk_vamana", p
 await q.upsert("items", [{ id: "a", vector: [0.1, 0.2, 0.3], payload: { tag: "x" } }]);
 const hits = await q.search("items", [0.1, 0.2, 0.3], { k: 5 });
 ```
+
+The TypeScript client mirrors the same surface: `hybridSearch` (dense ⊕
+sparse/BM25) and, with a [server-side provider](../features/embedding.md),
+`upsertText` / `searchText` (`{ rerank: true }` to reorder in one call).
 
 ## Client-side encryption helpers
 
