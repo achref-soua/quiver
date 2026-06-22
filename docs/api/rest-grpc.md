@@ -63,6 +63,7 @@ message SearchResponse { repeated Match matches = 1; string next_cursor = 2; }
 | `POST /v1/collections/{id}/documents/query` | SearchMultiVector (MaxSim) |
 | `POST /v1/keys` · `GET /v1/keys` · `DELETE /v1/keys/{id}` | API-key admin |
 | `GET /v1/collections/{id}/stats` | Stats |
+| `POST /v1/snapshot` | Snapshot — consistent online backup to a server-local dir (ADR-0050, admin) |
 | `GET /healthz` · `GET /readyz` · `GET /metrics` | ops |
 
 `CreateCollection` selects the per-collection index (ADR-0007): the JSON body and

@@ -94,6 +94,18 @@ pub enum Error {
 /// Result alias for database operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// What a [`Database::snapshot`] captured (ADR-0050): the catalog generation and
+/// the number of files / bytes copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotInfo {
+    /// The manifest version the snapshot reflects (its consistent LSN anchor).
+    pub manifest_version: u64,
+    /// Number of files copied into the snapshot directory.
+    pub files: u64,
+    /// Total bytes copied.
+    pub bytes: u64,
+}
+
 /// A single search or fetch result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Match {
@@ -1333,11 +1345,136 @@ impl Database {
         Ok(self.store.compact()?)
     }
 
+    /// The manifest version — the catalog generation a snapshot captures
+    /// (ADR-0050). Surfaced as snapshot-relevant status in `database_stats`.
+    #[must_use]
+    pub fn manifest_version(&self) -> u64 {
+        self.store.manifest_version()
+    }
+
+    /// Best-effort total on-disk size of the data directory, in bytes — what a
+    /// full snapshot would copy (ADR-0050). Unreadable entries are skipped.
+    #[must_use]
+    pub fn disk_usage_bytes(&self) -> u64 {
+        dir_size(self.store.dir())
+    }
+
+    /// Take a consistent online snapshot of the whole database into `dest`
+    /// (which must not already exist), returning what was captured (ADR-0050).
+    ///
+    /// The writer lock is held for the duration: `checkpoint` seals the active
+    /// buffer into segments and advances the WAL floor to the head, then the
+    /// data directory is byte-copied. Opening `dest` afterwards replays an empty
+    /// WAL tail and reconstructs the database exactly as of this call.
+    ///
+    /// # Errors
+    /// [`Error::Core`] if `dest` already exists, or on any I/O error during the
+    /// checkpoint or the copy.
+    pub fn snapshot(&mut self, dest: &Path) -> Result<SnapshotInfo> {
+        if dest.exists() {
+            return Err(Error::Core(quiver_core::CoreError::AlreadyExists(
+                dest.display().to_string(),
+            )));
+        }
+        // Consistency anchor: flush to segments and advance the WAL floor so the
+        // copied tree opens with no replay (ADR-0050).
+        self.checkpoint()?;
+        let (files, bytes) = copy_tree(self.store.dir(), dest)?;
+        // ponytail: flush the snapshot root's metadata only; a backup target is
+        // re-takeable, so per-file fsync isn't warranted. Add it if snapshots
+        // must survive an immediate post-copy crash.
+        let _ = std::fs::File::open(dest).and_then(|f| f.sync_all());
+        Ok(SnapshotInfo {
+            manifest_version: self.store.manifest_version(),
+            files,
+            bytes,
+        })
+    }
+
     fn handle(&self, name: &str) -> Result<&CollectionHandle> {
         self.collections
             .get(name)
             .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))
     }
+}
+
+/// Restore a snapshot directory `src` (produced by [`Database::snapshot`]) into a
+/// fresh `dest` directory, leaving it ready for the caller to open with the same
+/// keyring/codec the snapshot was written under (ADR-0050).
+///
+/// `dest` must not already exist — restore never overwrites a live data
+/// directory. The real integrity check is the caller's subsequent open (which,
+/// for an encrypted store, is the only party holding the key); this function
+/// only verifies the source looks like a snapshot and copies it.
+///
+/// # Errors
+/// [`Error::Core`] if `dest` exists, `src` is not a snapshot (no `CURRENT`), or
+/// on any I/O error during the copy.
+pub fn restore_snapshot(src: &Path, dest: &Path) -> Result<SnapshotInfo> {
+    if dest.exists() {
+        return Err(Error::Core(quiver_core::CoreError::AlreadyExists(
+            dest.display().to_string(),
+        )));
+    }
+    if !src.join("CURRENT").exists() {
+        return Err(Error::Core(quiver_core::CoreError::InvalidArgument(
+            format!("{} is not a snapshot (no CURRENT)", src.display()),
+        )));
+    }
+    let (files, bytes) = copy_tree(src, dest)?;
+    Ok(SnapshotInfo {
+        // The restored directory's manifest version is whatever the snapshot
+        // carried; report 0 since we don't re-open here to read it (the caller's
+        // open is authoritative). `files`/`bytes` reflect the copy.
+        manifest_version: 0,
+        files,
+        bytes,
+    })
+}
+
+// Recursively copy `src` into `dst`, returning `(files, bytes)`. I/O errors are
+// tagged with the offending path. The data directory contains only files and
+// directories (no symlinks), so a plain walk is complete.
+fn copy_tree(src: &Path, dst: &Path) -> Result<(u64, u64)> {
+    std::fs::create_dir_all(dst).map_err(|e| quiver_core::CoreError::io(dst, e))?;
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    for entry in std::fs::read_dir(src).map_err(|e| quiver_core::CoreError::io(src, e))? {
+        let entry = entry.map_err(|e| quiver_core::CoreError::io(src, e))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ft = entry
+            .file_type()
+            .map_err(|e| quiver_core::CoreError::io(&from, e))?;
+        if ft.is_dir() {
+            let (f, b) = copy_tree(&from, &to)?;
+            files += f;
+            bytes += b;
+        } else {
+            let n = std::fs::copy(&from, &to).map_err(|e| quiver_core::CoreError::io(&from, e))?;
+            files += 1;
+            bytes += n;
+        }
+    }
+    Ok((files, bytes))
+}
+
+// Best-effort recursive on-disk size (bytes) of `dir`; unreadable entries are
+// skipped so a stats read never fails on a transient error.
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return total;
+    };
+    for entry in rd.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            total += dir_size(&entry.path());
+        } else if let Ok(meta) = entry.metadata() {
+            total += meta.len();
+        }
+    }
+    total
 }
 
 // The byte separating a multi-vector document id from a token ordinal in a token
@@ -3867,6 +4004,85 @@ mod tests {
         assert!(matches!(
             db.upsert_document("docs", "a", &[vec![1.0, 0.0]], &json!({})),
             Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_then_open_reproduces_the_database() {
+        let src = tempfile::tempdir().unwrap();
+        let mut db = open(src.path());
+        db.create_collection("kb", desc()).unwrap();
+        db.create_collection("kb2", desc()).unwrap();
+        db.upsert("kb", "a", &[1.0, 0.0, 0.0, 0.0], &json!({ "n": 1 }))
+            .unwrap();
+        db.upsert("kb", "b", &[0.0, 1.0, 0.0, 0.0], &json!({ "n": 2 }))
+            .unwrap();
+        db.upsert("kb2", "z", &[0.0, 0.0, 1.0, 0.0], &json!({ "n": 3 }))
+            .unwrap();
+
+        let dest = tempfile::tempdir().unwrap();
+        let snap_dir = dest.path().join("snap");
+        let info = db.snapshot(&snap_dir).unwrap();
+        assert!(info.files > 0 && info.bytes > 0);
+        assert_eq!(info.manifest_version, db.manifest_version());
+
+        // A write after the snapshot must not appear in the snapshot.
+        db.upsert("kb", "late", &[1.0, 1.0, 0.0, 0.0], &json!({ "n": 9 }))
+            .unwrap();
+
+        let restored = open(&snap_dir);
+        let mut names = restored.collection_names();
+        names.sort();
+        assert_eq!(names, vec!["kb".to_owned(), "kb2".to_owned()]);
+        assert_eq!(restored.len("kb").unwrap(), 2, "no post-snapshot write");
+        assert_eq!(
+            restored.get("kb", "a").unwrap().unwrap().payload,
+            Some(json!({ "n": 1 }))
+        );
+        assert_eq!(restored.len("kb2").unwrap(), 1);
+        assert!(restored.get("kb", "late").unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_refuses_an_existing_destination() {
+        let src = tempfile::tempdir().unwrap();
+        let mut db = open(src.path());
+        let dest = tempfile::tempdir().unwrap(); // already exists
+        assert!(matches!(
+            db.snapshot(dest.path()),
+            Err(Error::Core(quiver_core::CoreError::AlreadyExists(_)))
+        ));
+    }
+
+    #[test]
+    fn restore_snapshot_roundtrips_and_guards() {
+        let src = tempfile::tempdir().unwrap();
+        let mut db = open(src.path());
+        db.create_collection("kb", desc()).unwrap();
+        db.upsert("kb", "a", &[1.0, 0.0, 0.0, 0.0], &json!({ "n": 1 }))
+            .unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let snap_dir = work.path().join("snap");
+        db.snapshot(&snap_dir).unwrap();
+
+        // Restore into a fresh directory, then open it.
+        let restored_dir = work.path().join("restored");
+        let info = restore_snapshot(&snap_dir, &restored_dir).unwrap();
+        assert!(info.files > 0);
+        let restored = open(&restored_dir);
+        assert_eq!(restored.len("kb").unwrap(), 1);
+
+        // Restoring over an existing directory is refused.
+        assert!(matches!(
+            restore_snapshot(&snap_dir, &restored_dir),
+            Err(Error::Core(quiver_core::CoreError::AlreadyExists(_)))
+        ));
+        // A directory that is not a snapshot (no CURRENT) is rejected.
+        let not_snap = work.path().join("not-a-snapshot");
+        std::fs::create_dir_all(&not_snap).unwrap();
+        assert!(matches!(
+            restore_snapshot(&not_snap, &work.path().join("out")),
+            Err(Error::Core(quiver_core::CoreError::InvalidArgument(_)))
         ));
     }
 }
