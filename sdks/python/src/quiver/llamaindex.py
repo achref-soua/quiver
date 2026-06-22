@@ -41,7 +41,7 @@ from llama_index.core.vector_stores.utils import (
     node_to_metadata_dict,
 )
 
-from .client import Client, FilterableField, Point, QuiverError
+from .client import TEXT_KEY, Client, FilterableField, Point, QuiverError
 
 __all__ = ["QuiverVectorStore"]
 
@@ -64,6 +64,9 @@ class QuiverVectorStore(BasePydanticVectorStore):
     index: Optional[str] = None
     pq_subspaces: Optional[int] = None
     create_collection: bool = True
+    # When True, also index each node's text for BM25 and fuse dense ⊕ BM25 at
+    # query time via RRF (ADR-0043/0046).
+    hybrid: bool = False
 
     _client: Client = PrivateAttr()
     _filterable: list[FilterableField] = PrivateAttr(default_factory=list)
@@ -80,6 +83,7 @@ class QuiverVectorStore(BasePydanticVectorStore):
         pq_subspaces: Optional[int] = None,
         filterable: Optional[Sequence[FilterableField]] = None,
         create_collection: bool = True,
+        hybrid: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -89,6 +93,7 @@ class QuiverVectorStore(BasePydanticVectorStore):
             index=index,
             pq_subspaces=pq_subspaces,
             create_collection=create_collection,
+            hybrid=hybrid,
             **kwargs,
         )
         self._client = client
@@ -113,6 +118,9 @@ class QuiverVectorStore(BasePydanticVectorStore):
             payload = node_to_metadata_dict(
                 node, remove_text=False, flat_metadata=self.flat_metadata
             )
+            if self.hybrid:
+                # Index the node's text for BM25 keyword search (ADR-0046).
+                payload[TEXT_KEY] = node.get_content()
             points.append(
                 Point(
                     id=node.node_id,
@@ -138,17 +146,25 @@ class QuiverVectorStore(BasePydanticVectorStore):
 
     def query(self, query: VectorStoreQuery, **_kwargs: Any) -> VectorStoreQueryResult:
         embedding = list(query.query_embedding or [])
-        matches = self._client.search(
-            self.collection_name,
-            embedding,
-            k=query.similarity_top_k,
-            filter=_to_quiver_filter(query.filters),
-        )
+        filter_ = _to_quiver_filter(query.filters)
+        k = query.similarity_top_k
+        if self.hybrid and query.query_str:
+            # Fuse the dense neighbours with a BM25 query over the indexed text.
+            matches = self._client.hybrid_search(
+                self.collection_name,
+                vector=embedding,
+                query_text=query.query_str,
+                k=k,
+                filter=filter_,
+            )
+        else:
+            matches = self._client.search(self.collection_name, embedding, k=k, filter=filter_)
         nodes: list[BaseNode] = []
         similarities: list[float] = []
         ids: list[str] = []
         for match in matches:
             payload = dict(match.payload or {})
+            payload.pop(TEXT_KEY, None)  # internal BM25 field, never a node metadata
             try:
                 node = metadata_dict_to_node(payload)
             except ValueError:

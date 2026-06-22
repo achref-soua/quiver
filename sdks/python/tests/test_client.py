@@ -358,9 +358,71 @@ def test_hybrid_search_sends_dense_and_sparse_body():
     assert body["filter"] == {"eq": {"field": "t", "value": 1}}
 
 
+@respx.mock
+def test_hybrid_search_sends_query_text_for_bm25():
+    route = respx.post(f"{BASE}/v1/collections/docs/query/hybrid").mock(
+        return_value=httpx.Response(200, json={"matches": [{"id": "cat", "score": 1.2}]})
+    )
+    with Client(BASE) as q:
+        hits = q.hybrid_search("docs", query_text="cats", k=5)
+    assert hits == [Match(id="cat", score=1.2)]
+    body = json.loads(route.calls.last.request.content)
+    assert body["query_text"] == "cats"
+    assert "vector" not in body
+
+
 def test_hybrid_search_requires_a_query():
     with Client(BASE) as q:
         import pytest as _pytest
 
         with _pytest.raises(ValueError):
             q.hybrid_search("kb")
+
+
+@respx.mock
+def test_upsert_text_posts_text_points():
+    route = respx.post(f"{BASE}/v1/collections/docs/points:text").mock(
+        return_value=httpx.Response(200, json={"upserted": 2})
+    )
+    with Client(BASE) as q:
+        n = q.upsert_text(
+            "docs",
+            [
+                {"id": "a", "text": "hello world", "payload": {"src": "x"}},
+                {"id": "b", "text": "second"},
+            ],
+        )
+    assert n == 2
+    body = json.loads(route.calls.last.request.content)
+    assert body["points"][0] == {"id": "a", "text": "hello world", "payload": {"src": "x"}}
+    assert body["points"][1] == {"id": "b", "text": "second"}
+
+
+@respx.mock
+def test_search_text_posts_query_and_rerank_flag():
+    route = respx.post(f"{BASE}/v1/collections/docs/query/text").mock(
+        return_value=httpx.Response(200, json={"matches": [{"id": "fox", "score": 2.0}]})
+    )
+    with Client(BASE) as q:
+        hits = q.search_text("docs", "quick fox", k=5, rerank=True)
+    assert hits == [Match(id="fox", score=2.0)]
+    body = json.loads(route.calls.last.request.content)
+    assert body["text"] == "quick fox"
+    assert body["k"] == 5
+    assert body["rerank"] is True
+
+
+@respx.mock
+def test_snapshot_posts_destination_and_returns_info():
+    route = respx.post(f"{BASE}/v1/snapshot").mock(
+        return_value=httpx.Response(
+            200, json={"manifest_version": 3, "files": 12, "bytes": 4096}
+        )
+    )
+    with Client(BASE) as q:
+        info = q.snapshot("/backups/snap1")
+    assert info["files"] == 12
+    assert info["bytes"] == 4096
+    assert info["manifest_version"] == 3
+    body = json.loads(route.calls.last.request.content)
+    assert body["destination"] == "/backups/snap1"

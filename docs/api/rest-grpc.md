@@ -14,7 +14,8 @@ service Quiver {
   rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
   rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse);
 
-  rpc Upsert(stream UpsertRequest) returns (UpsertResponse);     // client-streaming batches
+  rpc Upsert(UpsertRequest) returns (UpsertResponse);
+  rpc UpsertStream(stream UpsertRequest) returns (UpsertResponse); // client-streaming bulk load (ADR-0045)
   rpc DeletePoints(DeletePointsRequest) returns (DeletePointsResponse);
   rpc GetPoints(GetPointsRequest) returns (GetPointsResponse);
 
@@ -51,14 +52,19 @@ message SearchResponse { repeated Match matches = 1; string next_cursor = 2; }
 | `GET /v1/collections` | ListCollections (cursor) |
 | `DELETE /v1/collections/{id}` | DeleteCollection (crypto-shred) |
 | `POST /v1/collections/{id}/points` | Upsert (batch; `Idempotency-Key`) |
+| `POST /v1/collections/{id}/points:bulk` | Upsert (bulk load; one fsync + one index rebuild) |
+| `POST /v1/collections/{id}/points:text` | UpsertText (server-side embedding, ADR-0047) |
 | `DELETE /v1/collections/{id}/points` | DeletePoints |
 | `POST /v1/collections/{id}/query` | Search |
+| `POST /v1/collections/{id}/query/hybrid` | HybridSearch (dense ⊕ sparse/BM25, RRF) |
+| `POST /v1/collections/{id}/query/text` | SearchText (embed query, ⊕ BM25, optional rerank) |
 | `POST /v1/collections/{id}/query/batch` | BatchSearch |
 | `POST /v1/collections/{id}/documents` | UpsertMultiVector (late-interaction docs) |
 | `DELETE /v1/collections/{id}/documents` | DeleteDocuments |
 | `POST /v1/collections/{id}/documents/query` | SearchMultiVector (MaxSim) |
 | `POST /v1/keys` · `GET /v1/keys` · `DELETE /v1/keys/{id}` | API-key admin |
 | `GET /v1/collections/{id}/stats` | Stats |
+| `POST /v1/snapshot` | Snapshot — consistent online backup to a server-local dir (ADR-0050, admin) |
 | `GET /healthz` · `GET /readyz` · `GET /metrics` | ops |
 
 `CreateCollection` selects the per-collection index (ADR-0007): the JSON body and
@@ -82,7 +88,8 @@ REST bodies are JSON; vectors are JSON arrays (or base64 for `int8`/`binary`). E
 
 - **Auth:** `Authorization: Bearer <api-key>` (REST) / metadata `authorization` (gRPC), or mTLS client cert. Default-deny; scopes checked per resource (ADR-0011).
 - **Idempotency:** `Idempotency-Key` header / field on all mutations (see [`wire-protocol.md`](wire-protocol.md)).
-- **Limits:** query cost caps — `k`, `ef_search`, `fetch` limit, vector dimension, payload size, upsert batch size, and HTTP request body size (ADR-0040) — rejected with HTTP 400 / gRPC `InvalidArgument` when exceeded. Configure with `QUIVER_MAX_*` (see `.env.example`). Per-key/tenant rate limits (and `RateLimit-*` headers / 429) are a later phase.
+- **Limits:** query cost caps — `k`, `ef_search`, `fetch` limit, vector dimension, payload size, upsert batch size, and HTTP request body size (ADR-0040) — rejected with HTTP 400 / gRPC `InvalidArgument` when exceeded. Configure with `QUIVER_MAX_*` (see `.env.example`).
+- **Rate limiting:** opt-in per-key token bucket (ADR-0049) — `QUIVER_RATE_LIMIT_REQUESTS_PER_SECOND` / `_BURST` (`0` = off). Over-rate requests get HTTP 429 / gRPC `ResourceExhausted` with `Retry-After`; successful REST responses carry the `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` headers. In-memory, per node.
 - **Pagination:** opaque `next_cursor` (forward-only).
 
 ## OpenAPI & SDKs
@@ -91,4 +98,4 @@ REST bodies are JSON; vectors are JSON arrays (or base64 for `int8`/`binary`). E
 
 ## Observability hooks
 
-Every RPC opens a `tracing` span (trace-id propagated from client headers when present), increments Prometheus counters/histograms (per-op QPS, latency, error class), and emits an audit record for mutating/admin operations (ADR-0014).
+`GET /metrics` serves Prometheus exposition (ADR-0014/0054): per matched-route-template request counters, error counters, and latency histograms (p50/p95/p99 derivable), plus process-wide `quiver_auth_failures_total` and `quiver_rate_limited_total`. The endpoint is open (no API key) so a scraper needs no credential — bind it privately. Engine-facing operations carry secret-free `tracing` spans, OTLP-exportable via a `tracing-opentelemetry` layer. Mutating/admin operations also emit an audit record (ADR-0011). An importable Grafana dashboard ships in `infra/grafana/`.

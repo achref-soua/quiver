@@ -34,6 +34,9 @@ launched by an MCP-capable client (e.g. an agent runtime) as a subprocess.
 | `upsert_document` | `collection`, `id`, `vectors` (token set), `payload?` | Insert/replace a multi-vector (ColBERT) document |
 | `search_multi_vector` | `collection`, `query` (token set), `k?`, `filter?` | MaxSim late-interaction search with an optional payload filter |
 | `delete_document` | `collection`, `id` | Delete a multi-vector document |
+| `delete_collection` | `collection` | Drop a whole collection and its points (reports whether it existed) |
+| `database_stats` | — | Whole-database overview: collection count, total points, per-collection summary, and snapshot status (`manifest_version`, `disk_bytes`) |
+| `snapshot` | `destination` | Take a consistent online backup of the whole database into a server-local directory (ADR-0050) |
 
 `filter` is a Quiver [payload filter](api/wire-protocol.md) tree, e.g.
 `{"eq": {"field": "color", "value": "blue"}}`. The full JSON-Schema for each

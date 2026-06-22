@@ -62,8 +62,25 @@ Hybrid search is reachable from every surface (ADR-0045):
 - **gRPC:** the `HybridSearch` RPC (`HybridSearchRequest` with a dense `vector`, a
   `sparse` `SparseVector`, `filter`, `k`, `ef_search`, `rrf_k0`).
 - **MCP:** the `hybrid_search` tool (`vector`, `sparse_indices`/`sparse_values`,
-  `k`, `filter`, `rrf_k0`).
+  `query_text`, `k`, `filter`, `rrf_k0`).
 - **SDKs:** `hybrid_search` (Python) and `hybridSearch` (TypeScript).
+
+## Full-text (BM25) — search by words (ADR-0046)
+
+You don't have to build sparse vectors yourself. Give a point a `__quiver_text__`
+string and Quiver tokenizes it (Unicode split, lowercase, stop-words, Snowball
+stemming) into a term-frequency vector at ingest; query with `query_text` and Quiver
+scores it with **Okapi BM25** over the same inverted index — fused with a dense
+vector through the same RRF path for `dense ⊕ BM25` hybrid:
+
+```python
+client.upsert("docs", [Point(id="1", vector=embed(text), payload={"__quiver_text__": text})])
+client.hybrid_search("docs", vector=embed(query), query_text=query, k=10)  # dense ⊕ BM25
+```
+
+An explicit `__quiver_sparse__` vector (e.g. SPLADE) still takes precedence over
+`__quiver_text__`. BM25 uses the index's corpus statistics (document frequency,
+average length), so it stays correct under incremental upsert/delete.
 
 ## Performance: the derived inverted index
 
@@ -79,9 +96,11 @@ or client-side collection falls back to a correct full store scan.
 
 - The sparse query's term count is bounded by `QUIVER_MAX_SPARSE_TERMS` (default
   4096), alongside the other [query cost limits](../security/threat-model.md).
-- A built-in **BM25 tokenizer** — which would *produce* sparse term-weight vectors
-  from a text field, reusing all of this machinery — is the remaining tracked
-  follow-up (ADR-0045, slated for a later release).
+- Tokenization uses the **Snowball (Porter2) English stemmer** (ADR-0048), so
+  morphological variants conflate (`connection`/`connected`/`connecting` →
+  `connect`); ingest and query share it, keeping the conflation consistent. Term ids
+  are a 32-bit hash, so distinct tokens can in principle collide — negligible for
+  realistic vocabularies.
 
 See the [RAG guide](../guides/rag.md) for where hybrid retrieval fits in a
 pipeline.

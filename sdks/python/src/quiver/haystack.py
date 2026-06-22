@@ -26,7 +26,7 @@ from typing import Any, Optional
 from haystack import Document, component, default_to_dict
 from haystack.document_stores.types import DuplicatePolicy
 
-from .client import Client, FilterableField, Point
+from .client import TEXT_KEY, Client, FilterableField, Point
 
 __all__ = ["QuiverDocumentStore", "QuiverEmbeddingRetriever"]
 
@@ -48,6 +48,7 @@ class QuiverDocumentStore:
         index: Optional[str] = None,
         pq_subspaces: Optional[int] = None,
         filterable: Optional[list[FilterableField]] = None,
+        hybrid: bool = False,
     ) -> None:
         self._client = client
         self._collection = collection
@@ -56,6 +57,9 @@ class QuiverDocumentStore:
         self._index = index
         self._pq_subspaces = pq_subspaces
         self._filterable = list(filterable) if filterable else []
+        # When True, index each document's content for BM25 and fuse dense ⊕ BM25
+        # at retrieval when a query text is supplied (ADR-0043/0046).
+        self._hybrid = hybrid
 
     # --- Haystack DocumentStore protocol ---
 
@@ -78,15 +82,17 @@ class QuiverDocumentStore:
             raise ValueError("QuiverDocumentStore requires documents with embeddings")
         self._ensure_collection(len(first.embedding))
         points = [
-            Point(
-                id=doc.id,
-                vector=list(doc.embedding),
-                payload={"content": doc.content, "meta": doc.meta or {}},
-            )
+            Point(id=doc.id, vector=list(doc.embedding), payload=self._payload(doc))
             for doc in documents
             if doc.embedding is not None
         ]
         return self._client.upsert(self._collection, points)
+
+    def _payload(self, doc: Document) -> dict[str, Any]:
+        payload: dict[str, Any] = {"content": doc.content, "meta": doc.meta or {}}
+        if self._hybrid and doc.content:
+            payload[TEXT_KEY] = doc.content  # index the content for BM25 (ADR-0046)
+        return payload
 
     def filter_documents(self, filters: Optional[dict[str, Any]] = None) -> list[Document]:
         """Return documents matching ``filters`` (no ranking), via Quiver fetch."""
@@ -129,14 +135,23 @@ class QuiverDocumentStore:
         *,
         filters: Optional[dict[str, Any]] = None,
         top_k: int = 10,
+        query_text: Optional[str] = None,
     ) -> list[Document]:
-        hits = self._client.search(
-            self._collection,
-            query_embedding,
-            k=top_k,
-            filter=_to_quiver_filter(filters),
-            with_payload=True,
-        )
+        filter_ = _to_quiver_filter(filters)
+        if self._hybrid and query_text:
+            # Fuse the dense neighbours with a BM25 query over the indexed content.
+            hits = self._client.hybrid_search(
+                self._collection,
+                vector=query_embedding,
+                query_text=query_text,
+                k=top_k,
+                filter=filter_,
+                with_payload=True,
+            )
+        else:
+            hits = self._client.search(
+                self._collection, query_embedding, k=top_k, filter=filter_, with_payload=True
+            )
         return [_to_haystack_document(h.id, h.payload, None, score=h.score) for h in hits]
 
     def _ensure_collection(self, dim: int) -> None:
@@ -176,11 +191,14 @@ class QuiverEmbeddingRetriever:
         query_embedding: list[float],
         filters: Optional[dict[str, Any]] = None,
         top_k: Optional[int] = None,
+        query_text: Optional[str] = None,
     ) -> dict[str, list[Document]]:
+        # Pass ``query_text`` (with a hybrid store) to also score BM25 keywords.
         docs = self._store._embedding_retrieval(
             query_embedding,
             filters=filters if filters is not None else self._filters,
             top_k=top_k if top_k is not None else self._top_k,
+            query_text=query_text,
         )
         return {"documents": docs}
 
