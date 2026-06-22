@@ -86,7 +86,8 @@ REST bodies are JSON; vectors are JSON arrays (or base64 for `int8`/`binary`). E
 
 - **Auth:** `Authorization: Bearer <api-key>` (REST) / metadata `authorization` (gRPC), or mTLS client cert. Default-deny; scopes checked per resource (ADR-0011).
 - **Idempotency:** `Idempotency-Key` header / field on all mutations (see [`wire-protocol.md`](wire-protocol.md)).
-- **Limits:** query cost caps — `k`, `ef_search`, `fetch` limit, vector dimension, payload size, upsert batch size, and HTTP request body size (ADR-0040) — rejected with HTTP 400 / gRPC `InvalidArgument` when exceeded. Configure with `QUIVER_MAX_*` (see `.env.example`). Per-key/tenant rate limits (and `RateLimit-*` headers / 429) are a later phase.
+- **Limits:** query cost caps — `k`, `ef_search`, `fetch` limit, vector dimension, payload size, upsert batch size, and HTTP request body size (ADR-0040) — rejected with HTTP 400 / gRPC `InvalidArgument` when exceeded. Configure with `QUIVER_MAX_*` (see `.env.example`).
+- **Rate limiting:** opt-in per-key token bucket (ADR-0049) — `QUIVER_RATE_LIMIT_REQUESTS_PER_SECOND` / `_BURST` (`0` = off). Over-rate requests get HTTP 429 / gRPC `ResourceExhausted` with `Retry-After`; successful REST responses carry the `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` headers. In-memory, per node.
 - **Pagination:** opaque `next_cursor` (forward-only).
 
 ## OpenAPI & SDKs

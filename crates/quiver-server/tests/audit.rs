@@ -78,6 +78,7 @@ async fn audit_log_records_mutations_and_denials_without_leaking_secrets() {
         limits: quiver_server::Limits::default(),
         embedding: Default::default(),
         rerank: Default::default(),
+        rate_limit: Default::default(),
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

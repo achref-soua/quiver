@@ -20,7 +20,7 @@ use quiver_query::Filter;
 use crate::auth::Principal;
 use crate::{
     AppState, CollectionInfo, DocumentIn, DocumentMatchOut, Error, MatchOut, PointIn, PointOut,
-    TextPointIn,
+    RateDecision, RateLimitSnapshot, TextPointIn,
 };
 
 /// Build the REST router: open `/healthz`, `/readyz`, `/metrics`; the `/v1` API
@@ -81,8 +81,26 @@ async fn auth(State(state): State<AppState>, mut request: Request, next: Next) -
     match state.authenticate(presented.as_deref()) {
         // The caller's scope rides the request; each op authorizes against it.
         Some(principal) => {
+            // Per-key rate limit (ADR-0049): consume a token before the handler
+            // runs; 429 if the key is over its rate, else carry the snapshot to the
+            // response headers.
+            let snapshot = if state.rate_limit_enabled() {
+                match state.rate_limit(principal.actor()) {
+                    RateDecision::Limited {
+                        retry_after_secs,
+                        limit,
+                    } => return rate_limited_response(retry_after_secs, limit),
+                    RateDecision::Allowed(s) => Some(s),
+                }
+            } else {
+                None
+            };
             request.extensions_mut().insert(principal);
-            next.run(request).await
+            let mut response = next.run(request).await;
+            if let Some(s) = snapshot {
+                set_rate_limit_headers(response.headers_mut(), s);
+            }
+            response
         }
         None => {
             let body = json!({
@@ -94,6 +112,38 @@ async fn auth(State(state): State<AppState>, mut request: Request, next: Next) -
             (StatusCode::UNAUTHORIZED, Json(body)).into_response()
         }
     }
+}
+
+// Attach the standard `RateLimit-*` headers (ADR-0049) to a response.
+fn set_rate_limit_headers(headers: &mut axum::http::HeaderMap, s: RateLimitSnapshot) {
+    use axum::http::HeaderValue;
+    headers.insert("RateLimit-Limit", HeaderValue::from(s.limit));
+    headers.insert("RateLimit-Remaining", HeaderValue::from(s.remaining));
+    headers.insert("RateLimit-Reset", HeaderValue::from(s.reset_secs));
+}
+
+// A 429 with `Retry-After` and the `RateLimit-*` headers for a key over its rate.
+fn rate_limited_response(retry_after_secs: u64, limit: u32) -> Response {
+    let body = json!({
+        "type": "about:blank",
+        "title": "Too Many Requests",
+        "status": 429,
+        "detail": "rate limit exceeded for this API key; retry after the indicated delay",
+    });
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+    set_rate_limit_headers(
+        response.headers_mut(),
+        RateLimitSnapshot {
+            limit,
+            remaining: 0,
+            reset_secs: retry_after_secs,
+        },
+    );
+    use axum::http::HeaderValue;
+    response
+        .headers_mut()
+        .insert("Retry-After", HeaderValue::from(retry_after_secs));
+    response
 }
 
 async fn healthz() -> &'static str {

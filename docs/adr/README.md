@@ -68,5 +68,6 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0046](0046-bm25-full-text.md) | BM25 / full-text over the sparse path (tokenizer + BM25 scoring, `text`/`query_text`) | Accepted | 5 |
 | [0047](0047-server-side-embedding-and-rerank-hooks.md) | Server-side embedding & reranking hooks (provider-agnostic, opt-in per collection) | Proposed | 5 |
 | [0048](0048-snowball-stemmer.md) | Snowball (Porter2) stemmer for BM25 tokenization | Proposed | 5 |
+| [0049](0049-per-key-rate-limiting.md) | Per-key rate limiting (token bucket, RateLimit headers, 429) | Proposed | 5 |
 
 Phase-0 ADRs (0001–0018) are Accepted; Phase-2 decisions span 0019–0022; Phase-4 decisions begin at 0023. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.
