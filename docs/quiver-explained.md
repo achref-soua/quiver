@@ -602,6 +602,40 @@ The throughline: **correctness and security first, performance second, features 
 
 ---
 
+# Part 9 — Beyond Search: RAG, Full-Text & Operations
+
+A search engine is only half a product. The rest is the work of *using* it — turning text into vectors, mixing keyword and meaning, backing data up, watching the system breathe, and keeping one noisy client from starving the others.
+
+## 9.1 Bring your own *nothing*: server-side embedding
+
+The number-one friction in retrieval is the embedding step. Quiver stays model-agnostic at its core, but at the **edge** (never in the engine) it offers an opt-in, per-collection embedding hook. `upsert_text` sends a document's words; the server embeds them with the collection's configured provider and stores the vector. `search_text` embeds your query the same way, searches, and can **rerank** the shortlist with a second, sharper model — retrieve-then-rerank in one call. Providers are chosen by configuration, never hard-wired: OpenAI, Ollama (local), any OpenAI-compatible HTTP endpoint, Cohere, or a deterministic `fake` for tests. Secrets are never stored — a config field names an *environment variable*, resolved at startup so a missing key fails fast.
+
+## 9.2 Full-text without leaving home: BM25
+
+Sometimes you want the *exact word* — a product code, a name, an acronym a model has never seen. Quiver tokenises text (Unicode split, lowercase, stop-words, a **Snowball/Porter2 stemmer** so "running"/"runs"/"ran" conflate), builds an inverted index, and scores with **Okapi BM25** — the lexical workhorse behind Lucene. A single `query_text` runs dense, lexical, or both, fused with **RRF** (Reciprocal Rank Fusion).
+
+## 9.3 Backups that don't stop the world
+
+An **online snapshot** captures a consistent copy of a *running* database. Under the single-writer lock, the engine **checkpoints** (seals the in-memory buffer into segments and advances the WAL floor to the head), then byte-copies the whole data directory — layout-independent, so it can never drift out of sync with the file format. Opening the copy replays an empty WAL tail and is identical to the source at snapshot time. Reachable over the engine, REST (`POST /v1/snapshot`), the MCP server, and every SDK; the crash gate is untouched.
+
+## 9.4 Seeing inside: metrics & tracing
+
+Quiver serves a Prometheus `/metrics` endpoint (open, so a scraper needs no key) with per-route request counters and latency histograms, plus security counters (`quiver_auth_failures_total`, `quiver_rate_limited_total`); engine operations carry secret-free tracing spans, and an importable Grafana dashboard ships in `infra/grafana/`. The metrics defined here are the vocabulary the guide measures in: **recall@k** (fraction of the true k neighbours returned), **QPS** (queries/second), **p50/p95/p99** (tail latency), **RRF** (rank-based list fusion), **IDF** (rare-word weighting, the heart of BM25), **RSS** (physical RAM held — the memory-frugality headline), and **build time** (time to first query).
+
+## 9.5 Fairness under load: per-key rate limiting
+
+Each API key gets a **token bucket** that refills at a steady rate up to a burst capacity; every request spends a token. Over-rate requests get `429 Too Many Requests` with `Retry-After` and the standard `RateLimit-*` headers. Opt-in (off by default), enforced at one auth choke point so *every* REST and gRPC call is covered, and per-node in memory.
+
+## 9.6 The client fleet
+
+One engine, many front doors: SDKs for **Python** (sync + async), **TypeScript**, and **Go** (standard-library only), each mirroring the same surface — collections, points, search, hybrid, full-text, server-side embedding, and snapshots. For AI agents, an **MCP server** exposes the database as tools (create, upsert, search, hybrid, `database_stats`, `delete_collection`, `snapshot`) so an agent can *operate* Quiver, not just query it.
+
+## 9.7 The roads not (yet) taken
+
+Three large capabilities are *designed* — as architecture records — but deliberately unbuilt until the single-node story is unbeatable: **distributed/sharded mode** (hash sharding + scatter-gather + per-shard Raft for write HA), **GPU acceleration** (behind the index trait, CPU-default), and **lock-free MVCC reads** (versioned snapshots so reads never wait on the writer). Each ships as a design ADR first; none compromises the single static binary.
+
+---
+
 # Glossary (for the newcomer)
 
 - **Vector / Embedding** — a list of numbers representing the *meaning* of some content. Similar meanings → nearby numbers.
