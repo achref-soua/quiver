@@ -1,6 +1,6 @@
 # ADR-0045 — Hybrid everywhere + fast ingest (inverted index, parity, bulk upsert)
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-22
 **Deciders:** Achref Soua
 
@@ -107,6 +107,43 @@ reverses the benchmark's build-time column for batched HTTP loaders).
 - The inverted index costs memory proportional to the number of (doc, term) pairs.
   Interning ids to u32 slots keeps that tight; a collection with no sparse vectors
   pays nothing (the handle's `Option` stays `None`).
+
+## Implementation
+
+Shipped across five PRs:
+
+1. **`quiver-query::SparseInvertedIndex`** — the pure inverted index: postings
+   `dim → {slot → weight}` with `u32` slot interning and a free list, O(terms)
+   `upsert`/`remove` (no tombstones), and a term-at-a-time `search` returning
+   `(id, score)` sorted by score then id. Fully unit-tested.
+2. **`quiver-embed` wiring** — each single-vector, server-searchable handle carries
+   an `Option<SparseInvertedIndex>`, built in `rebuild_index` from the same store
+   scan that builds the dense index and maintained on `upsert`/`upsert_batch`/
+   `delete`. `sparse_ranked_ids` uses it when present and falls back to the store
+   scan otherwise.
+3. **Bulk ingest** — `Database::upsert_bulk` (one WAL `fdatasync` + a single deferred
+   rebuild), REST `POST /v1/collections/{name}/points:bulk`, and a new
+   `max_bulk_batch_size` limit (default 50,000, `QUIVER_MAX_BULK_BATCH_SIZE`).
+4. **gRPC parity** — a `HybridSearch` RPC (`SparseVector` + `HybridSearchRequest`
+   messages, reusing `SearchResponse`) delegating to `AppState::hybrid_search`.
+5. **MCP + TypeScript parity** — a `hybrid_search` MCP tool and a `hybridSearch`
+   TypeScript client method (the Python SDK already had it from ADR-0043).
+
+## Verification
+
+- The inverted-index module is unit-tested to full coverage of its production code
+  (ranking, tie-break, update/delete, slot reuse, dedup, score filtering,
+  fallback).
+- `quiver-embed` tests assert **parity** (the inverted index returns the identical
+  ranking to the store-scan fallback), **incremental == full rebuild** under an
+  update + a delete, **rebuild on reopen**, filter re-check, and that `upsert_bulk`
+  defers the index then searches correctly (dense + a sparse vector loaded via the
+  bulk path).
+- `cost_limits` drives the `:bulk` route (a batch of 3 succeeds where the cap-2
+  steady endpoint would reject; over the bulk cap is a 400). Hybrid is tested over
+  REST and gRPC end-to-end; the MCP tool and the TS method have their own tests.
+- No on-disk format change; the `kill -9` crash gate is unchanged (the inverted
+  index is derived and never persisted).
 
 ## Alternatives considered
 
