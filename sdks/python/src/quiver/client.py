@@ -279,6 +279,7 @@ class Client:
         *,
         vector: Optional[Sequence[float]] = None,
         sparse: Optional[SparseVector] = None,
+        query_text: Optional[str] = None,
         k: int = 10,
         filter: Optional[Mapping[str, Any]] = None,
         ef_search: int = 64,
@@ -286,14 +287,17 @@ class Client:
         with_payload: bool = True,
         with_vector: bool = False,
     ) -> list[Match]:
-        """Hybrid (dense + sparse) search, fused by Reciprocal Rank Fusion (ADR-0043).
+        """Hybrid search fused by Reciprocal Rank Fusion (ADR-0043/0046).
 
-        Provide a dense ``vector``, a ``sparse`` vector, or both (at least one is
-        required). The same payload ``filter`` is applied to both sides; ``rrf_k0``
-        is the RRF rank-bias constant. Returns matches ordered most-relevant-first.
+        Provide a dense ``vector``, a ``sparse`` vector, and/or a full-text
+        ``query_text`` (tokenized server-side and scored by BM25); at least one is
+        required. The same payload ``filter`` applies to every side; ``rrf_k0`` is
+        the RRF rank-bias constant. Returns matches ordered most-relevant-first.
         """
-        if vector is None and sparse is None:
-            raise ValueError("hybrid_search requires a dense vector, a sparse vector, or both")
+        if vector is None and sparse is None and query_text is None:
+            raise ValueError(
+                "hybrid_search requires a dense vector, a sparse vector, or a text query"
+            )
         body: dict[str, Any] = {
             "k": k,
             "ef_search": ef_search,
@@ -303,6 +307,8 @@ class Client:
         }
         if vector is not None:
             body["vector"] = list(vector)
+        if query_text is not None:
+            body["query_text"] = query_text
         if sparse is not None:
             body["sparse_indices"] = [int(i) for i in sparse.indices]
             body["sparse_values"] = [float(v) for v in sparse.values]

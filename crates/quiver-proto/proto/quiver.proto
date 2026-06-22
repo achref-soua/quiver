@@ -218,6 +218,9 @@ message HybridSearchRequest {
   float rrf_k0 = 7;
   bool with_payload = 8;
   bool with_vector = 9;
+  // Full-text query, tokenized server-side and scored by BM25 (ADR-0046); empty for
+  // non-lexical search.
+  string query_text = 10;
 }
 
 // Fetch points (no ranking) with an optional cleartext payload filter and a limit

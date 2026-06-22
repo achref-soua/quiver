@@ -160,6 +160,20 @@ describe("Quiver TypeScript client", () => {
     await expect(client.hybridSearch("kb", {})).rejects.toThrow(/dense vector, a sparse vector/);
   });
 
+  it("hybridSearch sends query_text for the BM25 full-text path", async () => {
+    let body: Record<string, unknown> | undefined;
+    const fetch = mockFetch(async (_path, _method, init) => {
+      body = parseBody(init);
+      return json({ matches: [{ id: "cat", score: 1.2 }] });
+    });
+    const hits = await new Client("http://x", { fetch }).hybridSearch("docs", {
+      queryText: "cats",
+    });
+    expect(body?.["query_text"]).toBe("cats");
+    expect(body?.["vector"]).toBeUndefined();
+    expect(hits[0]!.id).toBe("cat");
+  });
+
   it("getPoint returns null on 404", async () => {
     const fetch = mockFetch(async () => new Response("", { status: 404 }));
     const m = await new Client("http://x", { fetch }).getPoint("items", "nope");
