@@ -2383,6 +2383,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]

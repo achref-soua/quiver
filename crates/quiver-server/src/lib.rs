@@ -26,11 +26,13 @@
 
 mod audit;
 mod auth;
+mod embed_provider;
 mod error;
 mod grpc;
 mod replication;
 mod rest;
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -50,11 +52,15 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use quiver_crypto::AeadCodec;
 use quiver_embed::{
     Database, Descriptor, DistanceMetric, Dtype, FilterableField, IndexSpec, SearchParams,
-    SparseVector, VectorEncryption, WalEntry, WalOp,
+    SparseVector, TEXT_KEY, VectorEncryption, WalEntry, WalOp,
 };
 use quiver_query::Filter;
 
 pub use auth::{Action, ApiKey, CollectionScope};
+pub use embed_provider::{
+    EmbedRegistry, EmbeddingConfig, EmbeddingProvider, ProviderError, ProviderKind, RerankConfig,
+    RerankProvider,
+};
 pub use error::Error;
 
 use audit::{AuditLog, Outcome};
@@ -319,6 +325,18 @@ pub struct Config {
     /// Per-request cost limits (ADR-0040). Set with a `[limits]` table in
     /// `quiver.toml` or the `QUIVER_MAX_*` environment variables.
     pub limits: Limits,
+    /// Opt-in server-side embedding providers, keyed by collection name (ADR-0047).
+    /// Configured with `[embedding.<collection>]` tables in `quiver.toml`; default
+    /// empty, so the engine stays model-agnostic and library mode is unaffected.
+    /// API keys are referenced by env-var *name* and resolved at startup, never
+    /// stored. Enables `search_text` / `upsert_text` for the named collections.
+    #[serde(default)]
+    pub embedding: HashMap<String, EmbeddingConfig>,
+    /// Opt-in server-side rerank providers, keyed by collection name (ADR-0047).
+    /// Configured with `[rerank.<collection>]` tables; enables the one-call
+    /// retrieve→rerank stage of `search_text`.
+    #[serde(default)]
+    pub rerank: HashMap<String, RerankConfig>,
 }
 
 impl Default for Config {
@@ -338,6 +356,8 @@ impl Default for Config {
             leader_api_key: None,
             insecure: false,
             limits: Limits::default(),
+            embedding: HashMap::new(),
+            rerank: HashMap::new(),
         }
     }
 }
@@ -479,6 +499,10 @@ pub(crate) struct AppState {
     // Per-request cost limits, enforced at this op layer so both transports are
     // covered by one implementation (ADR-0040).
     limits: Limits,
+    // Opt-in, provider-agnostic server-side embedding/rerank providers, keyed by
+    // collection (ADR-0047). Empty on the common path; `search_text`/`upsert_text`
+    // require a configured embedder for the target collection.
+    embed: Arc<EmbedRegistry>,
 }
 
 /// A collection's metadata.
@@ -498,6 +522,31 @@ pub(crate) struct PointIn {
     pub id: String,
     pub vector: Vec<f32>,
     pub payload: Value,
+}
+
+/// A text point to embed server-side and upsert (ADR-0047).
+pub(crate) struct TextPointIn {
+    pub id: String,
+    pub text: String,
+    pub payload: Value,
+}
+
+/// Default candidate pool size a rerank stage over-fetches before reordering to
+/// the requested `k` (ADR-0047).
+const RERANK_CANDIDATES: usize = 50;
+
+/// The document text a rerank stage scores: the original text stored under
+/// [`TEXT_KEY`] by `upsert_text`, else the whole payload as a string so the
+/// reranker still has something to compare.
+fn doc_text(payload: Option<&Value>) -> String {
+    match payload {
+        Some(Value::Object(map)) => map
+            .get(TEXT_KEY)
+            .and_then(Value::as_str)
+            .map_or_else(|| Value::Object(map.clone()).to_string(), str::to_owned),
+        Some(v) => v.to_string(),
+        None => String::new(),
+    }
 }
 
 /// A fetched point.
@@ -959,6 +1008,164 @@ impl AppState {
         .await
     }
 
+    /// Embed `text` with the collection's configured provider and run a dense (or
+    /// dense ⊕ BM25, if the collection has text) search, optionally reranking the
+    /// candidates in one call (ADR-0047). The text is also passed to the BM25 side,
+    /// so a `upsert_text` corpus yields hybrid lexical+semantic retrieval for free.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn search_text(
+        &self,
+        principal: &Principal,
+        collection: String,
+        text: String,
+        k: usize,
+        filter: Option<Filter>,
+        ef_search: usize,
+        rrf_k0: f32,
+        with_payload: bool,
+        with_vector: bool,
+        rerank: bool,
+    ) -> Result<Vec<MatchOut>, Error> {
+        self.authorize(principal, Action::Read, "search_text", &collection)?;
+        self.limits.check_search(k, ef_search)?;
+        let embedder = self.embed.embedder(&collection).ok_or_else(|| {
+            Error::BadRequest(format!(
+                "collection {collection:?} has no embedding provider configured \
+                 (set an [embedding.{collection}] table in quiver.toml — ADR-0047)"
+            ))
+        })?;
+        // Embed off the async runtime: the provider call is blocking network I/O.
+        let query = text.clone();
+        let vector = tokio::task::spawn_blocking(move || embedder.embed(&[query]))
+            .await
+            .map_err(|e| Error::Internal(format!("embedding task failed: {e}")))?
+            .map_err(|e| Error::Upstream(e.to_string()))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Upstream("embedding provider returned no vector".to_owned()))?;
+        self.limits.check_vector_len(vector.len())?;
+
+        let reranker = if rerank {
+            self.embed.reranker(&collection)
+        } else {
+            None
+        };
+        // Over-fetch when reranking so the reranker can reorder a wide candidate set
+        // down to the requested `k`; fetch payloads when reranking (we need the doc
+        // text) even if the caller did not ask for them.
+        let need_payload = with_payload || reranker.is_some();
+        let fetch_k = if reranker.is_some() {
+            k.max(RERANK_CANDIDATES)
+        } else {
+            k
+        };
+
+        let mut hits = self
+            .hybrid_search(
+                principal,
+                collection,
+                Some(vector),
+                None,
+                Some(text.clone()),
+                fetch_k,
+                filter,
+                ef_search,
+                rrf_k0,
+                need_payload,
+                with_vector,
+            )
+            .await?;
+
+        if let Some(rr) = reranker {
+            let docs: Vec<String> = hits.iter().map(|h| doc_text(h.payload.as_ref())).collect();
+            let query = text;
+            let scores = tokio::task::spawn_blocking(move || rr.rerank(&query, &docs))
+                .await
+                .map_err(|e| Error::Internal(format!("rerank task failed: {e}")))?
+                .map_err(|e| Error::Upstream(e.to_string()))?;
+            // Re-score each hit and sort by the rerank score, descending.
+            let mut scored: Vec<(f32, MatchOut)> = scores
+                .into_iter()
+                .zip(hits)
+                .map(|(s, mut h)| {
+                    h.score = s;
+                    (s, h)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            hits = scored.into_iter().map(|(_, h)| h).collect();
+        }
+
+        hits.truncate(k);
+        // Drop payloads we only fetched for reranking if the caller didn't want them.
+        if !with_payload {
+            for h in &mut hits {
+                h.payload = None;
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Embed each point's `text` with the collection's provider and upsert it as a
+    /// dense point, co-populating the `__quiver_text__` payload key (ADR-0046) so the
+    /// same text is indexed for BM25 — one call feeds both the dense and lexical
+    /// sides (ADR-0047).
+    pub(crate) async fn upsert_text(
+        &self,
+        principal: &Principal,
+        collection: String,
+        points: Vec<TextPointIn>,
+    ) -> Result<u64, Error> {
+        self.ensure_writable("upsert_text")?;
+        self.authorize(principal, Action::Write, "upsert_text", &collection)?;
+        self.limits.check_batch(points.len())?;
+        for p in &points {
+            if !matches!(p.payload, Value::Object(_) | Value::Null) {
+                return Err(Error::BadRequest(
+                    "upsert_text payload must be a JSON object or null".to_owned(),
+                ));
+            }
+        }
+        let embedder = self.embed.embedder(&collection).ok_or_else(|| {
+            Error::BadRequest(format!(
+                "collection {collection:?} has no embedding provider configured \
+                 (set an [embedding.{collection}] table in quiver.toml — ADR-0047)"
+            ))
+        })?;
+        let texts: Vec<String> = points.iter().map(|p| p.text.clone()).collect();
+        let vectors = tokio::task::spawn_blocking(move || embedder.embed(&texts))
+            .await
+            .map_err(|e| Error::Internal(format!("embedding task failed: {e}")))?
+            .map_err(|e| Error::Upstream(e.to_string()))?;
+        if vectors.len() != points.len() {
+            return Err(Error::Upstream(format!(
+                "embedding provider returned {} vectors for {} inputs",
+                vectors.len(),
+                points.len()
+            )));
+        }
+        let dense: Vec<PointIn> = points
+            .into_iter()
+            .zip(vectors)
+            .map(|(p, vector)| {
+                let mut payload = match p.payload {
+                    Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                // Don't clobber a caller-supplied text key.
+                payload
+                    .entry(TEXT_KEY.to_owned())
+                    .or_insert_with(|| Value::String(p.text.clone()));
+                PointIn {
+                    id: p.id,
+                    vector,
+                    payload: Value::Object(payload),
+                }
+            })
+            .collect();
+        self.upsert(principal, collection, dense).await
+    }
+
     pub(crate) async fn fetch(
         &self,
         principal: &Principal,
@@ -1137,6 +1344,12 @@ pub async fn serve(
             let _ = tx.send(entry.clone());
         }));
     }
+    // Build the opt-in embedding/rerank providers, resolving each `api_key_env`
+    // from the environment now (ADR-0047) so a missing key fails fast at startup
+    // rather than on the first request.
+    let embed = EmbedRegistry::from_config(&config.embedding, &config.rerank)
+        .map_err(|e| Error::Config(e.to_string()))?;
+
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         keys: Arc::new(config.api_keys.clone()),
@@ -1144,6 +1357,7 @@ pub async fn serve(
         replication_tx,
         read_only: config.leader_url.is_some(),
         limits: config.limits,
+        embed: Arc::new(embed),
     };
 
     // A follower continuously applies the leader's committed-op stream (ADR-0030).
