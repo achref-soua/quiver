@@ -9,9 +9,10 @@
 //! real pipes.
 //!
 //! Tools: `list_collections`, `create_collection`, `collection_info`,
-//! `database_stats`, `delete_collection`, `upsert`, `search`, `hybrid_search`,
-//! `fetch`, `get`, `delete`, and the multi-vector document tools — enough for an
-//! agent to *operate* the database (inspect, manage, clean up), not just query it.
+//! `database_stats`, `delete_collection`, `snapshot`, `upsert`, `search`,
+//! `hybrid_search`, `fetch`, `get`, `delete`, and the multi-vector document
+//! tools — enough for an agent to *operate* the database (inspect, manage, back
+//! up, clean up), not just query it.
 //! The database is opened secure-by-default (encryption-at-rest on
 //! unless explicitly insecure) through the same envelope key-ring as the network
 //! server and `quiver admin`, so a data directory is interchangeable between them.
@@ -369,7 +370,23 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
             to_text(&json!({
                 "collection_count": names.len(),
                 "total_points": total_points,
+                // Snapshot-relevant status (ADR-0050): the catalog generation a
+                // snapshot would capture and the data directory's on-disk size.
+                "manifest_version": db.manifest_version(),
+                "disk_bytes": db.disk_usage_bytes(),
                 "collections": collections,
+            }))
+        }
+        "snapshot" => {
+            let destination = want_str(args, "destination")?;
+            let info = db
+                .snapshot(std::path::Path::new(destination))
+                .map_err(|e| e.to_string())?;
+            to_text(&json!({
+                "destination": destination,
+                "manifest_version": info.manifest_version,
+                "files": info.files,
+                "bytes": info.bytes,
             }))
         }
         other => Err(format!("unknown tool: {other}")),
@@ -591,8 +608,19 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "database_stats",
-            "description": "A whole-database overview for operating the instance: the number of collections, the total live point count, and a per-collection summary (dimension, metric, index, multivector flag, encryption mode, count). One call to see everything, instead of collection_info per collection.",
+            "description": "A whole-database overview for operating the instance: the number of collections, the total live point count, a per-collection summary (dimension, metric, index, multivector flag, encryption mode, count), and snapshot status (manifest_version, on-disk disk_bytes). One call to see everything, instead of collection_info per collection.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "snapshot",
+            "description": "Take a consistent online snapshot (backup) of the whole database into a server-local directory, which must not already exist. Returns the manifest version captured and the file/byte counts. Restore by pointing a Quiver instance at the snapshot directory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "destination": { "type": "string", "description": "Server-local destination directory; must not already exist" }
+                },
+                "required": ["destination"]
+            }
         }
     ])
 }
@@ -796,6 +824,7 @@ mod tests {
             "collection_info",
             "delete_collection",
             "database_stats",
+            "snapshot",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -883,6 +912,42 @@ mod tests {
         assert_eq!(by_name["a"]["count"], 2);
         assert_eq!(by_name["a"]["dim"], 2);
         assert_eq!(by_name["b"]["count"], 1);
+        // Snapshot status is present and sane.
+        assert!(stats["manifest_version"].is_u64());
+        assert!(stats["disk_bytes"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn snapshot_writes_a_restorable_copy() {
+        let (_t, mut db) = db();
+        call(&mut db, "create_collection", json!({"name":"kb","dim":2}));
+        call(
+            &mut db,
+            "upsert",
+            json!({"collection":"kb","id":"a","vector":[1.0,0.0]}),
+        );
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("snap");
+        let resp = call(
+            &mut db,
+            "snapshot",
+            json!({ "destination": dest.to_str().unwrap() }),
+        );
+        assert_eq!(resp["result"]["isError"], false);
+        let info: Value = serde_json::from_str(&result_text(&resp)).unwrap();
+        assert!(info["files"].as_u64().unwrap() > 0);
+
+        // The snapshot opens as an identical database.
+        let restored = Database::open(&dest).unwrap();
+        assert_eq!(restored.len("kb").unwrap(), 1);
+
+        // Snapshotting onto the existing directory is reported as an error.
+        let again = call(
+            &mut db,
+            "snapshot",
+            json!({ "destination": dest.to_str().unwrap() }),
+        );
+        assert_eq!(again["result"]["isError"], true);
     }
 
     #[test]
