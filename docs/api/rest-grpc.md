@@ -98,4 +98,4 @@ REST bodies are JSON; vectors are JSON arrays (or base64 for `int8`/`binary`). E
 
 ## Observability hooks
 
-Every RPC opens a `tracing` span (trace-id propagated from client headers when present), increments Prometheus counters/histograms (per-op QPS, latency, error class), and emits an audit record for mutating/admin operations (ADR-0014).
+`GET /metrics` serves Prometheus exposition (ADR-0014/0054): per matched-route-template request counters, error counters, and latency histograms (p50/p95/p99 derivable), plus process-wide `quiver_auth_failures_total` and `quiver_rate_limited_total`. The endpoint is open (no API key) so a scraper needs no credential — bind it privately. Engine-facing operations carry secret-free `tracing` spans, OTLP-exportable via a `tracing-opentelemetry` layer. Mutating/admin operations also emit an audit record (ADR-0011). An importable Grafana dashboard ships in `infra/grafana/`.

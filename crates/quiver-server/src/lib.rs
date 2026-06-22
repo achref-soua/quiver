@@ -30,6 +30,7 @@ mod auth;
 mod embed_provider;
 mod error;
 mod grpc;
+mod metrics;
 mod rate_limit;
 mod replication;
 mod rest;
@@ -519,6 +520,8 @@ pub(crate) struct AppState {
     embed: Arc<EmbedRegistry>,
     // Opt-in per-key token-bucket rate limiter (ADR-0049). A no-op when disabled.
     rate_limiter: Arc<RateLimiter>,
+    // Prometheus metrics registry (ADR-0014/0054), scraped at `GET /metrics`.
+    metrics: Arc<metrics::Metrics>,
 }
 
 /// A collection's metadata.
@@ -825,6 +828,7 @@ impl AppState {
         result
     }
 
+    #[tracing::instrument(skip_all, fields(collection = %collection, points = points.len()))]
     pub(crate) async fn upsert(
         &self,
         principal: &Principal,
@@ -890,6 +894,7 @@ impl AppState {
     /// Take a consistent online snapshot of the whole database into a
     /// server-local `destination` directory (ADR-0050). A global admin
     /// operation; runs the checkpoint + copy on the blocking pool.
+    #[tracing::instrument(skip_all)]
     pub(crate) async fn snapshot(
         &self,
         principal: &Principal,
@@ -962,6 +967,7 @@ impl AppState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip_all, fields(collection = %collection, k, filtered = filter.is_some()))]
     pub(crate) async fn search(
         &self,
         principal: &Principal,
@@ -1409,6 +1415,7 @@ pub async fn serve(
         limits: config.limits,
         embed: Arc::new(embed),
         rate_limiter: Arc::new(RateLimiter::new(config.rate_limit)),
+        metrics: Arc::new(metrics::Metrics::default()),
     };
 
     // A follower continuously applies the leader's committed-op stream (ADR-0030).
