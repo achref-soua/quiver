@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use quiver_proto::v1::{self, quiver_client::QuiverClient};
 use quiver_server::{Config, EmbeddingConfig, ProviderKind, RerankConfig, serve};
 use tokio::net::TcpListener;
 
@@ -187,6 +188,107 @@ async fn text_ingest_search_and_rerank_over_rest() {
         .await
         .unwrap();
     assert_eq!(no_provider_up.status(), 400);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn text_ingest_and_search_over_grpc() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rest_addr = rest_listener.local_addr().unwrap();
+    let grpc_addr = grpc_listener.local_addr().unwrap();
+
+    let mut embedding = HashMap::new();
+    embedding.insert("docs".to_owned(), fake_embedding(8));
+
+    let config = Config {
+        data_dir: tmp.path().to_path_buf(),
+        rest_addr,
+        grpc_addr,
+        insecure: true,
+        embedding,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move {
+        let _ = serve(config, rest_listener, grpc_listener).await;
+    });
+    let http = reqwest::Client::new();
+    let base = format!("http://{rest_addr}");
+    wait_ready(&http, &base).await;
+    http.post(format!("{base}/v1/collections"))
+        .json(&serde_json::json!({"name": "docs", "dim": 8, "metric": "cosine"}))
+        .send()
+        .await
+        .unwrap();
+
+    let mut client = QuiverClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .unwrap();
+
+    // Ingest by text over gRPC.
+    let upserted = client
+        .upsert_text(tonic::Request::new(v1::UpsertTextRequest {
+            collection: "docs".to_owned(),
+            points: vec![
+                v1::TextPoint {
+                    id: "fox".to_owned(),
+                    text: "the quick brown fox".to_owned(),
+                    payload: Vec::new(),
+                },
+                v1::TextPoint {
+                    id: "moon".to_owned(),
+                    text: "the moon orbits earth".to_owned(),
+                    payload: Vec::new(),
+                },
+            ],
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .upserted;
+    assert_eq!(upserted, 2);
+
+    // Text query over gRPC: BM25 over the co-populated text ranks the match first.
+    let matches = client
+        .search_text(tonic::Request::new(v1::SearchTextRequest {
+            collection: "docs".to_owned(),
+            text: "quick brown fox".to_owned(),
+            filter: Vec::new(),
+            k: 2,
+            ef_search: 0,
+            rrf_k0: 0.0,
+            with_payload: false,
+            with_vector: false,
+            rerank: false,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .matches;
+    assert_eq!(matches[0].id, "fox", "lexical match should rank first");
+
+    // A collection with no provider is InvalidArgument (400-equivalent).
+    http.post(format!("{base}/v1/collections"))
+        .json(&serde_json::json!({"name": "plain", "dim": 8, "metric": "cosine"}))
+        .send()
+        .await
+        .unwrap();
+    let no_provider = client
+        .search_text(tonic::Request::new(v1::SearchTextRequest {
+            collection: "plain".to_owned(),
+            text: "x".to_owned(),
+            filter: Vec::new(),
+            k: 1,
+            ef_search: 0,
+            rrf_k0: 0.0,
+            with_payload: false,
+            with_vector: false,
+            rerank: false,
+        }))
+        .await;
+    assert!(no_provider.is_err());
 
     server.abort();
 }

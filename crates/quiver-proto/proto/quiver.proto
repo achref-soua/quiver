@@ -26,6 +26,15 @@ service Quiver {
   // may be omitted for pure-dense or pure-sparse search.
   rpc HybridSearch(HybridSearchRequest) returns (SearchResponse);
 
+  // Server-side embedding (ADR-0047, opt-in per collection): embed each point's
+  // `text` with the collection's configured provider and upsert it; the text is
+  // also indexed for BM25. Requires an `[embedding.<collection>]` provider.
+  rpc UpsertText(UpsertTextRequest) returns (UpsertResponse);
+
+  // Server-side embedding + optional rerank (ADR-0047): embed `text`, search
+  // dense ⊕ BM25, and optionally rerank the candidate pool — all in one call.
+  rpc SearchText(SearchTextRequest) returns (SearchResponse);
+
   // Fetch points without server-side ranking — the retrieval path for
   // client-side-encrypted collections (ADR-0032); the client decrypts and ranks.
   rpc Fetch(FetchRequest) returns (FetchResponse);
@@ -221,6 +230,39 @@ message HybridSearchRequest {
   // Full-text query, tokenized server-side and scored by BM25 (ADR-0046); empty for
   // non-lexical search.
   string query_text = 10;
+}
+
+// A text point to embed server-side and upsert (ADR-0047).
+message TextPoint {
+  string id = 1;
+  string text = 2;
+  // JSON-encoded payload object; empty = none. The text is added under the
+  // `__quiver_text__` key for BM25 unless the payload already sets it.
+  bytes payload = 3;
+}
+
+// Embed each point's text with the collection's provider and upsert (ADR-0047).
+message UpsertTextRequest {
+  string collection = 1;
+  repeated TextPoint points = 2;
+}
+
+// Embed `text` and search dense ⊕ BM25, optionally reranking (ADR-0047). Reuses
+// SearchResponse.
+message SearchTextRequest {
+  string collection = 1;
+  string text = 2;
+  // JSON-encoded quiver-query Filter; empty = no filter.
+  bytes filter = 3;
+  uint32 k = 4;
+  uint32 ef_search = 5;
+  // RRF rank-bias constant; 0 uses the server default (60).
+  float rrf_k0 = 6;
+  bool with_payload = 7;
+  bool with_vector = 8;
+  // Opt-in: rerank the candidate pool with the collection's rerank provider and
+  // return the top-k reordered. Requires a `[rerank.<collection>]` provider.
+  bool rerank = 9;
 }
 
 // Fetch points (no ranking) with an optional cleartext payload filter and a limit

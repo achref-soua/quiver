@@ -377,3 +377,36 @@ def test_hybrid_search_requires_a_query():
 
         with _pytest.raises(ValueError):
             q.hybrid_search("kb")
+
+
+@respx.mock
+def test_upsert_text_posts_text_points():
+    route = respx.post(f"{BASE}/v1/collections/docs/points:text").mock(
+        return_value=httpx.Response(200, json={"upserted": 2})
+    )
+    with Client(BASE) as q:
+        n = q.upsert_text(
+            "docs",
+            [
+                {"id": "a", "text": "hello world", "payload": {"src": "x"}},
+                {"id": "b", "text": "second"},
+            ],
+        )
+    assert n == 2
+    body = json.loads(route.calls.last.request.content)
+    assert body["points"][0] == {"id": "a", "text": "hello world", "payload": {"src": "x"}}
+    assert body["points"][1] == {"id": "b", "text": "second"}
+
+
+@respx.mock
+def test_search_text_posts_query_and_rerank_flag():
+    route = respx.post(f"{BASE}/v1/collections/docs/query/text").mock(
+        return_value=httpx.Response(200, json={"matches": [{"id": "fox", "score": 2.0}]})
+    )
+    with Client(BASE) as q:
+        hits = q.search_text("docs", "quick fox", k=5, rerank=True)
+    assert hits == [Match(id="fox", score=2.0)]
+    body = json.loads(route.calls.last.request.content)
+    assert body["text"] == "quick fox"
+    assert body["k"] == 5
+    assert body["rerank"] is True

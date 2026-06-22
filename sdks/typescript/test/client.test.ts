@@ -174,6 +174,44 @@ describe("Quiver TypeScript client", () => {
     expect(hits[0]!.id).toBe("cat");
   });
 
+  it("upsertText posts to points:text with text and optional payload (ADR-0047)", async () => {
+    let path: string | undefined;
+    let body: Record<string, unknown> | undefined;
+    const fetch = mockFetch(async (p, _method, init) => {
+      path = p;
+      body = parseBody(init);
+      return json({ upserted: 2 });
+    });
+    const n = await new Client("http://x", { fetch }).upsertText("docs", [
+      { id: "a", text: "hello world", payload: { src: "x" } },
+      { id: "b", text: "second" },
+    ]);
+    expect(path).toBe("/v1/collections/docs/points:text");
+    const points = body?.["points"] as Array<Record<string, unknown>>;
+    expect(points[0]).toEqual({ id: "a", text: "hello world", payload: { src: "x" } });
+    expect(points[1]).toEqual({ id: "b", text: "second" });
+    expect(n).toBe(2);
+  });
+
+  it("searchText posts to query/text with the rerank flag (ADR-0047)", async () => {
+    let path: string | undefined;
+    let body: Record<string, unknown> | undefined;
+    const fetch = mockFetch(async (p, _method, init) => {
+      path = p;
+      body = parseBody(init);
+      return json({ matches: [{ id: "fox", score: 2 }] });
+    });
+    const hits = await new Client("http://x", { fetch }).searchText("docs", "quick fox", {
+      k: 5,
+      rerank: true,
+    });
+    expect(path).toBe("/v1/collections/docs/query/text");
+    expect(body?.["text"]).toBe("quick fox");
+    expect(body?.["k"]).toBe(5);
+    expect(body?.["rerank"]).toBe(true);
+    expect(hits[0]!.id).toBe("fox");
+  });
+
   it("getPoint returns null on 404", async () => {
     const fetch = mockFetch(async () => new Response("", { status: 404 }));
     const m = await new Client("http://x", { fetch }).getPoint("items", "nope");

@@ -14,4 +14,6 @@ export {
   type SearchOptions,
   type SparseVector,
   type HybridSearchOptions,
+  type TextPoint,
+  type SearchTextOptions,
 } from "./client.js";

@@ -322,6 +322,63 @@ class Client:
             for m in matches
         ]
 
+    def upsert_text(self, collection: str, points: Iterable[Mapping[str, Any]]) -> int:
+        """Embed each point's text server-side and upsert it (ADR-0047).
+
+        Each point is a mapping with ``id`` and ``text`` (and an optional
+        ``payload``); the server embeds the text with the collection's configured
+        provider and also indexes it for BM25. Requires an ``[embedding.<collection>]``
+        provider on the server. Returns the number upserted.
+        """
+        body = {
+            "points": [
+                {"id": p["id"], "text": p["text"], **({"payload": p["payload"]} if p.get("payload") is not None else {})}
+                for p in points
+            ]
+        }
+        return int(
+            self._send(
+                "POST", f"/v1/collections/{collection}/points:text", body
+            ).json()["upserted"]
+        )
+
+    def search_text(
+        self,
+        collection: str,
+        text: str,
+        *,
+        k: int = 10,
+        filter: Optional[Mapping[str, Any]] = None,
+        ef_search: int = 64,
+        rrf_k0: float = 60.0,
+        with_payload: bool = True,
+        with_vector: bool = False,
+        rerank: bool = False,
+    ) -> list[Match]:
+        """Embed ``text`` server-side and search dense ⊕ BM25, optionally reranking
+        the candidate pool in one call (ADR-0047). Requires an
+        ``[embedding.<collection>]`` provider (and, for ``rerank=True``, a
+        ``[rerank.<collection>]`` provider). Returns matches most-relevant-first.
+        """
+        body: dict[str, Any] = {
+            "text": text,
+            "k": k,
+            "ef_search": ef_search,
+            "rrf_k0": rrf_k0,
+            "with_payload": with_payload,
+            "with_vector": with_vector,
+            "rerank": rerank,
+        }
+        if filter is not None:
+            body["filter"] = filter
+        matches = self._send(
+            "POST", f"/v1/collections/{collection}/query/text", body
+        ).json()["matches"]
+        return [
+            Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
+            for m in matches
+        ]
+
     def fetch(
         self,
         collection: str,
