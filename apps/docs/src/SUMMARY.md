@@ -18,6 +18,7 @@
 
 - [Indexing & memory frugality](features/indexing.md)
 - [Hybrid (dense + sparse) search](features/hybrid-search.md)
+- [Server-side embedding & reranking](features/embedding.md)
 - [Multi-vector / late interaction](features/multi-vector.md)
 - [Encrypted vector search](features/encrypted-search.md)
 - [Migration importers](features/migration.md)

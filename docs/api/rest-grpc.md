@@ -51,8 +51,12 @@ message SearchResponse { repeated Match matches = 1; string next_cursor = 2; }
 | `GET /v1/collections` | ListCollections (cursor) |
 | `DELETE /v1/collections/{id}` | DeleteCollection (crypto-shred) |
 | `POST /v1/collections/{id}/points` | Upsert (batch; `Idempotency-Key`) |
+| `POST /v1/collections/{id}/points:bulk` | Upsert (bulk load; one fsync + one index rebuild) |
+| `POST /v1/collections/{id}/points:text` | UpsertText (server-side embedding, ADR-0047) |
 | `DELETE /v1/collections/{id}/points` | DeletePoints |
 | `POST /v1/collections/{id}/query` | Search |
+| `POST /v1/collections/{id}/query/hybrid` | HybridSearch (dense ⊕ sparse/BM25, RRF) |
+| `POST /v1/collections/{id}/query/text` | SearchText (embed query, ⊕ BM25, optional rerank) |
 | `POST /v1/collections/{id}/query/batch` | BatchSearch |
 | `POST /v1/collections/{id}/documents` | UpsertMultiVector (late-interaction docs) |
 | `DELETE /v1/collections/{id}/documents` | DeleteDocuments |
