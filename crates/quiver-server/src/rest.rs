@@ -40,6 +40,7 @@ pub(crate) fn router(state: AppState) -> Router {
             "/v1/collections/{name}/points",
             post(upsert).delete(delete_points),
         )
+        .route("/v1/collections/{name}/points:bulk", post(upsert_bulk))
         .route("/v1/collections/{name}/points/{id}", get(get_point))
         .route("/v1/collections/{name}/query", post(search))
         .route("/v1/collections/{name}/query/hybrid", post(hybrid_search))
@@ -371,6 +372,28 @@ async fn upsert(
         })
         .collect();
     let upserted = state.upsert(&principal, name, points).await?;
+    Ok(Json(UpsertResponse { upserted }))
+}
+
+/// Bulk upsert (ADR-0045): same body as `upsert`, but routed to the deferred
+/// single-rebuild path with the larger `max_bulk_batch_size` cap. The request is
+/// still bounded by `max_request_body_bytes`.
+async fn upsert_bulk(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(name): Path<String>,
+    Json(body): Json<UpsertBody>,
+) -> Result<Json<UpsertResponse>, Error> {
+    let points = body
+        .points
+        .into_iter()
+        .map(|p| PointIn {
+            id: p.id,
+            vector: p.vector,
+            payload: p.payload,
+        })
+        .collect();
+    let upserted = state.upsert_bulk(&principal, name, points).await?;
     Ok(Json(UpsertResponse { upserted }))
 }
 

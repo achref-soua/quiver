@@ -50,6 +50,7 @@ async fn over_limit_requests_are_rejected_with_400() {
             max_batch_size: 2,
             max_request_body_bytes: 1 << 20,
             max_sparse_terms: 8,
+            max_bulk_batch_size: 4,
         },
         ..Default::default()
     };
@@ -166,6 +167,43 @@ async fn over_limit_requests_are_rejected_with_400() {
         .await
         .unwrap();
     assert_eq!(big_payload.status(), 400, "payload over cap must be 400");
+
+    // Bulk upsert uses the larger max_bulk_batch_size (4): a batch of 3 — which the
+    // steady-state endpoint (cap 2) rejects — succeeds here, proving the `:bulk`
+    // route parses and uses its own cap; a batch of 5 over the bulk cap is a 400.
+    let bulk = format!("{base}/v1/collections/v/points:bulk");
+    let bulk_ok = http
+        .post(&bulk)
+        .json(&serde_json::json!({"points": [
+            {"id": "f", "vector": [0.0, 0.0, 0.0, 0.0]},
+            {"id": "g", "vector": [0.0, 0.0, 0.0, 0.0]},
+            {"id": "h", "vector": [0.0, 0.0, 0.0, 0.0]}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        bulk_ok.status().is_success(),
+        "bulk of 3 (over max_batch_size, under max_bulk_batch_size) should succeed"
+    );
+
+    let bulk_over = http
+        .post(&bulk)
+        .json(&serde_json::json!({"points": [
+            {"id": "i", "vector": [0.0, 0.0, 0.0, 0.0]},
+            {"id": "j", "vector": [0.0, 0.0, 0.0, 0.0]},
+            {"id": "k", "vector": [0.0, 0.0, 0.0, 0.0]},
+            {"id": "l", "vector": [0.0, 0.0, 0.0, 0.0]},
+            {"id": "m", "vector": [0.0, 0.0, 0.0, 0.0]}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bulk_over.status(),
+        400,
+        "bulk over max_bulk_batch_size must be 400"
+    );
 
     server.abort();
 }

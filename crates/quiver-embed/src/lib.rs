@@ -547,6 +547,51 @@ impl Database {
         Ok(records.len() as u64)
     }
 
+    /// Upsert a large batch for a bulk load, deferring all index work to a single
+    /// rebuild pass (ADR-0045).
+    ///
+    /// Like [`upsert_batch`](Self::upsert_batch) the points are committed with one
+    /// WAL `fdatasync`, but instead of folding each point into the in-memory index
+    /// one at a time, the collection's index is marked **stale** so the next search
+    /// rebuilds it in a single pass over the whole collection — far cheaper for a
+    /// fresh load (one k-means for IVF, one graph build for Vamana, one inverted-index
+    /// scan) than N incremental inserts. Prefer `upsert_batch` for steady-state
+    /// writes where query-after-write latency matters.
+    pub fn upsert_bulk(
+        &mut self,
+        collection: &str,
+        points: &[(&str, &[f32], &serde_json::Value)],
+    ) -> Result<u64> {
+        let handle = self
+            .collections
+            .get_mut(collection)
+            .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+        require_single_vector(handle)?;
+        let coll_id = handle.id;
+
+        let payload_bytes: Vec<Vec<u8>> = points
+            .iter()
+            .map(|(_, _, p)| serde_json::to_vec(p).map_err(Error::Json))
+            .collect::<Result<_>>()?;
+        let records: Vec<(&str, &[f32], &[u8])> = points
+            .iter()
+            .zip(payload_bytes.iter())
+            .map(|((id, vec, _), p)| (*id, *vec, p.as_slice()))
+            .collect();
+
+        self.store.upsert_batch(coll_id, &records)?;
+
+        // Defer the dense and sparse index maintenance to a single rebuild on the
+        // next read (a client-side-encrypted collection has no index to rebuild, but
+        // marking it stale is harmless — its rebuild produces the same no-op index).
+        let handle = self
+            .collections
+            .get_mut(collection)
+            .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+        handle.stale = true;
+        Ok(records.len() as u64)
+    }
+
     /// Delete a point by id. Returns whether it existed.
     pub fn delete(&mut self, collection: &str, id: &str) -> Result<bool> {
         let handle = self
@@ -2280,6 +2325,60 @@ mod tests {
             seq, bat,
             "batch and sequential produce different search results"
         );
+    }
+
+    #[test]
+    fn upsert_bulk_defers_the_index_then_searches_correctly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("c", desc()).unwrap();
+        let vectors: Vec<[f32; 4]> = (0..20u32).map(|i| [i as f32, 0.0, 0.0, 0.0]).collect();
+        let ids: Vec<String> = (0..20u32).map(|i| format!("p{i}")).collect();
+        // Give one point a sparse vector so the deferred rebuild also rebuilds the
+        // inverted index.
+        let plain = json!({});
+        let sparse_payload = json!({ "__quiver_sparse__": { "indices": [7], "values": [1.0] } });
+        let pts: Vec<(&str, &[f32], &serde_json::Value)> = ids
+            .iter()
+            .zip(vectors.iter())
+            .map(|(id, v)| {
+                let payload = if id == "p3" { &sparse_payload } else { &plain };
+                (id.as_str(), v.as_slice(), payload)
+            })
+            .collect();
+        let n = db.upsert_bulk("c", &pts).unwrap();
+        assert_eq!(n, 20);
+
+        // The bulk path defers index maintenance: the handle is stale until a read.
+        assert!(db.collections.get("c").unwrap().stale);
+
+        // Dense search triggers the single rebuild and returns the nearest points.
+        let query = [10.0f32, 0.0, 0.0, 0.0];
+        let params = SearchParams {
+            k: 5,
+            ..Default::default()
+        };
+        let hits: Vec<String> = db
+            .search("c", &query, &params)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(hits[0], "p10", "nearest to 10 is p10; got {hits:?}");
+        assert!(!db.collections.get("c").unwrap().stale, "rebuilt on read");
+
+        // The sparse vector loaded via the bulk path is searchable after the rebuild.
+        let q = SparseVector {
+            indices: vec![7],
+            values: vec![1.0],
+        };
+        let sparse_hits: Vec<String> = db
+            .hybrid_search("c", None, Some(&q), &params, DEFAULT_RRF_K0)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(sparse_hits, vec!["p3".to_owned()]);
     }
 
     #[test]
