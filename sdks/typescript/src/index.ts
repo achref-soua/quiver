@@ -12,4 +12,6 @@ export {
   type ClientOptions,
   type CreateCollectionOptions,
   type SearchOptions,
+  type SparseVector,
+  type HybridSearchOptions,
 } from "./client.js";

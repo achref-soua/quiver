@@ -133,6 +133,30 @@ export interface SearchOptions {
   withVector?: boolean;
 }
 
+/** A sparse query vector for hybrid search (ADR-0043): parallel dimension ids
+ * (`indices`) and weights (`values`). */
+export interface SparseVector {
+  indices: number[];
+  values: number[];
+}
+
+/** Options for {@link Client.hybridSearch}. Provide `vector`, `sparse`, or both;
+ * at least one is required. */
+export interface HybridSearchOptions {
+  /** Dense query vector (omit for pure-sparse search). */
+  vector?: number[];
+  /** Sparse query vector (omit for pure-dense search). */
+  sparse?: SparseVector;
+  k?: number;
+  /** A Quiver payload filter expression (applied on both sides). */
+  filter?: unknown;
+  efSearch?: number;
+  /** RRF rank-bias constant (default 60). */
+  rrfK0?: number;
+  withPayload?: boolean;
+  withVector?: boolean;
+}
+
 /** Options for {@link Client.fetch}. */
 export interface FetchOptions {
   /** A Quiver payload filter expression to narrow the set. */
@@ -261,6 +285,39 @@ export class Client {
     const res = (await this.#json(
       "POST",
       `/v1/collections/${encodeURIComponent(collection)}/query`,
+      body,
+    )) as { matches?: Match[] };
+    return (res.matches ?? []).map((m) => ({
+      id: m.id,
+      score: m.score,
+      payload: m.payload,
+      vector: m.vector,
+    }));
+  }
+
+  /** Hybrid (dense + sparse) search fused with Reciprocal Rank Fusion (ADR-0043).
+   * Provide a dense `vector`, a `sparse` query vector, or both — at least one is
+   * required. The same payload `filter` is applied on both sides. */
+  async hybridSearch(collection: string, opts: HybridSearchOptions = {}): Promise<Match[]> {
+    if (opts.vector === undefined && opts.sparse === undefined) {
+      throw new QuiverError("hybridSearch requires a dense vector, a sparse vector, or both");
+    }
+    const body: Record<string, unknown> = {
+      k: opts.k ?? 10,
+      ef_search: opts.efSearch ?? 64,
+      rrf_k0: opts.rrfK0 ?? 60,
+      with_payload: opts.withPayload ?? true,
+      with_vector: opts.withVector ?? false,
+    };
+    if (opts.vector !== undefined) body["vector"] = opts.vector;
+    if (opts.sparse !== undefined) {
+      body["sparse_indices"] = opts.sparse.indices;
+      body["sparse_values"] = opts.sparse.values;
+    }
+    if (opts.filter !== undefined) body["filter"] = opts.filter;
+    const res = (await this.#json(
+      "POST",
+      `/v1/collections/${encodeURIComponent(collection)}/query/hybrid`,
       body,
     )) as { matches?: Match[] };
     return (res.matches ?? []).map((m) => ({
