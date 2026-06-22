@@ -54,7 +54,7 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use quiver_crypto::AeadCodec;
 use quiver_embed::{
     Database, Descriptor, DistanceMetric, Dtype, FilterableField, IndexSpec, SearchParams,
-    SparseVector, TEXT_KEY, VectorEncryption, WalEntry, WalOp,
+    SnapshotInfo, SparseVector, TEXT_KEY, VectorEncryption, WalEntry, WalOp,
 };
 use quiver_query::Filter;
 
@@ -882,6 +882,27 @@ impl AppState {
             principal.actor(),
             "upsert_bulk",
             &resource,
+            Outcome::of(&result),
+        );
+        result
+    }
+
+    /// Take a consistent online snapshot of the whole database into a
+    /// server-local `destination` directory (ADR-0050). A global admin
+    /// operation; runs the checkpoint + copy on the blocking pool.
+    pub(crate) async fn snapshot(
+        &self,
+        principal: &Principal,
+        destination: String,
+    ) -> Result<SnapshotInfo, Error> {
+        self.ensure_writable("snapshot")?;
+        self.authorize_global(principal, Action::Admin, "snapshot")?;
+        let dest = std::path::PathBuf::from(&destination);
+        let result = self.run_blocking(move |db| db.snapshot(&dest)).await;
+        self.audit.record(
+            principal.actor(),
+            "snapshot",
+            &destination,
             Outcome::of(&result),
         );
         result

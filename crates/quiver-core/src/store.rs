@@ -715,6 +715,19 @@ impl Store {
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))
     }
 
+    /// The store's root data directory.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The current manifest version — the catalog generation a snapshot of this
+    /// store captures (ADR-0050).
+    #[must_use]
+    pub fn manifest_version(&self) -> u64 {
+        self.manifest_version
+    }
+
     /// The directory that holds a collection's index artifacts
     /// (`<data_dir>/collections/<id>/index`). Not created by this call.
     #[must_use]

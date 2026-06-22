@@ -56,6 +56,7 @@ pub(crate) fn router(state: AppState) -> Router {
             "/v1/collections/{name}/documents/query",
             post(search_multi_vector),
         )
+        .route("/v1/snapshot", post(snapshot))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state);
@@ -448,6 +449,23 @@ async fn upsert_bulk(
         .collect();
     let upserted = state.upsert_bulk(&principal, name, points).await?;
     Ok(Json(UpsertResponse { upserted }))
+}
+
+/// `POST /v1/snapshot` — take a consistent online snapshot of the whole database
+/// into a server-local directory (ADR-0050). Admin-only.
+#[derive(Deserialize)]
+struct SnapshotBody {
+    /// Server-local destination directory; must not already exist.
+    destination: String,
+}
+
+async fn snapshot(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<SnapshotBody>,
+) -> Result<Json<quiver_embed::SnapshotInfo>, Error> {
+    let info = state.snapshot(&principal, body.destination).await?;
+    Ok(Json(info))
 }
 
 #[derive(Deserialize)]
