@@ -23,6 +23,10 @@ test-py:
 test-ts:
     cd sdks/typescript && pnpm install --silent && pnpm typecheck && pnpm test
 
+# Run the Go SDK suite: vet + tests (requires the Go toolchain; httptest-mocked).
+test-go:
+    cd sdks/go && gofmt -l . && go vet ./... && go test ./...
+
 # Format check + clippy with warnings denied.
 lint:
     cargo fmt --all --check
