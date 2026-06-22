@@ -410,3 +410,19 @@ def test_search_text_posts_query_and_rerank_flag():
     assert body["text"] == "quick fox"
     assert body["k"] == 5
     assert body["rerank"] is True
+
+
+@respx.mock
+def test_snapshot_posts_destination_and_returns_info():
+    route = respx.post(f"{BASE}/v1/snapshot").mock(
+        return_value=httpx.Response(
+            200, json={"manifest_version": 3, "files": 12, "bytes": 4096}
+        )
+    )
+    with Client(BASE) as q:
+        info = q.snapshot("/backups/snap1")
+    assert info["files"] == 12
+    assert info["bytes"] == 4096
+    assert info["manifest_version"] == 3
+    body = json.loads(route.calls.last.request.content)
+    assert body["destination"] == "/backups/snap1"

@@ -418,6 +418,16 @@ class Client:
             for p in points
         ]
 
+    def snapshot(self, destination: str) -> dict[str, Any]:
+        """Take a consistent online snapshot (backup) of the whole database into a
+        server-local ``destination`` directory, which must not already exist
+        (ADR-0050); admin-only. Returns the captured ``manifest_version`` and the
+        ``files`` / ``bytes`` counts.
+        """
+        return dict(
+            self._send("POST", "/v1/snapshot", {"destination": destination}).json()
+        )
+
     def search_client_side(
         self,
         collection: str,

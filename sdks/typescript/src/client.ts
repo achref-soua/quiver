@@ -41,6 +41,13 @@ export interface Match {
   vector?: number[];
 }
 
+/** What a {@link QuiverClient.snapshot} captured (ADR-0050). */
+export interface SnapshotInfo {
+  manifestVersion: number;
+  files: number;
+  bytes: number;
+}
+
 /** A multi-vector (late-interaction / ColBERT) document: an id, its set of token
  * vectors, and an optional payload. */
 export interface Document {
@@ -430,6 +437,22 @@ export class Client {
       payload: p.payload,
       vector: p.vector,
     }));
+  }
+
+  /** Take a consistent online snapshot (backup) of the whole database into a
+   * server-local directory, which must not already exist (ADR-0050); admin-only.
+   * Resolves to the captured manifest version and the file/byte counts. */
+  async snapshot(destination: string): Promise<SnapshotInfo> {
+    const res = (await this.#json("POST", "/v1/snapshot", { destination })) as {
+      manifest_version?: number;
+      files?: number;
+      bytes?: number;
+    };
+    return {
+      manifestVersion: Number(res.manifest_version ?? 0),
+      files: Number(res.files ?? 0),
+      bytes: Number(res.bytes ?? 0),
+    };
   }
 
   /** Nearest-neighbour search over a `client_side`-encrypted collection (ADR-0032),

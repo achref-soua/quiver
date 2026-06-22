@@ -364,4 +364,18 @@ describe("Quiver TypeScript client", () => {
     expect(info.index).toBe("colbert");
     expect(info.multivector).toBe(true);
   });
+
+  it("snapshot posts the destination and parses the info", async () => {
+    let captured: Record<string, unknown> | undefined;
+    let capturedPath: string | undefined;
+    const fetch = mockFetch(async (path, _method, init) => {
+      capturedPath = path;
+      captured = parseBody(init);
+      return json({ manifest_version: 3, files: 12, bytes: 4096 });
+    });
+    const info = await new Client("http://x", { fetch }).snapshot("/backups/snap1");
+    expect(capturedPath).toBe("/v1/snapshot");
+    expect(captured?.["destination"]).toBe("/backups/snap1");
+    expect(info).toEqual({ manifestVersion: 3, files: 12, bytes: 4096 });
+  });
 });

@@ -16,4 +16,5 @@ export {
   type HybridSearchOptions,
   type TextPoint,
   type SearchTextOptions,
+  type SnapshotInfo,
 } from "./client.js";
