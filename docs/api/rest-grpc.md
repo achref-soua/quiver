@@ -14,7 +14,8 @@ service Quiver {
   rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
   rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse);
 
-  rpc Upsert(stream UpsertRequest) returns (UpsertResponse);     // client-streaming batches
+  rpc Upsert(UpsertRequest) returns (UpsertResponse);
+  rpc UpsertStream(stream UpsertRequest) returns (UpsertResponse); // client-streaming bulk load (ADR-0045)
   rpc DeletePoints(DeletePointsRequest) returns (DeletePointsResponse);
   rpc GetPoints(GetPointsRequest) returns (GetPointsResponse);
 

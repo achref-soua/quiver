@@ -37,6 +37,7 @@ reqwest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
 tokio-rustls = { workspace = true }
+tokio-stream = { workspace = true }
 
 [lints]
 workspace = true
