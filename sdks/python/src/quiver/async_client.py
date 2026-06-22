@@ -281,6 +281,13 @@ class AsyncClient:
             for p in resp.json()["points"]
         ]
 
+    async def snapshot(self, destination: str) -> dict[str, Any]:
+        """Take a consistent online snapshot of the whole database into a
+        server-local ``destination`` directory (ADR-0050); admin-only. See
+        :meth:`Client.snapshot`."""
+        resp = await self._send("POST", "/v1/snapshot", {"destination": destination})
+        return dict(resp.json())
+
     async def search_client_side(
         self,
         collection: str,
