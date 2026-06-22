@@ -9,7 +9,8 @@
 //! real pipes.
 //!
 //! Tools: `list_collections`, `create_collection`, `collection_info`, `upsert`,
-//! `search`, `fetch`, `get`, `delete`, and the multi-vector document tools. The
+//! `search`, `hybrid_search`, `fetch`, `get`, `delete`, and the multi-vector
+//! document tools. The
 //! database is opened secure-by-default (encryption-at-rest on
 //! unless explicitly insecure) through the same envelope key-ring as the network
 //! server and `quiver admin`, so a data directory is interchangeable between them.
@@ -20,8 +21,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use quiver_embed::{
-    Database, Descriptor, DistanceMetric, Dtype, FieldType, Filter, FilterableField, IndexKind,
-    IndexSpec, SearchParams, VectorEncryption,
+    DEFAULT_RRF_K0, Database, Descriptor, DistanceMetric, Dtype, FieldType, Filter,
+    FilterableField, IndexKind, IndexSpec, SearchParams, SparseVector, VectorEncryption,
 };
 
 /// The MCP protocol revision this server implements.
@@ -193,6 +194,59 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
             };
             let matches = db
                 .search(collection, &vector, &params)
+                .map_err(|e| e.to_string())?;
+            let rendered: Vec<Value> = matches
+                .iter()
+                .map(|m| json!({ "id": m.id, "score": m.score, "payload": m.payload }))
+                .collect();
+            to_text(&json!({ "matches": rendered }))
+        }
+        "hybrid_search" => {
+            let collection = want_str(args, "collection")?;
+            let dense = match args.get("vector") {
+                Some(v) if !v.is_null() => Some(want_vector(args, "vector")?),
+                _ => None,
+            };
+            let sparse = match (args.get("sparse_indices"), args.get("sparse_values")) {
+                (Some(i), Some(v)) if !i.is_null() && !v.is_null() => {
+                    let indices: Vec<u32> = serde_json::from_value(i.clone())
+                        .map_err(|e| format!("invalid sparse_indices: {e}"))?;
+                    let values: Vec<f32> = serde_json::from_value(v.clone())
+                        .map_err(|e| format!("invalid sparse_values: {e}"))?;
+                    Some(SparseVector { indices, values })
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(
+                        "sparse_indices and sparse_values must be provided together".to_owned()
+                    );
+                }
+            };
+            let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+            let filter = match args.get("filter") {
+                Some(f) if !f.is_null() => Some(
+                    serde_json::from_value::<Filter>(f.clone())
+                        .map_err(|e| format!("invalid filter: {e}"))?,
+                ),
+                _ => None,
+            };
+            let rrf_k0 = args
+                .get("rrf_k0")
+                .and_then(Value::as_f64)
+                .map_or(DEFAULT_RRF_K0, |x| x as f32);
+            let params = SearchParams {
+                k,
+                filter,
+                ..SearchParams::default()
+            };
+            let matches = db
+                .hybrid_search(
+                    collection,
+                    dense.as_deref(),
+                    sparse.as_ref(),
+                    &params,
+                    rrf_k0,
+                )
                 .map_err(|e| e.to_string())?;
             let rendered: Vec<Value> = matches
                 .iter()
@@ -396,6 +450,23 @@ pub fn tool_definitions() -> Value {
                     "filter": { "type": "object", "description": "Quiver payload filter tree" }
                 },
                 "required": ["collection", "vector"]
+            }
+        },
+        {
+            "name": "hybrid_search",
+            "description": "Hybrid (dense + sparse) search fused with Reciprocal Rank Fusion (ADR-0043/0045). Provide a dense 'vector', a sparse query ('sparse_indices' + 'sparse_values', parallel arrays), or both; at least one is required. Honours the same payload filter on both sides.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "collection": collection_arg,
+                    "vector": { "type": "array", "items": { "type": "number" }, "description": "Dense query vector (omit for pure-sparse search)" },
+                    "sparse_indices": { "type": "array", "items": { "type": "integer" }, "description": "Sparse query dimension ids (parallel to sparse_values)" },
+                    "sparse_values": { "type": "array", "items": { "type": "number" }, "description": "Sparse query weights (parallel to sparse_indices)" },
+                    "k": { "type": "integer", "default": 10 },
+                    "filter": { "type": "object", "description": "Quiver payload filter tree" },
+                    "rrf_k0": { "type": "number", "description": "RRF rank-bias constant (default 60)" }
+                },
+                "required": ["collection"]
             }
         },
         {
@@ -671,6 +742,7 @@ mod tests {
             "create_collection",
             "upsert",
             "search",
+            "hybrid_search",
             "get",
             "delete",
             "collection_info",
@@ -753,6 +825,64 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result_text(&r)).unwrap();
         let matches = parsed["matches"].as_array().unwrap();
         assert!(matches.iter().all(|m| m["payload"]["color"] == "blue"));
+    }
+
+    #[test]
+    fn hybrid_search_tool_fuses_dense_and_sparse() {
+        let (_t, mut db) = db();
+        call(
+            &mut db,
+            "create_collection",
+            json!({"name":"kb","dim":4,"metric":"l2"}),
+        );
+        // "a" is the dense nearest neighbour; "b" matches the sparse query.
+        call(
+            &mut db,
+            "upsert",
+            json!({"collection":"kb","id":"a","vector":[1.0,0.0,0.0,0.0],"payload":{"__quiver_sparse__":{"indices":[100],"values":[0.1]}}}),
+        );
+        call(
+            &mut db,
+            "upsert",
+            json!({"collection":"kb","id":"b","vector":[0.0,1.0,0.0,0.0],"payload":{"__quiver_sparse__":{"indices":[1,2],"values":[5.0,5.0]}}}),
+        );
+
+        // Dense + sparse: both "a" and "b" come back.
+        let r = call(
+            &mut db,
+            "hybrid_search",
+            json!({"collection":"kb","vector":[1.0,0.0,0.0,0.0],"sparse_indices":[1,2],"sparse_values":[1.0,1.0],"k":2}),
+        );
+        assert_eq!(r["result"]["isError"], false);
+        let parsed: Value = serde_json::from_str(&result_text(&r)).unwrap();
+        let ids: Vec<&str> = parsed["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"a") && ids.contains(&"b"), "got {ids:?}");
+
+        // Pure sparse: only "b" shares the query's terms.
+        let r = call(
+            &mut db,
+            "hybrid_search",
+            json!({"collection":"kb","sparse_indices":[1,2],"sparse_values":[1.0,1.0],"k":2}),
+        );
+        let parsed: Value = serde_json::from_str(&result_text(&r)).unwrap();
+        assert_eq!(parsed["matches"][0]["id"], "b");
+
+        // Neither query is a tool error.
+        let r = call(&mut db, "hybrid_search", json!({"collection":"kb","k":2}));
+        assert_eq!(r["result"]["isError"], true);
+
+        // Mismatched sparse arrays (only one provided) is a tool error.
+        let r = call(
+            &mut db,
+            "hybrid_search",
+            json!({"collection":"kb","sparse_indices":[1],"k":2}),
+        );
+        assert_eq!(r["result"]["isError"], true);
     }
 
     const ENC_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
