@@ -69,6 +69,13 @@ class FakeClient:
         pts = list(self.points.get(collection, {}).values())[:k]
         return [Match(id=p.id, score=0.5, payload=p.payload, vector=None) for p in pts]
 
+    def hybrid_search(
+        self, collection: str, *, vector: Any = None, query_text: Any = None, k: int = 10, filter: Any = None
+    ) -> list[Match]:
+        self.last_query_text = query_text
+        pts = list(self.points.get(collection, {}).values())[:k]
+        return [Match(id=p.id, score=0.6, payload=p.payload, vector=None) for p in pts]
+
     def delete_points(self, collection: str, ids: list[str]) -> int:
         self.deleted.append(list(ids))
         store = self.points.get(collection, {})
@@ -108,6 +115,24 @@ def test_add_creates_collection_and_query_reconstructs_nodes() -> None:
     assert result.ids == ["n1", "n2"]
     # Metadata survives the round-trip through the payload.
     assert {n.metadata.get("category") for n in result.nodes} == {"x", "y"}
+
+
+def test_hybrid_mode_indexes_text_and_fuses_bm25() -> None:
+    from quiver.client import TEXT_KEY
+
+    client = FakeClient(exists=True)
+    store = QuiverVectorStore(client, "docs", hybrid=True)
+    store.add([_node("n1", "quick brown fox", category="x")])
+    # Hybrid ingest co-populates the reserved BM25 key with the node text.
+    assert client.points["docs"]["n1"].payload[TEXT_KEY] == "quick brown fox"
+
+    result = store.query(
+        VectorStoreQuery(query_embedding=[1.0, 0.0, 1.0], similarity_top_k=1, query_str="quick fox")
+    )
+    # The query routed through hybrid_search with the raw text for BM25 fusion.
+    assert client.last_query_text == "quick fox"
+    # The internal BM25 field never leaks into node metadata.
+    assert TEXT_KEY not in result.nodes[0].metadata
 
 
 def test_existing_collection_is_not_recreated_and_deletes_by_id() -> None:

@@ -48,6 +48,20 @@ class FakeClient:
         pts = list(self.points.get(collection, {}).values())[:k]
         return [Match(id=p.id, score=0.9, payload=p.payload, vector=None) for p in pts]
 
+    def hybrid_search(
+        self,
+        collection: str,
+        *,
+        vector: Any = None,
+        query_text: Any = None,
+        k: int = 10,
+        filter: Any = None,
+    ) -> list[Match]:
+        self.hybrid_calls = getattr(self, "hybrid_calls", [])
+        self.hybrid_calls.append({"vector": vector, "query_text": query_text})
+        pts = list(self.points.get(collection, {}).values())[:k]
+        return [Match(id=p.id, score=0.8, payload=p.payload, vector=None) for p in pts]
+
     def delete_points(self, collection: str, ids: list[str]) -> int:
         store = self.points.get(collection, {})
         return sum(1 for i in ids if store.pop(i, None) is not None)
@@ -90,3 +104,23 @@ def test_add_texts_stores_text_in_payload_scores_and_deletes() -> None:
     assert store.delete(["i1"]) is True
     assert "i1" not in client.points["c"]
     assert store.delete([]) is None
+
+
+def test_hybrid_mode_indexes_text_and_fuses_bm25() -> None:
+    from quiver.client import TEXT_KEY
+
+    client = FakeClient()
+    store = QuiverVectorStore(client, "c", FakeEmbeddings(), hybrid=True)
+    store.add_texts(["quick brown fox"], [{"src": "a"}], ids=["i1"])
+    # Hybrid ingest co-populates the reserved BM25 key alongside the readable text.
+    payload = client.points["c"]["i1"].payload
+    assert payload[TEXT_KEY] == "quick brown fox"
+    assert payload["text"] == "quick brown fox"
+
+    docs = store.similarity_search("quick fox", k=1)
+    # The query routed through hybrid_search with the raw text for BM25 fusion.
+    assert client.hybrid_calls[0]["query_text"] == "quick fox"
+    # The internal BM25 field never leaks into the returned document metadata.
+    assert TEXT_KEY not in docs[0].metadata
+    assert "text" not in docs[0].metadata
+    assert docs[0].page_content == "quick brown fox"

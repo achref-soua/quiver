@@ -26,13 +26,19 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 
-from .client import Client, Match, Point
+from .client import TEXT_KEY, Client, Match, Point
 
 __all__ = ["QuiverVectorStore"]
 
 
 class QuiverVectorStore(VectorStore):
-    """A LangChain ``VectorStore`` over a single Quiver collection."""
+    """A LangChain ``VectorStore`` over a single Quiver collection.
+
+    Set ``hybrid=True`` for ``dense ⊕ BM25`` retrieval (ADR-0043/0046): each text
+    is also indexed for keyword search at ingest, and ``similarity_search`` fuses
+    the dense nearest-neighbours with a BM25 query over the same text via RRF —
+    lexical recall on top of semantic, no extra plumbing.
+    """
 
     def __init__(
         self,
@@ -41,11 +47,13 @@ class QuiverVectorStore(VectorStore):
         embedding: Embeddings,
         *,
         text_key: str = "text",
+        hybrid: bool = False,
     ) -> None:
         self._client = client
         self._collection = collection
         self._embedding = embedding
         self._text_key = text_key
+        self._hybrid = hybrid
 
     @property
     def embeddings(self) -> Embeddings:
@@ -64,7 +72,7 @@ class QuiverVectorStore(VectorStore):
         out_ids = list(ids) if ids is not None else [str(uuid4()) for _ in items]
         metas = list(metadatas) if metadatas is not None else [{} for _ in items]
         points = [
-            Point(id=id_, vector=list(vector), payload={**meta, self._text_key: text})
+            Point(id=id_, vector=list(vector), payload=self._payload(meta, text))
             for id_, text, vector, meta in zip(out_ids, items, vectors, metas)
         ]
         if points:
@@ -88,13 +96,27 @@ class QuiverVectorStore(VectorStore):
         filter: Optional[dict[str, Any]] = None,
         **_kwargs: Any,
     ) -> list[tuple[Document, float]]:
-        vector = self._embedding.embed_query(query)
-        matches = self._client.search(self._collection, list(vector), k=k, filter=filter)
+        vector = list(self._embedding.embed_query(query))
+        if self._hybrid:
+            matches = self._client.hybrid_search(
+                self._collection, vector=vector, query_text=query, k=k, filter=filter
+            )
+        else:
+            matches = self._client.search(self._collection, vector, k=k, filter=filter)
         return [(self._to_document(m), m.score) for m in matches]
+
+    def _payload(self, meta: dict[str, Any], text: str) -> dict[str, Any]:
+        # Store the text for retrieval, and (in hybrid mode) also under the reserved
+        # BM25 key so the server indexes it for keyword search (ADR-0046).
+        payload = {**meta, self._text_key: text}
+        if self._hybrid:
+            payload[TEXT_KEY] = text
+        return payload
 
     def _to_document(self, match: Match) -> Document:
         payload = dict(match.payload or {})
         text = payload.pop(self._text_key, "")
+        payload.pop(TEXT_KEY, None)  # never surface the internal BM25 field
         return Document(page_content=str(text), metadata=payload, id=match.id)
 
     @classmethod
@@ -112,6 +134,7 @@ class QuiverVectorStore(VectorStore):
         pq_subspaces: Optional[int] = None,
         create: bool = True,
         text_key: str = "text",
+        hybrid: bool = False,
         ids: Optional[list[str]] = None,
         **_kwargs: Any,
     ) -> "QuiverVectorStore":
@@ -121,6 +144,6 @@ class QuiverVectorStore(VectorStore):
             client.create_collection(
                 collection, resolved_dim, metric, index=index, pq_subspaces=pq_subspaces
             )
-        store = cls(client, collection, embedding, text_key=text_key)
+        store = cls(client, collection, embedding, text_key=text_key, hybrid=hybrid)
         store.add_texts(items, metadatas, ids=ids)
         return store
