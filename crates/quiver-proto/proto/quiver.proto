@@ -22,6 +22,10 @@ service Quiver {
 
   rpc Search(SearchRequest) returns (SearchResponse);
 
+  // Hybrid (dense + sparse) search fused with RRF (ADR-0043/0045). Either query
+  // may be omitted for pure-dense or pure-sparse search.
+  rpc HybridSearch(HybridSearchRequest) returns (SearchResponse);
+
   // Fetch points without server-side ranking — the retrieval path for
   // client-side-encrypted collections (ADR-0032); the client decrypts and ranks.
   rpc Fetch(FetchRequest) returns (FetchResponse);
@@ -190,6 +194,30 @@ message Match {
 
 message SearchResponse {
   repeated Match matches = 1;
+}
+
+// A sparse query vector (ADR-0043): parallel dimension ids and weights.
+message SparseVector {
+  repeated uint32 indices = 1;
+  repeated float values = 2;
+}
+
+// Hybrid (dense + sparse) search request (ADR-0045). Omit `vector` for pure-sparse
+// or `sparse` for pure-dense; at least one is required. Reuses SearchResponse.
+message HybridSearchRequest {
+  string collection = 1;
+  // Dense query vector; empty for pure-sparse search.
+  repeated float vector = 2;
+  // Sparse query vector; absent for pure-dense search.
+  SparseVector sparse = 3;
+  // JSON-encoded quiver-query Filter; empty = no filter.
+  bytes filter = 4;
+  uint32 k = 5;
+  uint32 ef_search = 6;
+  // RRF rank-bias constant; 0 uses the server default (60).
+  float rrf_k0 = 7;
+  bool with_payload = 8;
+  bool with_vector = 9;
 }
 
 // Fetch points (no ranking) with an optional cleartext payload filter and a limit
