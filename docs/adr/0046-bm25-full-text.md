@@ -1,6 +1,6 @@
 # ADR-0046 — BM25 / full-text over the sparse path
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-22
 **Deciders:** Achref Soua
 
@@ -39,8 +39,8 @@ storage, no new index, no new dependency.
 ### Tokenizer (`quiver-query`, dependency-free)
 
 A small, deterministic tokenizer: Unicode-aware splitting on non-alphanumeric
-boundaries, lowercasing (Unicode), an optional English stop-word filter, and
-**light suffix stemming** (plurals and common verb endings). Each token is mapped
+boundaries, lowercasing (Unicode), an English stop-word filter, and **light plural
+stemming** (a consistency-only S-stemmer). Each token is mapped
 to a `u32` dimension id by a stable hash (FNV-1a, truncated), so a tokenized text
 *is* a `SparseVector` whose values are term frequencies — reusing ADR-0043 end to
 end.
@@ -98,6 +98,39 @@ build sparse vectors myself" friction for lexical search.
   derived, so the crash gate is untouched and there is no migration.
 - The simple stemmer is a known quality ceiling; the `tokenize` seam isolates it for
   a later Snowball upgrade. Term-id hashing can collide (documented, negligible).
+
+## Implementation
+
+Shipped across four PRs:
+
+1. **`quiver-query::tokenize`** — the dependency-free tokenizer: Unicode split +
+   lowercase, a small stop-word list, FNV-1a term ids, `text_to_sparse` (tf vector)
+   and `query_term_ids`. The stemmer landed as a **plural-only S-stemmer**
+   (consistency-only: `cats`→`cat`, `boxes`→`box`, `ponies`→`pony`); the broader
+   "verb endings" idea was dropped as too crude without a real stemmer — the
+   `tokens` seam is the documented place to drop in Snowball later.
+2. **`SparseInvertedIndex`** gained per-document length tracking (O(1) `avgdl`) and
+   `bm25_search(query_terms, k1, b)` using Okapi BM25 with the Lucene-style smoothed
+   IDF (always non-negative — no clamp), beside the existing dot-product `search`.
+3. **`quiver-embed`** — a point's `__quiver_text__` string is tokenized into a tf
+   vector at ingest (an explicit `__quiver_sparse__` wins); `hybrid_search` gained a
+   `text_query` arm scored by BM25 over the inverted index and fused via RRF with the
+   dense/sparse sides. The query is reachable on every surface: REST `query_text`,
+   gRPC `HybridSearchRequest.query_text`, the MCP `hybrid_search` tool's `query_text`,
+   and `query_text`/`queryText` on the Python and TypeScript SDKs.
+
+## Verification
+
+- The tokenizer and BM25 scorer are unit-tested (tokenization, stop-words, stemmer
+  conflation, tf counting, BM25 ranking by term frequency, length normalization,
+  doc-length tracking through update/delete) to full coverage of their production
+  code.
+- `quiver-embed` tests assert text ingest + BM25 ranking, dense⊕text fusion, and the
+  no-match case. The full-text path is tested end-to-end over REST and gRPC, plus the
+  MCP tool and the Python/TS SDK bodies.
+- No on-disk format change — `__quiver_text__` rides the existing payload and the
+  derived inverted index — so the `kill -9` crash gate is untouched and there is no
+  migration.
 
 ## Alternatives considered
 
