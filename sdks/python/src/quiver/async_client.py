@@ -214,6 +214,50 @@ class AsyncClient:
             for m in resp.json()["matches"]
         ]
 
+    async def upsert_text(self, collection: str, points: Iterable[Mapping[str, Any]]) -> int:
+        """Embed each point's text server-side and upsert it (ADR-0047). See
+        :meth:`Client.upsert_text`."""
+        body = {
+            "points": [
+                {"id": p["id"], "text": p["text"], **({"payload": p["payload"]} if p.get("payload") is not None else {})}
+                for p in points
+            ]
+        }
+        resp = await self._send("POST", f"/v1/collections/{collection}/points:text", body)
+        return int(resp.json()["upserted"])
+
+    async def search_text(
+        self,
+        collection: str,
+        text: str,
+        *,
+        k: int = 10,
+        filter: Optional[Mapping[str, Any]] = None,
+        ef_search: int = 64,
+        rrf_k0: float = 60.0,
+        with_payload: bool = True,
+        with_vector: bool = False,
+        rerank: bool = False,
+    ) -> list[Match]:
+        """Embed ``text`` server-side and search dense ⊕ BM25, optionally reranking
+        (ADR-0047). See :meth:`Client.search_text`."""
+        body: dict[str, Any] = {
+            "text": text,
+            "k": k,
+            "ef_search": ef_search,
+            "rrf_k0": rrf_k0,
+            "with_payload": with_payload,
+            "with_vector": with_vector,
+            "rerank": rerank,
+        }
+        if filter is not None:
+            body["filter"] = filter
+        resp = await self._send("POST", f"/v1/collections/{collection}/query/text", body)
+        return [
+            Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
+            for m in resp.json()["matches"]
+        ]
+
     async def fetch(
         self,
         collection: str,

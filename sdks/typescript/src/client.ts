@@ -159,6 +159,28 @@ export interface HybridSearchOptions {
   withVector?: boolean;
 }
 
+/** A text point for {@link Client.upsertText} (ADR-0047): the server embeds
+ * `text` with the collection's configured provider and indexes it for BM25. */
+export interface TextPoint {
+  id: string;
+  text: string;
+  payload?: unknown;
+}
+
+/** Options for {@link Client.searchText} (ADR-0047). */
+export interface SearchTextOptions {
+  k?: number;
+  /** A Quiver payload filter expression. */
+  filter?: unknown;
+  efSearch?: number;
+  /** RRF rank-bias constant (default 60). */
+  rrfK0?: number;
+  withPayload?: boolean;
+  withVector?: boolean;
+  /** Opt-in: rerank the candidate pool with the collection's rerank provider. */
+  rerank?: boolean;
+}
+
 /** Options for {@link Client.fetch}. */
 export interface FetchOptions {
   /** A Quiver payload filter expression to narrow the set. */
@@ -324,6 +346,56 @@ export class Client {
     const res = (await this.#json(
       "POST",
       `/v1/collections/${encodeURIComponent(collection)}/query/hybrid`,
+      body,
+    )) as { matches?: Match[] };
+    return (res.matches ?? []).map((m) => ({
+      id: m.id,
+      score: m.score,
+      payload: m.payload,
+      vector: m.vector,
+    }));
+  }
+
+  /** Embed each point's `text` server-side and upsert it (ADR-0047); the text is
+   * also indexed for BM25. Requires an `[embedding.<collection>]` provider on the
+   * server. Resolves to the number upserted. */
+  async upsertText(collection: string, points: TextPoint[]): Promise<number> {
+    const body = {
+      points: points.map((p) => ({
+        id: p.id,
+        text: p.text,
+        ...(p.payload !== undefined ? { payload: p.payload } : {}),
+      })),
+    };
+    const res = (await this.#json(
+      "POST",
+      `/v1/collections/${encodeURIComponent(collection)}/points:text`,
+      body,
+    )) as { upserted?: number };
+    return Number(res.upserted ?? 0);
+  }
+
+  /** Embed `text` server-side and search dense ⊕ BM25, optionally reranking the
+   * candidate pool in one call (ADR-0047). Requires an `[embedding.<collection>]`
+   * provider (and a `[rerank.<collection>]` provider for `rerank: true`). */
+  async searchText(
+    collection: string,
+    text: string,
+    opts: SearchTextOptions = {},
+  ): Promise<Match[]> {
+    const body: Record<string, unknown> = {
+      text,
+      k: opts.k ?? 10,
+      ef_search: opts.efSearch ?? 64,
+      rrf_k0: opts.rrfK0 ?? 60,
+      with_payload: opts.withPayload ?? true,
+      with_vector: opts.withVector ?? false,
+      rerank: opts.rerank ?? false,
+    };
+    if (opts.filter !== undefined) body["filter"] = opts.filter;
+    const res = (await this.#json(
+      "POST",
+      `/v1/collections/${encodeURIComponent(collection)}/query/text`,
       body,
     )) as { matches?: Match[] };
     return (res.matches ?? []).map((m) => ({

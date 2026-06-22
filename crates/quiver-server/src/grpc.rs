@@ -18,7 +18,10 @@ use quiver_proto::v1::{
 use quiver_query::Filter;
 
 use crate::auth::Principal;
-use crate::{AppState, CollectionInfo, DocumentIn, DocumentMatchOut, MatchOut, PointIn, PointOut};
+use crate::{
+    AppState, CollectionInfo, DocumentIn, DocumentMatchOut, MatchOut, PointIn, PointOut,
+    TextPointIn,
+};
 
 /// Build the gRPC service over the shared state.
 pub(crate) fn service(state: AppState) -> QuiverServer<QuiverService> {
@@ -496,6 +499,74 @@ impl Quiver for QuiverService {
                 rrf_k0,
                 req.with_payload,
                 req.with_vector,
+            )
+            .await
+            .map_err(|e| e.to_status())?;
+        Ok(Response::new(v1::SearchResponse {
+            matches: matches.into_iter().map(match_to_proto).collect(),
+        }))
+    }
+
+    async fn upsert_text(
+        &self,
+        request: Request<v1::UpsertTextRequest>,
+    ) -> Result<Response<v1::UpsertResponse>, Status> {
+        let principal = self.authenticate(&request)?;
+        let req = request.into_inner();
+        let mut points = Vec::with_capacity(req.points.len());
+        for point in req.points {
+            points.push(TextPointIn {
+                id: point.id,
+                text: point.text,
+                payload: parse_payload(&point.payload)?,
+            });
+        }
+        let upserted = self
+            .state
+            .upsert_text(&principal, req.collection, points)
+            .await
+            .map_err(|e| e.to_status())?;
+        Ok(Response::new(v1::UpsertResponse { upserted }))
+    }
+
+    async fn search_text(
+        &self,
+        request: Request<v1::SearchTextRequest>,
+    ) -> Result<Response<v1::SearchResponse>, Status> {
+        let principal = self.authenticate(&request)?;
+        let req = request.into_inner();
+        let filter: Option<Filter> = if req.filter.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_slice(&req.filter)
+                    .map_err(|e| Status::invalid_argument(format!("invalid filter json: {e}")))?,
+            )
+        };
+        let k = if req.k == 0 { 10 } else { req.k as usize };
+        let ef_search = if req.ef_search == 0 {
+            64
+        } else {
+            req.ef_search as usize
+        };
+        let rrf_k0 = if req.rrf_k0 == 0.0 {
+            DEFAULT_RRF_K0
+        } else {
+            req.rrf_k0
+        };
+        let matches = self
+            .state
+            .search_text(
+                &principal,
+                req.collection,
+                req.text,
+                k,
+                filter,
+                ef_search,
+                rrf_k0,
+                req.with_payload,
+                req.with_vector,
+                req.rerank,
             )
             .await
             .map_err(|e| e.to_status())?;
