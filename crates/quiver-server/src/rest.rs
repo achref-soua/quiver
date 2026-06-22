@@ -536,6 +536,10 @@ struct HybridSearchBody {
     sparse_indices: Option<Vec<u32>>,
     #[serde(default)]
     sparse_values: Option<Vec<f32>>,
+    /// Full-text query — tokenized server-side and scored by BM25 over the inverted
+    /// index (ADR-0046). Omit for non-lexical search.
+    #[serde(default)]
+    query_text: Option<String>,
     #[serde(default = "default_k")]
     k: usize,
     #[serde(default)]
@@ -571,6 +575,7 @@ async fn hybrid_search(
             name,
             body.vector,
             sparse,
+            body.query_text,
             body.k,
             body.filter,
             body.ef_search,

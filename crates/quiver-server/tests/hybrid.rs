@@ -224,3 +224,63 @@ async fn hybrid_search_over_grpc_fuses_dense_and_sparse() {
 
     server.abort();
 }
+
+#[tokio::test]
+async fn full_text_search_over_rest_uses_bm25() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rest_addr = rest_listener.local_addr().unwrap();
+    let grpc_addr = grpc_listener.local_addr().unwrap();
+    let config = Config {
+        data_dir: tmp.path().to_path_buf(),
+        rest_addr,
+        grpc_addr,
+        insecure: true,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move {
+        let _ = serve(config, rest_listener, grpc_listener).await;
+    });
+    let http = reqwest::Client::new();
+    let base = format!("http://{rest_addr}");
+    wait_ready(&http, &base).await;
+
+    http.post(format!("{base}/v1/collections"))
+        .json(&serde_json::json!({"name": "docs", "dim": 4, "metric": "l2"}))
+        .send()
+        .await
+        .unwrap();
+    // Points carry only text, tokenized server-side at ingest (ADR-0046).
+    http.post(format!("{base}/v1/collections/docs/points"))
+        .json(&serde_json::json!({"points": [
+            {"id": "cat", "vector": [0.0, 0.0, 0.0, 0.0], "payload": {"__quiver_text__": "the quick brown cat jumps over the fence"}},
+            {"id": "dog", "vector": [0.0, 0.0, 0.0, 0.0], "payload": {"__quiver_text__": "a lazy dog sleeps in the sun all day"}}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+
+    // A text query ranks the lexical match; "cats" stems to conflate with "cat".
+    let resp = http
+        .post(format!("{base}/v1/collections/docs/query/hybrid"))
+        .json(&serde_json::json!({"query_text": "cats jumping", "k": 5}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body = resp.json::<serde_json::Value>().await.unwrap();
+    let ids: Vec<String> = body["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["cat".to_owned()],
+        "only the cat doc matches; got {ids:?}"
+    );
+
+    server.abort();
+}

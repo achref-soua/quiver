@@ -23,6 +23,12 @@ use std::collections::HashMap;
 
 use crate::sparse::SparseVector;
 
+/// The reserved payload key carrying a point's full-text field (ADR-0046). When a
+/// point has no explicit `__quiver_sparse__` vector but carries a string under this
+/// key, the engine tokenizes it into a term-frequency sparse vector at ingest, so
+/// the point is searchable by BM25 over text alone.
+pub const TEXT_KEY: &str = "__quiver_text__";
+
 /// A compact English stop-word list (closed-class function words). Small on
 /// purpose: aggressive stop-word removal hurts more than it helps for short
 /// queries, and BM25's IDF already down-weights ubiquitous terms.

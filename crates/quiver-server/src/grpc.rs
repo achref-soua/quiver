@@ -489,6 +489,8 @@ impl Quiver for QuiverService {
                 req.collection,
                 dense,
                 sparse,
+                // `query_text` (full-text BM25) parity comes in the ADR-0046 follow-up.
+                None,
                 k,
                 filter,
                 ef_search,

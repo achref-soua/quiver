@@ -906,6 +906,7 @@ impl AppState {
         collection: String,
         dense: Option<Vec<f32>>,
         sparse: Option<(Vec<u32>, Vec<f32>)>,
+        text: Option<String>,
         k: usize,
         filter: Option<Filter>,
         ef_search: usize,
@@ -937,8 +938,14 @@ impl AppState {
                 with_vector,
             };
             let sv = sparse.map(|(indices, values)| SparseVector { indices, values });
-            let matches =
-                db.hybrid_search(&collection, dense.as_deref(), sv.as_ref(), &params, rrf_k0)?;
+            let matches = db.hybrid_search(
+                &collection,
+                dense.as_deref(),
+                sv.as_ref(),
+                text.as_deref(),
+                &params,
+                rrf_k0,
+            )?;
             Ok(matches
                 .into_iter()
                 .map(|m| MatchOut {
