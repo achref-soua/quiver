@@ -20,7 +20,7 @@ pub mod sparse_index;
 pub mod tokenize;
 pub use sparse::{DEFAULT_RRF_K0, SPARSE_KEY, SparseVector, rrf_fuse};
 pub use sparse_index::{BM25_B, BM25_K1, SparseInvertedIndex};
-pub use tokenize::{query_term_ids, term_id, text_to_sparse, tokens};
+pub use tokenize::{TEXT_KEY, query_term_ids, term_id, text_to_sparse, tokens};
 
 /// A predicate over a point's JSON payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

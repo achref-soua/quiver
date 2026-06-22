@@ -54,7 +54,10 @@ pub use quiver_core::{
     VectorEncryption,
 };
 pub use quiver_query::Filter;
-pub use quiver_query::{DEFAULT_RRF_K0, SPARSE_KEY, SparseInvertedIndex, SparseVector, rrf_fuse};
+pub use quiver_query::{
+    BM25_B, BM25_K1, DEFAULT_RRF_K0, SPARSE_KEY, SparseInvertedIndex, SparseVector, TEXT_KEY,
+    query_term_ids, rrf_fuse, text_to_sparse,
+};
 
 /// Errors returned by the embeddable database.
 #[derive(Debug, Error)]
@@ -776,25 +779,27 @@ impl Database {
         Ok(out)
     }
 
-    /// Hybrid search (ADR-0043): fuse a dense ANN ranking and a sparse
-    /// inverted-index ranking with Reciprocal Rank Fusion. Either query may be
-    /// `None` (giving pure dense or pure sparse search through the same path); at
-    /// least one is required. The same payload `filter` is re-checked on both
-    /// sides, so results stay exact. `rrf_k0` is the RRF rank-bias constant
-    /// ([`DEFAULT_RRF_K0`]).
+    /// Hybrid search (ADR-0043/0046): fuse up to three rankings with Reciprocal
+    /// Rank Fusion — a dense ANN ranking, a sparse inverted-index dot-product
+    /// ranking (`sparse_query`), and a BM25 full-text ranking (`text_query`, scored
+    /// over the same inverted index). Any may be `None`; at least one is required,
+    /// giving pure dense / sparse / lexical or any blend through the same path. The
+    /// same payload `filter` is re-checked on every side, so results stay exact.
+    /// `rrf_k0` is the RRF rank-bias constant ([`DEFAULT_RRF_K0`]).
     pub fn hybrid_search(
         &mut self,
         collection: &str,
         dense_query: Option<&[f32]>,
         sparse_query: Option<&SparseVector>,
+        text_query: Option<&str>,
         params: &SearchParams,
         rrf_k0: f32,
     ) -> Result<Vec<Match>> {
         require_single_vector(self.handle(collection)?)?;
         require_server_searchable(self.handle(collection)?)?;
-        if dense_query.is_none() && sparse_query.is_none() {
+        if dense_query.is_none() && sparse_query.is_none() && text_query.is_none() {
             return Err(Error::Unsupported(
-                "hybrid_search requires a dense query, a sparse query, or both",
+                "hybrid_search requires a dense query, a sparse query, or a text query",
             ));
         }
         if self.handle(collection)?.stale {
@@ -820,6 +825,9 @@ impl Database {
         }
         if let Some(sp) = sparse_query {
             lists.push(self.sparse_ranked_ids(handle, sp, depth, filter)?);
+        }
+        if let Some(text) = text_query {
+            lists.push(self.bm25_ranked_ids(handle, text, depth, filter)?);
         }
         let fused = rrf_fuse(&lists, rrf_k0, params.k);
 
@@ -951,6 +959,37 @@ impl Database {
         }
         scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         Ok(scored.into_iter().take(depth).map(|(_, id)| id).collect())
+    }
+
+    // BM25 full-text candidates as a ranked list of external ids (ADR-0046): tokenize
+    // the query text into term ids and score them with BM25 over the derived inverted
+    // index, re-checking the filter on the ranked ids until `depth` are filled. BM25
+    // needs the index's corpus statistics, so when a collection has no inverted index
+    // (a not-yet-rebuilt or client-side collection — neither reachable here, since
+    // hybrid rebuilds a stale handle and rejects client-side) there is nothing to
+    // score and the list is empty; any dense side still contributes.
+    fn bm25_ranked_ids(
+        &self,
+        handle: &CollectionHandle,
+        query_text: &str,
+        depth: usize,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<String>> {
+        let Some(idx) = handle.sparse.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let terms = query_term_ids(query_text);
+        let mut ids = Vec::new();
+        for (ext_id, _score) in idx.bm25_search(&terms, BM25_K1, BM25_B) {
+            if !self.passes_filter(handle.id, &ext_id, filter)? {
+                continue;
+            }
+            ids.push(ext_id);
+            if ids.len() >= depth {
+                break;
+            }
+        }
+        Ok(ids)
     }
 
     // Re-check a payload filter against a row (loading its payload). `None` filter
@@ -1817,10 +1856,16 @@ fn sparse_vector_from_payload(payload: &[u8]) -> Option<SparseVector> {
 }
 
 // As [`sparse_vector_from_payload`] but over an already-parsed payload `Value`
-// (the upsert path has the payload before it is serialized).
+// (the upsert path has the payload before it is serialized). An explicit
+// `__quiver_sparse__` vector wins; otherwise a `__quiver_text__` string is
+// tokenized into a term-frequency vector (ADR-0046), so a point is searchable by
+// BM25 over text alone.
 fn sparse_vector_from_value(payload: &Value) -> Option<SparseVector> {
-    let raw = payload.get(SPARSE_KEY)?;
-    serde_json::from_value::<SparseVector>(raw.clone()).ok()
+    if let Some(raw) = payload.get(SPARSE_KEY) {
+        return serde_json::from_value::<SparseVector>(raw.clone()).ok();
+    }
+    let text = payload.get(TEXT_KEY)?.as_str()?;
+    Some(text_to_sparse(text))
 }
 
 // Maintain the derived sparse inverted index for one point write (ADR-0045): index
@@ -2040,6 +2085,7 @@ mod tests {
                 "kb",
                 Some(&dense_q),
                 Some(&sparse_q),
+                None,
                 &params,
                 DEFAULT_RRF_K0,
             )
@@ -2050,19 +2096,19 @@ mod tests {
 
         // Pure sparse: only "b" shares the query's terms.
         let sparse_only = db
-            .hybrid_search("kb", None, Some(&sparse_q), &params, DEFAULT_RRF_K0)
+            .hybrid_search("kb", None, Some(&sparse_q), None, &params, DEFAULT_RRF_K0)
             .unwrap();
         assert_eq!(sparse_only[0].id, "b");
 
         // Pure dense: "a" is nearest.
         let dense_only = db
-            .hybrid_search("kb", Some(&dense_q), None, &params, DEFAULT_RRF_K0)
+            .hybrid_search("kb", Some(&dense_q), None, None, &params, DEFAULT_RRF_K0)
             .unwrap();
         assert_eq!(dense_only[0].id, "a");
 
         // Neither query is an error.
         assert!(
-            db.hybrid_search("kb", None, None, &params, DEFAULT_RRF_K0)
+            db.hybrid_search("kb", None, None, None, &params, DEFAULT_RRF_K0)
                 .is_err()
         );
     }
@@ -2073,7 +2119,7 @@ mod tests {
             k: 10,
             ..SearchParams::default()
         };
-        db.hybrid_search("kb", None, Some(q), &params, DEFAULT_RRF_K0)
+        db.hybrid_search("kb", None, Some(q), None, &params, DEFAULT_RRF_K0)
             .unwrap()
             .into_iter()
             .map(|m| m.id)
@@ -2224,13 +2270,79 @@ mod tests {
             ..SearchParams::default()
         };
         let hits: Vec<String> = db
-            .hybrid_search("kb", None, Some(&q), &params, DEFAULT_RRF_K0)
+            .hybrid_search("kb", None, Some(&q), None, &params, DEFAULT_RRF_K0)
             .unwrap()
             .into_iter()
             .map(|m| m.id)
             .collect();
         // "b" scores higher but is filtered out by lang == "en".
         assert_eq!(hits, vec!["a".to_owned()]);
+    }
+
+    #[test]
+    fn hybrid_text_search_indexes_and_ranks_by_bm25() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("kb", desc()).unwrap();
+        let z = [0.0f32, 0.0, 0.0, 0.0];
+        // Points carry only a `__quiver_text__` string — tokenized at ingest.
+        db.upsert(
+            "kb",
+            "cats",
+            &z,
+            &json!({ "__quiver_text__": "the quick brown cat jumps" }),
+        )
+        .unwrap();
+        db.upsert(
+            "kb",
+            "dogs",
+            &z,
+            &json!({ "__quiver_text__": "a lazy dog sleeps all day" }),
+        )
+        .unwrap();
+
+        let params = SearchParams {
+            k: 10,
+            ..SearchParams::default()
+        };
+        // A text query (no dense, no explicit sparse) ranks the lexical match first;
+        // "cat"/"cats" conflate via the stemmer.
+        let hits: Vec<String> = db
+            .hybrid_search("kb", None, None, Some("cats"), &params, DEFAULT_RRF_K0)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(hits, vec!["cats".to_owned()], "only the cat doc matches");
+
+        // A non-matching query returns nothing from the text side.
+        assert!(
+            db.hybrid_search("kb", None, None, Some("elephant"), &params, DEFAULT_RRF_K0)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Text fuses with a dense query through the same RRF path.
+        let dense_q = [1.0, 0.0, 0.0, 0.0];
+        db.upsert("kb", "near", &[1.0, 0.0, 0.0, 0.0], &json!({}))
+            .unwrap();
+        let fused: Vec<String> = db
+            .hybrid_search(
+                "kb",
+                Some(&dense_q),
+                None,
+                Some("dog"),
+                &params,
+                DEFAULT_RRF_K0,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert!(
+            fused.contains(&"near".to_owned()) && fused.contains(&"dogs".to_owned()),
+            "dense match + lexical match both surface; got {fused:?}"
+        );
     }
 
     #[test]
@@ -2373,7 +2485,7 @@ mod tests {
             values: vec![1.0],
         };
         let sparse_hits: Vec<String> = db
-            .hybrid_search("c", None, Some(&q), &params, DEFAULT_RRF_K0)
+            .hybrid_search("c", None, Some(&q), None, &params, DEFAULT_RRF_K0)
             .unwrap()
             .into_iter()
             .map(|m| m.id)

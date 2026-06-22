@@ -244,6 +244,8 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
                     collection,
                     dense.as_deref(),
                     sparse.as_ref(),
+                    // `query_text` (full-text BM25) parity comes in the ADR-0046 follow-up.
+                    None,
                     &params,
                     rrf_k0,
                 )
