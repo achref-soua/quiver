@@ -15,14 +15,14 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Points};
-use ratatui::widgets::{Block, Paragraph, Widget};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 use serde::Deserialize;
 use tokio_stream::StreamExt;
 
@@ -38,6 +38,10 @@ const REFRESH: Duration = Duration::from_secs(2);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 /// How many points the constellation view samples per query.
 const CONSTELLATION_K: usize = 256;
+/// How many hits the query runner requests per text search.
+const SEARCH_K: usize = 12;
+/// How many recent queries the query runner remembers.
+const RECENT_SEARCHES: usize = 8;
 
 /// How to reach the server.
 #[derive(Debug, Clone)]
@@ -206,6 +210,80 @@ pub async fn fetch_constellation(
     Ok(Constellation { points, vectors })
 }
 
+/// One ranked hit from the query runner: a result of a text search.
+#[derive(Debug, Clone)]
+pub struct Hit {
+    /// The point's external id.
+    pub id: String,
+    /// The similarity / fusion score (higher is closer).
+    pub score: f32,
+    /// The point's payload, when the server returned it.
+    pub payload: Option<serde_json::Value>,
+}
+
+// One hit as returned by `POST /v1/collections/{name}/query/text`.
+#[derive(Deserialize)]
+struct TextHit {
+    id: String,
+    score: f32,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct TextHits {
+    matches: Vec<TextHit>,
+}
+
+/// Run a text search against `collection`: the server embeds `text` and runs
+/// dense (⊕ BM25) retrieval (ADR-0047), returning ranked [`Hit`]s. A non-success
+/// response — e.g. no `[embedding.<collection>]` is configured — is surfaced as
+/// an error carrying the server's message, so the cockpit can show why.
+pub async fn fetch_text_search(
+    client: &reqwest::Client,
+    options: &TuiOptions,
+    collection: &str,
+    text: &str,
+    k: usize,
+) -> anyhow::Result<Vec<Hit>> {
+    let mut request = client
+        .post(format!(
+            "{}/v1/collections/{collection}/query/text",
+            options.base_url
+        ))
+        .json(&serde_json::json!({
+            "text": text,
+            "k": k,
+            "with_payload": true,
+        }));
+    if let Some(key) = &options.api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!("unauthorized — set --api-key");
+    }
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let reason = body.trim();
+        if reason.is_empty() {
+            anyhow::bail!("{status}");
+        }
+        anyhow::bail!("{}: {}", status.as_u16(), truncate(reason, 120));
+    }
+    let hits = response.json::<TextHits>().await?;
+    Ok(hits
+        .matches
+        .into_iter()
+        .map(|h| Hit {
+            id: h.id,
+            score: h.score,
+            payload: h.payload,
+        })
+        .collect())
+}
+
 /// Project `vectors` (with their `ids`, in distance order) to 2-D via a fixed
 /// seeded random projection, normalized to the unit square. Two stable random
 /// axes keep the layout consistent; degenerate spreads collapse to the centre.
@@ -319,6 +397,58 @@ enum View {
     Browser,
     /// A 2-D constellation scatter of one collection's vector space.
     Constellation(ConstellationView),
+    /// The query runner: text search + result inspector for one collection.
+    Search(SearchView),
+}
+
+/// The view's kind, used to dispatch key handling without holding a borrow of
+/// `view` across the `&mut self` handler call.
+enum ViewKind {
+    Browser,
+    Constellation,
+    Search,
+}
+
+/// State of the query runner: a typed query, the ranked results, the inspector
+/// cursor, and the in-flight/error state.
+struct SearchView {
+    collection: String,
+    // The query being typed.
+    input: String,
+    // The query that produced `results` (shown once accepted).
+    query: Option<String>,
+    results: Vec<Hit>,
+    selected: usize,
+    // A pending search is in flight (drawn as a spinner-less "searching…").
+    pending: bool,
+    // A search error to surface instead of an empty list.
+    error: Option<String>,
+}
+
+impl SearchView {
+    fn new(collection: String) -> Self {
+        Self {
+            collection,
+            input: String::new(),
+            query: None,
+            results: Vec::new(),
+            selected: 0,
+            pending: false,
+            error: None,
+        }
+    }
+
+    fn select_next(&mut self) {
+        if !self.results.is_empty() {
+            self.selected = (self.selected + 1) % self.results.len();
+        }
+    }
+
+    fn select_prev(&mut self) {
+        if !self.results.is_empty() {
+            self.selected = (self.selected + self.results.len() - 1) % self.results.len();
+        }
+    }
 }
 
 /// State of the constellation view: one collection's projected points, the raw
@@ -346,6 +476,10 @@ struct App {
     history: Vec<u64>,
     activity: Vec<Activity>,
     view: View,
+    // Recent query-runner searches, most-recent-first, de-duplicated and bounded.
+    recent_searches: Vec<String>,
+    // Whether the modal keybinding-help overlay is shown.
+    help: bool,
     should_quit: bool,
 }
 
@@ -363,8 +497,18 @@ impl App {
             history: Vec::new(),
             activity: Vec::new(),
             view: View::Browser,
+            recent_searches: Vec::new(),
+            help: false,
             should_quit: false,
         })
+    }
+
+    fn view_kind(&self) -> ViewKind {
+        match self.view {
+            View::Browser => ViewKind::Browser,
+            View::Constellation(_) => ViewKind::Constellation,
+            View::Search(_) => ViewKind::Search,
+        }
     }
 
     // A short monotonic timestamp ("+12s") for the activity log.
@@ -556,6 +700,166 @@ impl App {
             v.selected = (v.selected + v.points.len() - 1) % v.points.len();
         }
     }
+
+    // Open the query runner for the selected collection.
+    fn open_search(&mut self) {
+        if let Some(c) = self.collections.get(self.selected) {
+            self.view = View::Search(SearchView::new(c.name.clone()));
+        }
+    }
+
+    // Record a query at the front of the recent list (de-duplicated, bounded).
+    fn remember_search(&mut self, query: String) {
+        self.recent_searches.retain(|q| q != &query);
+        self.recent_searches.insert(0, query);
+        self.recent_searches.truncate(RECENT_SEARCHES);
+    }
+
+    // Run a text search against the active query-runner collection and apply the
+    // result (or the error) to the view. The only network step in the keymap.
+    async fn run_search(&mut self, query: String) {
+        let View::Search(view) = &self.view else {
+            return;
+        };
+        let collection = view.collection.clone();
+        let result =
+            fetch_text_search(&self.client, &self.options, &collection, &query, SEARCH_K).await;
+        match result {
+            Ok(results) => {
+                let n = results.len();
+                if let View::Search(view) = &mut self.view {
+                    view.results = results;
+                    view.query = Some(query.clone());
+                    view.selected = 0;
+                    view.error = None;
+                    view.pending = false;
+                    view.input.clear();
+                }
+                self.remember_search(query);
+                self.log(Severity::Info, format!("search · {n} hits"));
+            }
+            Err(err) => {
+                if let View::Search(view) = &mut self.view {
+                    view.error = Some(err.to_string());
+                    view.pending = false;
+                }
+                self.log(Severity::Warn, format!("search failed · {err}"));
+            }
+        }
+    }
+
+    /// Handle one key press, performing every synchronous state transition inline
+    /// and returning any async work the run loop must await ([`Effect`]). Pure
+    /// over `&mut self` — no terminal, no network — so the whole keymap is
+    /// table-testable.
+    fn handle_key(&mut self, key: KeyEvent) -> Effect {
+        // Theme cycle is global; a control-modified key never inserts a character
+        // into the query input.
+        if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            theme::cycle();
+            return Effect::None;
+        }
+        // The help overlay is modal: Esc / ? / F1 dismiss it, everything else is
+        // swallowed.
+        if self.help {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::F(1)) {
+                self.help = false;
+            }
+            return Effect::None;
+        }
+        match self.view_kind() {
+            ViewKind::Browser => self.handle_browser_key(key.code),
+            ViewKind::Constellation => self.handle_constellation_key(key.code),
+            ViewKind::Search => self.handle_search_key(key),
+        }
+    }
+
+    fn handle_browser_key(&mut self, code: KeyCode) -> Effect {
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('?') | KeyCode::F(1) => self.help = true,
+            KeyCode::Char('r') => return Effect::Refresh,
+            KeyCode::Down | KeyCode::Char('j') => self.select_next(),
+            KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
+            KeyCode::Char('v') | KeyCode::Enter => return Effect::EnterConstellation,
+            KeyCode::Char('/') => self.open_search(),
+            _ => {}
+        }
+        Effect::None
+    }
+
+    fn handle_constellation_key(&mut self, code: KeyCode) -> Effect {
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('?') | KeyCode::F(1) => self.help = true,
+            KeyCode::Esc => self.exit_constellation(),
+            KeyCode::Char('r') | KeyCode::Enter => return Effect::Requery,
+            KeyCode::Down | KeyCode::Char('j') => self.star_next(),
+            KeyCode::Up | KeyCode::Char('k') => self.star_prev(),
+            _ => {}
+        }
+        Effect::None
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> Effect {
+        match key.code {
+            KeyCode::Esc => self.view = View::Browser,
+            KeyCode::Enter => {
+                let typed = match &self.view {
+                    View::Search(v) => v.input.trim().to_owned(),
+                    _ => return Effect::None,
+                };
+                // Enter on an empty input repeats the most recent search.
+                // ponytail: shell-style last-query recall — no full history picker.
+                let query = if typed.is_empty() {
+                    self.recent_searches.first().cloned()
+                } else {
+                    Some(typed)
+                };
+                if let Some(query) = query {
+                    if let View::Search(v) = &mut self.view {
+                        v.pending = true;
+                    }
+                    return Effect::RunSearch(query);
+                }
+            }
+            KeyCode::Backspace => {
+                if let View::Search(v) = &mut self.view {
+                    v.input.pop();
+                }
+            }
+            KeyCode::Down => {
+                if let View::Search(v) = &mut self.view {
+                    v.select_next();
+                }
+            }
+            KeyCode::Up => {
+                if let View::Search(v) = &mut self.view {
+                    v.select_prev();
+                }
+            }
+            // Printable characters edit the query; control-combos are ignored here
+            // (the global `Ctrl-t` was handled before dispatch).
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let View::Search(v) = &mut self.view {
+                    v.input.push(c);
+                }
+            }
+            _ => {}
+        }
+        Effect::None
+    }
+}
+
+/// Async work the run loop must perform after a key press; every synchronous
+/// state change already happened in [`App::handle_key`].
+#[derive(Debug, PartialEq, Eq)]
+enum Effect {
+    None,
+    Refresh,
+    EnterConstellation,
+    Requery,
+    RunSearch(String),
 }
 
 /// Launch the cockpit against `options`, returning when the user quits.
@@ -581,50 +885,12 @@ async fn run_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> any
             _ = ticker.tick() => app.refresh().await,
             maybe_event = events.next() => match maybe_event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                    let in_constellation = matches!(app.view, View::Constellation(_));
-                    match key.code {
-                        KeyCode::Char('q') => app.should_quit = true,
-                        KeyCode::Esc => {
-                            if in_constellation {
-                                app.exit_constellation();
-                            } else {
-                                app.should_quit = true;
-                            }
-                        }
-                        KeyCode::Char('r') => {
-                            if in_constellation {
-                                app.requery_constellation().await;
-                            } else {
-                                app.refresh().await;
-                            }
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if in_constellation {
-                                app.star_next();
-                            } else {
-                                app.select_next();
-                            }
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            if in_constellation {
-                                app.star_prev();
-                            } else {
-                                app.select_prev();
-                            }
-                        }
-                        KeyCode::Char('v') => {
-                            if !in_constellation {
-                                app.enter_constellation().await;
-                            }
-                        }
-                        KeyCode::Enter => {
-                            if in_constellation {
-                                app.requery_constellation().await;
-                            } else {
-                                app.enter_constellation().await;
-                            }
-                        }
-                        _ => {}
+                    match app.handle_key(key) {
+                        Effect::None => {}
+                        Effect::Refresh => app.refresh().await,
+                        Effect::EnterConstellation => app.enter_constellation().await,
+                        Effect::Requery => app.requery_constellation().await,
+                        Effect::RunSearch(query) => app.run_search(query).await,
                     }
                 }
                 Some(Err(err)) => return Err(err.into()),
@@ -730,6 +996,12 @@ impl Dashboard {
     }
 }
 
+/// Cycle the cockpit theme between Bronze and Slate (the `Ctrl-t` action),
+/// exposed so the screenshot tool can capture the alternate palette.
+pub fn cycle_theme() {
+    theme::cycle();
+}
+
 /// Render the logo banner centred on an oak background to a fresh buffer (for the
 /// README / docs logo image and the splash).
 #[must_use]
@@ -771,16 +1043,17 @@ pub fn render_constellation_demo(width: u16, height: u16) -> Buffer {
 }
 
 fn ui(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let buf = frame.buffer_mut();
     match &app.view {
-        View::Browser => draw_dashboard(frame.area(), frame.buffer_mut(), &app.dashboard()),
-        View::Constellation(view) => {
-            draw_constellation(
-                frame.area(),
-                frame.buffer_mut(),
-                view,
-                &app.options.base_url,
-            );
+        View::Browser => draw_dashboard(area, buf, &app.dashboard()),
+        View::Constellation(view) => draw_constellation(area, buf, view, &app.options.base_url),
+        View::Search(view) => {
+            draw_search(area, buf, view, &app.recent_searches, &app.options.base_url);
         }
+    }
+    if app.help {
+        draw_help_overlay(area, buf);
     }
 }
 
@@ -800,7 +1073,7 @@ fn draw_dashboard(area: Rect, buf: &mut Buffer, dash: &Dashboard) {
     banner_header(&dash.base_url).render(rows[0], buf);
     let body =
         Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).split(rows[1]);
-    let left = Layout::vertical([Constraint::Length(9), Constraint::Min(0)]).split(body[0]);
+    let left = Layout::vertical([Constraint::Length(12), Constraint::Min(0)]).split(body[0]);
     status_panel(dash).render(left[0], buf);
     relationships_panel(dash).render(left[1], buf);
     let right = Layout::vertical([Constraint::Min(0), Constraint::Length(8)]).split(body[1]);
@@ -925,6 +1198,271 @@ fn demo_constellation_view() -> ConstellationView {
     }
 }
 
+// Lay out and render the query runner into `buf`: a compact header, the query
+// input, the ranked results and a recent-search strip on the left, a point
+// inspector on the right, and the footer.
+fn draw_search(area: Rect, buf: &mut Buffer, view: &SearchView, recent: &[String], url: &str) {
+    Block::new()
+        .style(Style::new().bg(theme::BG))
+        .render(area, buf);
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    compact_header(url).render(rows[0], buf);
+
+    let body =
+        Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(rows[1]);
+    let left = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(6),
+    ])
+    .split(body[0]);
+
+    search_input_panel(view).render(left[0], buf);
+    search_results_panel(view).render(left[1], buf);
+    recent_panel(recent).render(left[2], buf);
+    inspector_panel(view).render(body[1], buf);
+
+    search_footer().render(rows[2], buf);
+}
+
+// The query input line with a block cursor, or a "searching…" note in flight.
+fn search_input_panel(view: &SearchView) -> Paragraph<'static> {
+    let line = if view.pending {
+        Line::from(vec![
+            Span::styled("▸ ", theme::accent()),
+            Span::styled(view.input.clone(), theme::text()),
+            Span::styled("   searching…", theme::dim()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("▸ ", theme::accent()),
+            Span::styled(view.input.clone(), theme::text()),
+            Span::styled("▏", theme::accent()),
+        ])
+    };
+    Paragraph::new(line).block(decor::panel_active(&format!("query · {}", view.collection)))
+}
+
+// The ranked results: id, score, and a score bar; the cursor row highlighted.
+fn search_results_panel(view: &SearchView) -> Paragraph<'static> {
+    let title = match &view.query {
+        Some(q) => format!("results · “{}”", truncate(q, 26)),
+        None => "results".to_owned(),
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(err) = &view.error {
+        lines.push(Line::from(Span::styled(
+            format!("search failed: {}", truncate(err, 56)),
+            theme::alert(),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "text search needs a per-collection [embedding.*] provider",
+            theme::dim(),
+        )));
+    } else if view.results.is_empty() {
+        let hint = if view.query.is_some() {
+            "no matches"
+        } else {
+            "type a query and press enter"
+        };
+        lines.push(Line::from(Span::styled(hint, theme::dim())));
+    } else {
+        let top = view
+            .results
+            .iter()
+            .map(|h| h.score)
+            .fold(f32::MIN, f32::max)
+            .max(f32::EPSILON);
+        for (i, hit) in view.results.iter().enumerate() {
+            let selected = i == view.selected;
+            let marker = if selected { "▸" } else { " " };
+            let id_style = if selected {
+                theme::selected()
+            } else {
+                theme::text()
+            };
+            let frac = (hit.score.max(0.0) / top).clamp(0.0, 1.0);
+            let bar = decor::bar((frac * 1000.0) as u64, 1000, 6);
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker} "), theme::accent()),
+                Span::styled(format!("{:<20}", truncate(&hit.id, 20)), id_style),
+                Span::styled(format!("{:>8.4}  ", hit.score), theme::dim()),
+                Span::styled(bar, theme::accent()),
+            ]));
+        }
+    }
+    Paragraph::new(lines).block(decor::panel(&title))
+}
+
+// The recent-search strip (most-recent first).
+fn recent_panel(recent: &[String]) -> Paragraph<'static> {
+    let lines: Vec<Line> = if recent.is_empty() {
+        vec![Line::from(Span::styled("no searches yet", theme::dim()))]
+    } else {
+        recent
+            .iter()
+            .take(4)
+            .map(|q| {
+                Line::from(vec![
+                    Span::styled("· ", theme::accent()),
+                    Span::styled(truncate(q, 34), theme::text()),
+                ])
+            })
+            .collect()
+    };
+    Paragraph::new(lines).block(decor::panel("recent"))
+}
+
+// The point inspector: the selected hit's id, score, and pretty-printed payload.
+fn inspector_panel(view: &SearchView) -> Paragraph<'static> {
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(hit) = view.results.get(view.selected) {
+        lines.push(kv("id", &hit.id));
+        lines.push(kv("score", &format!("{:.6}", hit.score)));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("payload", theme::dim())));
+        match &hit.payload {
+            Some(payload) => {
+                let pretty =
+                    serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string());
+                for raw in pretty.lines().take(22) {
+                    lines.push(Line::from(Span::styled(truncate(raw, 44), theme::text())));
+                }
+            }
+            None => lines.push(Line::from(Span::styled("—", theme::dim()))),
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "select a result to inspect",
+            theme::dim(),
+        )));
+    }
+    Paragraph::new(lines).block(decor::panel("inspector"))
+}
+
+// A reproducible demo for screenshots and tests — never fetched.
+fn demo_search_view() -> SearchView {
+    let hit = |id: &str, score: f32, payload: serde_json::Value| Hit {
+        id: id.to_owned(),
+        score,
+        payload: Some(payload),
+    };
+    SearchView {
+        collection: "documents".to_owned(),
+        input: "self-hosted vector search".to_owned(),
+        query: Some("encrypted vector database".to_owned()),
+        results: vec![
+            hit(
+                "doc-2381",
+                0.9412,
+                serde_json::json!({"title": "Encrypted ANN at the edge", "tags": ["security", "ann"], "words": 1840}),
+            ),
+            hit(
+                "doc-0907",
+                0.9123,
+                serde_json::json!({"title": "Self-hosting your search stack", "tags": ["ops"], "words": 2210}),
+            ),
+            hit(
+                "doc-1455",
+                0.8806,
+                serde_json::json!({"title": "HNSW vs Vamana on disk", "tags": ["index"], "words": 3050}),
+            ),
+            hit(
+                "doc-7782",
+                0.8530,
+                serde_json::json!({"title": "Crypto-shredding a tenant", "tags": ["security"], "words": 990}),
+            ),
+            hit(
+                "doc-3310",
+                0.8194,
+                serde_json::json!({"title": "BM25 meets dense retrieval", "tags": ["hybrid"], "words": 1620}),
+            ),
+        ],
+        selected: 1,
+        pending: false,
+        error: None,
+    }
+}
+
+/// Render the query-runner demo to a fresh `width`×`height` buffer.
+#[must_use]
+pub fn render_search_demo(width: u16, height: u16) -> Buffer {
+    let view = demo_search_view();
+    let recent = [
+        "encrypted vector database".to_owned(),
+        "send-time optimization".to_owned(),
+        "hnsw recall tuning".to_owned(),
+    ];
+    let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+    draw_search(buf.area, &mut buf, &view, &recent, "http://127.0.0.1:6333");
+    buf
+}
+
+// The keybinding-help content, grouped by view.
+fn help_lines() -> Vec<Line<'static>> {
+    let key = |k: &str, d: &str| {
+        Line::from(vec![
+            Span::styled(format!("  {k:<11}"), theme::accent()),
+            Span::styled(d.to_owned(), theme::text()),
+        ])
+    };
+    let head = |h: &str| Line::from(Span::styled(h.to_owned(), theme::heading()));
+    vec![
+        head("browser"),
+        key("↑/↓ · j/k", "select a collection"),
+        key("v · enter", "open the constellation view"),
+        key("/", "open the query runner"),
+        key("r", "refresh now"),
+        key("q · esc", "quit"),
+        Line::from(""),
+        head("constellation"),
+        key("↑/↓", "move the cursor"),
+        key("enter · r", "query around the point"),
+        key("esc", "back to the browser"),
+        Line::from(""),
+        head("query runner"),
+        key("type", "edit the query"),
+        key("enter", "run (empty repeats the last)"),
+        key("↑/↓", "move through results"),
+        key("esc", "back to the browser"),
+        Line::from(""),
+        head("anywhere"),
+        key("^t", "toggle theme (bronze · slate)"),
+        key("? · F1", "toggle this help"),
+    ]
+}
+
+// Draw the modal help overlay: a centred, opaque keybindings panel.
+fn draw_help_overlay(area: Rect, buf: &mut Buffer) {
+    let lines = help_lines();
+    let w = 50u16.min(area.width);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let rect = Rect::new(x, y, w, h);
+    Clear.render(rect, buf);
+    Block::new()
+        .style(Style::new().bg(theme::BG))
+        .render(rect, buf);
+    Paragraph::new(lines)
+        .block(decor::panel_active("keybindings"))
+        .render(rect, buf);
+}
+
+/// Render the help overlay atop the demo dashboard to a fresh buffer.
+#[must_use]
+pub fn render_help(width: u16, height: u16) -> Buffer {
+    let mut buf = render_dashboard(width, height, &Dashboard::demo());
+    draw_help_overlay(buf.area, &mut buf);
+    buf
+}
+
 // The dashboard hero: the QUIVER logo banner (the V is a 3-D arrowhead) in a
 // rounded frame titled with the tagline and the server URL.
 fn banner_header(url: &str) -> Paragraph<'static> {
@@ -974,6 +1512,19 @@ fn status_panel(dash: &Dashboard) -> Paragraph<'static> {
             Span::styled(decor::sparkline(&dash.history), theme::accent()),
         ]));
     }
+    if dash.history.len() >= 2 {
+        // Per-poll deltas of the cumulative total — an ingest-rate sparkline.
+        let deltas: Vec<u64> = dash
+            .history
+            .windows(2)
+            .map(|w| w[1].saturating_sub(w[0]))
+            .collect();
+        lines.push(Line::from(vec![
+            Span::styled("ingest Δ     ", theme::dim()),
+            Span::styled(decor::sparkline(&deltas), theme::accent()),
+        ]));
+    }
+    lines.push(kv("theme", theme::name()));
     if let Some(err) = &dash.offline {
         lines.push(Line::from(Span::styled(truncate(err, 30), theme::alert())));
     }
@@ -1115,14 +1666,21 @@ fn group_thousands(n: u64) -> String {
 
 fn footer() -> Paragraph<'static> {
     Paragraph::new(Line::from(Span::styled(
-        " [q] quit   [r] refresh   [↑/↓] select   [v/enter] constellation ",
+        " [q] quit  [r] refresh  [↑/↓] select  [v] constellation  [/] search  [^t] theme  [?] help ",
         theme::dim(),
     )))
 }
 
 fn constellation_footer() -> Paragraph<'static> {
     Paragraph::new(Line::from(Span::styled(
-        " [↑/↓] move cursor   [enter] query around point   [r] re-query   [esc] back   [q] quit ",
+        " [↑/↓] move cursor   [enter] query around point   [r] re-query   [esc] back   [?] help   [q] quit ",
+        theme::dim(),
+    )))
+}
+
+fn search_footer() -> Paragraph<'static> {
+    Paragraph::new(Line::from(Span::styled(
+        " [type] query   [enter] run · empty repeats last   [↑/↓] inspect   [esc] back   [^t] theme ",
         theme::dim(),
     )))
 }
@@ -1393,11 +1951,193 @@ mod tests {
         });
         let cursor = |app: &App| match &app.view {
             View::Constellation(v) => v.selected,
-            View::Browser => panic!("expected the constellation view"),
+            _ => panic!("expected the constellation view"),
         };
         app.star_prev(); // wraps to the last point
         assert_eq!(cursor(&app), 1);
         app.star_next(); // wraps back to the first
         assert_eq!(cursor(&app), 0);
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn browser_keys_navigate_and_dispatch_effects() {
+        let mut app = App::new(TuiOptions::default()).unwrap();
+        app.collections = vec![collection("a", 1), collection("b", 2)];
+        // Navigation is synchronous (no effect).
+        assert_eq!(app.handle_key(press(KeyCode::Down)), Effect::None);
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.handle_key(press(KeyCode::Char('k'))), Effect::None);
+        assert_eq!(app.selected, 0);
+        // Async actions surface as effects, not inline awaits.
+        assert_eq!(app.handle_key(press(KeyCode::Char('r'))), Effect::Refresh);
+        assert_eq!(
+            app.handle_key(press(KeyCode::Char('v'))),
+            Effect::EnterConstellation
+        );
+        // `/` opens the query runner for the selected collection.
+        assert_eq!(app.handle_key(press(KeyCode::Char('/'))), Effect::None);
+        assert!(matches!(&app.view, View::Search(v) if v.collection == "a"));
+        // `q` quits from the browser.
+        let mut app = App::new(TuiOptions::default()).unwrap();
+        app.handle_key(press(KeyCode::Char('q')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn help_overlay_is_modal() {
+        let mut app = App::new(TuiOptions::default()).unwrap();
+        assert!(!app.help);
+        app.handle_key(press(KeyCode::Char('?')));
+        assert!(app.help, "? opens help");
+        // While help is up, ordinary keys are swallowed (no navigation, no quit).
+        app.collections = vec![collection("a", 1), collection("b", 2)];
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(app.selected, 0, "navigation is swallowed by the overlay");
+        app.handle_key(press(KeyCode::Char('q')));
+        assert!(!app.should_quit, "q does not quit through the overlay");
+        // Esc dismisses it.
+        app.handle_key(press(KeyCode::Esc));
+        assert!(!app.help, "esc closes help");
+    }
+
+    #[test]
+    fn ctrl_t_cycles_the_theme_from_any_view() {
+        let mut app = App::new(TuiOptions::default()).unwrap();
+        assert_eq!(theme::name(), "bronze");
+        let effect = app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(effect, Effect::None);
+        assert_eq!(theme::name(), "slate");
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(theme::name(), "bronze", "cycles back");
+    }
+
+    #[test]
+    fn search_input_edits_and_runs() {
+        let mut app = App::new(TuiOptions::default()).unwrap();
+        app.collections = vec![collection("docs", 1)];
+        app.open_search();
+        // Printable characters edit the query; control-combos do not.
+        for c in "cat".chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        let input = match &app.view {
+            View::Search(v) => v.input.clone(),
+            _ => panic!("expected the search view"),
+        };
+        assert_eq!(input, "cat", "ctrl-combos are not typed");
+        // Backspace edits.
+        app.handle_key(press(KeyCode::Backspace));
+        // Enter runs the trimmed query.
+        let effect = app.handle_key(press(KeyCode::Enter));
+        assert_eq!(effect, Effect::RunSearch("ca".to_owned()));
+        match &app.view {
+            View::Search(v) => assert!(v.pending, "the view marks the search in flight"),
+            _ => panic!("expected the search view"),
+        }
+        // Esc returns to the browser.
+        app.handle_key(press(KeyCode::Esc));
+        assert!(matches!(app.view, View::Browser));
+    }
+
+    #[test]
+    fn enter_on_empty_input_repeats_the_last_search() {
+        let mut app = App::new(TuiOptions::default()).unwrap();
+        app.collections = vec![collection("docs", 1)];
+        app.open_search();
+        // No recent searches yet: empty Enter is a no-op.
+        assert_eq!(app.handle_key(press(KeyCode::Enter)), Effect::None);
+        // With a recent search, empty Enter repeats it.
+        app.recent_searches = vec!["last query".to_owned()];
+        assert_eq!(
+            app.handle_key(press(KeyCode::Enter)),
+            Effect::RunSearch("last query".to_owned())
+        );
+    }
+
+    #[test]
+    fn remember_search_dedupes_and_bounds() {
+        let mut app = App::new(TuiOptions::default()).unwrap();
+        app.remember_search("a".to_owned());
+        app.remember_search("b".to_owned());
+        app.remember_search("a".to_owned()); // moves "a" to the front, no dup
+        assert_eq!(app.recent_searches, vec!["a".to_owned(), "b".to_owned()]);
+        for i in 0..RECENT_SEARCHES + 4 {
+            app.remember_search(format!("q{i}"));
+        }
+        assert_eq!(
+            app.recent_searches.len(),
+            RECENT_SEARCHES,
+            "the list is bounded"
+        );
+        assert_eq!(app.recent_searches[0], format!("q{}", RECENT_SEARCHES + 3));
+    }
+
+    #[test]
+    fn search_results_cursor_wraps() {
+        let mut view = SearchView::new("docs".to_owned());
+        view.results = vec![
+            Hit {
+                id: "a".to_owned(),
+                score: 0.9,
+                payload: None,
+            },
+            Hit {
+                id: "b".to_owned(),
+                score: 0.8,
+                payload: None,
+            },
+        ];
+        view.select_prev();
+        assert_eq!(view.selected, 1, "wraps to the last");
+        view.select_next();
+        assert_eq!(view.selected, 0, "wraps back to the first");
+    }
+
+    #[test]
+    fn search_demo_renders_query_results_inspector_and_recent() {
+        let text = buffer_text(&render_search_demo(120, 36));
+        assert!(text.contains("query · documents"), "the query input panel");
+        assert!(
+            text.contains("doc-2381") && text.contains("results"),
+            "ranked results"
+        );
+        assert!(
+            text.contains("inspector") && text.contains("title"),
+            "the payload inspector"
+        );
+        assert!(
+            text.contains("recent") && text.contains("hnsw recall tuning"),
+            "recent searches"
+        );
+    }
+
+    #[test]
+    fn help_overlay_renders_the_keybindings() {
+        let text = buffer_text(&render_help(120, 36));
+        assert!(text.contains("keybindings"), "the help panel title");
+        assert!(
+            text.contains("query runner") && text.contains("constellation"),
+            "grouped keys"
+        );
+        assert!(
+            text.contains("toggle theme"),
+            "the theme toggle is documented"
+        );
+    }
+
+    #[test]
+    fn dashboard_shows_both_telemetry_sparklines_and_the_theme() {
+        let text = buffer_text(&render_dashboard(120, 36, &Dashboard::demo()));
+        assert!(text.contains("trend"), "the points-trend sparkline");
+        assert!(text.contains("ingest"), "the ingest-rate sparkline");
+        assert!(
+            text.contains("theme") && text.contains("bronze"),
+            "the active theme"
+        );
     }
 }

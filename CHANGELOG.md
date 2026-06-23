@@ -12,6 +12,15 @@ for the per-release rationale and Definitions of Done.
 
 ### Added
 
+- Interactive TUI cockpit (ADR-0060): the retro cockpit gains a **query runner**
+  (`/`) — type a query, run a server-side embed-and-search, inspect any result's
+  payload, and recall recent searches — plus a modal keybinding-help overlay
+  (`?` / `F1`), a live theme toggle (`Ctrl-t`, Bronze ↔ Slate), and an
+  ingest-rate sparkline alongside the points trend. Key handling is refactored
+  into a pure, table-tested dispatcher with network I/O pushed to the edge; every
+  screen renders to a buffer and is asserted with ratatui's `TestBackend`. New
+  committed screenshots (`search`, `help`, `theme-slate`) regenerate from the
+  real render via `just tui-shots`.
 - OpenTelemetry traces exporter (ADR-0059): opt-in behind the `otlp` cargo
   feature and a runtime endpoint (`QUIVER_OTLP_ENDPOINT` / `[otlp]` in
   `quiver.toml`), exporting the existing `#[tracing::instrument]` spans over

@@ -31,7 +31,7 @@ We say plainly what we do **not** do: client-side payload encryption protects *p
 
 ## The cockpit
 
-A retro terminal cockpit ships in the box (`quiver tui`): a live dashboard in the **Bronze Quiver** theme — connection health and an `ONLINE`/`OFFLINE` badge, a collections table with per-collection load bars, a points-trend sparkline, the relationship view of the selected collection, and a severity-tagged activity log.
+A retro terminal cockpit ships in the box (`quiver tui`): a live dashboard in the **Bronze Quiver** theme — connection health and an `ONLINE`/`OFFLINE` badge, a collections table with per-collection load bars, points-trend and ingest-rate sparklines, the relationship view of the selected collection, and a severity-tagged activity log.
 
 ![The Quiver cockpit dashboard](docs/assets/cockpit/dashboard.png)
 
@@ -39,7 +39,11 @@ Press `v`/`enter` on a collection for the **constellation view** — a 2-D proje
 
 ![The Quiver constellation view](docs/assets/cockpit/constellation.png)
 
-The screenshots are generated from the *real* render of seeded demo data with `just tui-shots` (a dev-only, workspace-isolated tool), so they regenerate in one command and never go stale ([ADR-0036](./docs/adr/0036-retro-cockpit-design-system.md)).
+Press `/` for the **query runner** — type a query, run a server-side embed-and-search (ADR-0047), inspect any result's payload, and recall recent searches:
+
+![The Quiver query runner](docs/assets/cockpit/search.png)
+
+`?` opens a keybinding overlay and `Ctrl-t` toggles a cool **Slate** palette. The whole UI renders to a buffer behind a render-to-buffer API, so every screen is unit-tested with ratatui's `TestBackend` and the screenshots are generated from the *real* render of seeded demo data with `just tui-shots` (a dev-only, workspace-isolated tool) — they regenerate in one command and never go stale ([ADR-0036](./docs/adr/0036-retro-cockpit-design-system.md), [ADR-0060](./docs/adr/0060-interactive-tui-cockpit.md)).
 
 ## 📖 Field guide — *Quiver, Explained*
 
