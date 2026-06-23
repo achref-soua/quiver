@@ -10,9 +10,16 @@
 //!
 //! Tools: `list_collections`, `create_collection`, `collection_info`,
 //! `database_stats`, `delete_collection`, `snapshot`, `upsert`, `search`,
-//! `hybrid_search`, `fetch`, `get`, `delete`, and the multi-vector document
-//! tools — enough for an agent to *operate* the database (inspect, manage, back
-//! up, clean up), not just query it.
+//! `hybrid_search`, `fetch`, `get`, `delete`, the multi-vector document tools,
+//! and — when an embedding provider is configured (ADR-0058) — the text tools
+//! `upsert_text` / `search_text`, which embed text server-side so an agent never
+//! runs an embedding model itself. Enough for an agent to *operate* the database
+//! (inspect, manage, back up, clean up), not just query it.
+//!
+//! The text tools read their provider configuration from a Quiver TOML config
+//! file (`[embedding.<collection>]` / `[rerank.<collection>]`, the same tables
+//! `quiver serve` uses) passed to [`run_with_config`]; with no config they are
+//! advertised but return a clear "no embedding provider configured" error.
 //! The database is opened secure-by-default (encryption-at-rest on
 //! unless explicitly insecure) through the same envelope key-ring as the network
 //! server and `quiver admin`, so a data directory is interchangeable between them.
@@ -24,8 +31,14 @@ use serde_json::{Value, json};
 
 use quiver_embed::{
     DEFAULT_RRF_K0, Database, Descriptor, DistanceMetric, Dtype, FieldType, Filter,
-    FilterableField, IndexKind, IndexSpec, SearchParams, SparseVector, VectorEncryption,
+    FilterableField, IndexKind, IndexSpec, SearchParams, SparseVector, TEXT_KEY, VectorEncryption,
 };
+use quiver_providers::EmbedRegistry;
+
+/// When reranking a text search, over-fetch this many candidates so the reranker
+/// has a wide pool to reorder down to the requested `k` (mirrors the network
+/// server's `RERANK_CANDIDATES`).
+const RERANK_CANDIDATES: usize = 50;
 
 /// The MCP protocol revision this server implements.
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -58,10 +71,32 @@ pub fn open(
 /// Returns an error if the database cannot be opened (see [`open`]) or on an I/O
 /// failure.
 pub fn run(data_dir: &Path, encryption_key: Option<&str>, insecure: bool) -> anyhow::Result<()> {
+    run_with_config(data_dir, encryption_key, insecure, None)
+}
+
+/// Like [`run`], but also load embedding/rerank providers from `config_path` (a
+/// Quiver TOML config), enabling the `upsert_text` / `search_text` tools for any
+/// collection with an `[embedding.<collection>]` table. A `None` path — or a
+/// missing file — runs with no providers (the text tools then error when used).
+///
+/// # Errors
+/// Returns an error if the config is malformed or names an unbuildable provider
+/// (e.g. a missing required API key), or if the database cannot be opened.
+pub fn run_with_config(
+    data_dir: &Path,
+    encryption_key: Option<&str>,
+    insecure: bool,
+    config_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let embed = match config_path {
+        Some(path) => EmbedRegistry::from_toml_path(path)
+            .map_err(|e| anyhow::anyhow!("loading embedding providers from config: {e}"))?,
+        None => EmbedRegistry::default(),
+    };
     let mut db = open(data_dir, encryption_key, insecure)?;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    serve(&mut db, stdin.lock(), stdout.lock())?;
+    serve_with_embed(&mut db, &embed, stdin.lock(), stdout.lock())?;
     Ok(())
 }
 
@@ -71,8 +106,18 @@ pub fn run(data_dir: &Path, encryption_key: Option<&str>, insecure: bool) -> any
 ///
 /// # Errors
 /// Propagates I/O errors from reading or writing the streams.
-pub fn serve(
+pub fn serve(db: &mut Database, reader: impl BufRead, writer: impl Write) -> std::io::Result<()> {
+    serve_with_embed(db, &EmbedRegistry::default(), reader, writer)
+}
+
+/// Like [`serve`], but with an [`EmbedRegistry`] backing the `upsert_text` /
+/// `search_text` tools. [`serve`] is this with an empty registry.
+///
+/// # Errors
+/// Propagates I/O errors from reading or writing the streams.
+pub fn serve_with_embed(
     db: &mut Database,
+    embed: &EmbedRegistry,
     reader: impl BufRead,
     mut writer: impl Write,
 ) -> std::io::Result<()> {
@@ -82,7 +127,7 @@ pub fn serve(
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => handle_message(db, &msg),
+            Ok(msg) => handle_message_with_embed(db, embed, &msg),
             Err(e) => Some(error_response(
                 &Value::Null,
                 -32700,
@@ -104,6 +149,18 @@ pub fn serve(
 /// the agent can read and react to them (the MCP convention).
 #[must_use]
 pub fn handle_message(db: &mut Database, msg: &Value) -> Option<Value> {
+    handle_message_with_embed(db, &EmbedRegistry::default(), msg)
+}
+
+/// Like [`handle_message`], but with an [`EmbedRegistry`] so a `tools/call` for
+/// `upsert_text` / `search_text` can embed text. [`handle_message`] is this with
+/// an empty registry (those tools then return a clear "no provider" error).
+#[must_use]
+pub fn handle_message_with_embed(
+    db: &mut Database,
+    embed: &EmbedRegistry,
+    msg: &Value,
+) -> Option<Value> {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     let is_notification = msg.get("id").is_none();
     let method = msg.get("method").and_then(Value::as_str);
@@ -112,7 +169,7 @@ pub fn handle_message(db: &mut Database, msg: &Value) -> Option<Value> {
         Some("initialize") => Some(success(&id, initialize_result())),
         Some("ping") => Some(success(&id, json!({}))),
         Some("tools/list") => Some(success(&id, json!({ "tools": tool_definitions() }))),
-        Some("tools/call") => Some(handle_tool_call(db, &id, msg.get("params"))),
+        Some("tools/call") => Some(handle_tool_call(db, embed, &id, msg.get("params"))),
         // Notifications such as `notifications/initialized` need no response.
         Some(_) if is_notification => None,
         Some(other) => Some(error_response(
@@ -129,20 +186,39 @@ pub fn handle_message(db: &mut Database, msg: &Value) -> Option<Value> {
     }
 }
 
-fn handle_tool_call(db: &mut Database, id: &Value, params: Option<&Value>) -> Value {
+fn handle_tool_call(
+    db: &mut Database,
+    embed: &EmbedRegistry,
+    id: &Value,
+    params: Option<&Value>,
+) -> Value {
     let Some(name) = params.and_then(|p| p.get("name")).and_then(Value::as_str) else {
         return error_response(id, -32602, "tools/call requires a tool name");
     };
     let empty = json!({});
     let args = params.and_then(|p| p.get("arguments")).unwrap_or(&empty);
-    match call_tool(db, name, args) {
+    match call_tool_embed(db, embed, name, args) {
         Ok(text) => success(id, tool_result(&text, false)),
         Err(message) => success(id, tool_result(&message, true)),
     }
 }
 
-/// Execute a tool, returning its text content or an error message.
+/// Execute a tool with no embedding providers configured. Kept for callers and
+/// tests that do not exercise the text tools; delegates to [`call_tool_embed`]
+/// with an empty registry.
+#[cfg(test)]
 fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, String> {
+    call_tool_embed(db, &EmbedRegistry::default(), name, args)
+}
+
+/// Execute a tool, returning its text content or an error message. `embed` backs
+/// the `upsert_text` / `search_text` tools; all other tools ignore it.
+fn call_tool_embed(
+    db: &mut Database,
+    embed: &EmbedRegistry,
+    name: &str,
+    args: &Value,
+) -> Result<String, String> {
     match name {
         "list_collections" => to_text(&json!({ "collections": db.collection_names() })),
         "create_collection" => {
@@ -389,7 +465,133 @@ fn call_tool(db: &mut Database, name: &str, args: &Value) -> Result<String, Stri
                 "bytes": info.bytes,
             }))
         }
+        "upsert_text" => {
+            let collection = want_str(args, "collection")?;
+            let point_id = want_str(args, "id")?;
+            let text = want_str(args, "text")?;
+            let embedder = embed
+                .embedder(collection)
+                .ok_or_else(|| no_provider_message(collection))?;
+            let vector = embedder
+                .embed(&[text.to_owned()])
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .next()
+                .ok_or("embedding provider returned no vector")?;
+            // Co-populate the full-text key (ADR-0046) so one call feeds both the
+            // dense index and BM25, without clobbering a caller-supplied text key.
+            let mut payload = match args.get("payload").cloned() {
+                Some(Value::Object(map)) => map,
+                _ => serde_json::Map::new(),
+            };
+            payload
+                .entry(TEXT_KEY.to_owned())
+                .or_insert_with(|| Value::String(text.to_owned()));
+            db.upsert(collection, point_id, &vector, &Value::Object(payload))
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "embedded and upserted '{point_id}' into '{collection}'"
+            ))
+        }
+        "search_text" => {
+            let collection = want_str(args, "collection")?;
+            let text = want_str(args, "text")?;
+            let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+            let filter = match args.get("filter") {
+                Some(f) if !f.is_null() => Some(
+                    serde_json::from_value::<Filter>(f.clone())
+                        .map_err(|e| format!("invalid filter: {e}"))?,
+                ),
+                _ => None,
+            };
+            let rrf_k0 = args
+                .get("rrf_k0")
+                .and_then(Value::as_f64)
+                .map_or(DEFAULT_RRF_K0, |x| x as f32);
+            let want_rerank = args.get("rerank").and_then(Value::as_bool).unwrap_or(false);
+            let embedder = embed
+                .embedder(collection)
+                .ok_or_else(|| no_provider_message(collection))?;
+            let vector = embedder
+                .embed(&[text.to_owned()])
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .next()
+                .ok_or("embedding provider returned no vector")?;
+            // Rerank only when asked *and* a reranker is configured; over-fetch a
+            // wide candidate set so it has something to reorder.
+            let reranker = if want_rerank {
+                embed.reranker(collection)
+            } else {
+                None
+            };
+            let fetch_k = if reranker.is_some() {
+                k.max(RERANK_CANDIDATES)
+            } else {
+                k
+            };
+            let params = SearchParams {
+                k: fetch_k,
+                filter,
+                ..SearchParams::default()
+            };
+            let mut matches = db
+                .hybrid_search(
+                    collection,
+                    Some(vector.as_slice()),
+                    None,
+                    Some(text),
+                    &params,
+                    rrf_k0,
+                )
+                .map_err(|e| e.to_string())?;
+            if let Some(rr) = reranker {
+                let docs: Vec<String> = matches
+                    .iter()
+                    .map(|m| doc_text(m.payload.as_ref()))
+                    .collect();
+                let scores = rr.rerank(text, &docs).map_err(|e| e.to_string())?;
+                let mut scored: Vec<(f32, _)> = scores.into_iter().zip(matches).collect();
+                scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                matches = scored
+                    .into_iter()
+                    .map(|(s, mut m)| {
+                        m.score = s;
+                        m
+                    })
+                    .collect();
+            }
+            matches.truncate(k);
+            let rendered: Vec<Value> = matches
+                .iter()
+                .map(|m| json!({ "id": m.id, "score": m.score, "payload": m.payload }))
+                .collect();
+            to_text(&json!({ "matches": rendered }))
+        }
         other => Err(format!("unknown tool: {other}")),
+    }
+}
+
+/// The error an agent sees when a text tool is used on a collection with no
+/// `[embedding.<collection>]` provider configured.
+fn no_provider_message(collection: &str) -> String {
+    format!(
+        "collection '{collection}' has no embedding provider configured \
+         (add an [embedding.{collection}] table to the Quiver config passed to \
+         `quiver mcp --config` — ADR-0047/0058)"
+    )
+}
+
+/// The text a reranker scores for a hit: the `__quiver_text__` payload field if
+/// present (what `upsert_text` stores), else the whole payload stringified.
+fn doc_text(payload: Option<&Value>) -> String {
+    match payload {
+        Some(Value::Object(map)) => map
+            .get(TEXT_KEY)
+            .and_then(Value::as_str)
+            .map_or_else(|| Value::Object(map.clone()).to_string(), str::to_owned),
+        Some(other) => other.to_string(),
+        None => String::new(),
     }
 }
 
@@ -620,6 +822,36 @@ pub fn tool_definitions() -> Value {
                     "destination": { "type": "string", "description": "Server-local destination directory; must not already exist" }
                 },
                 "required": ["destination"]
+            }
+        },
+        {
+            "name": "upsert_text",
+            "description": "Embed a text with the collection's configured embedding provider (ADR-0047/0058) and upsert it as a dense point, co-populating the BM25 full-text field so one call feeds both dense and keyword search. Requires an [embedding.<collection>] provider in the Quiver config passed to `quiver mcp --config`; lets an agent store documents without running an embedding model itself.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "collection": collection_arg,
+                    "id": { "type": "string", "description": "External point id" },
+                    "text": { "type": "string", "description": "Text to embed and store" },
+                    "payload": { "type": "object", "description": "Arbitrary JSON metadata (the text is also stored under the full-text key automatically)" }
+                },
+                "required": ["collection", "id", "text"]
+            }
+        },
+        {
+            "name": "search_text",
+            "description": "Embed a query text with the collection's embedding provider and run a hybrid dense+BM25 search, optionally reranking the results with the collection's rerank provider. Requires an [embedding.<collection>] provider in the Quiver config passed to `quiver mcp --config`; lets an agent search by text without embedding the query itself.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "collection": collection_arg,
+                    "text": { "type": "string", "description": "Query text to embed and search with" },
+                    "k": { "type": "integer", "default": 10 },
+                    "filter": { "type": "object", "description": "Quiver payload filter tree" },
+                    "rerank": { "type": "boolean", "default": false, "description": "Rerank results with the collection's [rerank.<collection>] provider, if configured" },
+                    "rrf_k0": { "type": "number", "description": "RRF rank-bias constant (default 60)" }
+                },
+                "required": ["collection", "text"]
             }
         }
     ])
@@ -1405,5 +1637,155 @@ mod tests {
         )
         .unwrap();
         assert!(msg.contains("deleted document 'b'"));
+    }
+
+    use quiver_providers::{EmbeddingConfig, ProviderKind, RerankConfig};
+
+    /// A registry with a deterministic, network-free `fake` embedder (and
+    /// optionally a `fake` reranker) for `collection`, so the text tools are
+    /// exercised end-to-end without a real model.
+    fn fake_registry(collection: &str, dim: u32, with_reranker: bool) -> EmbedRegistry {
+        let mut embedding = std::collections::HashMap::new();
+        embedding.insert(
+            collection.to_owned(),
+            EmbeddingConfig {
+                provider: ProviderKind::Fake,
+                model: String::new(),
+                endpoint: String::new(),
+                dim,
+                api_key_env: String::new(),
+            },
+        );
+        let mut rerank = std::collections::HashMap::new();
+        if with_reranker {
+            rerank.insert(
+                collection.to_owned(),
+                RerankConfig {
+                    provider: ProviderKind::Fake,
+                    model: String::new(),
+                    endpoint: String::new(),
+                    api_key_env: String::new(),
+                },
+            );
+        }
+        EmbedRegistry::from_config(&embedding, &rerank).unwrap()
+    }
+
+    #[test]
+    fn upsert_text_and_search_text_round_trip() {
+        let (_t, mut db) = db();
+        let reg = fake_registry("docs", 16, false);
+        call_tool(
+            &mut db,
+            "create_collection",
+            &json!({"name":"docs","dim":16,"metric":"cosine"}),
+        )
+        .unwrap();
+        for (id, text) in [("cat", "the quick brown cat"), ("dog", "a lazy dog sleeps")] {
+            let msg = call_tool_embed(
+                &mut db,
+                &reg,
+                "upsert_text",
+                &json!({"collection":"docs","id":id,"text":text}),
+            )
+            .unwrap();
+            assert!(msg.contains(id));
+        }
+        // The text was co-stored under the full-text key, so BM25 ranks the cat
+        // document for the stemmed query "cats".
+        let out = call_tool_embed(
+            &mut db,
+            &reg,
+            "search_text",
+            &json!({"collection":"docs","text":"cats","k":5}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["matches"][0]["id"], "cat");
+        // The stored payload carries the text key, so a plain `get` sees it too.
+        let got = call_tool(&mut db, "get", &json!({"collection":"docs","id":"cat"})).unwrap();
+        assert!(got.contains("quick brown cat"));
+    }
+
+    #[test]
+    fn search_text_reranks_when_requested() {
+        let (_t, mut db) = db();
+        let reg = fake_registry("docs", 16, true);
+        call_tool(
+            &mut db,
+            "create_collection",
+            &json!({"name":"docs","dim":16,"metric":"cosine"}),
+        )
+        .unwrap();
+        for (id, text) in [("cat", "the quick brown cat"), ("dog", "a lazy dog sleeps")] {
+            call_tool_embed(
+                &mut db,
+                &reg,
+                "upsert_text",
+                &json!({"collection":"docs","id":id,"text":text}),
+            )
+            .unwrap();
+        }
+        // The fake reranker scores by lexical overlap, so the query "lazy dog"
+        // reorders the dog document to the top.
+        let out = call_tool_embed(
+            &mut db,
+            &reg,
+            "search_text",
+            &json!({"collection":"docs","text":"lazy dog","k":2,"rerank":true}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["matches"][0]["id"], "dog");
+    }
+
+    #[test]
+    fn text_tools_are_advertised_and_error_without_a_provider() {
+        let (_t, mut db) = db();
+        // Both tools are in the advertised catalog regardless of configuration.
+        let resp = handle_message(
+            &mut db,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .unwrap();
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"upsert_text"), "upsert_text advertised");
+        assert!(names.contains(&"search_text"), "search_text advertised");
+        // With no provider configured (the default no-embed path), using one is a
+        // clear tool error, not a panic.
+        call_tool(
+            &mut db,
+            "create_collection",
+            &json!({"name":"docs","dim":4}),
+        )
+        .unwrap();
+        let r = call(
+            &mut db,
+            "upsert_text",
+            json!({"collection":"docs","id":"a","text":"hi"}),
+        );
+        assert_eq!(r["result"]["isError"], true);
+        assert!(result_text(&r).contains("no embedding provider"));
+    }
+
+    #[test]
+    fn handle_message_with_embed_routes_text_tools() {
+        let (_t, mut db) = db();
+        let reg = fake_registry("docs", 8, false);
+        call_tool(
+            &mut db,
+            "create_collection",
+            &json!({"name":"docs","dim":8}),
+        )
+        .unwrap();
+        let msg = json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"upsert_text","arguments":{"collection":"docs","id":"x","text":"hello world"}}});
+        let resp = handle_message_with_embed(&mut db, &reg, &msg).unwrap();
+        assert_eq!(resp["result"]["isError"], false, "{}", result_text(&resp));
     }
 }

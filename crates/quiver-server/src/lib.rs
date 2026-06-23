@@ -31,7 +31,6 @@
 
 mod audit;
 mod auth;
-mod embed_provider;
 mod error;
 mod grpc;
 mod metrics;
@@ -64,11 +63,13 @@ use quiver_embed::{
 use quiver_query::Filter;
 
 pub use auth::{Action, ApiKey, CollectionScope};
-pub use embed_provider::{
+pub use error::Error;
+// The embedding/rerank seam lives in its own lean crate (ADR-0058) so the MCP
+// server can share it; re-exported here so the server's public API is unchanged.
+pub use quiver_providers::{
     EmbedRegistry, EmbeddingConfig, EmbeddingProvider, ProviderError, ProviderKind, RerankConfig,
     RerankProvider,
 };
-pub use error::Error;
 pub use rate_limit::{RateDecision, RateLimitConfig, RateLimitSnapshot, RateLimiter};
 
 use audit::{AuditLog, Outcome};

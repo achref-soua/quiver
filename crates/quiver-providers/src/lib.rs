@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Opt-in, provider-agnostic server-side embedding & reranking (ADR-0047).
+//! Opt-in, provider-agnostic embedding & reranking adapters (ADR-0047/0058).
 //!
 //! The Quiver engine is deliberately model-agnostic: it stores and searches
-//! float vectors and knows nothing about embedding models. This module is the
-//! **server-edge** adapter that lets an operator turn *"give me text"* into a
+//! float vectors and knows nothing about embedding models. This crate is the
+//! **edge** adapter that lets an operator turn *"give me text"* into a
 //! stored/searched vector without the client running an embedding model — the
-//! single biggest RAG friction. It lives only here, never in `quiver-core` or
-//! the `quiver-embed` engine crate, so library-mode users pay nothing.
+//! single biggest RAG friction. It lives in its own lean crate (no axum/tonic)
+//! so it can be shared by both the network server (`quiver-server`) and the
+//! in-process MCP server (`quiver-mcp`) without either pulling the other's
+//! dependency tree (ADR-0058); it is never used by `quiver-core` or the
+//! `quiver-embed` engine crate, so library-mode users pay nothing.
 //!
 //! ## Design (ADR-0047)
 //! - **Provider-agnostic.** [`EmbeddingProvider`] / [`RerankProvider`] are traits;
@@ -29,9 +32,14 @@
 //! `ureq` call; live network calls are **not** in CI (stated, not faked).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use figment::{
+    Figment,
+    providers::{Format, Toml},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -407,6 +415,16 @@ fn resolve_key(api_key_env: &str) -> Result<Option<String>, ProviderError> {
         .map_err(|_| ProviderError::MissingKey(api_key_env.to_owned()))
 }
 
+/// The `[embedding.*]` and `[rerank.*]` tables of a Quiver config file, used by
+/// [`EmbedRegistry::from_toml_path`]. Every other config key is ignored.
+#[derive(Debug, Default, Deserialize)]
+struct ProviderTables {
+    #[serde(default)]
+    embedding: HashMap<String, EmbeddingConfig>,
+    #[serde(default)]
+    rerank: HashMap<String, RerankConfig>,
+}
+
 /// Per-collection embedding/rerank providers, built once at startup from config.
 #[derive(Clone, Default)]
 pub struct EmbedRegistry {
@@ -434,6 +452,22 @@ impl EmbedRegistry {
             embedders,
             rerankers,
         })
+    }
+
+    /// Build a registry from the `[embedding.*]` / `[rerank.*]` tables of a Quiver
+    /// TOML config file — the same tables `quiver serve` reads — so the MCP server
+    /// (`quiver mcp`) can offer text-in/text-out tools with the same configuration
+    /// surface as the network server (ADR-0058). Any other config keys are ignored.
+    ///
+    /// A missing file yields an *empty* registry rather than an error: the MCP
+    /// server still starts, and the text tools report "no embedding provider
+    /// configured" only when actually invoked. A malformed file, or a provider that
+    /// cannot be built (e.g. a missing required API key), is a hard error.
+    pub fn from_toml_path(path: &Path) -> Result<Self, ProviderError> {
+        let tables: ProviderTables = Figment::from(Toml::file(path))
+            .extract()
+            .map_err(|e| ProviderError::Config(e.to_string()))?;
+        Self::from_config(&tables.embedding, &tables.rerank)
     }
 
     /// The embedder configured for `collection`, if any.
@@ -649,6 +683,63 @@ mod tests {
         assert!(reg.embedder("missing").is_none());
         assert!(reg.reranker("docs").is_some());
         assert!(EmbedRegistry::default().is_empty());
+    }
+
+    #[test]
+    fn from_toml_path_loads_embedding_and_rerank_tables() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quiver.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // A fake provider needs no network/keys, so the loaded registry is usable
+        // in-process. Unrelated tables (here `[server]`) must be ignored.
+        writeln!(
+            f,
+            r#"
+[server]
+host = "127.0.0.1"
+
+[embedding.docs]
+provider = "fake"
+dim = 16
+
+[rerank.docs]
+provider = "fake"
+"#
+        )
+        .unwrap();
+        let reg = EmbedRegistry::from_toml_path(&path).unwrap();
+        assert_eq!(reg.embedder("docs").unwrap().dim(), 16);
+        assert!(reg.reranker("docs").is_some());
+        assert!(reg.embedder("missing").is_none());
+    }
+
+    #[test]
+    fn from_toml_path_missing_file_is_empty_not_an_error() {
+        let reg = EmbedRegistry::from_toml_path(Path::new("definitely-not-here.toml")).unwrap();
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn from_toml_path_propagates_a_misconfigured_provider() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quiver.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // `http` requires an `endpoint`; omitting it is a hard configuration error.
+        writeln!(
+            f,
+            r#"
+[embedding.docs]
+provider = "http"
+dim = 8
+"#
+        )
+        .unwrap();
+        assert!(matches!(
+            EmbedRegistry::from_toml_path(&path),
+            Err(ProviderError::Config(_))
+        ));
     }
 
     #[test]
