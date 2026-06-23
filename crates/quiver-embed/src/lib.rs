@@ -28,10 +28,17 @@
 //! over-fetches from the ANN index and post-filters. Both arms re-check the full
 //! filter, so results are exact regardless of which path runs.
 //!
-//! ## Concurrency (Phase 1)
-//! Single-writer: every operation takes `&mut self` (a search may rebuild a
-//! stale index). A server serializes access behind a lock; the lock-free MVCC
-//! snapshot model (ADR-0006) arrives with Phase 2.
+//! ## Concurrency (ADR-0057)
+//! Single-writer. Writes take `&mut self`. Reads come in two flavors: the
+//! `&mut self` convenience methods (`search`, `hybrid_search`,
+//! `search_multi_vector`) rebuild a stale index in place and are ideal for
+//! embedded, single-threaded use; the `&self` `*_snapshot` methods read the
+//! current immutable snapshot and run **concurrently**, returning
+//! [`Error::IndexStale`] if a prior write deferred the index rebuild so a server
+//! can hand off to its single writer ([`Database::ensure_indexed`]) and retry.
+//! A server therefore serves concurrent reads behind a reader–writer lock and
+//! takes the exclusive lock only for writes and the occasional rebuild. The
+//! fully lock-free arc-swap snapshot model is the staged successor (ADR-0057).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -82,6 +89,14 @@ pub enum Error {
     /// The requested index / metric combination is not supported.
     #[error("unsupported configuration: {0}")]
     Unsupported(&'static str),
+    /// A read found the collection's index stale (a prior write deferred its
+    /// rebuild). An internal control signal, never surfaced to a client: the
+    /// `&self` `*_snapshot` reads return it so a caller holding only a shared
+    /// lock can hand off to a single writer for the rebuild, then retry. The
+    /// `&mut self` convenience methods and the server's read path both catch it,
+    /// call [`Database::ensure_indexed`], and retry (ADR-0057).
+    #[error("index rebuild required")]
+    IndexStale,
     /// A durable index snapshot could not be restored (ADR-0025); the caller
     /// falls back to rebuilding from the store, so this does not surface to users.
     #[error(transparent)]
@@ -693,6 +708,41 @@ impl Database {
         Ok(out)
     }
 
+    /// Rebuild a collection's index if a prior write deferred it (the `stale`
+    /// flag), making the collection's read snapshot current. Idempotent and cheap
+    /// when already fresh. Separating this `&mut self` maintenance from the `&self`
+    /// `*_snapshot` reads is what lets a server serve concurrent reads behind a
+    /// shared lock and take the exclusive lock only for the rare rebuild (ADR-0057).
+    pub fn ensure_indexed(&mut self, collection: &str) -> Result<()> {
+        if self.handle(collection)?.stale {
+            let store = &self.store;
+            let handle = self
+                .collections
+                .get_mut(collection)
+                .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+            rebuild_index(store, handle)?;
+        }
+        Ok(())
+    }
+
+    // Run a `&self` snapshot read; if it reports a deferred index rebuild
+    // ([`Error::IndexStale`]), rebuild once (mutably) and retry. The shared retry
+    // path behind the `&mut self` `search`/`hybrid_search`/`search_multi_vector`
+    // convenience methods (ADR-0057).
+    fn search_with_retry<T>(
+        &mut self,
+        collection: &str,
+        mut attempt: impl FnMut(&Self) -> Result<T>,
+    ) -> Result<T> {
+        match attempt(self) {
+            Err(Error::IndexStale) => {
+                self.ensure_indexed(collection)?;
+                attempt(self)
+            }
+            other => other,
+        }
+    }
+
     /// Search a collection for the nearest points to `query`, optionally
     /// post-filtered by payload predicate.
     pub fn search(
@@ -701,16 +751,29 @@ impl Database {
         query: &[f32],
         params: &SearchParams,
     ) -> Result<Vec<Match>> {
+        // Snapshot read first; rebuild once and retry if a prior write deferred the
+        // index (ADR-0057). The server runs the same dance across an `RwLock`, so
+        // the hot, fresh path stays lock-free for concurrent readers.
+        self.search_with_retry(collection, |db| {
+            db.search_snapshot(collection, query, params)
+        })
+    }
+
+    /// Search a collection's **current immutable snapshot** for the nearest points
+    /// to `query`, optionally post-filtered by payload predicate. Takes `&self`, so
+    /// many readers run concurrently. Returns [`Error::IndexStale`] when a prior
+    /// write deferred this collection's index rebuild — the caller rebuilds via
+    /// [`Database::ensure_indexed`] and retries (ADR-0057).
+    pub fn search_snapshot(
+        &self,
+        collection: &str,
+        query: &[f32],
+        params: &SearchParams,
+    ) -> Result<Vec<Match>> {
         require_single_vector(self.handle(collection)?)?;
         require_server_searchable(self.handle(collection)?)?;
-        // Rebuild the index first if a prior update/delete left it stale.
         if self.handle(collection)?.stale {
-            let store = &self.store;
-            let handle = self
-                .collections
-                .get_mut(collection)
-                .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
-            rebuild_index(store, handle)?;
+            return Err(Error::IndexStale);
         }
 
         let handle = self.handle(collection)?;
@@ -807,6 +870,31 @@ impl Database {
         params: &SearchParams,
         rrf_k0: f32,
     ) -> Result<Vec<Match>> {
+        // Snapshot read first, rebuild-and-retry on a deferred index (ADR-0057).
+        self.search_with_retry(collection, |db| {
+            db.hybrid_search_snapshot(
+                collection,
+                dense_query,
+                sparse_query,
+                text_query,
+                params,
+                rrf_k0,
+            )
+        })
+    }
+
+    /// Hybrid search over the collection's current immutable snapshot (`&self`, so
+    /// readers run concurrently). Returns [`Error::IndexStale`] when a prior write
+    /// deferred the index rebuild; the caller rebuilds and retries (ADR-0057).
+    pub fn hybrid_search_snapshot(
+        &self,
+        collection: &str,
+        dense_query: Option<&[f32]>,
+        sparse_query: Option<&SparseVector>,
+        text_query: Option<&str>,
+        params: &SearchParams,
+        rrf_k0: f32,
+    ) -> Result<Vec<Match>> {
         require_single_vector(self.handle(collection)?)?;
         require_server_searchable(self.handle(collection)?)?;
         if dense_query.is_none() && sparse_query.is_none() && text_query.is_none() {
@@ -815,12 +903,7 @@ impl Database {
             ));
         }
         if self.handle(collection)?.stale {
-            let store = &self.store;
-            let handle = self
-                .collections
-                .get_mut(collection)
-                .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
-            rebuild_index(store, handle)?;
+            return Err(Error::IndexStale);
         }
         let handle = self.handle(collection)?;
 
@@ -1142,6 +1225,25 @@ impl Database {
         query_tokens: &[Vec<f32>],
         params: &SearchParams,
     ) -> Result<Vec<DocumentMatch>> {
+        // Snapshot read first, rebuild-and-retry on a deferred index (ADR-0057). A
+        // small corpus is scored exactly and never returns `IndexStale`, so the
+        // mutable rebuild only runs for a large corpus whose ANN index went stale.
+        self.search_with_retry(collection, |db| {
+            db.search_multi_vector_snapshot(collection, query_tokens, params)
+        })
+    }
+
+    /// Multi-vector (late-interaction) search over the collection's current
+    /// immutable snapshot (`&self`, so readers run concurrently). A small corpus is
+    /// scored exactly; a large corpus draws candidates from the ANN index and
+    /// returns [`Error::IndexStale`] if a prior write deferred its rebuild, which
+    /// the caller resolves with [`Database::ensure_indexed`] (ADR-0057).
+    pub fn search_multi_vector_snapshot(
+        &self,
+        collection: &str,
+        query_tokens: &[Vec<f32>],
+        params: &SearchParams,
+    ) -> Result<Vec<DocumentMatch>> {
         require_multivector(self.handle(collection)?)?;
         let dim = self.handle(collection)?.descriptor.dim as usize;
         if query_tokens.is_empty() {
@@ -1166,15 +1268,10 @@ impl Database {
                 .map(|d| d.keys().cloned().collect())
                 .unwrap_or_default()
         } else {
-            // Large corpus: generate candidates from the token pool, rebuilding the
-            // ANN index first if a prior write left it stale.
+            // Large corpus: generate candidates from the token pool. A prior write
+            // may have deferred the ANN index rebuild — signal the caller to do it.
             if self.handle(collection)?.stale {
-                let store = &self.store;
-                let handle = self
-                    .collections
-                    .get_mut(collection)
-                    .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
-                rebuild_index(store, handle)?;
+                return Err(Error::IndexStale);
             }
             let handle = self.handle(collection)?;
             let per_token_k = params
