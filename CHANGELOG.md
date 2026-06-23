@@ -15,6 +15,9 @@ for the per-release rationale and Definitions of Done.
 - Packaging & distribution pipeline (ADR-0056): backfilled `CHANGELOG.md`, crate
   publish metadata, secret-gated crates.io / PyPI / npm publish jobs, and a Helm
   chart + Kubernetes manifests under `infra/`.
+- TypeScript SDK parity with the Python async client: `upsertIter` (batches a
+  sync or async iterable), `scroll` (an async generator for export / re-embedding),
+  and `deleteByFilter` (paged erasure).
 
 ### Changed
 
