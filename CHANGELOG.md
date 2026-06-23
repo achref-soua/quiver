@@ -12,6 +12,12 @@ for the per-release rationale and Definitions of Done.
 
 ### Added
 
+- OpenTelemetry traces exporter (ADR-0059): opt-in behind the `otlp` cargo
+  feature and a runtime endpoint (`QUIVER_OTLP_ENDPOINT` / `[otlp]` in
+  `quiver.toml`), exporting the existing `#[tracing::instrument]` spans over
+  OTLP/gRPC to a collector (Jaeger/Tempo/Grafana). Off by default — no new
+  dependencies in a normal build; the OTLP/gRPC transport reuses the in-tree
+  `tonic`. A failed exporter degrades to `fmt`-only rather than failing startup.
 - MCP text tools (ADR-0058): `upsert_text` and `search_text` over the MCP server,
   so an AI agent can store and search documents by text — Quiver embeds them
   server-side — without running an embedding model itself. Configured with

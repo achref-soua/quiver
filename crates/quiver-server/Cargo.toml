@@ -34,6 +34,23 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# OTLP traces export (ADR-0059) — optional, enabled by the `otlp` feature.
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[features]
+# Compile the OpenTelemetry traces exporter. Off by default; even when compiled
+# in, the exporter only activates when an OTLP endpoint is configured at runtime
+# (QUIVER_OTLP_ENDPOINT). See ADR-0059 and docs/observability.
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+
 [dev-dependencies]
 rcgen = { workspace = true }
 reqwest = { workspace = true }

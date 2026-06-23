@@ -34,6 +34,7 @@ mod auth;
 mod error;
 mod grpc;
 mod metrics;
+mod otlp;
 mod rate_limit;
 mod replication;
 mod rest;
@@ -64,6 +65,7 @@ use quiver_query::Filter;
 
 pub use auth::{Action, ApiKey, CollectionScope};
 pub use error::Error;
+pub use otlp::OtlpConfig;
 // The embedding/rerank seam lives in its own lean crate (ADR-0058) so the MCP
 // server can share it; re-exported here so the server's public API is unchanged.
 pub use quiver_providers::{
@@ -351,6 +353,11 @@ pub struct Config {
     /// `requests_per_second = 0` (the default) disables it.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Opt-in OpenTelemetry traces export (ADR-0059). Set an `[otlp]` table or the
+    /// `QUIVER_OTLP_*` env vars; an empty `endpoint` (the default) disables it.
+    /// Export additionally requires the server's `otlp` build feature.
+    #[serde(default)]
+    pub otlp: OtlpConfig,
 }
 
 impl Default for Config {
@@ -373,6 +380,7 @@ impl Default for Config {
             embedding: HashMap::new(),
             rerank: HashMap::new(),
             rate_limit: RateLimitConfig::default(),
+            otlp: OtlpConfig::default(),
         }
     }
 }
@@ -394,6 +402,8 @@ impl Config {
             .rate_limit
             .apply_env_overrides()
             .map_err(Error::Config)?;
+        // Same for the flat `QUIVER_OTLP_*` keys (ADR-0059).
+        config.otlp.apply_env_overrides().map_err(Error::Config)?;
         Ok(config)
     }
 
@@ -1660,9 +1670,48 @@ fn rustls_server_config(
 /// Initialize structured logging from `RUST_LOG` (defaulting to `info`). Safe to
 /// call once at startup; a second call is ignored.
 pub fn init_tracing() {
+    init_observability(&Config::default());
+}
+
+/// Install the global tracing subscriber: an `RUST_LOG`-driven `fmt` layer plus,
+/// when the `otlp` feature is built **and** an OTLP endpoint is configured
+/// (ADR-0059), an OpenTelemetry traces export layer. Safe to call once at
+/// startup; a second call is a no-op. A failure to build the OTLP exporter logs a
+/// warning and falls back to `fmt`-only rather than taking the server down.
+#[cfg_attr(not(feature = "otlp"), allow(unused_variables))]
+pub fn init_observability(config: &Config) {
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::prelude::*;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer());
+
+    #[cfg(feature = "otlp")]
+    if config.otlp.is_enabled() {
+        match otlp::build_provider(&config.otlp) {
+            Ok(provider) => {
+                use opentelemetry::trace::TracerProvider as _;
+                let tracer = provider.tracer("quiver");
+                otlp::store_provider(provider);
+                let _ = registry
+                    .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                    .try_init();
+                return;
+            }
+            Err(e) => eprintln!("OTLP traces export disabled: {e}"),
+        }
+    }
+
+    let _ = registry.try_init();
+}
+
+/// Flush and shut down the OpenTelemetry exporter, if one was installed. A no-op
+/// without the `otlp` feature or when no endpoint was configured. Call once on
+/// server shutdown so batched spans are not lost.
+pub fn shutdown_observability() {
+    #[cfg(feature = "otlp")]
+    otlp::shutdown();
 }
 
 #[cfg(test)]
