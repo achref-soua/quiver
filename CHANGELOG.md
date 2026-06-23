@@ -10,6 +10,8 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-06-23
+
 ### Added
 
 - Packaging & distribution pipeline (ADR-0056): backfilled `CHANGELOG.md`, crate
@@ -268,7 +270,8 @@ for the per-release rationale and Definitions of Done.
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.20.1...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/achref-soua/quiver/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/achref-soua/quiver/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/achref-soua/quiver/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/achref-soua/quiver/compare/v0.18.1...v0.19.0
