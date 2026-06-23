@@ -54,9 +54,21 @@ await q.upsert("items", [{ id: "a", vector: [0.1, 0.2, 0.3], payload: { tag: "x"
 const hits = await q.search("items", [0.1, 0.2, 0.3], { k: 5 });
 ```
 
-The TypeScript client mirrors the same surface: `hybridSearch` (dense ⊕
-sparse/BM25) and, with a [server-side provider](../features/embedding.md),
-`upsertText` / `searchText` (`{ rerank: true }` to reorder in one call).
+The TypeScript client is fully `Promise`-based and mirrors the same surface as
+the Python async client: `hybridSearch` (dense ⊕ sparse/BM25); with a
+[server-side provider](../features/embedding.md), `upsertText` / `searchText`
+(`{ rerank: true }` to reorder in one call); and the bulk/maintenance helpers
+`upsertIter` (batches a sync **or async** iterable), `scroll` (an async generator
+over a collection, for export / re-embedding), and `deleteByFilter` (paged
+erasure, for GDPR / re-indexing).
+
+```ts
+for await (const point of q.scroll("items", { batch: 500 })) {
+  // export or re-embed each point
+}
+await q.upsertIter("items", asyncSource, { batch: 500, onProgress: (n) => console.log(n) });
+await q.deleteByFilter("items", { eq: { field: "tag", value: "stale" } });
+```
 
 ## Go
 
