@@ -283,6 +283,7 @@ Every option is an environment variable with a secure default; see [`.env.exampl
 
 - **Documentation site** — [`apps/docs`](./apps/docs) (mdBook; `just docs`)
 - **Roadmap & Definitions of Done** — [`docs/roadmap.md`](./docs/roadmap.md)
+- **Changelog** — [`CHANGELOG.md`](./CHANGELOG.md)
 - **Security policy** — [`SECURITY.md`](./SECURITY.md) · **Threat model** — [`docs/security/threat-model.md`](./docs/security/threat-model.md)
 - **Contributing** — [`CONTRIBUTING.md`](./CONTRIBUTING.md)
 - **License** — [AGPL-3.0-only](./LICENSE)

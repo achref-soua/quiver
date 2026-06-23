@@ -75,5 +75,6 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0053](0053-lock-free-mvcc-reads.md) | Lock-free MVCC reads (versioned snapshots, epoch reclamation) — design only | Proposed | 5 |
 | [0054](0054-prometheus-metrics-and-tracing.md) | Prometheus `/metrics` (real counters/histograms) + request tracing spans + Grafana dashboard | Accepted | 5 |
 | [0055](0055-benchmark-v0.20.0-bulk-build.md) | v0.20.0 multi-DB benchmark re-run with the bulk-ingest build path (honest time-until-queryable) | Accepted | 5 |
+| [0056](0056-packaging-and-distribution.md) | Packaging & distribution — publish pipeline (crates.io/PyPI/npm), Helm chart, CHANGELOG | Accepted | 5 |
 
 Phase-0 ADRs (0001–0018) are Accepted; Phase-2 decisions span 0019–0022; Phase-4 decisions begin at 0023. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.
