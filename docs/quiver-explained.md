@@ -541,19 +541,19 @@ This single table shows the central trade-off of the whole field. As you turn th
 
 | `ef_search` | 16 | 32 | 64 | 128 | 256 |
 |---|---|---|---|---|---|
-| **recall@10** | 0.794 | 0.898 | 0.960 | 0.987 | 0.996 |
-| **QPS** (1 thread) | 1150 | 1032 | 870 | 673 | 508 |
-| **p95 latency** (ms) | 1.1 | 1.2 | 1.5 | 1.9 | 2.7 |
+| **recall@10** | 0.793 | 0.895 | 0.958 | 0.986 | 0.995 |
+| **QPS** (1 thread) | 1539 | 1424 | 1222 | 955 | 701 |
+| **p95 latency** (ms) | 0.8 | 0.8 | 1.0 | 1.3 | 1.7 |
 
 As an ASCII chart of the fundamental tension:
 
 ```
 recall ▲
- 1.00 ┤                                  ● 0.996 (ef=256, 508 QPS)
- 0.99 ┤                        ● 0.987 (ef=128, 673 QPS)
- 0.96 ┤              ● 0.960 (ef=64, 870 QPS)
- 0.90 ┤        ● 0.898 (ef=32, 1032 QPS)
- 0.79 ┤  ● 0.794 (ef=16, 1150 QPS)
+ 1.00 ┤                                  ● 0.995 (ef=256, 701 QPS)
+ 0.99 ┤                        ● 0.986 (ef=128, 955 QPS)
+ 0.96 ┤              ● 0.958 (ef=64, 1222 QPS)
+ 0.90 ┤        ● 0.895 (ef=32, 1424 QPS)
+ 0.79 ┤  ● 0.793 (ef=16, 1539 QPS)
       └──┴────┴────────┴─────────────────┴────────→  more search effort →
          (faster)                          (more accurate)
 ```
@@ -564,21 +564,22 @@ You pick your point on this curve per workload. RAG pipeline that re-ranks anywa
 
 | System | recall@10 | QPS (1T) | p95 (ms) | RSS (MB) | build |
 |---|---:|---:|---:|---:|---:|
-| FAISS 1.14 | 0.968 | **2900** | 0.5 | 1234 ¹ | 110 s |
-| **Quiver v0.18** | 0.960 | **870** | **1.5** | 1617 | ≈14 min ² |
-| Chroma 1.5 | 0.977 | 743 | 2.1 | 3534 ¹ | 202 s |
-| Milvus 2.5 (server) | 0.987 | 522 | 2.8 | 1254 | 31 s |
-| Weaviate 1.27 | 0.983 | 506 | 2.6 | 2161 | 40 min |
-| Qdrant 1.13 | 0.993 | 337 | 5.7 | **259** ³ | 118 s |
-| LanceDB 0.33 | 0.557 ⁴ | 159 | 7.8 | 2255 ¹ | 19 s |
+| FAISS 1.14 | 0.968 | **3842** | 0.4 | 1234 ¹ | 82 s |
+| **Quiver v0.20** | 0.958 | **1222** | **1.0** | 2069 | 581 s ² |
+| Chroma 1.5 | 0.977 | 1009 | 1.1 | 3752 ¹ | 153 s |
+| Weaviate 1.27 | 0.983 | 663 | 1.7 | 2218 | 38 min |
+| Milvus 2.5 (server) | 0.986 | 649 | 1.9 | 2075 | 26 s |
+| Qdrant 1.13 | 0.974 | 358 | 4.5 | **258** ³ | 98 s |
+| pgvector 0.7 | 0.980 | 118 | 11.8 | 1291 | 132 s |
+| LanceDB 0.33 | 0.557 ⁴ | 219 | 5.3 | 2475 ¹ | 15 s |
 
-**Quiver lands second only to FAISS** on both throughput and tail latency at this recall bar, with the second-best p95 latency of the whole field — a strong result for a from-scratch engine. On the harder **GIST1M** (1M × 960-d) test, Quiver *matches FAISS on recall* (0.925 vs 0.920).
+**Quiver lands second only to FAISS** on both throughput and tail latency at this recall bar, with the second-best p95 latency of the whole field — and on the v0.20.0 engine its single-thread QPS rose ~40% over v0.18.0 (870 → 1222 at recall ≥ 0.95). On the harder **GIST1M** (1M × 960-d) test, Quiver *matches FAISS on recall* (0.923 vs 0.919).
 
 The footnotes are where the honesty lives:
 - ¹ FAISS/Chroma/LanceDB run *in-process*, so their RAM figures are inflated by the Python harness — not directly comparable to the isolated-server numbers.
-- ² Quiver's "build" time is the slow **REST-upload** path (1M individual HTTP POSTs), *not* engine speed — a bulk-ingest endpoint is on the roadmap. It's reported anyway rather than hidden.
+- ² Quiver's "build" is now the **bulk-ingest** path (`points:bulk`) measured as honest *time-until-queryable* — ingest plus the deferred index build forced by the first query (581 s, down from v0.18.0's 854 s REST-upload path); in-process FAISS still builds fastest as it skips the network entirely.
 - ³ Qdrant memory-maps vectors to disk by default, which is why its RAM looks tiny.
-- ⁴ LanceDB's config didn't reach the 0.95 recall bar in this sweep; shown at its best honestly.
+- ⁴ LanceDB's config didn't reach the 0.95 recall bar in this sweep; shown at its best honestly (and it DNF'd GIST1M entirely — a 960-d/1M in-process build exhausts memory).
 
 > 🔑 **The crucial caveat Quiver states itself:** *this table is an in-memory comparison, so it is NOT where Quiver's memory wedge shows up.* The wedge is the **disk-resident path** (§4.4), which holds only PQ codes in RAM for ~32× less memory — and Quiver explicitly marks the head-to-head RAM comparison there as "reference-hardware-pending; we never fabricate." A benchmark table you can trust is one that tells you where it *doesn't* flatter the author.
 

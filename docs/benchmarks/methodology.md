@@ -30,7 +30,7 @@ Ground truth is the provided exact neighbors, or brute-forced with the SIMD kern
 
 `ann-benchmarks`-style, in `bench/`:
 
-1. Build the index (record build time + RSS + disk size).
+1. Build the index (record build time + RSS + disk size). **Build time is *time-until-queryable*** — for Quiver this means ingest via the bulk endpoint (`POST …/points:bulk`) plus the deferred index build, which the harness forces with one query inside the timer so the number is comparable to competitors whose build includes index construction ([ADR-0055](../adr/0055-benchmark-v0.20.0-bulk-build.md)).
 2. Warm up (discard), then run the query set single- and multi-threaded.
 3. Sweep the quality knob to trace the recall–QPS curve; record p50/p95/p99 latency at each operating point.
 4. Emit raw **CSV** + the exact config used.
@@ -47,7 +47,7 @@ Ground truth is the provided exact neighbors, or brute-forced with the SIMD kern
 - Pinned dataset versions + checksums; fixed RNG seeds; pinned Quiver + competitor versions.
 - **Reference hardware is documented** with each result set: CPU model + core count, RAM, SSD model, OS/kernel, Rust version. Official numbers come from this documented reference hardware — the day-to-day dev box is resource-shared, so it is **not** the source of published numbers, and CI runs only small smoke datasets (correctness/regression gates), never the headline benchmarks. The step-by-step procedure to produce the published numbers (Quiver + Qdrant + LanceDB) is the [reference-hardware runbook](./reference-hardware-runbook.md).
 - **Regression gates:** a fixed small dataset guards recall@10 and p95 in CI; a drop beyond a threshold fails the build.
-- Results live in `docs/benchmarks/results/` (CSV + a short write-up) and are summarized as a table in the README with a link here.
+- Results live in `docs/benchmarks/results/` (CSV + a short write-up) and are summarized as a table in the README with a link here. The current run is [`comparison-v0.20.0`](./results/comparison-v0.20.0/comparison-v0.20.0.md) (SIFT1M + GIST1M, eight adapters), regenerable with `just bench-compare` + `just bench-report`.
 
 ## Reporting template (per result set)
 

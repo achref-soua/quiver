@@ -161,6 +161,26 @@ def test_report_generate_no_data(tmp_path):
     assert "No result CSVs" in report
 
 
+# ── Quiver bulk-ingest batch sizing ──────────────────────────────────────────
+
+def test_bulk_batch_size_bounds():
+    from quiver_bench.competitors.quiver_adapter import (
+        _BULK_TARGET_BYTES,
+        _BYTES_PER_FLOAT_TEXT,
+        _MAX_BULK_BATCH,
+        bulk_batch_size,
+    )
+
+    # 128-d (SIFT) stays under the body cap and below the server batch ceiling.
+    s = bulk_batch_size(128)
+    assert 1 <= s <= _MAX_BULK_BATCH
+    assert s * 128 * _BYTES_PER_FLOAT_TEXT <= _BULK_TARGET_BYTES
+    # 960-d (GIST) yields a smaller batch than 128-d (bytes-per-point is higher).
+    assert bulk_batch_size(960) < s
+    # Pathologically wide vectors still make progress (never 0).
+    assert bulk_batch_size(5_000_000) == 1
+
+
 def test_report_generate_with_data(tmp_path):
     import csv
     sub = tmp_path / "smoke"

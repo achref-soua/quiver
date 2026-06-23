@@ -151,7 +151,7 @@ def generate(result_dir: Path) -> str:
         lines += [
             "## Hardware manifest",
             "",
-            f"| | |",
+            "| | |",
             "|---|---|",
             f"| OS | {hw.get('os', '?')} {hw.get('os_release', '')} |",
             f"| Processor | {hw.get('processor', '?')} |",
@@ -169,6 +169,13 @@ def generate(result_dir: Path) -> str:
     if not dataset_dirs:
         lines.append("_No result CSVs found. Run `just bench-compare` first._\n")
     else:
+        # Union of every competitor seen across all datasets, so a system that
+        # ran on one dataset but is missing on another (e.g. an OOM/DNF that left
+        # no CSV) is reported honestly rather than silently dropped.
+        all_comps: set[str] = set()
+        for _, d in dataset_dirs:
+            all_comps |= set(_load_results(d).keys())
+
         for ds_name, ds_dir in dataset_dirs:
             data_by_comp = _load_results(ds_dir)
             best_rows: dict[str, dict | None] = {
@@ -205,7 +212,7 @@ def generate(result_dir: Path) -> str:
                     continue
                 # Find the adapter version from the CSV (not stored — use a known map)
                 versions = {
-                    "quiver": "v0.18.0-dev",
+                    "quiver": "v0.20.0",
                     "faiss": "1.14.3",
                     "lancedb": "0.33.0",
                     "chroma": "1.5.9",
@@ -234,7 +241,7 @@ def generate(result_dir: Path) -> str:
             lines += [""]
 
             # Full sweep tables per competitor
-            lines += [f"### Full ef/nprobe sweep", ""]
+            lines += ["### Full ef/nprobe sweep", ""]
             for comp_name, rows in sorted(data_by_comp.items()):
                 lines += [
                     f"<details><summary>{comp_name}</summary>",
@@ -259,6 +266,18 @@ def generate(result_dir: Path) -> str:
             lines += ["### Wins / ties / losses (Quiver vs field)", ""]
             lines.append(_wins_matrix(best_rows))
 
+            # Did-not-complete note: competitors that ran on another dataset but
+            # left no CSV here (an OOM/DNF), so absence is explained, not hidden.
+            if not is_smoke:
+                missing = sorted(all_comps - set(data_by_comp))
+                if missing:
+                    lines += [
+                        f"> **Did not complete on {ds_name.upper()}:** "
+                        f"{', '.join(missing)} — ran on another dataset but failed or "
+                        "ran out of memory here on this box (recorded honestly, never estimated).",
+                        "",
+                    ]
+
     # Reference-hardware callout
     lines += [
         "---",
@@ -272,19 +291,26 @@ def generate(result_dir: Path) -> str:
         "",
         "- **Absolute RSS.** Only the *isolated* systems are comparable: Quiver, Qdrant, Weaviate, and "
         "Milvus **server** report the DB process/container RSS. FAISS, LanceDB, and Chroma run "
-        "in-process, so their RSS includes the Python harness **and the resident 512 MB dataset** — "
-        "inflated, not directly comparable. This SIFT1M table is an **in-memory HNSW** comparison for "
-        "every system; Quiver's memory-frugality wedge is its **disk-resident DiskVamana path** "
-        "(holds only PQ codes in RAM), measured separately in "
-        "[`docs/benchmarks/results/disk-path.md`](./disk-path.md) — not this table.",
-        "- **Build time.** Quiver's build is the **REST-upload** path (1M points in batched POSTs); "
-        "competitors using in-process or bulk insert are faster. A bulk-ingest endpoint is a known "
-        "follow-up; it does not reflect engine speed.",
+        "in-process, so their RSS includes the Python harness **and the resident dataset** (~512 MB "
+        "for SIFT1M, ~3.7 GB for GIST1M) — inflated, not directly comparable. These are **in-memory "
+        "HNSW** comparisons for every system; Quiver's memory-frugality wedge is its **disk-resident "
+        "DiskVamana path** (holds only PQ codes in RAM), measured separately in "
+        "[`docs/benchmarks/results/disk-path.md`](./disk-path.md) — not these tables.",
+        "- **Build time.** As of v0.20.0 Quiver's build uses the **bulk-ingest** path "
+        "(`POST …/points:bulk`, ADR-0045): one WAL fsync per request and a single deferred index "
+        "pass, with the first query forcing the rebuild so the reported number is the honest "
+        "*time-until-queryable* (the same thing every competitor's build column measures). This "
+        "replaces the v0.18.0 REST-upload path (1M points in 500-point POSTs, each doing incremental "
+        "index maintenance) — compare the two `comparison-*` result sets for the improvement. "
+        "In-process libraries (FAISS) still build fastest because they skip the network and "
+        "serialization entirely.",
         "",
-        "Pending on dedicated, otherwise-idle reference hardware (runbook "
-        "[`§9`](../reference-hardware-runbook.md)): **GIST1M** (960-d), **Deep10M** (the disk-path "
-        "memory headline), and the official absolute-RSS table. Milvus is benchmarked as the **server** "
-        "(Docker), not the in-process Lite build, which is not performance-representative.",
+        "The **SIFT1M and GIST1M comparative standings above are dev-box but real** (R6 — identical "
+        "box, identical conditions). What stays pending on dedicated, otherwise-idle reference hardware "
+        "(runbook [`§9`](../reference-hardware-runbook.md)): the **official absolute-RSS table**, "
+        "**saturated multi-thread QPS** (QPS NT — these runs are single-thread), and **Deep10M** (the "
+        "disk-path memory headline). Milvus is benchmarked as the **server** (Docker), not the "
+        "in-process Lite build, which is not performance-representative.",
         "",
     ]
 
