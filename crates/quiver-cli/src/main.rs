@@ -173,9 +173,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve => {
-            quiver_server::init_tracing();
             let config = quiver_server::Config::load()?;
-            quiver_server::run(config).await?;
+            quiver_server::init_observability(&config);
+            let result = quiver_server::run(config).await;
+            // Flush any batched OTLP spans before exiting, even on error.
+            quiver_server::shutdown_observability();
+            result?;
         }
         Command::Tui { url, api_key } => {
             quiver_tui::run(quiver_tui::TuiOptions {

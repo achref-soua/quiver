@@ -40,6 +40,7 @@ async fn cockpit_reads_live_server_snapshot() {
         embedding: Default::default(),
         rerank: Default::default(),
         rate_limit: Default::default(),
+        otlp: Default::default(),
     };
     tokio::spawn(async move {
         let _ = serve(config, rest, grpc).await;

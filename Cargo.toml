@@ -116,6 +116,17 @@ tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# OpenTelemetry traces export (ADR-0059), opt-in behind quiver-server's `otlp`
+# feature and an endpoint at runtime — off by default. The OTLP/gRPC transport
+# reuses the tonic/prost already in the tree (no reqwest). cargo-deny verified
+# clean over the full opentelemetry tree even with the feature off.
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "grpc-tonic",
+    "trace",
+] }
+tracing-opentelemetry = "0.33"
 
 # Retro terminal cockpit (quiver-tui): ratatui renders; crossterm drives input
 # (its version is pinned to the one ratatui re-exports so they share a single
