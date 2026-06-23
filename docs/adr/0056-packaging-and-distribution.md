@@ -37,11 +37,27 @@ a live publish.
   `authors`, and `rust-version`. Internal deps already carry a `version`
   alongside `path`, so they rewrite cleanly to registry deps on publish.
 
-- **CLI crate name.** `quiver-cli` is squatted, so the CLI crate is published
-  under an available name (candidate **`quiverdb`**; the *binary* stays
-  `quiver`). The exact name is confirmed against the live registry at publish
-  time (owner action) — the workspace path/dep name `quiver-cli` is internal and
-  unaffected.
+- **crates.io naming (verified against the sparse index, 2026-06-23).** Two
+  `quiver-*` names are held by **unrelated** projects:
+  - `quiver-cli` — squatted (recorded since v0.12.0).
+  - `quiver-core` — an unrelated crate (`deiu25/quiver`, "Domain types and
+    traits for the quiver workspace", v0.1.3).
+
+  Every other library name (`quiver-crypto`, `quiver-simd`, `quiver-proto`,
+  `quiver-index`, `quiver-query`, `quiver-embed`, `quiver-import`, `quiver-mcp`,
+  `quiver-server`, `quiver-tui`) is **free**. Because `cargo install` resolves a
+  binary's whole dependency tree from the registry, the `quiver-core` collision
+  blocks the crates.io path for the *entire* workspace, not just one crate.
+
+  **Decision:** publish under the fully-free **`quiverdb-*`** namespace
+  (`quiverdb-core`, …, `quiverdb-server`) with the CLI as **`quiverdb`** (all
+  eleven verified free). Each renamed crate keeps `[lib] name = "quiver_*"` and a
+  `package = "quiverdb-*"` rename in its dependents, so there are **no Rust
+  source changes** and the *binary* stays `quiver`. The namespace rename is a
+  focused follow-up PR (it touches every `Cargo.toml` dependency key) and the
+  live publish is owner-gated; this ADR records the decision and the verified
+  table. The PyPI/npm SDK name (`quiver-client`) is **free on both** registries,
+  so those publish paths are unblocked today.
 
 - **Publish pipeline (`release.yml`).** Three tag-gated publish jobs run after
   the binary release, each **guarded by a repository secret** so a fork or a
@@ -77,9 +93,11 @@ a live publish.
   linting, so the pipeline cannot silently rot.
 - **−** The first live publish is a manual, owner-token, DAG-ordered step; the
   CI dry-runs verify metadata, not a real upload (stated plainly above).
-- **−** The published CLI name diverges from the internal crate name
-  (`quiverdb` vs `quiver-cli`); the binary name `quiver` is unchanged, so users
-  are unaffected.
+- **−** The published crate names diverge from the internal names
+  (`quiverdb-*` vs `quiver-*`) because `quiver-core`/`quiver-cli` are taken; each
+  crate keeps `[lib] name = "quiver_*"` and the binary stays `quiver`, so Rust
+  source and end users are unaffected. The crates.io publish is gated on that
+  namespace-rename follow-up PR; PyPI/npm are unblocked now.
 
 ## Implementation
 
