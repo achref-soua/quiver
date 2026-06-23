@@ -439,6 +439,70 @@ export class Client {
     }));
   }
 
+  /** Upsert a large (sync or async) iterable of points in server-friendly
+   * batches; resolves to the total upserted. `batch` must stay within the
+   * server's `max_batch_size` (ADR-0040, default 1000). `onProgress` is called
+   * with the running total after each batch (may be sync or async). Mirrors the
+   * Python `upsert_iter`. */
+  async upsertIter(
+    collection: string,
+    points: Iterable<Point> | AsyncIterable<Point>,
+    opts: { batch?: number; onProgress?: (total: number) => void | Promise<void> } = {},
+  ): Promise<number> {
+    const batch = opts.batch ?? 500;
+    let total = 0;
+    let chunk: Point[] = [];
+    const flush = async (): Promise<void> => {
+      if (chunk.length === 0) return;
+      total += await this.upsert(collection, chunk);
+      chunk = [];
+      if (opts.onProgress) await opts.onProgress(total);
+    };
+    // `for await` iterates sync and async iterables alike.
+    for await (const p of points as AsyncIterable<Point>) {
+      chunk.push(p);
+      if (chunk.length >= batch) await flush();
+    }
+    await flush();
+    return total;
+  }
+
+  /** Yield points page by page, for export / re-embedding. The REST fetch is
+   * limit-bounded without a server cursor, so this returns up to `batch` points
+   * in one page — pass a narrowing `filter` for large collections (a server-side
+   * scroll cursor is a follow-up). Mirrors the Python async `scroll`. */
+  async *scroll(
+    collection: string,
+    opts: { filter?: unknown; batch?: number; withPayload?: boolean; withVector?: boolean } = {},
+  ): AsyncGenerator<Match> {
+    const page = await this.fetch(collection, {
+      filter: opts.filter,
+      limit: opts.batch ?? 500,
+      withPayload: opts.withPayload ?? true,
+      withVector: opts.withVector ?? false,
+    });
+    for (const m of page) yield m;
+  }
+
+  /** Delete every point matching `filter`; resolves to the number deleted.
+   * Fetches matching ids (paged by `batch`) and deletes them until none remain —
+   * useful for GDPR erasure and re-indexing. Mirrors the Python `delete_by_filter`. */
+  async deleteByFilter(
+    collection: string,
+    filter: unknown,
+    opts: { batch?: number } = {},
+  ): Promise<number> {
+    const batch = opts.batch ?? 500;
+    let total = 0;
+    for (;;) {
+      const page = await this.fetch(collection, { filter, limit: batch, withPayload: false });
+      const ids = page.map((m) => m.id);
+      if (ids.length === 0) return total;
+      total += await this.deletePoints(collection, ids);
+      if (ids.length < batch) return total;
+    }
+  }
+
   /** Take a consistent online snapshot (backup) of the whole database into a
    * server-local directory, which must not already exist (ADR-0050); admin-only.
    * Resolves to the captured manifest version and the file/byte counts. */

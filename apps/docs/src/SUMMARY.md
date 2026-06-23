@@ -7,6 +7,7 @@
 - [Concepts](concepts.md)
 - [Quickstart](quickstart.md)
 - [Self-hosting & configuration](self-hosting.md)
+- [Kubernetes & Helm](kubernetes.md)
 
 # Guides
 

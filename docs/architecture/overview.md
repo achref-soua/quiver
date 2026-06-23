@@ -73,6 +73,7 @@ Both ship in one static binary; `quiver-server` is a thin network/policy shell o
 ## Cross-cutting concerns
 
 - **Security layers:** TLS/mTLS in transit (`quiver-crypto`/`rustls`); envelope encryption at rest (per-collection DEK wrapped by a master key, AEAD on segment pages); optional client-side payload encryption (opaque ciphertext to the server); API-key scopes + RBAC + tenant isolation; append-only audit log; crypto-shredding by DEK destruction. See [`../security/threat-model.md`](../security/threat-model.md) and [`../security/crypto.md`](../security/crypto.md).
+- **Concurrency:** single-writer, many-reader. The server guards the engine with a reader–writer lock (ADR-0057): searches take the shared lock and run **in parallel**, writes take the exclusive lock, and a read that finds a collection's index stale (a prior write deferred its rebuild) takes the write lock once to rebuild before serving concurrently again. Durability and the `kill -9` crash gate are unchanged; the fully lock-free arc-swap snapshot path is the staged successor.
 - **Observability:** OpenTelemetry-compatible `tracing` spans across server→query→index→core; Prometheus `/metrics`; structured logs; `/healthz` + `/readyz`.
 - **Configuration:** typed, validated config with secure defaults; secrets via env + KMS pattern (see ADR-0013).
 

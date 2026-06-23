@@ -353,7 +353,109 @@ func (c *Client) Fetch(ctx context.Context, collection string, opts *FetchOption
 	if opts.Filter != nil {
 		body["filter"] = opts.Filter
 	}
-	return c.matches(ctx, "/v1/collections/"+pathEscape(collection)+"/fetch", body)
+	// The fetch endpoint returns {"points": [...]} (not {"matches": [...]} like
+	// the ranked queries); each fetched point carries score 0.
+	var out struct {
+		Points []Match `json:"points"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v1/collections/"+pathEscape(collection)+"/fetch", body, &out); err != nil {
+		return nil, err
+	}
+	return out.Points, nil
+}
+
+// ScrollOptions configures Scroll.
+type ScrollOptions struct {
+	Batch       int            // page size, default 500
+	Filter      map[string]any // narrow the set (recommended for large collections)
+	WithPayload *bool          // default true
+	WithVector  bool
+}
+
+// UpsertBatch upserts a large slice of points in server-friendly batches (each no
+// larger than batch, which must stay within the server's max_batch_size — ADR-0040,
+// default 1000), returning the total upserted. It stops at the first error,
+// including a context cancellation observed between batches. batch <= 0 defaults
+// to 500. The Python upsert_iter / TypeScript upsertIter analogue.
+func (c *Client) UpsertBatch(ctx context.Context, collection string, points []Point, batch int) (uint64, error) {
+	if batch <= 0 {
+		batch = 500
+	}
+	var total uint64
+	for start := 0; start < len(points); start += batch {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		end := start + batch
+		if end > len(points) {
+			end = len(points)
+		}
+		n, err := c.Upsert(ctx, collection, points[start:end])
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// Scroll lists points page by page and calls fn for each, for export or
+// re-embedding. The REST fetch is limit-bounded without a server cursor, so this
+// returns up to opts.Batch points in one page; pass a narrowing Filter for large
+// collections (a server-side scroll cursor is a follow-up). fn returning a
+// non-nil error stops the scroll and that error is returned. Mirrors the Python
+// async scroll generator.
+func (c *Client) Scroll(ctx context.Context, collection string, opts *ScrollOptions, fn func(Match) error) error {
+	if opts == nil {
+		opts = &ScrollOptions{}
+	}
+	page, err := c.Fetch(ctx, collection, &FetchOptions{
+		Limit:       opts.Batch,
+		Filter:      opts.Filter,
+		WithPayload: opts.WithPayload,
+		WithVector:  opts.WithVector,
+	})
+	if err != nil {
+		return err
+	}
+	for _, m := range page {
+		if err := fn(m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DeleteByFilter deletes every point matching filter, returning the number
+// deleted. It fetches matching ids in pages of batch and deletes them until none
+// remain — useful for GDPR erasure and re-indexing. batch <= 0 defaults to 500.
+func (c *Client) DeleteByFilter(ctx context.Context, collection string, filter map[string]any, batch int) (uint64, error) {
+	if batch <= 0 {
+		batch = 500
+	}
+	noPayload := false
+	var total uint64
+	for {
+		page, err := c.Fetch(ctx, collection, &FetchOptions{Limit: batch, Filter: filter, WithPayload: &noPayload})
+		if err != nil {
+			return total, err
+		}
+		if len(page) == 0 {
+			return total, nil
+		}
+		ids := make([]string, len(page))
+		for i, m := range page {
+			ids[i] = m.ID
+		}
+		n, err := c.DeletePoints(ctx, collection, ids)
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if len(page) < batch {
+			return total, nil
+		}
+	}
 }
 
 // Snapshot takes a consistent online snapshot of the whole database into a
