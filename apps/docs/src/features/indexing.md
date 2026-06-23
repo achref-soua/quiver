@@ -48,7 +48,7 @@ the index and data, so host-independent:
 
 | `ef_search` | 16 | 32 | 64 | 128 | 256 |
 |---|---|---|---|---|---|
-| **recall@10** | 0.794 | 0.898 | 0.960 | 0.987 | 0.996 |
+| **recall@10** | 0.793 | 0.895 | 0.958 | 0.986 | 0.995 |
 
 Reproduce with `cargo run --release --example sift_recall`.
 

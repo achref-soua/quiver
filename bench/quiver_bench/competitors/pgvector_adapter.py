@@ -117,7 +117,12 @@ class PgvectorAdapter(CompetitorAdapter):
             rows = [(lo + j, vec.tolist()) for j, vec in enumerate(chunk)]
             execute_values(cur, f"INSERT INTO {TABLE} (id, vec) VALUES %s", rows)
 
-        # Build IVFFlat index
+        # Build IVFFlat index. pgvector's own docs recommend raising
+        # maintenance_work_mem for index builds (the kmeans step needs it to hold
+        # the sample); the pg16 default of 64 MB is too small for a 1M-row build
+        # (it errors with "memory required is N MB"). 2 GB is generous headroom
+        # for both SIFT1M (128-d) and GIST1M (960-d) — a fair config, not a handicap.
+        cur.execute("SET maintenance_work_mem = '2GB'")
         n_lists = min(int(n ** 0.5), 4096)
         idx_op = "vector_l2_ops" if metric == "l2" else "vector_cosine_ops"
         cur.execute(
