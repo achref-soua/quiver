@@ -85,8 +85,10 @@ hits, _ := c.HybridSearch(ctx, "items", &quiver.HybridOptions{QueryText: "hello"
 ```
 
 The Go client mirrors the same surface — `Search`, `HybridSearch`, `UpsertText` /
-`SearchText`, `Fetch`, and `Snapshot`. Non-2xx responses return a typed
-`*quiver.APIError`.
+`SearchText`, `Fetch`, and `Snapshot`, plus the bulk/maintenance helpers
+`UpsertBatch` (batched upload), `Scroll` (page through a collection via a
+callback), and `DeleteByFilter` (paged erasure). Every call takes a
+`context.Context`; non-2xx responses return a typed `*quiver.APIError`.
 
 ## Snapshots
 

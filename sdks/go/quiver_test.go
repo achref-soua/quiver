@@ -3,6 +3,7 @@ package quiver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -218,5 +219,117 @@ func TestWithPayloadFalseIsSent(t *testing.T) {
 	}
 	if rec.body["with_payload"] != false {
 		t.Fatalf("with_payload should be false: %v", rec.body)
+	}
+}
+
+func TestUpsertBatchSplitsIntoServerFriendlyBatches(t *testing.T) {
+	var sizes []int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Points []map[string]any `json:"points"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		sizes = append(sizes, len(body.Points))
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `{"upserted":`+itoa(len(body.Points))+`}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL)
+	pts := make([]Point, 7)
+	for i := range pts {
+		pts[i] = Point{ID: "p", Vector: []float32{float32(i)}}
+	}
+	total, err := c.UpsertBatch(context.Background(), "c", pts, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 7 {
+		t.Fatalf("total = %d", total)
+	}
+	if len(sizes) != 3 || sizes[0] != 3 || sizes[1] != 3 || sizes[2] != 1 {
+		t.Fatalf("batch sizes = %v, want [3 3 1]", sizes)
+	}
+}
+
+func TestScrollYieldsEachPointAndStopsOnError(t *testing.T) {
+	srv, rec := mock(t, 200, `{"points":[{"id":"a"},{"id":"b"},{"id":"c"}]}`)
+	c := New(srv.URL)
+
+	var got []string
+	if err := c.Scroll(context.Background(), "c", &ScrollOptions{Batch: 10}, func(m Match) error {
+		got = append(got, m.ID)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0] != "a" || got[2] != "c" {
+		t.Fatalf("ids = %v", got)
+	}
+	if rec.path != "/v1/collections/c/fetch" {
+		t.Fatalf("path = %s", rec.path)
+	}
+	if rec.body["limit"] != float64(10) {
+		t.Fatalf("limit = %v", rec.body["limit"])
+	}
+
+	// fn's error stops the scroll and propagates.
+	stop := fmt.Errorf("stop")
+	err := c.Scroll(context.Background(), "c", nil, func(m Match) error { return stop })
+	if err != stop {
+		t.Fatalf("err = %v, want stop", err)
+	}
+}
+
+func TestDeleteByFilterPagesUntilEmpty(t *testing.T) {
+	pages := []string{
+		`{"points":[{"id":"a"},{"id":"b"}]}`, // full page (batch=2) -> keep going
+		`{"points":[{"id":"c"}]}`,            // short page -> last
+	}
+	var fetches, deletes int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		if r.Method == http.MethodPost {
+			_, _ = io.WriteString(w, pages[fetches])
+			fetches++
+			return
+		}
+		// DELETE
+		var body struct {
+			IDs []string `json:"ids"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		deletes++
+		_, _ = io.WriteString(w, `{"deleted":`+itoa(len(body.IDs))+`}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL)
+	total, err := c.DeleteByFilter(context.Background(), "c", map[string]any{"eq": map[string]any{"field": "k", "value": "v"}}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 {
+		t.Fatalf("total = %d", total)
+	}
+	if fetches != 2 || deletes != 2 {
+		t.Fatalf("fetches=%d deletes=%d, want 2 and 2", fetches, deletes)
+	}
+}
+
+func itoa(n int) string { return fmt.Sprintf("%d", n) }
+
+func TestFetchParsesPointsEnvelope(t *testing.T) {
+	// Regression: the fetch endpoint returns {"points":...}, not {"matches":...}.
+	srv, _ := mock(t, 200, `{"points":[{"id":"a","payload":{"n":1}},{"id":"b"}]}`)
+	c := New(srv.URL)
+	got, err := c.Fetch(context.Background(), "c", &FetchOptions{Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "b" {
+		t.Fatalf("points = %v", got)
 	}
 }
