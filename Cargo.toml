@@ -15,7 +15,12 @@ edition = "2024"
 rust-version = "1.88"
 license = "AGPL-3.0-only"
 repository = "https://github.com/achref-soua/quiver"
+homepage = "https://github.com/achref-soua/quiver"
 authors = ["Achref Soua <achref.soua@outlook.com>"]
+# crates.io discovery metadata, inherited by every crate via `*.workspace = true`.
+# Categories are crates.io slugs; keywords are <=5 and <=20 chars each.
+keywords = ["vector-database", "embeddings", "search", "ann", "hnsw"]
+categories = ["database", "data-structures"]
 
 # Shared lint policy applied by every crate via `[lints] workspace = true`.
 # See ADR-0017 (error handling) and ADR-0009 (unsafe discipline).
