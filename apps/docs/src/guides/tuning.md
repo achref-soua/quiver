@@ -38,13 +38,13 @@ shows the shape.
 
 `ef_search` is the recall/latency dial. On **SIFT1M** (in-memory HNSW) Quiver's
 own curve — second only to FAISS on throughput at this recall bar
-([full comparison](https://github.com/achref-soua/quiver/blob/main/docs/benchmarks/results/comparison-v0.18.0/comparison-v0.18.0.md)):
+([full comparison](https://github.com/achref-soua/quiver/blob/main/docs/benchmarks/results/comparison-v0.20.0/comparison-v0.20.0.md)):
 
 | `ef_search` | 16 | 32 | 64 | 128 | 256 |
 |---|---|---|---|---|---|
-| recall@10 | 0.794 | 0.898 | 0.960 | 0.987 | 0.996 |
-| QPS (1T) | 1150 | 1032 | 870 | 673 | 508 |
-| p95 (ms) | 1.1 | 1.2 | 1.5 | 1.9 | 2.7 |
+| recall@10 | 0.793 | 0.895 | 0.958 | 0.986 | 0.995 |
+| QPS (1T) | 1539 | 1424 | 1222 | 955 | 701 |
+| p95 (ms) | 0.8 | 0.8 | 1.0 | 1.3 | 1.7 |
 
 For RAG, recall@10 ≈ 0.95–0.99 (here `ef_search` 64–256) is the usual sweet spot:
 the LLM tolerates a near-miss in the candidate set, and you save latency. Raise

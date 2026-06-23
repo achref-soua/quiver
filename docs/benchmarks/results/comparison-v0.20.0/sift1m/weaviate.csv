@@ -1,0 +1,6 @@
+competitor,dataset,param_name,param_value,build_s,index_disk_mb,rss_mb,recall_at_10,qps_1t,qps_nt,concurrency,p50_ms,p95_ms,p99_ms,recall_stdev,qps_stdev,config,notes,error
+weaviate,sift1m,ef_search,16,2308.9609141699984,,2172.928,0.9829,647.0,,1,1.528,1.794,2.105,0.0,11.7,{'metric': 'l2'},,
+weaviate,sift1m,ef_search,32,2308.9609141699984,,2225.152,0.9829,653.9,,1,1.509,1.758,2.159,0.0,11.7,{'metric': 'l2'},,
+weaviate,sift1m,ef_search,64,2308.9609141699984,,2217.984,0.9829,658.3,,1,1.506,1.748,2.115,0.0,5.6,{'metric': 'l2'},,
+weaviate,sift1m,ef_search,128,2308.9609141699984,,2217.984,0.9829,658.0,,1,1.503,1.747,2.201,0.0,8.3,{'metric': 'l2'},,
+weaviate,sift1m,ef_search,256,2308.9609141699984,,2217.984,0.9829,663.1,,1,1.497,1.702,1.973,0.0,4.6,{'metric': 'l2'},,

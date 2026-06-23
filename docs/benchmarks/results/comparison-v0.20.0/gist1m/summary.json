@@ -1,0 +1,117 @@
+[
+  {
+    "competitor": "quiver",
+    "dataset": "gist1m",
+    "param_name": "ef_search",
+    "param_value": 16,
+    "build_s": 2314.4477042539947,
+    "index_disk_mb": null,
+    "rss_mb": 10116.34765625,
+    "recall_at_10": 0.487,
+    "qps_1t": 717.8,
+    "qps_nt": null,
+    "concurrency": 1,
+    "p50_ms": 1.306,
+    "p95_ms": 1.936,
+    "p99_ms": 3.062,
+    "recall_stdev": 0.0,
+    "qps_stdev": 68.3,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "quiver",
+    "dataset": "gist1m",
+    "param_name": "ef_search",
+    "param_value": 32,
+    "build_s": 2314.4477042539947,
+    "index_disk_mb": null,
+    "rss_mb": 10116.66015625,
+    "recall_at_10": 0.6225,
+    "qps_1t": 667.0,
+    "qps_nt": null,
+    "concurrency": 1,
+    "p50_ms": 1.482,
+    "p95_ms": 1.776,
+    "p99_ms": 1.981,
+    "recall_stdev": 0.0,
+    "qps_stdev": 20.7,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "quiver",
+    "dataset": "gist1m",
+    "param_name": "ef_search",
+    "param_value": 64,
+    "build_s": 2314.4477042539947,
+    "index_disk_mb": null,
+    "rss_mb": 10116.66015625,
+    "recall_at_10": 0.7492,
+    "qps_1t": 514.8,
+    "qps_nt": null,
+    "concurrency": 1,
+    "p50_ms": 1.809,
+    "p95_ms": 2.132,
+    "p99_ms": 2.343,
+    "recall_stdev": 0.0,
+    "qps_stdev": 72.1,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "quiver",
+    "dataset": "gist1m",
+    "param_name": "ef_search",
+    "param_value": 128,
+    "build_s": 2314.4477042539947,
+    "index_disk_mb": null,
+    "rss_mb": 10116.66015625,
+    "recall_at_10": 0.8532,
+    "qps_1t": 402.5,
+    "qps_nt": null,
+    "concurrency": 1,
+    "p50_ms": 2.504,
+    "p95_ms": 2.968,
+    "p99_ms": 3.244,
+    "recall_stdev": 0.0,
+    "qps_stdev": 3.8,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  },
+  {
+    "competitor": "quiver",
+    "dataset": "gist1m",
+    "param_name": "ef_search",
+    "param_value": 256,
+    "build_s": 2314.4477042539947,
+    "index_disk_mb": null,
+    "rss_mb": 10116.66015625,
+    "recall_at_10": 0.923,
+    "qps_1t": 268.3,
+    "qps_nt": null,
+    "concurrency": 1,
+    "p50_ms": 3.8,
+    "p95_ms": 4.41,
+    "p99_ms": 4.83,
+    "recall_stdev": 0.0,
+    "qps_stdev": 2.8,
+    "config": {
+      "metric": "l2"
+    },
+    "notes": "",
+    "error": ""
+  }
+]
