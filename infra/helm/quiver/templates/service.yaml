@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "quiver.fullname" . }}
+  labels:
+    {{- include "quiver.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "quiver.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: rest
+      port: {{ .Values.service.restPort }}
+      targetPort: rest
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc

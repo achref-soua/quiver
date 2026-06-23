@@ -1,0 +1,85 @@
+# Default values for the Quiver server chart. Override with `--set` or `-f`.
+
+image:
+  # An image containing the `quiver` binary (built from infra/docker/Dockerfile).
+  # No image is published by the project yet — build and push your own, or point
+  # this at your registry. The binary is also available from the GitHub releases.
+  repository: ghcr.io/achref-soua/quiver
+  tag: "" # defaults to .Chart.appVersion when empty
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+replicaCount: 1 # Quiver is single-node; replicas share no state (see ADR-0030 for read replicas).
+nameOverride: ""
+fullnameOverride: ""
+
+# Encryption-at-rest (on by default). Provide the master key one of three ways:
+#   1. masterKey:        the chart creates a Secret holding it (simplest; keep it out of values).
+#   2. existingSecret:   reference a Secret you manage (name + key).
+#   3. insecure: true    DEV ONLY — disables at-rest encryption (QUIVER_INSECURE).
+encryption:
+  masterKey: ""
+  existingSecret: "" # name of a Secret containing the master key
+  existingSecretKey: "master.key"
+  insecure: false
+
+# API keys for authenticated access (QUIVER_API_KEYS, comma-separated). Stored in
+# the chart-managed Secret. Leave empty to manage keys out-of-band.
+apiKeys: ""
+
+service:
+  type: ClusterIP
+  restPort: 6333
+  grpcPort: 6334
+
+# Persistent volume for the data directory (QUIVER_DATA_DIR=/data).
+persistence:
+  enabled: true
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: 10Gi
+  # mountPath is fixed at /data (matches QUIVER_DATA_DIR below).
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: quiver.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+# Extra environment variables (e.g. QUIVER_MAX_K, QUIVER_RATE_LIMIT_*). Map of name: value.
+extraEnv: {}
+
+# The distroless `nonroot` user (uid/gid 65532). Read-only root FS; /data is the
+# only writable mount.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+serviceAccount:
+  create: true
+  name: ""
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

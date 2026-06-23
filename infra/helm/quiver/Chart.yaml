@@ -1,0 +1,19 @@
+apiVersion: v2
+name: quiver
+description: The security-first, memory-frugal vector database.
+type: application
+# Chart version — bump on chart changes (independent of the app version).
+version: 0.1.0
+# The Quiver release this chart defaults to (overridable via image.tag).
+appVersion: "0.20.1"
+home: https://github.com/achref-soua/quiver
+sources:
+  - https://github.com/achref-soua/quiver
+keywords:
+  - vector-database
+  - embeddings
+  - search
+  - ann
+maintainers:
+  - name: Achref Soua
+    email: achref.soua@outlook.com
