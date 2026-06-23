@@ -3,10 +3,14 @@
 //! API-key auth and secure-by-default configuration.
 //!
 //! Both transports are thin shells over the same shared engine operations; the
-//! engine is synchronous and CPU/`fsync`-bound, so every
-//! call is offloaded with `spawn_blocking` and serialized behind a single mutex
-//! (ADR-0002, single-writer per ADR-0006). The lock-free MVCC read path is
-//! Phase 2.
+//! engine is synchronous and CPU/`fsync`-bound, so every call is offloaded with
+//! `spawn_blocking`. Access is guarded by a reader–writer lock (ADR-0057): reads
+//! take the shared lock and run **concurrently**, writes take the exclusive lock,
+//! and the single-writer model is unchanged (ADR-0002/0006). A read that finds a
+//! collection's index stale (a prior write deferred its rebuild) takes the write
+//! lock once to rebuild via [`Database::ensure_indexed`], then serves concurrently
+//! again. The fully lock-free arc-swap snapshot path is the staged successor
+//! (ADR-0057, "Phased plan").
 //!
 //! Auth is by scoped API key (Bearer / gRPC `authorization` metadata) with
 //! default-deny RBAC: each key carries a role (read ⊆ write ⊆ admin) and a
@@ -40,7 +44,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use axum_server::tls_rustls::RustlsConfig;
 use figment::Figment;
@@ -502,7 +506,11 @@ fn warn_if_world_readable(_path: &std::path::Path) {}
 /// API keys with their RBAC scopes, and the audit log.
 #[derive(Clone)]
 pub(crate) struct AppState {
-    db: Arc<Mutex<Database>>,
+    // The engine behind a reader–writer lock (ADR-0057): reads take the shared
+    // lock and run concurrently; writes take the exclusive lock. A read that finds
+    // a collection's index stale upgrades to the write lock once to rebuild it,
+    // then serves concurrently again.
+    db: Arc<RwLock<Database>>,
     keys: Arc<Vec<ApiKey>>,
     audit: Arc<AuditLog>,
     // Fan-out of every committed op to replication followers (ADR-0030). The
@@ -619,7 +627,10 @@ impl AppState {
         self.rate_limiter.enabled()
     }
 
-    async fn run_blocking<T, F>(&self, f: F) -> Result<T, Error>
+    // Run a **mutating** engine op behind the exclusive write lock, off the async
+    // runtime (the engine is synchronous and CPU/IO-bound). The single writer is
+    // unchanged from the prior single-mutex model (ADR-0006/0057).
+    async fn write_blocking<T, F>(&self, f: F) -> Result<T, Error>
     where
         T: Send + 'static,
         F: FnOnce(&mut Database) -> quiver_embed::Result<T> + Send + 'static,
@@ -627,9 +638,64 @@ impl AppState {
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || -> Result<T, Error> {
             let mut guard = db
-                .lock()
+                .write()
                 .map_err(|_| Error::Internal("database lock poisoned".to_owned()))?;
             f(&mut guard).map_err(Error::Engine)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))?
+    }
+
+    // Run a **read-only** engine op behind the shared read lock — many of these run
+    // concurrently (ADR-0057). The closure gets `&Database`, so it can only call the
+    // `&self` reads (`*_snapshot`, `fetch`, accessors).
+    async fn read_blocking<T, F>(&self, f: F) -> Result<T, Error>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Database) -> quiver_embed::Result<T> + Send + 'static,
+    {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> Result<T, Error> {
+            let guard = db
+                .read()
+                .map_err(|_| Error::Internal("database lock poisoned".to_owned()))?;
+            f(&guard).map_err(Error::Engine)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))?
+    }
+
+    // Run a snapshot read for `collection` (ADR-0057). The hot path takes only the
+    // shared read lock, so concurrent searches run in parallel. If a prior write
+    // deferred this collection's index rebuild, the snapshot read returns
+    // [`quiver_embed::Error::IndexStale`]; we then take the exclusive lock once to
+    // rebuild and run the search while still holding it. `f` is `Fn` because it may
+    // be called twice (fresh attempt, then the post-rebuild retry); it never leaks
+    // `IndexStale` to the caller.
+    async fn search_blocking<T, F>(&self, collection: String, f: F) -> Result<T, Error>
+    where
+        T: Send + 'static,
+        F: Fn(&Database) -> quiver_embed::Result<T> + Send + 'static,
+    {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || -> Result<T, Error> {
+            {
+                let guard = db
+                    .read()
+                    .map_err(|_| Error::Internal("database lock poisoned".to_owned()))?;
+                match f(&guard) {
+                    Err(quiver_embed::Error::IndexStale) => {}
+                    result => return result.map_err(Error::Engine),
+                }
+            }
+            // Cold path: rebuild the deferred index under the exclusive lock, then
+            // search while still holding it (no window for another writer to
+            // re-stale it between the rebuild and the read).
+            let mut guard = db
+                .write()
+                .map_err(|_| Error::Internal("database lock poisoned".to_owned()))?;
+            guard.ensure_indexed(&collection).map_err(Error::Engine)?;
+            f(&guard).map_err(Error::Engine)
         })
         .await
         .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))?
@@ -674,7 +740,7 @@ impl AppState {
     ) -> Result<(Vec<WalOp>, broadcast::Receiver<WalEntry>), Error> {
         self.authorize_global(principal, Action::Admin, "replicate")?;
         let tx = self.replication_tx.clone();
-        self.run_blocking(move |db| {
+        self.read_blocking(move |db| {
             let rx = tx.subscribe();
             let snapshot = db.replication_snapshot()?;
             Ok((snapshot, rx))
@@ -686,7 +752,7 @@ impl AppState {
     /// follower stream — deliberately NOT gated by `read_only`, which only refuses
     /// *external* client writes.
     pub(crate) async fn apply_replicated(&self, op: WalOp) -> Result<(), Error> {
-        self.run_blocking(move |db| db.apply_replicated(op)).await
+        self.write_blocking(move |db| db.apply_replicated(op)).await
     }
 
     // Refuse a mutating operation on a read-only replication follower (ADR-0030);
@@ -722,7 +788,7 @@ impl AppState {
             .with_vector_encryption(vector_encryption);
         let owned = name.clone();
         let result = self
-            .run_blocking(move |db| db.create_collection(&owned, descriptor))
+            .write_blocking(move |db| db.create_collection(&owned, descriptor))
             .await;
         self.audit.record(
             principal.actor(),
@@ -749,7 +815,7 @@ impl AppState {
         name: String,
     ) -> Result<CollectionInfo, Error> {
         self.authorize(principal, Action::Read, "get_collection", &name)?;
-        self.run_blocking(move |db| {
+        self.read_blocking(move |db| {
             let descriptor = db
                 .descriptor(&name)
                 .cloned()
@@ -781,7 +847,7 @@ impl AppState {
     ) -> Result<Vec<CollectionInfo>, Error> {
         self.authorize_global(principal, Action::Read, "list_collections")?;
         let mut infos = self
-            .run_blocking(|db| {
+            .read_blocking(|db| {
                 let mut out = Vec::new();
                 for name in db.collection_names() {
                     if let Some(descriptor) = db.descriptor(&name).cloned() {
@@ -818,7 +884,9 @@ impl AppState {
         self.ensure_writable("delete_collection")?;
         self.authorize(principal, Action::Admin, "delete_collection", &name)?;
         let resource = name.clone();
-        let result = self.run_blocking(move |db| db.drop_collection(&name)).await;
+        let result = self
+            .write_blocking(move |db| db.drop_collection(&name))
+            .await;
         self.audit.record(
             principal.actor(),
             "delete_collection",
@@ -844,7 +912,7 @@ impl AppState {
         }
         let resource = collection.clone();
         let result = self
-            .run_blocking(move |db| {
+            .write_blocking(move |db| {
                 let records: Vec<(&str, &[f32], &serde_json::Value)> = points
                     .iter()
                     .map(|p| (p.id.as_str(), p.vector.as_slice(), &p.payload))
@@ -874,7 +942,7 @@ impl AppState {
         }
         let resource = collection.clone();
         let result = self
-            .run_blocking(move |db| {
+            .write_blocking(move |db| {
                 let records: Vec<(&str, &[f32], &serde_json::Value)> = points
                     .iter()
                     .map(|p| (p.id.as_str(), p.vector.as_slice(), &p.payload))
@@ -903,7 +971,7 @@ impl AppState {
         self.ensure_writable("snapshot")?;
         self.authorize_global(principal, Action::Admin, "snapshot")?;
         let dest = std::path::PathBuf::from(&destination);
-        let result = self.run_blocking(move |db| db.snapshot(&dest)).await;
+        let result = self.write_blocking(move |db| db.snapshot(&dest)).await;
         self.audit.record(
             principal.actor(),
             "snapshot",
@@ -923,7 +991,7 @@ impl AppState {
         self.authorize(principal, Action::Write, "delete_points", &collection)?;
         let resource = collection.clone();
         let result = self
-            .run_blocking(move |db| {
+            .write_blocking(move |db| {
                 let mut count = 0u64;
                 for id in &ids {
                     if db.delete(&collection, id)? {
@@ -950,7 +1018,7 @@ impl AppState {
         with_vector: bool,
     ) -> Result<Vec<PointOut>, Error> {
         self.authorize(principal, Action::Read, "get_points", &collection)?;
-        self.run_blocking(move |db| {
+        self.read_blocking(move |db| {
             let mut out = Vec::new();
             for id in &ids {
                 if let Some(m) = db.get(&collection, id)? {
@@ -982,15 +1050,16 @@ impl AppState {
         self.authorize(principal, Action::Read, "search", &collection)?;
         self.limits.check_search(k, ef_search)?;
         self.limits.check_vector_len(vector.len())?;
-        self.run_blocking(move |db| {
-            let params = SearchParams {
-                k,
-                filter,
-                ef_search,
-                with_payload,
-                with_vector,
-            };
-            let matches = db.search(&collection, &vector, &params)?;
+        let params = SearchParams {
+            k,
+            filter,
+            ef_search,
+            with_payload,
+            with_vector,
+        };
+        let coll = collection.clone();
+        self.search_blocking(coll, move |db| {
+            let matches = db.search_snapshot(&collection, &vector, &params)?;
             Ok(matches
                 .into_iter()
                 .map(|m| MatchOut {
@@ -1034,16 +1103,17 @@ impl AppState {
                 )));
             }
         }
-        self.run_blocking(move |db| {
-            let params = SearchParams {
-                k,
-                filter,
-                ef_search,
-                with_payload,
-                with_vector,
-            };
-            let sv = sparse.map(|(indices, values)| SparseVector { indices, values });
-            let matches = db.hybrid_search(
+        let params = SearchParams {
+            k,
+            filter,
+            ef_search,
+            with_payload,
+            with_vector,
+        };
+        let sv = sparse.map(|(indices, values)| SparseVector { indices, values });
+        let coll = collection.clone();
+        self.search_blocking(coll, move |db| {
+            let matches = db.hybrid_search_snapshot(
                 &collection,
                 dense.as_deref(),
                 sv.as_ref(),
@@ -1233,7 +1303,7 @@ impl AppState {
     ) -> Result<Vec<MatchOut>, Error> {
         self.authorize(principal, Action::Read, "fetch", &collection)?;
         self.limits.check_fetch(limit)?;
-        self.run_blocking(move |db| {
+        self.read_blocking(move |db| {
             let matches = db.fetch(
                 &collection,
                 filter.as_ref(),
@@ -1271,7 +1341,7 @@ impl AppState {
         }
         let resource = collection.clone();
         let result = self
-            .run_blocking(move |db| {
+            .write_blocking(move |db| {
                 let mut count = 0u64;
                 for doc in &documents {
                     db.upsert_document(&collection, &doc.id, &doc.vectors, &doc.payload)?;
@@ -1299,7 +1369,7 @@ impl AppState {
         self.authorize(principal, Action::Write, "delete_documents", &collection)?;
         let resource = collection.clone();
         let result = self
-            .run_blocking(move |db| {
+            .write_blocking(move |db| {
                 let mut count = 0u64;
                 for id in &ids {
                     if db.delete_document(&collection, id)? {
@@ -1335,15 +1405,16 @@ impl AppState {
         for token in &query {
             self.limits.check_vector_len(token.len())?;
         }
-        self.run_blocking(move |db| {
-            let params = SearchParams {
-                k,
-                filter,
-                ef_search,
-                with_payload,
-                with_vector,
-            };
-            let matches = db.search_multi_vector(&collection, &query, &params)?;
+        let params = SearchParams {
+            k,
+            filter,
+            ef_search,
+            with_payload,
+            with_vector,
+        };
+        let coll = collection.clone();
+        self.search_blocking(coll, move |db| {
+            let matches = db.search_multi_vector_snapshot(&collection, &query, &params)?;
             Ok(matches
                 .into_iter()
                 .map(|m| DocumentMatchOut {
@@ -1407,7 +1478,7 @@ pub async fn serve(
         .map_err(|e| Error::Config(e.to_string()))?;
 
     let state = AppState {
-        db: Arc::new(Mutex::new(db)),
+        db: Arc::new(RwLock::new(db)),
         keys: Arc::new(config.api_keys.clone()),
         audit,
         replication_tx,

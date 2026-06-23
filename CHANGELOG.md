@@ -16,6 +16,15 @@ for the per-release rationale and Definitions of Done.
   publish metadata, secret-gated crates.io / PyPI / npm publish jobs, and a Helm
   chart + Kubernetes manifests under `infra/`.
 
+### Changed
+
+- Concurrent reads (ADR-0057): the server serves searches behind a reader–writer
+  lock instead of a single mutex, so reads run in parallel. The engine gains
+  `&self` `search_snapshot` / `hybrid_search_snapshot` /
+  `search_multi_vector_snapshot` reads and `ensure_indexed`; the single-writer
+  model, durability, and crash gate are unchanged. Fully lock-free arc-swap
+  snapshots are the staged successor.
+
 ## [0.20.1] — 2026-06-23
 
 ### Changed
