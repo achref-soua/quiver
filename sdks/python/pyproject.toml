@@ -1,6 +1,6 @@
 [project]
 name = "quiver-client"
-version = "0.20.1"
+version = "0.21.0"
 description = "Python client for Quiver, the security-first vector database."
 readme = "README.md"
 requires-python = ">=3.10"
