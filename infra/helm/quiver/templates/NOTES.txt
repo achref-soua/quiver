@@ -1,0 +1,20 @@
+Quiver is deployed as {{ include "quiver.fullname" . }}.
+
+REST  : port {{ .Values.service.restPort }}
+gRPC  : port {{ .Values.service.grpcPort }}
+
+Reach it from inside the cluster:
+
+  kubectl port-forward svc/{{ include "quiver.fullname" . }} {{ .Values.service.restPort }}:{{ .Values.service.restPort }}
+  curl http://127.0.0.1:{{ .Values.service.restPort }}/metrics
+
+{{- if .Values.encryption.insecure }}
+
+WARNING: encryption.insecure=true — encryption-at-rest is DISABLED. Use only for
+local/dev clusters.
+{{- end }}
+{{- if not .Values.persistence.enabled }}
+
+WARNING: persistence.enabled=false — data lives in an emptyDir and is lost when
+the pod is rescheduled.
+{{- end }}

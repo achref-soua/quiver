@@ -90,3 +90,16 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
           npm pack --dry-run
+
+  helm:
+    name: helm lint + template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Helm lint
+        run: helm lint infra/helm/quiver --set encryption.masterKey="$(openssl rand -hex 32)"
+      - name: Helm template (with key)
+        run: helm template q infra/helm/quiver --set encryption.masterKey="$(openssl rand -hex 32)" > /dev/null
+      - name: Helm template (insecure)
+        run: helm template q infra/helm/quiver --set encryption.insecure=true > /dev/null
