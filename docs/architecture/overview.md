@@ -25,6 +25,7 @@ The core (storage, indexes, kernels, query planner, on-disk format, wire protoco
 | `quiver-query` | Query planner; hybrid filtered search (vector + metadata predicate + optional BM25); top-k merge & re-rank | — |
 | `quiver-proto` | Wire types: gRPC service (`tonic`/`prost`), REST DTOs, OpenAPI generation | `tonic`, `prost`, `serde` |
 | `quiver-embed` | Embeddable in-process database handle — the clean Rust API over core+index+query+crypto | — |
+| `quiver-providers` | Edge embedding/rerank adapters (OpenAI-compatible/Cohere/fake) shared by the network and MCP servers (ADR-0047/0058) | `ureq`, `figment` |
 | `quiver-server` | The daemon: `axum` REST + `tonic` gRPC, auth, RBAC, audit, query cost limits (ADR-0040), config, observability | `axum`, `tonic`, `tokio`, `tracing` |
 | `quiver-tui` | The `ratatui` cockpit (API client; works local or remote) | `ratatui`, `crossterm` |
 | `quiver-mcp` | MCP server exposing Quiver as agent tools | MCP SDK / `rmcp` |
@@ -44,11 +45,15 @@ flowchart TD
   query --> core
   embed[quiver-embed] --> query
   embed --> crypto
+  providers[quiver-providers]
   server[quiver-server] --> embed
   server --> proto
   server --> crypto
+  server --> providers
   tui[quiver-tui] --> proto
-  mcp[quiver-mcp] --> proto
+  mcp[quiver-mcp] --> embed
+  mcp --> crypto
+  mcp --> providers
   cli[quiver-cli] --> server
   cli --> tui
   cli --> mcp

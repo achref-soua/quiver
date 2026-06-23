@@ -83,8 +83,10 @@ const hits = await client.searchText("docs", "what is quiver?", { k: 5, rerank: 
 ```
 
 Reachable on **every surface**: REST (`POST …/points:text`, `POST …/query/text`),
-gRPC (`UpsertText` / `SearchText`), and the Python (sync + async) and TypeScript
-SDKs (`upsert_text` / `search_text`, `upsertText` / `searchText`). The
+gRPC (`UpsertText` / `SearchText`), the Python (sync + async) and TypeScript SDKs
+(`upsert_text` / `search_text`, `upsertText` / `searchText`), and the
+[MCP server](../api/mcp.md) (`upsert_text` / `search_text` tools — run
+`quiver mcp --config quiver.toml` so the provider tables are loaded). The
 sparse-term cost limit (`QUIVER_MAX_SPARSE_TERMS`) bounds the tokenized query.
 
 ## When to use which

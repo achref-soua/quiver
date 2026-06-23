@@ -16,6 +16,7 @@ quiver-core = { workspace = true }
 quiver-crypto = { workspace = true }
 quiver-embed = { workspace = true }
 quiver-proto = { workspace = true }
+quiver-providers = { workspace = true }
 quiver-query = { workspace = true }
 
 axum = { workspace = true }
@@ -32,7 +33,6 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-ureq = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

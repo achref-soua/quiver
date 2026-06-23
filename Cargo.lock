@@ -2330,6 +2330,7 @@ dependencies = [
  "anyhow",
  "quiver-crypto",
  "quiver-embed",
+ "quiver-providers",
  "serde",
  "serde_json",
  "tempfile",
@@ -2346,6 +2347,18 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "quiver-providers"
+version = "0.21.0"
+dependencies = [
+ "figment",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "ureq",
 ]
 
 [[package]]
@@ -2368,6 +2381,7 @@ dependencies = [
  "quiver-crypto",
  "quiver-embed",
  "quiver-proto",
+ "quiver-providers",
  "quiver-query",
  "rcgen",
  "reqwest",
@@ -2384,7 +2398,6 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
- "ureq",
 ]
 
 [[package]]

@@ -10,6 +10,22 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Added
+
+- MCP text tools (ADR-0058): `upsert_text` and `search_text` over the MCP server,
+  so an AI agent can store and search documents by text — Quiver embeds them
+  server-side — without running an embedding model itself. Configured with
+  `quiver mcp --config <quiver.toml>` (`[embedding.<collection>]` /
+  `[rerank.<collection>]` tables, the same surface as `quiver serve`); `search_text`
+  optionally reranks. This brings the MCP surface to full provider parity with
+  REST, gRPC, and the SDKs.
+
+### Changed
+
+- The embedding/rerank provider seam moved from `quiver-server` into a new lean
+  `quiver-providers` crate (ADR-0058) shared by the network and MCP servers; the
+  server re-exports the types, so its public API is unchanged.
+
 ## [0.21.0] — 2026-06-23
 
 ### Added

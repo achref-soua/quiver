@@ -1,6 +1,6 @@
 [package]
-name = "quiver-mcp"
-description = "An MCP server exposing Quiver's capabilities as agent tools."
+name = "quiver-providers"
+description = "Opt-in, provider-agnostic embedding & rerank adapters shared by the Quiver server and MCP server (ADR-0047/0058)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,15 +12,11 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-quiver-crypto = { workspace = true }
-quiver-embed = { workspace = true }
-quiver-providers = { workspace = true }
-
-anyhow = { workspace = true }
+figment = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
+ureq = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
