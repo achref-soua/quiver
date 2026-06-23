@@ -132,3 +132,79 @@ jobs:
             dist/quiver-windows-x86_64.exe.sha256
             docs/assets/icon/quiver-256.png
             quiver.spdx.json
+
+  # ---------------------------------------------------------------------------
+  # Package-registry publish jobs (ADR-0056). Each is OFF by default and only
+  # runs when the owner sets the matching repository *variable* (the explicit
+  # opt-in) AND provides the matching *secret* (the token). Variables are
+  # readable in `if:`; secrets are passed through `env:` and never interpolated
+  # into a shell. A normal tag push with none of these set publishes only the
+  # GitHub-release binaries above, so the release stays green.
+  # ---------------------------------------------------------------------------
+
+  publish-crates:
+    name: publish crates.io
+    needs: release
+    # crates.io publish in dependency-DAG order. REQUIRES the quiverdb-* namespace
+    # rename first (ADR-0056): `quiver-core` and `quiver-cli` are held by unrelated
+    # crates, so the package names below must be the renamed names before this can
+    # succeed. The rename follow-up PR updates this list. Enable with
+    # `vars.PUBLISH_CRATES=true` + `secrets.CARGO_REGISTRY_TOKEN`.
+    if: ${{ vars.PUBLISH_CRATES == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo publish (topological order)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          for crate in quiver-core quiver-simd quiver-proto quiver-query \
+                       quiver-tui quiver-crypto quiver-index quiver-embed \
+                       quiver-import quiver-mcp quiver-server quiver-cli; do
+            echo "::group::publish ${crate}"
+            cargo publish -p "${crate}"
+            echo "::endgroup::"
+          done
+
+  publish-pypi:
+    name: publish PyPI
+    needs: release
+    # quiver-client is free on PyPI (verified) — ready once the token is set.
+    # Enable with `vars.PUBLISH_PYPI=true` + `secrets.PYPI_API_TOKEN`.
+    if: ${{ vars.PUBLISH_PYPI == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build + publish the Python SDK
+        working-directory: sdks/python
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          uv build
+          uvx twine check dist/*
+          uv publish
+
+  publish-npm:
+    name: publish npm
+    needs: release
+    # quiver-client is free on npm (verified) — ready once the token is set.
+    # Enable with `vars.PUBLISH_NPM=true` + `secrets.NPM_TOKEN`.
+    if: ${{ vars.PUBLISH_NPM == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - name: Build + publish the TypeScript SDK
+        working-directory: sdks/typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          npm publish --access public

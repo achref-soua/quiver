@@ -3,6 +3,15 @@
   "version": "0.20.1",
   "description": "TypeScript client for Quiver — a security-first, memory-frugal vector database.",
   "license": "AGPL-3.0-only",
+  "author": "Achref Soua <achref.soua@outlook.com>",
+  "homepage": "https://github.com/achref-soua/quiver",
+  "keywords": [
+    "vector-database",
+    "embeddings",
+    "search",
+    "ann",
+    "quiver"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

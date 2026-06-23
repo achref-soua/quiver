@@ -55,3 +55,36 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  package:
+    name: package (publishability)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # `--no-verify` skips the registry verification build (a dependent crate's
+      # deps are not on crates.io yet — the chicken-and-egg the first publish
+      # resolves), so this checks the crate metadata and that every crate packages
+      # cleanly. It fails the moment a crate loses `description`/`license`/… (ADR-0056).
+      - name: cargo package (metadata + tarball)
+        run: cargo package --workspace --no-verify
+
+      - uses: astral-sh/setup-uv@v5
+      - name: Build + check the Python SDK distribution
+        working-directory: sdks/python
+        run: |
+          uv build
+          uvx twine check dist/*
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build + dry-run pack the TypeScript SDK
+        working-directory: sdks/typescript
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          npm pack --dry-run
