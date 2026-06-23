@@ -79,5 +79,6 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0057](0057-concurrent-reads-rwlock.md) | Concurrent reads behind a reader–writer lock + `&self` snapshot reads (staged path to lock-free arc-swap) | Accepted | 4 |
 | [0058](0058-mcp-text-tools-and-provider-crate.md) | MCP `upsert_text`/`search_text` tools + extract the embedding/rerank seam into the shared `quiver-providers` crate | Accepted | 4 |
 | [0059](0059-otlp-traces-exporter.md) | OpenTelemetry traces exporter — opt-in `otlp` cargo feature + runtime endpoint gate (OTLP/gRPC, reuses tonic) | Accepted | 4 |
+| [0060](0060-interactive-tui-cockpit.md) | Interactive TUI cockpit — query runner, point inspector, recent searches, help overlay, theme toggle; pure table-tested key handler | Accepted | 4 |
 
 Phase-0 ADRs (0001–0018) are Accepted; Phase-2 decisions span 0019–0022; Phase-4 decisions begin at 0023. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.
