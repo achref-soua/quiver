@@ -43,8 +43,7 @@ struct Palette {
 
 /// The warm **Bronze Quiver** brand (ADR-0036) — the default. Its fields are the
 /// brand consts above, so the default thread renders byte-for-byte as before.
-/// A `static` (not `const`) so it has a stable address for `ptr::eq` identity.
-static BRONZE: Palette = Palette {
+const BRONZE: Palette = Palette {
     chrome: CHROME,
     text: TEXT,
     dim: DIM,
@@ -56,7 +55,7 @@ static BRONZE: Palette = Palette {
 /// A cool **Slate** alternate — steel chrome, ice body, slate labels, cyan
 /// accent — for high-contrast / cool-light preference. Background and the raw
 /// arrowhead facets stay oak+verdigris; this recolours the chrome/text surface.
-static SLATE: Palette = Palette {
+const SLATE: Palette = Palette {
     chrome: Color::Rgb(0x9F, 0xB3, 0xC8),
     text: Color::Rgb(0xE6, 0xED, 0xF3),
     dim: Color::Rgb(0x5B, 0x6B, 0x7E),
@@ -65,36 +64,58 @@ static SLATE: Palette = Palette {
     ok: Color::Rgb(0x7E, 0xC8, 0x99),
 };
 
+/// Which palette is active. A plain discriminant — selection is a `match`, not a
+/// pointer-identity comparison, so the palettes stay `const` with no address
+/// footgun (ADR-0060).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Theme {
+    Bronze,
+    Slate,
+}
+
+impl Theme {
+    fn palette(self) -> &'static Palette {
+        match self {
+            Theme::Bronze => &BRONZE,
+            Theme::Slate => &SLATE,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Theme::Bronze => "bronze",
+            Theme::Slate => "slate",
+        }
+    }
+
+    fn next(self) -> Theme {
+        match self {
+            Theme::Bronze => Theme::Slate,
+            Theme::Slate => Theme::Bronze,
+        }
+    }
+}
+
 thread_local! {
-    // ponytail: thread-local active palette — the cockpit renders on one thread,
+    // ponytail: thread-local active theme — the cockpit renders on one thread,
     // so this avoids threading a palette param through ~30 render call sites.
     // Thread a param instead if the renderer ever goes multi-threaded.
-    static ACTIVE: Cell<&'static Palette> = const { Cell::new(&BRONZE) };
+    static ACTIVE: Cell<Theme> = const { Cell::new(Theme::Bronze) };
 }
 
 fn active() -> &'static Palette {
-    ACTIVE.with(Cell::get)
+    ACTIVE.with(Cell::get).palette()
 }
 
 /// Toggle the active palette between Bronze and Slate (the `Ctrl-t` action).
 pub fn cycle() {
-    ACTIVE.with(|a| {
-        a.set(if std::ptr::eq(a.get(), &BRONZE) {
-            &SLATE
-        } else {
-            &BRONZE
-        })
-    });
+    ACTIVE.with(|a| a.set(a.get().next()));
 }
 
 /// The active palette's name, for the status line.
 #[must_use]
 pub fn name() -> &'static str {
-    if std::ptr::eq(active(), &BRONZE) {
-        "bronze"
-    } else {
-        "slate"
-    }
+    ACTIVE.with(Cell::get).label()
 }
 
 /// Bright chrome headings, the logo wordmark.
