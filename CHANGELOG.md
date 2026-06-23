@@ -18,6 +18,9 @@ for the per-release rationale and Definitions of Done.
 - TypeScript SDK parity with the Python async client: `upsertIter` (batches a
   sync or async iterable), `scroll` (an async generator for export / re-embedding),
   and `deleteByFilter` (paged erasure).
+- Go SDK bulk/maintenance helpers: `UpsertBatch` (batched upload), `Scroll` (page
+  through a collection via a callback), and `DeleteByFilter` (paged erasure) — all
+  context-aware, standard-library only.
 
 ### Changed
 
@@ -27,6 +30,12 @@ for the per-release rationale and Definitions of Done.
   `search_multi_vector_snapshot` reads and `ensure_indexed`; the single-writer
   model, durability, and crash gate are unchanged. Fully lock-free arc-swap
   snapshots are the staged successor.
+
+### Fixed
+
+- Go SDK `Fetch` parsed the wrong response envelope (`matches` instead of the
+  `points` the fetch endpoint returns), so it never returned points; now fixed,
+  with a regression test.
 
 ## [0.20.1] — 2026-06-23
 
