@@ -13,7 +13,7 @@ model-agnostic and just stores the vectors you give it.
 
 ```bash
 # 1. Start a local server (insecure mode is dev-only)
-QUIVER_INSECURE=true QUIVER_API_KEYS=dev cargo run --release -p quiver-cli -- serve &
+QUIVER_INSECURE=true QUIVER_API_KEYS=dev cargo run --release -p quiverdb-cli -- serve &
 
 # 2. Install the SDK and run the script
 pip install ./sdks/python

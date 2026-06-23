@@ -1,5 +1,5 @@
 [package]
-name = "quiver-proto"
+name = "quiverdb-proto"
 description = "Wire types for Quiver: the gRPC service contract and generated code."
 version.workspace = true
 edition.workspace = true
@@ -22,3 +22,6 @@ protoc-bin-vendored = { workspace = true }
 
 [lints]
 workspace = true
+
+[lib]
+name = "quiver_proto"

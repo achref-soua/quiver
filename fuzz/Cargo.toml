@@ -16,8 +16,8 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 serde_json = "1"
 tempfile = "3"
-quiver-core = { path = "../crates/quiver-core" }
-quiver-query = { path = "../crates/quiver-query" }
+quiver-core = { path = "../crates/quiver-core", package = "quiverdb-core" }
+quiver-query = { path = "../crates/quiver-query", package = "quiverdb-query" }
 
 [[bin]]
 name = "filter_json"

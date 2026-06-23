@@ -50,7 +50,7 @@ the feature compiled in, export stays off until an endpoint is configured.
 
 ```bash
 # Build with the exporter compiled in.
-cargo build -p quiver-cli --release --features otlp
+cargo build -p quiverdb-cli --release --features otlp
 
 # Enable it at runtime (OTLP/gRPC, default collector port 4317).
 QUIVER_OTLP_ENDPOINT=http://localhost:4317 \

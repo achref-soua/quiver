@@ -17,7 +17,7 @@ Start a server, then run the synthetic smoke set (a small random dataset with
 exact ground truth — it validates the harness, not performance):
 
 ```bash
-QUIVER_INSECURE=true cargo run -p quiver-cli -- serve &      # dev only
+QUIVER_INSECURE=true cargo run -p quiverdb-cli -- serve &      # dev only
 uv run --project bench python -m quiver_bench.run --synthetic
 ```
 

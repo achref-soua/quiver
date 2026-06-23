@@ -25,7 +25,7 @@ fi
 DATA_DIR="$(mktemp -d /tmp/quiver-bench-gist-all7.XXXXXX)"
 LOG=/tmp/gist1m_all7.log
 : > "$LOG"
-cargo build --release -p quiver-cli >>"$LOG" 2>&1 || { echo "BUILD FAILED" | tee -a "$LOG"; exit 1; }
+cargo build --release -p quiverdb-cli >>"$LOG" 2>&1 || { echo "BUILD FAILED" | tee -a "$LOG"; exit 1; }
 QUIVER_REST_ADDR=127.0.0.1:7333 QUIVER_GRPC_ADDR=127.0.0.1:7334 \
 QUIVER_INSECURE=true QUIVER_API_KEYS=bench-key QUIVER_DATA_DIR="$DATA_DIR" \
   target/release/quiver serve >>"$LOG" 2>&1 &

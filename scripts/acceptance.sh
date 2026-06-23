@@ -45,7 +45,7 @@ fail() { red "FAIL: $*"; exit 1; }
 pass() { grn "  ok: $*"; }
 
 hdr "build"
-cargo build -q -p quiver-cli
+cargo build -q -p quiverdb-cli
 
 hdr "boot encrypted server on ${REST_ADDR}"
 QUIVER_ENCRYPTION_KEY="$ENC_KEY" \

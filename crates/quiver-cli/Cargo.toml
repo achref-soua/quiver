@@ -1,5 +1,5 @@
 [package]
-name = "quiver-cli"
+name = "quiverdb-cli"
 description = "Quiver command-line interface and single-binary entrypoint."
 version.workspace = true
 edition.workspace = true

@@ -63,11 +63,11 @@ verify: lint test doc deny audit
 
 # Run the server.
 run *ARGS:
-    cargo run -p quiver-cli -- serve {{ ARGS }}
+    cargo run -p quiverdb-cli -- serve {{ ARGS }}
 
 # Launch the terminal cockpit.
 tui:
-    cargo run -p quiver-cli -- tui
+    cargo run -p quiverdb-cli -- tui
 
 # One-command demo: build, start an encrypted server, seed a collection, and
 # print how to open the cockpit (Ctrl-C to stop). Requires uv, curl, openssl.
@@ -135,7 +135,7 @@ release-local TAG:
       if ! rustup target list --installed | grep -qx "$target"; then
         echo "  skip $asset — rust target $target not installed"; return; fi
       echo "  building $asset ($target)…"
-      if ! cargo build --release -p quiver-cli --target "$target" >/dev/null 2>&1; then
+      if ! cargo build --release -p quiverdb-cli --target "$target" >/dev/null 2>&1; then
         echo "  skip $asset — build failed (missing linker/toolchain for $target)"; return; fi
       cp "target/$target/release/$bin" "$dist/$asset"
       ( cd "$dist" && sha256sum "$asset" > "$asset.sha256" )

@@ -300,7 +300,7 @@ version = "0.0.0"
 dependencies = [
  "ab_glyph",
  "image",
- "quiver-tui",
+ "quiverdb-tui",
  "ratatui",
 ]
 
@@ -1709,8 +1709,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
-name = "quiver-tui"
-version = "0.18.0"
+name = "quiverdb-tui"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "crossterm",

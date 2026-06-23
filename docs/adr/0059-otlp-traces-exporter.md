@@ -59,7 +59,7 @@ startup.
 - `cargo-deny` was run over the full opentelemetry tree and is **clean**
   (advisories / bans / licenses / sources ok); the only effect is a few
   `multiple-versions = "warn"` duplicates, which the repo policy already permits.
-- CI gains a `cargo clippy -p quiver-server --features otlp` step so the gated
+- CI gains a `cargo clippy -p quiverdb-server --features otlp` step so the gated
   exporter cannot rot even though the default build excludes it.
 - **Testing honesty:** the `OtlpConfig` parsing/enablement logic is fully
   unit-tested. The code that builds the live exporter and connects to a collector
