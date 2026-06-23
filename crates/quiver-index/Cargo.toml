@@ -1,5 +1,5 @@
 [package]
-name = "quiver-index"
+name = "quiverdb-index"
 description = "Vector indexes for Quiver: HNSW now; DiskANN/Vamana and IVF later."
 version.workspace = true
 edition.workspace = true
@@ -25,3 +25,6 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[lib]
+name = "quiver_index"

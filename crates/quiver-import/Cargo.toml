@@ -1,5 +1,5 @@
 [package]
-name = "quiver-import"
+name = "quiverdb-import"
 description = "Migration importers: load Qdrant / Chroma / pgvector exports into Quiver."
 version.workspace = true
 edition.workspace = true
@@ -30,3 +30,6 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[lib]
+name = "quiver_import"

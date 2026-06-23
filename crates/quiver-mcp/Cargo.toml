@@ -1,5 +1,5 @@
 [package]
-name = "quiver-mcp"
+name = "quiverdb-mcp"
 description = "An MCP server exposing Quiver's capabilities as agent tools."
 version.workspace = true
 edition.workspace = true
@@ -27,3 +27,6 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[lib]
+name = "quiver_mcp"

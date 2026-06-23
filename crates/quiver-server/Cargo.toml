@@ -1,5 +1,5 @@
 [package]
-name = "quiver-server"
+name = "quiverdb-server"
 description = "The Quiver daemon: gRPC + REST with auth, RBAC, audit, and metrics."
 version.workspace = true
 edition.workspace = true
@@ -61,3 +61,6 @@ tokio-stream = { workspace = true }
 
 [lints]
 workspace = true
+
+[lib]
+name = "quiver_server"

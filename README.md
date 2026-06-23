@@ -127,7 +127,7 @@ exercise the workspace directly:
 ```bash
 just build            # compile the workspace
 just verify           # the full local quality gate (lint · test · doc · deny · audit)
-cargo run -p quiver-cli -- --help
+cargo run -p quiverdb-cli -- --help
 ```
 
 > **Heads-up:** the `quiver-cli` crate currently on crates.io is an unrelated

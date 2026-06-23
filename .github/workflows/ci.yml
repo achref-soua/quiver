@@ -30,7 +30,7 @@ jobs:
       - name: Clippy (warnings denied)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Clippy (optional otlp feature — keeps the gated exporter from rotting)
-        run: cargo clippy -p quiver-server --features otlp --all-targets -- -D warnings
+        run: cargo clippy -p quiverdb-server --features otlp --all-targets -- -D warnings
       - name: Test (workspace, excluding the crash-recovery stress test)
         run: cargo test --workspace -- --skip kill_mid_write_preserves_acknowledged_writes
       - name: Crash-recovery stress test (retried — kill -9 timing is runner-sensitive)
@@ -43,7 +43,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             echo "::group::crash_recovery attempt ${attempt}"
-            if cargo test -p quiver-core --test crash_recovery; then
+            if cargo test -p quiverdb-core --test crash_recovery; then
               echo "::endgroup::"
               echo "crash_recovery passed on attempt ${attempt}"
               exit 0

@@ -1,5 +1,5 @@
 [package]
-name = "quiver-providers"
+name = "quiverdb-providers"
 description = "Opt-in, provider-agnostic embedding & rerank adapters shared by the Quiver server and MCP server (ADR-0047/0058)."
 version.workspace = true
 edition.workspace = true
@@ -23,3 +23,6 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[lib]
+name = "quiver_providers"

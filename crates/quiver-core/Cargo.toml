@@ -1,5 +1,5 @@
 [package]
-name = "quiver-core"
+name = "quiverdb-core"
 description = "Quiver's storage engine: pages, WAL, manifest, segments, and recovery."
 version.workspace = true
 edition.workspace = true
@@ -26,3 +26,6 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[lib]
+name = "quiver_core"

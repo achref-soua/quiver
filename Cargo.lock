@@ -2310,18 +2310,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
-name = "quiver-cli"
+name = "quiverdb-cli"
 version = "0.21.0"
 dependencies = [
  "anyhow",
  "clap",
  "ico",
- "quiver-crypto",
- "quiver-embed",
- "quiver-import",
- "quiver-mcp",
- "quiver-server",
- "quiver-tui",
+ "quiverdb-crypto",
+ "quiverdb-embed",
+ "quiverdb-import",
+ "quiverdb-mcp",
+ "quiverdb-server",
+ "quiverdb-tui",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -2331,7 +2331,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiver-core"
+name = "quiverdb-core"
 version = "0.21.0"
 dependencies = [
  "crc32c",
@@ -2346,7 +2346,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiver-crypto"
+name = "quiverdb-crypto"
 version = "0.21.0"
 dependencies = [
  "base64",
@@ -2354,8 +2354,8 @@ dependencies = [
  "chacha20poly1305",
  "hkdf",
  "hmac 0.12.1",
- "quiver-core",
- "quiver-embed",
+ "quiverdb-core",
+ "quiverdb-embed",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -2364,13 +2364,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiver-embed"
+name = "quiverdb-embed"
 version = "0.21.0"
 dependencies = [
  "postcard",
- "quiver-core",
- "quiver-index",
- "quiver-query",
+ "quiverdb-core",
+ "quiverdb-index",
+ "quiverdb-query",
  "serde",
  "serde_json",
  "tempfile",
@@ -2378,11 +2378,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiver-import"
+name = "quiverdb-import"
 version = "0.21.0"
 dependencies = [
  "postgres",
- "quiver-embed",
+ "quiverdb-embed",
  "rustls",
  "serde_json",
  "tempfile",
@@ -2393,13 +2393,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiver-index"
+name = "quiverdb-index"
 version = "0.21.0"
 dependencies = [
  "memmap2",
  "postcard",
- "quiver-core",
- "quiver-simd",
+ "quiverdb-core",
+ "quiverdb-simd",
  "serde",
  "serde_json",
  "tempfile",
@@ -2407,13 +2407,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiver-mcp"
+name = "quiverdb-mcp"
 version = "0.21.0"
 dependencies = [
  "anyhow",
- "quiver-crypto",
- "quiver-embed",
- "quiver-providers",
+ "quiverdb-crypto",
+ "quiverdb-embed",
+ "quiverdb-providers",
  "serde",
  "serde_json",
  "tempfile",
@@ -2422,7 +2422,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiver-proto"
+name = "quiverdb-proto"
 version = "0.21.0"
 dependencies = [
  "prost",
@@ -2433,7 +2433,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiver-providers"
+name = "quiverdb-providers"
 version = "0.21.0"
 dependencies = [
  "figment",
@@ -2445,7 +2445,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiver-query"
+name = "quiverdb-query"
 version = "0.21.0"
 dependencies = [
  "rust-stemmers",
@@ -2454,7 +2454,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiver-server"
+name = "quiverdb-server"
 version = "0.21.0"
 dependencies = [
  "axum",
@@ -2463,12 +2463,12 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "quiver-core",
- "quiver-crypto",
- "quiver-embed",
- "quiver-proto",
- "quiver-providers",
- "quiver-query",
+ "quiverdb-core",
+ "quiverdb-crypto",
+ "quiverdb-embed",
+ "quiverdb-proto",
+ "quiverdb-providers",
+ "quiverdb-query",
  "rcgen",
  "reqwest",
  "rustls",
@@ -2488,7 +2488,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiver-simd"
+name = "quiverdb-simd"
 version = "0.21.0"
 dependencies = [
  "criterion",
@@ -2496,12 +2496,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiver-tui"
+name = "quiverdb-tui"
 version = "0.21.0"
 dependencies = [
  "anyhow",
  "crossterm",
- "quiver-server",
+ "quiverdb-server",
  "ratatui",
  "reqwest",
  "serde",

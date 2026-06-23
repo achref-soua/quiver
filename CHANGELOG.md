@@ -31,6 +31,11 @@ for the per-release rationale and Definitions of Done.
 - The embedding/rerank provider seam moved from `quiver-server` into a new lean
   `quiver-providers` crate (ADR-0058) shared by the network and MCP servers; the
   server re-exports the types, so its public API is unchanged.
+- Crates are now published under the `quiverdb-*` namespace (ADR-0056): each
+  package is renamed `quiverdb-<crate>` while its library/extern name stays
+  `quiver_<crate>` and the binary stays `quiver`, so source, imports, and
+  `cargo install --path` are unchanged. This unblocks the (owner-gated) crates.io
+  publish job, since `quiver-core` / `quiver-cli` are held by unrelated crates.
 
 ## [0.21.0] — 2026-06-23
 

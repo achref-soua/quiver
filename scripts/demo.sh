@@ -15,7 +15,7 @@ ENC_KEY="${QUIVER_DEMO_ENCRYPTION_KEY:-$(openssl rand -hex 32)}"
 DATA_DIR="$(mktemp -d)"
 
 echo "==> building quiver"
-cargo build -p quiver-cli
+cargo build -p quiverdb-cli
 
 echo "==> starting encrypted server on ${REST_ADDR} (data: ${DATA_DIR})"
 QUIVER_ENCRYPTION_KEY="$ENC_KEY" \

@@ -60,7 +60,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release -p quiver-cli --target ${{ matrix.target }}
+        run: cargo build --release -p quiverdb-cli --target ${{ matrix.target }}
 
       - name: Package binary + checksum
         # Git Bash on the Windows runner provides cp + sha256sum, so one step
@@ -145,10 +145,10 @@ jobs:
   publish-crates:
     name: publish crates.io
     needs: release
-    # crates.io publish in dependency-DAG order. REQUIRES the quiverdb-* namespace
-    # rename first (ADR-0056): `quiver-core` and `quiver-cli` are held by unrelated
-    # crates, so the package names below must be the renamed names before this can
-    # succeed. The rename follow-up PR updates this list. Enable with
+    # crates.io publish in dependency-DAG order. Uses the `quiverdb-*` namespace
+    # (ADR-0056): `quiver-core` and `quiver-cli` are held by unrelated crates, so
+    # every crate publishes under its renamed `quiverdb-*` package name (the lib /
+    # extern names stay `quiver_*` and the binary stays `quiver`). Enable with
     # `vars.PUBLISH_CRATES=true` + `secrets.CARGO_REGISTRY_TOKEN`.
     if: ${{ vars.PUBLISH_CRATES == 'true' }}
     runs-on: ubuntu-latest
@@ -159,9 +159,9 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          for crate in quiver-core quiver-simd quiver-proto quiver-query \
-                       quiver-tui quiver-crypto quiver-index quiver-embed \
-                       quiver-import quiver-mcp quiver-server quiver-cli; do
+          for crate in quiverdb-core quiverdb-simd quiverdb-proto quiverdb-providers quiverdb-query \
+                       quiverdb-crypto quiverdb-index quiverdb-embed quiverdb-import quiverdb-tui \
+                       quiverdb-mcp quiverdb-server quiverdb-cli; do
             echo "::group::publish ${crate}"
             cargo publish -p "${crate}"
             echo "::endgroup::"

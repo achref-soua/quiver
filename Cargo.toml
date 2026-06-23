@@ -39,18 +39,18 @@ todo = "warn"
 [workspace.dependencies]
 # Internal crates (path deps with a version so `cargo deny` sees no wildcard),
 # referenced as `quiver-x = { workspace = true }`.
-quiver-core = { path = "crates/quiver-core", version = "0.21" }
-quiver-crypto = { path = "crates/quiver-crypto", version = "0.21" }
-quiver-embed = { path = "crates/quiver-embed", version = "0.21" }
-quiver-import = { path = "crates/quiver-import", version = "0.21" }
-quiver-index = { path = "crates/quiver-index", version = "0.21" }
-quiver-mcp = { path = "crates/quiver-mcp", version = "0.21" }
-quiver-proto = { path = "crates/quiver-proto", version = "0.21" }
-quiver-providers = { path = "crates/quiver-providers", version = "0.21" }
-quiver-query = { path = "crates/quiver-query", version = "0.21" }
-quiver-server = { path = "crates/quiver-server", version = "0.21" }
-quiver-simd = { path = "crates/quiver-simd", version = "0.21" }
-quiver-tui = { path = "crates/quiver-tui", version = "0.21" }
+quiver-core = { path = "crates/quiver-core", version = "0.21", package = "quiverdb-core" }
+quiver-crypto = { path = "crates/quiver-crypto", version = "0.21", package = "quiverdb-crypto" }
+quiver-embed = { path = "crates/quiver-embed", version = "0.21", package = "quiverdb-embed" }
+quiver-import = { path = "crates/quiver-import", version = "0.21", package = "quiverdb-import" }
+quiver-index = { path = "crates/quiver-index", version = "0.21", package = "quiverdb-index" }
+quiver-mcp = { path = "crates/quiver-mcp", version = "0.21", package = "quiverdb-mcp" }
+quiver-proto = { path = "crates/quiver-proto", version = "0.21", package = "quiverdb-proto" }
+quiver-providers = { path = "crates/quiver-providers", version = "0.21", package = "quiverdb-providers" }
+quiver-query = { path = "crates/quiver-query", version = "0.21", package = "quiverdb-query" }
+quiver-server = { path = "crates/quiver-server", version = "0.21", package = "quiverdb-server" }
+quiver-simd = { path = "crates/quiver-simd", version = "0.21", package = "quiverdb-simd" }
+quiver-tui = { path = "crates/quiver-tui", version = "0.21", package = "quiverdb-tui" }
 
 anyhow = "1"
 axum = "0.8"

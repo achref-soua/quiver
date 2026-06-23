@@ -1,5 +1,5 @@
 [package]
-name = "quiver-tui"
+name = "quiverdb-tui"
 description = "The Quiver retro terminal cockpit (an API client)."
 version.workspace = true
 edition.workspace = true
@@ -27,3 +27,6 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[lib]
+name = "quiver_tui"
