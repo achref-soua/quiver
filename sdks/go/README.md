@@ -3,7 +3,9 @@
 A small, **standard-library-only** Go client for the Quiver vector database. It
 mirrors the REST surface (`docs/api/rest-grpc.md`): collections, points, search,
 hybrid / full-text (BM25) search, server-side embedding (`UpsertText` /
-`SearchText`), fetch, and snapshots.
+`SearchText`), fetch, snapshots, and the bulk/maintenance helpers `UpsertBatch`
+(batched upload), `Scroll` (page through a collection via a callback), and
+`DeleteByFilter` (paged erasure). Every call takes a `context.Context`.
 
 ```go
 import quiver "github.com/achref-soua/quiver/sdks/go"

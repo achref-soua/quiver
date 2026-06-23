@@ -1,0 +1,120 @@
+{{- if and (not .Values.encryption.insecure) (not .Values.encryption.masterKey) (not .Values.encryption.existingSecret) }}
+{{- fail "Quiver encrypts at rest by default. Set encryption.masterKey (64 hex chars), or encryption.existingSecret, or encryption.insecure=true (DEV ONLY)." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "quiver.fullname" . }}
+  labels:
+    {{- include "quiver.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "quiver.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "quiver.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "quiver.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: quiver
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args: ["serve"]
+          ports:
+            - name: rest
+              containerPort: {{ .Values.service.restPort }}
+            - name: grpc
+              containerPort: {{ .Values.service.grpcPort }}
+          env:
+            - name: QUIVER_REST_ADDR
+              value: "0.0.0.0:{{ .Values.service.restPort }}"
+            - name: QUIVER_GRPC_ADDR
+              value: "0.0.0.0:{{ .Values.service.grpcPort }}"
+            - name: QUIVER_DATA_DIR
+              value: /data
+            {{- if .Values.encryption.insecure }}
+            - name: QUIVER_INSECURE
+              value: "1"
+            {{- else }}
+            - name: QUIVER_MASTER_KEY_FILE
+              value: /etc/quiver/master.key
+            {{- end }}
+            {{- if or .Values.apiKeys (not .Values.encryption.existingSecret) }}
+            - name: QUIVER_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "quiver.masterKeySecret" . }}
+                  key: api-keys
+                  optional: true
+            {{- end }}
+            {{- range $k, $v := .Values.extraEnv }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            {{- if not .Values.encryption.insecure }}
+            - name: master-key
+              mountPath: /etc/quiver
+              readOnly: true
+            {{- end }}
+          livenessProbe:
+            tcpSocket:
+              port: rest
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: rest
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.encryption.insecure }}
+        - name: master-key
+          secret:
+            secretName: {{ include "quiver.masterKeySecret" . }}
+            items:
+              - key: {{ if .Values.encryption.existingSecret }}{{ .Values.encryption.existingSecretKey }}{{ else }}master.key{{ end }}
+                path: master.key
+        {{- end }}
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "quiver.fullname" . }}-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

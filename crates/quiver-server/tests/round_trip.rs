@@ -284,3 +284,112 @@ async fn rest_and_grpc_round_trip() {
 
     server.abort();
 }
+
+/// ADR-0057: reads run behind the shared lock; a write that defers a collection's
+/// index rebuild leaves it stale, and the next read takes the exclusive lock once
+/// to rebuild before serving. This drives many concurrent queries straight at a
+/// deferred rebuild and asserts they all succeed with the correct result — the
+/// server's `search_blocking` cold path (read → `IndexStale` → write-locked
+/// rebuild → retry), exercised under contention.
+#[tokio::test]
+async fn rest_concurrent_reads_survive_a_deferred_rebuild() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = "test-api-key";
+
+    let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rest_addr = rest_listener.local_addr().unwrap();
+    let grpc_addr = grpc_listener.local_addr().unwrap();
+
+    let config = Config {
+        data_dir: tmp.path().to_path_buf(),
+        rest_addr,
+        grpc_addr,
+        api_keys: vec![key.into()],
+        encryption_key: Some(
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_owned(),
+        ),
+        tls_cert: None,
+        tls_key: None,
+        tls_client_ca: None,
+        master_key_file: None,
+        audit_log: None,
+        leader_url: None,
+        leader_api_key: None,
+        insecure: false,
+        limits: quiver_server::Limits::default(),
+        embedding: Default::default(),
+        rerank: Default::default(),
+        rate_limit: Default::default(),
+    };
+    let server = tokio::spawn(async move {
+        let _ = serve(config, rest_listener, grpc_listener).await;
+    });
+
+    let http = reqwest::Client::new();
+    let base = format!("http://{rest_addr}");
+    wait_ready(&http, &base).await;
+
+    // Build a small HNSW collection and query once to materialize the index.
+    http.post(format!("{base}/v1/collections"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({"name": "items", "dim": 4, "metric": "l2"}))
+        .send()
+        .await
+        .unwrap();
+    http.post(format!("{base}/v1/collections/items/points"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({"points": [
+            {"id": "a", "vector": [0.0, 0.0, 0.0, 0.0], "payload": {}},
+            {"id": "b", "vector": [1.0, 0.0, 0.0, 0.0], "payload": {}},
+            {"id": "c", "vector": [5.0, 0.0, 0.0, 0.0], "payload": {}}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    let warm = http
+        .post(format!("{base}/v1/collections/items/query"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({"vector": [0.1, 0.0, 0.0, 0.0], "k": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(warm.status(), reqwest::StatusCode::OK);
+
+    // Re-upsert an existing id: HNSW cannot update in place, so this defers the
+    // rebuild and leaves the index stale.
+    http.post(format!("{base}/v1/collections/items/points"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({"points": [
+            {"id": "b", "vector": [0.2, 0.0, 0.0, 0.0], "payload": {}}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+
+    // Fire many concurrent queries at the now-stale collection. Exactly one
+    // rebuilds under the write lock; all must return the correct nearest point.
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let http = http.clone();
+        let base = base.clone();
+        tasks.push(tokio::spawn(async move {
+            let resp = http
+                .post(format!("{base}/v1/collections/items/query"))
+                .bearer_auth("test-api-key")
+                .json(&serde_json::json!({"vector": [0.15, 0.0, 0.0, 0.0], "k": 1}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            // `b` moved to [0.2,…], the closest point to the query.
+            assert_eq!(body["matches"][0]["id"], "b");
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    server.abort();
+}

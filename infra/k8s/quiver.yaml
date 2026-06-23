@@ -1,0 +1,133 @@
+# Raw Kubernetes manifests for Quiver (the Helm-free path).
+#
+#   1. Put a 256-bit master key + API keys in the Secret below
+#      (KEY=$(openssl rand -hex 32); echo -n "$KEY").
+#   2. Set image to one you built from infra/docker/Dockerfile.
+#   3. kubectl apply -f infra/k8s/quiver.yaml
+#
+# Quiver encrypts at rest by default; the server refuses to start without a key.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: quiver-secrets
+type: Opaque
+stringData:
+  # REPLACE: 64 hex characters (openssl rand -hex 32).
+  master.key: "REPLACE_WITH_64_HEX_CHARS" # gitleaks:allow — placeholder, not a real secret
+  # REPLACE or remove: comma-separated API keys.
+  api-keys: "REPLACE_WITH_API_KEYS" # gitleaks:allow — placeholder, not a real secret
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: quiver-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quiver
+  labels:
+    app.kubernetes.io/name: quiver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: quiver
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: quiver
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: quiver
+          # REPLACE: an image containing the `quiver` binary.
+          image: ghcr.io/achref-soua/quiver:0.20.1
+          args: ["serve"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: rest
+              containerPort: 6333
+            - name: grpc
+              containerPort: 6334
+          env:
+            - name: QUIVER_REST_ADDR
+              value: "0.0.0.0:6333"
+            - name: QUIVER_GRPC_ADDR
+              value: "0.0.0.0:6334"
+            - name: QUIVER_DATA_DIR
+              value: /data
+            - name: QUIVER_MASTER_KEY_FILE
+              value: /etc/quiver/master.key
+            - name: QUIVER_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: quiver-secrets
+                  key: api-keys
+                  optional: true
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: master-key
+              mountPath: /etc/quiver
+              readOnly: true
+          livenessProbe:
+            tcpSocket:
+              port: rest
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: rest
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: master-key
+          secret:
+            secretName: quiver-secrets
+            items:
+              - key: master.key
+                path: master.key
+        - name: data
+          persistentVolumeClaim:
+            claimName: quiver-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: quiver
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: quiver
+  ports:
+    - name: rest
+      port: 6333
+      targetPort: rest
+    - name: grpc
+      port: 6334
+      targetPort: grpc

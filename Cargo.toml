@@ -7,7 +7,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.20.1"
+version = "0.21.0"
 edition = "2024"
 # MSRV: 1.88 — the minimum the dependency tree supports (ratatui 0.30's
 # `ratatui-core`/`-widgets`/`-crossterm`). Bumped from 1.85 when updating ratatui
@@ -15,7 +15,12 @@ edition = "2024"
 rust-version = "1.88"
 license = "AGPL-3.0-only"
 repository = "https://github.com/achref-soua/quiver"
+homepage = "https://github.com/achref-soua/quiver"
 authors = ["Achref Soua <achref.soua@outlook.com>"]
+# crates.io discovery metadata, inherited by every crate via `*.workspace = true`.
+# Categories are crates.io slugs; keywords are <=5 and <=20 chars each.
+keywords = ["vector-database", "embeddings", "search", "ann", "hnsw"]
+categories = ["database", "data-structures"]
 
 # Shared lint policy applied by every crate via `[lints] workspace = true`.
 # See ADR-0017 (error handling) and ADR-0009 (unsafe discipline).
@@ -34,17 +39,17 @@ todo = "warn"
 [workspace.dependencies]
 # Internal crates (path deps with a version so `cargo deny` sees no wildcard),
 # referenced as `quiver-x = { workspace = true }`.
-quiver-core = { path = "crates/quiver-core", version = "0.20" }
-quiver-crypto = { path = "crates/quiver-crypto", version = "0.20" }
-quiver-embed = { path = "crates/quiver-embed", version = "0.20" }
-quiver-import = { path = "crates/quiver-import", version = "0.20" }
-quiver-index = { path = "crates/quiver-index", version = "0.20" }
-quiver-mcp = { path = "crates/quiver-mcp", version = "0.20" }
-quiver-proto = { path = "crates/quiver-proto", version = "0.20" }
-quiver-query = { path = "crates/quiver-query", version = "0.20" }
-quiver-server = { path = "crates/quiver-server", version = "0.20" }
-quiver-simd = { path = "crates/quiver-simd", version = "0.20" }
-quiver-tui = { path = "crates/quiver-tui", version = "0.20" }
+quiver-core = { path = "crates/quiver-core", version = "0.21" }
+quiver-crypto = { path = "crates/quiver-crypto", version = "0.21" }
+quiver-embed = { path = "crates/quiver-embed", version = "0.21" }
+quiver-import = { path = "crates/quiver-import", version = "0.21" }
+quiver-index = { path = "crates/quiver-index", version = "0.21" }
+quiver-mcp = { path = "crates/quiver-mcp", version = "0.21" }
+quiver-proto = { path = "crates/quiver-proto", version = "0.21" }
+quiver-query = { path = "crates/quiver-query", version = "0.21" }
+quiver-server = { path = "crates/quiver-server", version = "0.21" }
+quiver-simd = { path = "crates/quiver-simd", version = "0.21" }
+quiver-tui = { path = "crates/quiver-tui", version = "0.21" }
 
 anyhow = "1"
 axum = "0.8"

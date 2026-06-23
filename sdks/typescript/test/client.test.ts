@@ -378,4 +378,75 @@ describe("Quiver TypeScript client", () => {
     expect(captured?.["destination"]).toBe("/backups/snap1");
     expect(info).toEqual({ manifestVersion: 3, files: 12, bytes: 4096 });
   });
+
+  it("upsertIter batches a large iterable and reports progress", async () => {
+    const batches: number[] = [];
+    const fetch = mockFetch(async (_path, _method, init) => {
+      const n = (parseBody(init)["points"] as unknown[]).length;
+      batches.push(n);
+      return json({ upserted: n });
+    });
+    const client = new Client("http://x", { apiKey: "k", fetch });
+    const points = Array.from({ length: 7 }, (_, i) => ({ id: `p${i}`, vector: [i] }));
+    const progress: number[] = [];
+    const total = await client.upsertIter("c", points, {
+      batch: 3,
+      onProgress: (t) => {
+        progress.push(t);
+      },
+    });
+    expect(total).toBe(7);
+    expect(batches).toEqual([3, 3, 1]); // server-friendly batches, remainder flushed
+    expect(progress).toEqual([3, 6, 7]); // running total after each batch
+  });
+
+  it("upsertIter accepts an async iterable", async () => {
+    const fetch = mockFetch(async (_path, _method, init) => {
+      const n = (parseBody(init)["points"] as unknown[]).length;
+      return json({ upserted: n });
+    });
+    async function* gen() {
+      for (let i = 0; i < 4; i++) yield { id: `p${i}`, vector: [i] };
+    }
+    const total = await new Client("http://x", { fetch }).upsertIter("c", gen(), { batch: 2 });
+    expect(total).toBe(4);
+  });
+
+  it("scroll yields points from one fetch page", async () => {
+    let capturedPath: string | undefined;
+    const fetch = mockFetch(async (path, _method, init) => {
+      capturedPath = path;
+      expect(parseBody(init)["limit"]).toBe(2);
+      return json({ points: [{ id: "a" }, { id: "b" }] });
+    });
+    const client = new Client("http://x", { fetch });
+    const ids: string[] = [];
+    for await (const m of client.scroll("c", { batch: 2 })) ids.push(m.id);
+    expect(capturedPath).toBe("/v1/collections/c/fetch");
+    expect(ids).toEqual(["a", "b"]);
+  });
+
+  it("deleteByFilter pages through matches until none remain", async () => {
+    const pages = [
+      { points: [{ id: "a" }, { id: "b" }] }, // full page -> keep going
+      { points: [{ id: "c" }] }, // short page -> last
+    ];
+    const deleted: string[][] = [];
+    let fetchCall = 0;
+    const fetch = mockFetch(async (path, method, init) => {
+      if (method === "POST" && path.endsWith("/fetch")) {
+        return json(pages[fetchCall++] ?? { points: [] });
+      }
+      const ids = parseBody(init)["ids"] as string[]; // DELETE points
+      deleted.push(ids);
+      return json({ deleted: ids.length });
+    });
+    const total = await new Client("http://x", { fetch }).deleteByFilter(
+      "c",
+      { eq: { field: "k", value: "v" } },
+      { batch: 2 },
+    );
+    expect(total).toBe(3);
+    expect(deleted).toEqual([["a", "b"], ["c"]]);
+  });
 });

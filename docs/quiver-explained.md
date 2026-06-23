@@ -467,6 +467,10 @@ So **corruption is detected on read and never silently served.** A page that doe
 
 > 🔑 **The bottom line.** Acknowledged writes survive `kill -9` and power loss; corruption is always *detected* rather than served as a wrong answer; and — critically — all of this holds **whether or not encryption is on**, because the checksums guard the plaintext path and the encryption layer sits *on top*. Quiver's test suite literally kills the process with `kill -9` mid-operation and asserts the data is intact on restart (the "crash gate").
 
+## 5.3 Many readers, one writer
+
+Durability is about *not losing* writes; throughput is about *serving* reads. Quiver is **single-writer, many-reader**: the server guards the engine with a reader–writer lock (ADR-0057). A search takes the *shared* lock, so many searches run **in parallel** — read throughput scales with cores instead of serializing on one mutex — while a write takes the *exclusive* lock and the single-writer model above is unchanged. Some writes (an HNSW in-place update, a bulk load) deliberately **defer** the index rebuild to batch the work; a reader that lands on a still-stale collection gets a signal rather than a wrong answer, takes the write lock *once* to rebuild (`ensure_indexed`), then serves — and every reader after it is concurrent again. This moves read *visibility*, never *durability*: a query may not yet see a write that committed a millisecond ago, but never a half-applied one, and the WAL-fsync acknowledgement is untouched. The fully **lock-free** path — reads proceeding *during* writes over an immutable arc-swapped per-collection snapshot — is designed and staged as the successor in ADR-0057; Quiver ships the honest step now rather than the risky leap.
+
 ---
 
 # Part 6 — Security, the Defining Feature
@@ -629,11 +633,11 @@ Each API key gets a **token bucket** that refills at a steady rate up to a burst
 
 ## 9.6 The client fleet
 
-One engine, many front doors: SDKs for **Python** (sync + async), **TypeScript**, and **Go** (standard-library only), each mirroring the same surface — collections, points, search, hybrid, full-text, server-side embedding, and snapshots. For AI agents, an **MCP server** exposes the database as tools (create, upsert, search, hybrid, `database_stats`, `delete_collection`, `snapshot`) so an agent can *operate* Quiver, not just query it.
+One engine, many front doors: SDKs for **Python** (sync + async), **TypeScript**, and **Go** (standard-library only), each mirroring the same surface — collections, points, search, hybrid, full-text, server-side embedding, and snapshots. The three are kept at **method parity**: alongside the core calls, each carries the same bulk/maintenance helpers — batched upload (`upsertIter` / `UpsertBatch`), a `scroll` over a whole collection for export and re-embedding, and a paged `deleteByFilter` for GDPR erasure — with the TypeScript client taking a sync *or* async iterable and the Go client a context on every call. For AI agents, an **MCP server** exposes the database as tools (create, upsert, search, hybrid, `database_stats`, `delete_collection`, `snapshot`) so an agent can *operate* Quiver, not just query it.
 
 ## 9.7 The roads not (yet) taken
 
-Three large capabilities are *designed* — as architecture records — but deliberately unbuilt until the single-node story is unbeatable: **distributed/sharded mode** (hash sharding + scatter-gather + per-shard Raft for write HA), **GPU acceleration** (behind the index trait, CPU-default), and **lock-free MVCC reads** (versioned snapshots so reads never wait on the writer). Each ships as a design ADR first; none compromises the single static binary.
+Two large capabilities are *designed* — as architecture records — but deliberately unbuilt until the single-node story is unbeatable: **distributed/sharded mode** (hash sharding + scatter-gather + per-shard Raft for write HA) and **GPU acceleration** (behind the index trait, CPU-default). A third — **concurrent reads** — has taken its first real step: reads now run in parallel behind a reader–writer lock (§5.3), with the fully **lock-free MVCC** path (versioned arc-swap snapshots so reads never wait on the writer at all) staged as the successor. Each ships as a design ADR first; none compromises the single static binary.
 
 ---
 
