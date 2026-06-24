@@ -469,7 +469,29 @@ So **corruption is detected on read and never silently served.** A page that doe
 
 ## 5.3 Many readers, one writer
 
-Durability is about *not losing* writes; throughput is about *serving* reads. Quiver is **single-writer, many-reader**: the server guards the engine with a reader–writer lock (ADR-0057). A search takes the *shared* lock, so many searches run **in parallel** — read throughput scales with cores instead of serializing on one mutex — while a write takes the *exclusive* lock and the single-writer model above is unchanged. Some writes (an HNSW in-place update, a bulk load) deliberately **defer** the index rebuild to batch the work; a reader that lands on a still-stale collection gets a signal rather than a wrong answer, takes the write lock *once* to rebuild (`ensure_indexed`), then serves — and every reader after it is concurrent again. This moves read *visibility*, never *durability*: a query may not yet see a write that committed a millisecond ago, but never a half-applied one, and the WAL-fsync acknowledgement is untouched. The fully **lock-free** path — reads proceeding *during* writes over an immutable arc-swapped per-collection snapshot — is designed and staged as the successor in ADR-0057; Quiver ships the honest step now rather than the risky leap.
+Durability is about *not losing* writes; throughput is about *serving* reads. Quiver is **single-writer, many-reader**: the server guards the engine with a reader–writer lock (ADR-0057). A search takes the *shared* lock, so many searches run **in parallel** — read throughput scales with cores instead of serializing on one mutex. A write takes the *exclusive* lock; the single-writer model, and everything in §5.1–5.2, is unchanged.
+
+There is one subtlety, and it is the whole story of this section. Some writes — an HNSW in-place update, a bulk load, a delete, a replicated write — cannot be absorbed into the index in place, so the engine **defers** the rebuild: it marks the collection stale and leaves the prior, still-valid index in place. The question is what the *next* reader does about it. The naïve answer (what v0.21.0 shipped) is to take the exclusive lock and rebuild before serving. That is correct, but it has a brutal failure mode.
+
+## 5.4 The rebuild that doesn't stop the world
+
+Rebuilding an ANN index is roughly a single-threaded build pass over the whole collection. If a reader does it *under the exclusive lock*, every other reader blocks for the entire build. We measured exactly that, with a reproducible harness (`crates/quiver-embed/tests/mvcc_measurement.rs`, ADR-0062; dev box, HNSW, dim 128, indicative):
+
+| Collection size | single-thread rebuild | steady read p99 (concurrent) | reader stall during rebuild |
+|---|---:|---:|---:|
+| 20,000 vectors | 7.3 s | 422 µs | **8.1 s** |
+| 50,000 vectors | 26.7 s | 379 µs | **29.7 s** |
+| 100,000 vectors | 68.7 s | 408 µs | **76.6 s** |
+
+The stall tracks the rebuild duration and is **four to five orders of magnitude** above the steady-state p99 — borne by *every* read that arrives during the window, and worse at scale (a 1M disk-Vamana rebuild is minutes).
+
+> ### The fix — rebuild off the exclusive lock (ADR-0062)
+>
+> **Serve the prior snapshot, build with no lock held, swap at the end.** A stale reader returns results from the *prior* index (still a valid graph over the prior ids) instead of blocking. Meanwhile one rebuild is driven off-lock: its inputs are captured under the *shared* lock (other reads continue), the new index is built holding **no lock at all**, and only the final pointer-swap takes a brief exclusive lock. A per-collection **write-generation counter** guards against a write that lands mid-build: if the generation moved, the collection stays stale and another rebuild is scheduled — so no write is ever lost.
+
+The seconds-long stall collapses to the cost of serving the prior snapshot (sub-millisecond) plus a brief swap. No `unsafe`, no lock-free data structure, no `loom` — just `Arc` and the existing `RwLock`.
+
+This moves read *visibility*: a server read may briefly miss a write committed a millisecond ago (snapshot isolation, sanctioned by ADR-0053), but never a half-applied one, and the WAL-fsync acknowledgement of §5.1 is byte-for-byte unchanged. Embedded `&mut` callers still rebuild synchronously, so an in-process program always reads its own writes. The fully **lock-free** path — reads proceeding *during* the swap over an atomically-swapped snapshot (arc-swap + epoch reclamation) — remains designed and staged in ADR-0053; the measurement showed the seconds were in the rebuild's *lock scope*, not the read's lock *acquire*, so Quiver fixed the former first.
 
 ---
 
@@ -589,6 +611,45 @@ The footnotes are where the honesty lives:
 
 ---
 
+## 7.3 The v0.22.0 dimensions: recall depth, concurrency, and filtering
+
+The v0.22.0 release added four measurement dimensions (ADR-0061), all on the same SIFT1M, all *dev-box · indicative*, and **every number below traces to a committed CSV** in `docs/benchmarks/results/comparison-v0.22.0/`.
+
+**Recall depth.** Recall@10 is the headline, but a RAG pipeline that re-ranks 50 candidates cares about recall@100. At a fixed `ef_search`, recall@100 needs a *deeper* candidate beam than recall@10, so it only catches up once you widen the search:
+
+| ef_search | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|
+| recall@1 | 0.853 | 0.928 | 0.966 | 0.984 | 0.988 |
+| recall@10 | 0.793 | 0.895 | 0.958 | 0.986 | 0.995 |
+| recall@100 | 0.918 | 0.918 | 0.918 | 0.944 | 0.983 |
+
+**Saturated concurrency** — the payoff of the §5.3 reader–writer lock and the §5.4 off-lock rebuild: QPS under 8 saturating client threads (NT) versus one (1T). Read it *honestly*: a single Python client process (GIL + one HTTP socket) is itself a concurrency ceiling, so for *light* queries (low `ef`, sub-2 ms) the client saturates first and NT sits at or below 1T; the server-side win appears on *heavier* queries, up to **1.76× at ef=256** (recall 0.995). It is not a fabricated "8×".
+
+| ef_search | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|
+| QPS (1T) | 1131 | 1001 | 855 | 673 | 506 |
+| QPS (8T) | 949 | 968 | 928 | 938 | 892 |
+| **speed-up** | 0.84× | 0.97× | 1.08× | 1.39× | **1.76×** |
+
+**Quantization tradeoff.** The disk-Vamana + PQ path holds recall@10 close to in-memory HNSW, but PQ trades away the *deep* tail — recall@100 falls from 0.94 to 0.71. The absolute serving-RAM wedge is **reference-hardware-pending** (post-build RSS on this box is the build's allocator high-water mark, not the cold-reload footprint where only PQ codes stay resident), so it is omitted, not estimated.
+
+| Config | recall@1 | recall@10 | recall@100 | build (s) | QPS (1T) |
+|---|---|---|---|---|---|
+| hnsw (in-memory) | 0.984 | 0.986 | 0.944 | 619 | 883 |
+| disk_vamana + pq16 | 0.974 | 0.966 | **0.709** | 1025 | 598 |
+
+**Filtered selectivity.** A payload pre-filter keeps `s`% of the collection; recall is measured against the *filtered* exact ground truth. The planner crosses regimes: a very selective filter pre-filters to an *exact scan* (recall ≈ 1.0, but the scan to find the subset is the latency cost — ~142 ms); a looser filter post-filters an ANN result, which dips into a **recall valley** at mid-selectivity before recovering; an empty filter is pure ANN again (878 QPS). The filter is re-checked on every survivor (§4.5), so the valley is a *recall* dip the planner trades for speed, never a wrong answer.
+
+| kept by filter | recall@10 | QPS (1T) | p50 (ms) | regime |
+|---|---|---|---|---|
+| 1% | 1.000 | 7 | 142.3 | pre-filter · exact scan |
+| 5% | **0.618** | 7 | 134.6 | post-filter · recall valley |
+| 25% | 0.970 | 5 | 189.2 | post-filter · recovering |
+| 50% | 0.981 | 4 | 253.6 | post-filter |
+| 100% | 0.986 | 878 | 1.1 | no filter · pure ANN |
+
+---
+
 # Part 8 — The Decisions Behind the Code
 
 Great engineering is visible in the *choices*, especially the restraint. A few that define Quiver, each recorded as an "Architecture Decision Record" (ADR) in the repo:
@@ -615,6 +676,19 @@ A search engine is only half a product. The rest is the work of *using* it — t
 
 The number-one friction in retrieval is the embedding step. Quiver stays model-agnostic at its core, but at the **edge** (never in the engine) it offers an opt-in, per-collection embedding hook. `upsert_text` sends a document's words; the server embeds them with the collection's configured provider and stores the vector. `search_text` embeds your query the same way, searches, and can **rerank** the shortlist with a second, sharper model — retrieve-then-rerank in one call. Providers are chosen by configuration, never hard-wired: OpenAI, Ollama (local), any OpenAI-compatible HTTP endpoint, Cohere, or a deterministic `fake` for tests. Secrets are never stored — a config field names an *environment variable*, resolved at startup so a missing key fails fast.
 
+Our running example, finally as real calls — a `movies` collection that embeds text (payloads like `{"year":1982}` ride along):
+
+```python
+upsert_text("movies", "br",   "Blade Runner — a replicant hunter in a neon dystopia")
+upsert_text("movies", "gits", "Ghost in the Shell — a cyborg cop questions identity")
+upsert_text("movies", "pad",  "Paddington 2 — a kind bear clears his name")
+
+search_text("movies", "a moody sci-fi about androids and identity", k=2, rerank=True)
+#   → [ br (0.83), gits (0.79) ]   Paddington is correctly far away
+```
+
+Those two verbs are not just SDK methods — `upsert_text` / `search_text` are exposed as **MCP tools** (ADR-0058) via a shared `quiver-providers` crate, so an autonomous agent can build and query a corpus in plain words, with no embedding model of its own.
+
 ## 9.2 Full-text without leaving home: BM25
 
 Sometimes you want the *exact word* — a product code, a name, an acronym a model has never seen. Quiver tokenises text (Unicode split, lowercase, stop-words, a **Snowball/Porter2 stemmer** so "running"/"runs"/"ran" conflate), builds an inverted index, and scores with **Okapi BM25** — the lexical workhorse behind Lucene. A single `query_text` runs dense, lexical, or both, fused with **RRF** (Reciprocal Rank Fusion).
@@ -623,21 +697,31 @@ Sometimes you want the *exact word* — a product code, a name, an acronym a mod
 
 An **online snapshot** captures a consistent copy of a *running* database. Under the single-writer lock, the engine **checkpoints** (seals the in-memory buffer into segments and advances the WAL floor to the head), then byte-copies the whole data directory — layout-independent, so it can never drift out of sync with the file format. Opening the copy replays an empty WAL tail and is identical to the source at snapshot time. Reachable over the engine, REST (`POST /v1/snapshot`), the MCP server, and every SDK; the crash gate is untouched.
 
-## 9.4 Seeing inside: metrics & tracing
+## 9.4 Scaling reads: leader & followers
 
-Quiver serves a Prometheus `/metrics` endpoint (open, so a scraper needs no key) with per-route request counters and latency histograms, plus security counters (`quiver_auth_failures_total`, `quiver_rate_limited_total`); engine operations carry secret-free tracing spans, and an importable Grafana dashboard ships in `infra/grafana/`. The metrics defined here are the vocabulary the guide measures in: **recall@k** (fraction of the true k neighbours returned), **QPS** (queries/second), **p50/p95/p99** (tail latency), **RRF** (rank-based list fusion), **IDF** (rare-word weighting, the heart of BM25), **RSS** (physical RAM held — the memory-frugality headline), and **build time** (time to first query).
+Quiver is single-node first, but reads can fan out. Point a follower at a leader (`QUIVER_LEADER_URL`) and it bootstraps from a snapshot, then tails the leader's writes **asynchronously** — no consensus, no failover, no write coordination. Followers are read-only warm standbys that absorb query load; the leader stays the single writer, so durability and the crash gate are exactly as Part 5 describes. A clearly-labelled stretch feature: read scale-out without the cost of consensus, eventually consistent, with the leader the one source of truth.
 
-## 9.5 Fairness under load: per-key rate limiting
+## 9.5 Seeing inside: metrics, tracing & OpenTelemetry
+
+Quiver serves a Prometheus `/metrics` endpoint (open, so a scraper needs no key) with per-route request counters and latency histograms, plus security counters (`quiver_auth_failures_total`, `quiver_rate_limited_total`); engine operations carry secret-free `tracing` spans, and an importable Grafana dashboard ships in `infra/grafana/`. New in v0.22.0, those spans can be **exported over OpenTelemetry** (ADR-0059): opt in behind the `otlp` build feature and a runtime endpoint (`QUIVER_OTLP_ENDPOINT`), and the existing spans stream over OTLP/gRPC to Jaeger, Tempo, or Grafana — off by default (a normal build links no extra dependency, and a failed exporter degrades to console logging rather than failing startup). The metrics defined here are the vocabulary the guide measures in: **recall@k** (fraction of the true k neighbours returned), **QPS** (queries/second), **p50/p95/p99** (tail latency), **RRF** (rank-based list fusion), **IDF** (rare-word weighting, the heart of BM25), **RSS** (physical RAM held — the memory-frugality headline), and **build time** (time to first query).
+
+## 9.6 Fairness under load: per-key rate limiting
 
 Each API key gets a **token bucket** that refills at a steady rate up to a burst capacity; every request spends a token. Over-rate requests get `429 Too Many Requests` with `Retry-After` and the standard `RateLimit-*` headers. Opt-in (off by default), enforced at one auth choke point so *every* REST and gRPC call is covered, and per-node in memory.
 
-## 9.6 The client fleet
+## 9.7 The client fleet: SDKs, agents, and the cockpit
 
-One engine, many front doors: SDKs for **Python** (sync + async), **TypeScript**, and **Go** (standard-library only), each mirroring the same surface — collections, points, search, hybrid, full-text, server-side embedding, and snapshots. The three are kept at **method parity**: alongside the core calls, each carries the same bulk/maintenance helpers — batched upload (`upsertIter` / `UpsertBatch`), a `scroll` over a whole collection for export and re-embedding, and a paged `deleteByFilter` for GDPR erasure — with the TypeScript client taking a sync *or* async iterable and the Go client a context on every call. For AI agents, an **MCP server** exposes the database as tools (create, upsert, search, hybrid, `database_stats`, `delete_collection`, `snapshot`) so an agent can *operate* Quiver, not just query it.
+One engine, many front doors: SDKs for **Python** (sync + async), **TypeScript**, and **Go** (standard-library only), each mirroring the same surface — collections, points, search, hybrid, full-text, server-side embedding, and snapshots. The three are kept at **method parity**: alongside the core calls, each carries the same bulk/maintenance helpers — batched upload (`upsertIter` / `UpsertBatch`), a `scroll` over a whole collection for export and re-embedding, and a paged `deleteByFilter` for GDPR erasure — with the TypeScript client taking a sync *or* async iterable and the Go client a context on every call. For AI agents, an **MCP server** exposes the database as tools — create, upsert, search, hybrid, `database_stats`, `delete_collection`, `snapshot`, and (v0.22.0) the text tools `upsert_text` / `search_text` — so an agent can *operate* Quiver, in plain words, not just query it.
 
-## 9.7 The roads not (yet) taken
+The last front door is for humans. `quiver tui` opens a retro terminal **cockpit** in the Bronze Quiver palette — a live dashboard of connection health, a collections table with load bars, points-trend and ingest-rate sparklines, and an activity log. New in v0.22.0 (ADR-0060) it became *interactive*: press `/` for a **query runner** (type a question, run a server-side `search_text`, inspect any result's payload), `?` for a keybinding overlay, and `Ctrl-t` to toggle a Slate theme. Every screen renders to a buffer behind a render-to-buffer API, so each is unit-tested with ratatui's `TestBackend` and the screenshots are generated from the *real* render — they never go stale.
 
-Two large capabilities are *designed* — as architecture records — but deliberately unbuilt until the single-node story is unbeatable: **distributed/sharded mode** (hash sharding + scatter-gather + per-shard Raft for write HA) and **GPU acceleration** (behind the index trait, CPU-default). A third — **concurrent reads** — has taken its first real step: reads now run in parallel behind a reader–writer lock (§5.3), with the fully **lock-free MVCC** path (versioned arc-swap snapshots so reads never wait on the writer at all) staged as the successor. Each ships as a design ADR first; none compromises the single static binary.
+Everything above ships in **one static binary**. For source and registry distribution the crates publish under the **`quiverdb-*`** namespace (ADR-0056) — each package is `quiverdb-<crate>` while its library name stays `quiver_<crate>` and the binary stays `quiver`, so imports and `cargo install --path` are unchanged. A multi-stage Docker image, a docker-compose, and a Helm chart round out the deploy story; secure defaults mean the server refuses to start on a non-loopback bind without a master key and TLS.
+
+## 9.8 The roads not (yet) taken
+
+Two large capabilities are *designed* — as architecture records — but deliberately unbuilt until the single-node story is unbeatable: **distributed/sharded mode** (hash sharding + scatter-gather + per-shard Raft for write HA) and **GPU acceleration** (behind the index trait, CPU-default). A third — **concurrent reads** — has taken its first real step: reads now run in parallel behind a reader–writer lock (§5.3) with the off-lock rebuild of §5.4, and the fully **lock-free MVCC** path (versioned arc-swap snapshots so reads never wait on the writer at all) staged as the successor. Each ships as a design ADR first; none compromises the single static binary.
+
+To make the sharding shape concrete (designed, not built — ADR-0051): suppose the movie catalogue outgrows one node. Hash each point's id into one of three **shards**, each an ordinary Quiver node owning ~⅓ of the vectors. A write routes to the owning shard; a query is a **scatter-gather** — the coordinator sends the query vector to all three in parallel, each returns its local top-*k*, and the coordinator merges them by exact distance into a global top-*k* (the same approximate-then-re-rank shape, one level up). Write availability would come from a small per-shard Raft group. It stays on paper because per-shard consensus is a multi-quarter commitment, and Quiver's rule is to be unbeatable at one node first — the §5.4 off-lock rebuild is exactly the kind of intra-node win that buys time before reaching for distribution.
 
 ---
 
@@ -663,6 +747,15 @@ Two large capabilities are *designed* — as architecture records — but delibe
 - **RRF (Reciprocal Rank Fusion)** — merging two ranked result lists using only their ranks.
 - **Payload / metadata** — the structured data attached to a vector (`{"year": 1982}`), used for filtering.
 - **MCP (Model Context Protocol)** — a standard that lets AI agents call tools; Quiver exposes itself as such tools.
+- **RwLock / concurrent reads** — a reader–writer lock: many searches run in parallel, a write takes the exclusive lock.
+- **Off-lock rebuild** — rebuilding a stale index without the exclusive lock; the prior index is served while the new one builds, then swapped in (ADR-0062).
+- **Snapshot isolation / MVCC** — a read sees one consistent version; it may miss a just-committed write but never a half-applied one.
+- **Saturated throughput (NT)** — QPS under many concurrent client threads vs one (1T) — the test for whether parallel reads help.
+- **Selectivity** — the fraction of a collection a filter keeps; decides pre-filter (selective) vs post-filter (broad).
+- **Replication (leader–follower)** — asynchronous read replicas: a follower tails a leader's writes to scale reads, with no consensus.
+- **Sharding / scatter-gather** — splitting data across nodes (designed, not built); a query fans out to all shards and merges results.
+- **OTLP / OpenTelemetry** — the wire protocol for exporting traces to a collector (Jaeger/Tempo/Grafana); opt-in in Quiver.
+- **Cockpit (TUI)** — the retro terminal interface (`quiver tui`): a live dashboard plus an interactive query runner.
 
 ---
 

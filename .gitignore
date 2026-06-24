@@ -49,6 +49,3 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
-
-# Standalone figures exported from the Quiver-Explained build (PDF + md are the deliverables)
-/docs/assets/explained-figures/
