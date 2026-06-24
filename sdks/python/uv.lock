@@ -1145,23 +1145,27 @@ wheels = [
 
 [[package]]
 name = "langsmith"
-version = "0.8.15"
+version = "0.9.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "anyio" },
+    { name = "distro" },
     { name = "httpx" },
     { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
     { name = "packaging" },
     { name = "pydantic" },
     { name = "requests" },
     { name = "requests-toolbelt" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
     { name = "uuid-utils" },
     { name = "websockets" },
     { name = "xxhash" },
     { name = "zstandard" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/64/2e/572ceee3ba566c86d4967fa19a146ed0a9485c2591f7e7762ecd2c03c045/langsmith-0.8.15.tar.gz", hash = "sha256:72e57c79eef82ddbbe22c5edb8bdf79eb557e65c3a1172ddfa05a724555c8294", size = 4508376, upload-time = "2026-06-12T03:02:56.118Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5b/26/b72987d947278f63ec1e85f01ce85ca7ab2621c7efc0845d4a3a8e5d5dfb/langsmith-0.9.1.tar.gz", hash = "sha256:e5eb905224d156bcece4985285c55b51fffcb06c9353b2c4adb42e1c48b0d05d", size = 4557557, upload-time = "2026-06-23T17:04:23.233Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/df/2f/30d6c24c2b1a1504a63dd554c3e3b4b75712b85cd0586395c703f8e6a633/langsmith-0.8.15-py3-none-any.whl", hash = "sha256:9cdf26495814c9ae38998cee7895cdba267b0b3566b598e407c0bb7eefb5aaf9", size = 498036, upload-time = "2026-06-12T03:02:54.186Z" },
+    { url = "https://files.pythonhosted.org/packages/63/42/13c67eb24cddb368df2c8af13e319c86b1d270c90f5b8c9e8baed3593e04/langsmith-0.9.1-py3-none-any.whl", hash = "sha256:1160bf667af63d9bc081821f1df351cb84f7875740858f2a97ffef62b21800a9", size = 578856, upload-time = "2026-06-23T17:04:21.47Z" },
 ]
 
 [[package]]
@@ -2337,7 +2341,7 @@ wheels = [
 
 [[package]]
 name = "quiver-client"
-version = "0.22.0"
+version = "0.23.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
