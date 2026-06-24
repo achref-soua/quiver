@@ -152,6 +152,7 @@ async fn tls_secures_both_rest_and_grpc() {
         rerank: Default::default(),
         rate_limit: Default::default(),
         otlp: Default::default(),
+        mvcc_reads: false,
     };
     tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;
@@ -242,6 +243,7 @@ async fn mtls_requires_a_client_certificate() {
         rerank: Default::default(),
         rate_limit: Default::default(),
         otlp: Default::default(),
+        mvcc_reads: false,
     };
     tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

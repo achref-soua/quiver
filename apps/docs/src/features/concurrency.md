@@ -79,13 +79,19 @@ visibility, not durability).
 
 This ships in **staged increments** behind the default-off flag:
 
-- **Increments 1–2 (now):** the snapshot infrastructure and lock-free reads over
-  the snapshot — pure-vector, payload/vector enrichment, **filtered** (exact
-  pre-filter and post-filter), and **hybrid** (dense ⊕ sparse/BM25) — all served
-  from the published snapshot, reusing the same store-fetch and RRF logic as the
-  locked path.
-- **Increment 3 (staged):** a `loom` model of the publish/load and a before/after
-  read-during-write benchmark on dedicated hardware — after which MVCC becomes the
-  default and the `RwLock` read path retires.
+- **Increments 1–2 (done):** the snapshot infrastructure and reads over the
+  snapshot — pure-vector, payload/vector enrichment, **filtered** (exact pre-filter
+  and post-filter), and **hybrid** (dense ⊕ sparse/BM25) — all served from the
+  published snapshot, reusing the same store-fetch and RRF logic as the locked path.
+- **Increment 3 (server cutover, done):** the server caches each MVCC-served
+  collection's snapshot cell **outside** the database lock, so a **pure-vector**
+  query loads the cell and searches it with *no lock at all* — it never blocks on a
+  concurrent writer. (Payload, filtered, and hybrid reads still take the read lock
+  for the store fetch — the store is not safe to read lock-free under a writer
+  (ADR-0057) — but they too serve from the snapshot.) The writer drives off-lock
+  consolidation, since fast-path reads bypass the reader-driven scheduler.
+- **Remaining:** a before/after read-during-write benchmark (the ratio is measured
+  on the shared dev box; absolute QPS stays reference-hardware-pending). The flag
+  stays **default-off** until that evidence justifies flipping it.
 
 Leave the flag off (the default) for the proven `RwLock` read path.
