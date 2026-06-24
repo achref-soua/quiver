@@ -10,6 +10,7 @@
 # --- Benchmark datasets (large; fetched on demand) ---
 /bench/datasets/
 /bench/results/*.local.*
+/bench/results/windows-local/
 
 # --- Node / SDKs ---
 node_modules/
