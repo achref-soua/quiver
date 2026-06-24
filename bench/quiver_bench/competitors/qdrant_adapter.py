@@ -8,6 +8,7 @@ Qdrant is pulled at the pinned version specified in ADR-0037.
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 import uuid
 
@@ -32,6 +33,21 @@ class QdrantAdapter(CompetitorAdapter):
         self._container: str | None = None
         self._client = None
         self._metric = "l2"
+        # qdrant-client wraps a single httpx session that is not safe to share
+        # across the saturated-QPS thread pool, so each worker thread gets its
+        # own client. ponytail: per-thread clients are GC-closed when the pool's
+        # threads exit; we don't track them for an explicit close.
+        self._local = threading.local()
+
+    def _thread_client(self):
+        """A QdrantClient owned by the calling thread (created on first use)."""
+        client = getattr(self._local, "client", None)
+        if client is None:
+            from qdrant_client import QdrantClient  # type: ignore[import]
+
+            client = QdrantClient(url=f"http://127.0.0.1:{REST_PORT}")
+            self._local.client = client
+        return client
 
     def start(self) -> None:
         # Pull the image (no-op if already cached)
@@ -111,7 +127,8 @@ class QdrantAdapter(CompetitorAdapter):
         from qdrant_client.models import SearchParams  # type: ignore[import]
 
         # qdrant-client ≥ 1.10 removed `search`; use `query_points` instead.
-        results = self._client.query_points(  # type: ignore[union-attr]
+        # Per-thread client so the saturated-QPS pass is genuinely concurrent.
+        results = self._thread_client().query_points(
             collection_name=COLLECTION,
             query=query.tolist(),
             limit=k,
