@@ -53,6 +53,10 @@ quiver-simd = { path = "crates/quiver-simd", version = "0.23", package = "quiver
 quiver-tui = { path = "crates/quiver-tui", version = "0.23", package = "quiverdb-tui" }
 
 anyhow = "1"
+# Lock-free atomic `Arc` swap for the MVCC serving snapshot (ADR-0064): readers
+# `load()` without a lock, the single writer `store()`s a new snapshot, and
+# reclamation is the `Arc` refcount — no `unsafe`, no epoch GC.
+arc-swap = "1.7"
 axum = "0.8"
 # TLS-in-transit (ADR-0010): rustls with the audited `ring` provider — no
 # OpenSSL, and no `aws-lc-rs` (which needs a C toolchain unavailable on minimal

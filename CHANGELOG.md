@@ -8,6 +8,26 @@ Quiver is pre-1.0: minor releases ship coherent, owner-gated feature sets and
 may include pre-1.0 API refinements. See [`docs/roadmap.md`](docs/roadmap.md)
 for the per-release rationale and Definitions of Done.
 
+## [Unreleased]
+
+### Added
+
+- Lock-free MVCC reads (ADR-0064), **experimental and default-off** behind
+  `QUIVER_MVCC_READS`. For single-vector, in-memory collections the single writer
+  publishes an immutable `CollectionSnapshot` (the base index plus a small overlay
+  of writes since the last rebuild) into an `arc-swap` cell; a reader `load()`s it
+  and merges base ⊕ overlay **without taking any lock**, so reads no longer block
+  on a concurrent writer's exclusive lock. This increment 1 serves **pure-vector**
+  reads (no payload filter); filtered/hybrid reads over the snapshot return an
+  explicit error under the flag (they land in increment 2). Durability and the
+  `kill -9` crash gate are unchanged — MVCC changes visibility, not durability.
+  Justified by a measured read-during-write contention sweep
+  (`docs/benchmarks/results/read-during-write.md`): a single concurrent writer of
+  small upserts already retains only ~0.10× of read throughput under the `RwLock`.
+- Read-during-write contention sweep now measures a grid of write pressure
+  (writer-thread counts × upsert batch sizes), recording the retained-read-QPS
+  ceiling that gates the MVCC build.
+
 ## [0.23.0] — 2026-06-24
 
 ### Added
@@ -381,7 +401,7 @@ for the per-release rationale and Definitions of Done.
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.23.0...HEAD
 [0.22.0]: https://github.com/achref-soua/quiver/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/achref-soua/quiver/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/achref-soua/quiver/compare/v0.20.0...v0.20.1

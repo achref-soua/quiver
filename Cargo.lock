@@ -2367,6 +2367,7 @@ dependencies = [
 name = "quiverdb-embed"
 version = "0.23.0"
 dependencies = [
+ "arc-swap",
  "postcard",
  "quiverdb-core",
  "quiverdb-index",
