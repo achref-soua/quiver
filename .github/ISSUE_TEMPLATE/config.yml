@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/achref-soua/quiver/security/advisories/new
+    about: Please report security issues privately via a GitHub Security Advisory or the contact in SECURITY.md — do not open a public issue.
+  - name: 💬 Questions & discussion
+    url: https://github.com/achref-soua/quiver/discussions
+    about: Ask questions, share ideas, and discuss usage with the community.
+  - name: 📖 Documentation
+    url: https://github.com/achref-soua/quiver/tree/main/docs
+    about: Concepts, self-hosting, API/SDKs, security, and the architecture deep-dive.
