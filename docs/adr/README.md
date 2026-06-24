@@ -81,5 +81,6 @@ ADRs are immutable once Accepted; we supersede rather than edit. Numbers are sta
 | [0059](0059-otlp-traces-exporter.md) | OpenTelemetry traces exporter — opt-in `otlp` cargo feature + runtime endpoint gate (OTLP/gRPC, reuses tonic) | Accepted | 4 |
 | [0060](0060-interactive-tui-cockpit.md) | Interactive TUI cockpit — query runner, point inspector, recent searches, help overlay, theme toggle; pure table-tested key handler | Accepted | 4 |
 | [0061](0061-benchmark-dimensions-v0.22.0.md) | v0.22.0 benchmark dimensions — recall@{1,10,100}, saturated-concurrency QPS (qdrant thread-local fix), quantization memory wedge, filtered-selectivity sweep | Accepted | 4 |
+| [0062](0062-rebuild-off-the-exclusive-lock.md) | Move the index rebuild off the exclusive lock — measured the rebuild stall (8–77 s, scales with size), captures the lock-free win with `Arc`+`RwLock`, no `unsafe`/`loom`; refines ADR-0057 ph2 / ADR-0053 | Accepted | 4 |
 
 Phase-0 ADRs (0001–0018) are Accepted; Phase-2 decisions span 0019–0022; Phase-4 decisions begin at 0023. New decisions take the next free number; superseded ADRs are marked as such — never deleted or renumbered.
