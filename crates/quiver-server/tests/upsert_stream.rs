@@ -85,22 +85,32 @@ async fn grpc_upsert_stream_bulk_loads_then_is_searchable() {
     let resp = client.upsert_stream(stream).await.unwrap().into_inner();
     assert_eq!(resp.upserted, 4);
 
-    // The bulk-loaded points are searchable.
-    let found = client
-        .search(tonic::Request::new(v1::SearchRequest {
-            collection: "kb".to_owned(),
-            vector: vec![1.0, 0.0, 0.0, 0.0],
-            k: 4,
-            ef_search: 0,
-            filter: Vec::new(),
-            with_payload: false,
-            with_vector: false,
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(found.matches.len(), 4);
-    assert_eq!(found.matches[0].id, "a");
+    // The bulk-loaded points become searchable. A bulk load defers the index
+    // rebuild, which the server runs off-lock (ADR-0062), so the first read may
+    // serve the prior (empty) snapshot until that rebuild commits — poll until fresh.
+    let mut found = Vec::new();
+    for _ in 0..250 {
+        found = client
+            .search(tonic::Request::new(v1::SearchRequest {
+                collection: "kb".to_owned(),
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                k: 4,
+                ef_search: 0,
+                filter: Vec::new(),
+                with_payload: false,
+                with_vector: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .matches;
+        if found.len() == 4 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(found.len(), 4);
+    assert_eq!(found[0].id, "a");
 
     // A stream whose chunks target different collections is rejected.
     let mixed = tokio_stream::iter(vec![

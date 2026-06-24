@@ -268,22 +268,33 @@ async fn a_follower_mirrors_the_leader_and_refuses_writes() {
     }
     assert_eq!(count, 2, "follower replicated both points");
 
-    // It serves the same nearest neighbour as the leader.
-    let hits = follower
-        .search(v1::SearchRequest {
-            collection: "places".to_owned(),
-            vector: vec![1.0, 0.0],
-            k: 1,
-            filter: vec![],
-            ef_search: 0,
-            with_payload: false,
-            with_vector: false,
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .matches;
-    assert_eq!(hits[0].id, "a");
+    // It serves the same nearest neighbour as the leader. A replicated write defers
+    // the index rebuild, which the follower runs off-lock (ADR-0062), so the first
+    // search may serve the prior (empty) snapshot while that rebuild completes —
+    // eventual consistency, in keeping with async replication. Poll until it lands.
+    let mut top = None;
+    for _ in 0..250 {
+        let hits = follower
+            .search(v1::SearchRequest {
+                collection: "places".to_owned(),
+                vector: vec![1.0, 0.0],
+                k: 1,
+                filter: vec![],
+                ef_search: 0,
+                with_payload: false,
+                with_vector: false,
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .matches;
+        if let Some(hit) = hits.first() {
+            top = Some(hit.id.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(top.as_deref(), Some("a"), "follower serves the leader's NN");
 
     // And it refuses a direct write (read-only follower).
     let denied = follower

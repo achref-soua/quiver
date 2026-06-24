@@ -37,6 +37,15 @@ for the per-release rationale and Definitions of Done.
 
 ### Changed
 
+- Index rebuilds run **off the exclusive lock** (ADR-0062): a write that defers a
+  collection's rebuild no longer stalls concurrent reads. The server serves the
+  prior snapshot while it rebuilds the index off-lock — captured under the shared
+  read lock, built with no lock held, swapped in under a brief write lock — so a
+  rebuild that previously blocked every read for the whole build (measured ~8 s at
+  20k vectors, ~30 s at 50k, ~77 s at 100k) now keeps reads in the sub-millisecond
+  tail. Server reads are snapshot-isolated and eventually consistent across a
+  rebuild window; embedded `&mut` searches still rebuild synchronously for
+  read-your-writes. Durability and the crash-recovery gate are unchanged.
 - The embedding/rerank provider seam moved from `quiver-server` into a new lean
   `quiver-providers` crate (ADR-0058) shared by the network and MCP servers; the
   server re-exports the types, so its public API is unchanged.

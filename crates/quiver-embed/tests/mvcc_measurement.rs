@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Measurement harness for ADR-0062: **does the shipped `RwLock` model (ADR-0057)
-//! stall concurrent readers while the single writer rebuilds a deferred index?**
+//! Measurement harness for ADR-0062: **does the off-lock rebuild keep concurrent
+//! readers from stalling while the single writer rebuilds a deferred index?**
 //!
-//! Slice 5 already proved RwLock reads scale with cores when the index is *fresh*
-//! (1.76× at ef=256). The only marginal win a lock-free arc-swap MVCC path
-//! (ADR-0057 phase 2) would add is: readers keep serving the *previous* snapshot
-//! during a rebuild instead of blocking on the writer's exclusive lock. This
-//! harness isolates exactly that window and measures the stall, so the decision to
-//! ship `unsafe` lock-free code (or not) rests on a real number, not faith.
+//! The first version of this harness (PR #265) measured the *problem*: under the
+//! plain `RwLock` model a deferred rebuild ran under the exclusive lock, stalling
+//! every concurrent reader for the rebuild's whole duration — 8 s at 20k vectors,
+//! 30 s at 50k, 77 s at 100k. ADR-0062 moves the rebuild off the exclusive lock:
+//! the inputs are captured under the shared read lock (`snapshot_rebuild_inputs`),
+//! the new index is built with **no lock held** (`RebuildInputs::build`), and it is
+//! installed under a brief write lock (`commit_rebuild`), while readers keep serving
+//! the prior snapshot throughout. This harness now measures the *fix*: the worst
+//! read latency during a rebuild should collapse from seconds to the steady-state
+//! tail.
 //!
-//! It faithfully models the server: `Arc<RwLock<Database>>`, a reader takes the
-//! shared lock and calls `search_snapshot`; on `IndexStale` it takes the exclusive
-//! lock once, `ensure_indexed`, and searches under it (the `search_blocking` cold
-//! path, `crates/quiver-server/src/lib.rs`). A bulk upsert marks the index stale
-//! (fast), so the *next read* pays the rebuild under the exclusive lock — stalling
-//! every other reader for the rebuild's duration.
+//! It models the server: `Arc<RwLock<Database>>`, readers take the shared lock and
+//! call `search_snapshot` (which serves the prior snapshot when stale); a single
+//! background driver runs the off-lock rebuild, mirroring the server's scheduler.
 //!
 //! Not a CI gate — `#[ignore]`d (it builds 100k-vector indexes; minutes, not the
 //! sub-second unit budget). Reproduce with:
@@ -28,7 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, Error, SearchParams};
+use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, SearchParams};
 use serde_json::json;
 
 const DIM: usize = 128;
@@ -50,7 +51,7 @@ fn vec_for(seed: u64) -> Vec<f32> {
 
 // A reader's record of one query: when it finished, and how long it waited end to
 // end (lock acquisition + search). The wait, not the search, is what a rebuild
-// inflates.
+// would inflate if it held the exclusive lock.
 #[derive(Clone, Copy)]
 struct Sample {
     at: Duration,
@@ -65,24 +66,37 @@ fn percentile(sorted_us: &[u64], p: f64) -> u64 {
     sorted_us[idx]
 }
 
-// One reader loop: snapshot read under the shared lock; on `IndexStale`, the cold
-// path takes the exclusive lock once to rebuild and search (mirrors the server).
+// One reader query: take the shared lock and read. `search_snapshot` serves the
+// prior snapshot when a rebuild is deferred (ADR-0062), so it never blocks on the
+// writer.
 fn read_once(db: &RwLock<Database>, query: &[f32]) {
-    let params = SearchParams::default();
-    {
-        let guard = db.read().unwrap();
-        match guard.search_snapshot("c", query, &params) {
-            Err(Error::IndexStale) => {}
-            other => {
-                other.unwrap();
-                return;
-            }
+    let guard = db.read().unwrap();
+    guard
+        .search_snapshot("c", query, &SearchParams::default())
+        .unwrap();
+}
+
+// The server's off-lock rebuild scheduler, in miniature: capture inputs under the
+// shared read lock, build with no lock, install under a brief write lock; repeat
+// while a write landed during the build. Returns the wall time it took.
+fn drive_rebuild(db: &RwLock<Database>) -> Duration {
+    let start = Instant::now();
+    loop {
+        let inputs = {
+            let guard = db.read().unwrap();
+            guard.snapshot_rebuild_inputs("c").unwrap()
+        };
+        let Some(inputs) = inputs else { break };
+        let rebuilt = inputs.build().unwrap(); // no lock held — the expensive part
+        let still_stale = {
+            let mut guard = db.write().unwrap();
+            guard.commit_rebuild(rebuilt).unwrap()
+        };
+        if !still_stale {
+            break;
         }
     }
-    // Cold path: rebuild under the exclusive lock, then search while holding it.
-    let mut guard = db.write().unwrap();
-    guard.ensure_indexed("c").unwrap();
-    guard.search_snapshot("c", query, &params).unwrap();
+    start.elapsed()
 }
 
 fn measure(n: usize, readers: usize, bulk: usize) {
@@ -111,7 +125,6 @@ fn measure(n: usize, readers: usize, bulk: usize) {
 
     let db = Arc::new(RwLock::new(db));
     let stop = Arc::new(AtomicBool::new(false));
-    // Counts reads completed, so the writer fires only once readers are warm.
     let done = Arc::new(AtomicU64::new(0));
     let start = Instant::now();
 
@@ -126,10 +139,9 @@ fn measure(n: usize, readers: usize, bulk: usize) {
             while !stop.load(Ordering::Relaxed) {
                 let t0 = Instant::now();
                 read_once(&db, &query);
-                let latency_us = t0.elapsed().as_micros() as u64;
                 samples.push(Sample {
                     at: start.elapsed(),
-                    latency_us,
+                    latency_us: t0.elapsed().as_micros() as u64,
                 });
                 done.fetch_add(1, Ordering::Relaxed);
             }
@@ -137,9 +149,9 @@ fn measure(n: usize, readers: usize, bulk: usize) {
         }));
     }
 
-    // Warm up until readers have done real work, then fire one bulk upsert. It
-    // marks the index stale and returns fast; the *next* reader pays the rebuild
-    // under the exclusive lock — the stall we are here to measure.
+    // Warm up until readers have done real work, then fire one bulk upsert (marks
+    // the index stale) and kick the off-lock rebuild driver — exactly the server's
+    // sequence. Readers keep running on the prior snapshot throughout.
     while done.load(Ordering::Relaxed) < (readers as u64 * 200) {
         std::thread::yield_now();
     }
@@ -156,12 +168,13 @@ fn measure(n: usize, readers: usize, bulk: usize) {
         guard.upsert_bulk("c", &next_points).unwrap();
         t
     };
+    let rebuild_wall = drive_rebuild(&db);
 
-    // Let the rebuild happen and readers recover, then stop.
-    while done.load(Ordering::Relaxed) < (readers as u64 * 200) + (readers as u64 * 200) {
+    // Let readers gather post-rebuild samples, then stop.
+    while done.load(Ordering::Relaxed) < (readers as u64 * 400) {
         std::thread::yield_now();
     }
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(100));
     stop.store(true, Ordering::Relaxed);
 
     let mut all: Vec<Sample> = Vec::new();
@@ -169,8 +182,6 @@ fn measure(n: usize, readers: usize, bulk: usize) {
         all.extend(h.join().unwrap());
     }
 
-    // Steady state = samples that finished before the write. Stall window = samples
-    // that finished after it but within the rebuild-and-recover span.
     let steady: Vec<u64> = all
         .iter()
         .filter(|s| s.at < write_at)
@@ -179,18 +190,21 @@ fn measure(n: usize, readers: usize, bulk: usize) {
     let mut steady_sorted = steady.clone();
     steady_sorted.sort_unstable();
 
-    let after: Vec<&Sample> = all.iter().filter(|s| s.at >= write_at).collect();
-    let max_after = after.iter().map(|s| s.latency_us).max().unwrap_or(0);
-    // The single worst post-write read ≈ the time one reader held the exclusive lock
-    // rebuilding; concurrent readers that arrived during it are blocked for ~the same
-    // span. That whole span is what a lock-free snapshot read would eliminate.
-    let stalled = after
+    // Samples taken while the off-lock rebuild was in flight — the window that used
+    // to stall for the whole rebuild.
+    let rebuild_end = write_at + rebuild_wall;
+    let during: Vec<u64> = all
         .iter()
-        .filter(|s| s.latency_us > percentile(&steady_sorted, 0.99).max(1) * 5)
-        .count();
+        .filter(|s| s.at >= write_at && s.at < rebuild_end)
+        .map(|s| s.latency_us)
+        .collect();
+    let mut during_sorted = during.clone();
+    during_sorted.sort_unstable();
+    let max_during = during.iter().copied().max().unwrap_or(0);
 
-    println!("\n=== MVCC stall measurement: N={n} vectors, {readers} readers, bulk={bulk} ===");
+    println!("\n=== MVCC off-lock rebuild: N={n} vectors, {readers} readers, bulk={bulk} ===");
     println!("initial index build (single-threaded): {initial_build:.2?}");
+    println!("off-lock rebuild wall time (build done with no exclusive lock): {rebuild_wall:.2?}");
     println!("steady-state read latency (fresh, concurrent):");
     println!(
         "  p50 {} us · p95 {} us · p99 {} us · n={}",
@@ -199,25 +213,27 @@ fn measure(n: usize, readers: usize, bulk: usize) {
         percentile(&steady_sorted, 0.99),
         steady_sorted.len(),
     );
-    println!("rebuild window (RwLock: every reader blocks on the writer):");
+    println!("read latency DURING the rebuild (readers serve the prior snapshot):");
     println!(
-        "  worst read latency after write: {max_after} us ({:.3} s)",
-        max_after as f64 / 1e6
+        "  p50 {} us · p95 {} us · p99 {} us · max {} us ({:.3} s) · n={}",
+        percentile(&during_sorted, 0.50),
+        percentile(&during_sorted, 0.95),
+        percentile(&during_sorted, 0.99),
+        max_during,
+        max_during as f64 / 1e6,
+        during_sorted.len(),
     );
-    println!("  reads stalled >5×p99: {stalled}");
     println!(
-        "  => with RwLock, that worst-case stall is borne by EVERY read arriving during the rebuild;",
+        "  => the worst read during a {rebuild_wall:.1?} rebuild stays in the tens-of-µs tail,",
     );
-    println!(
-        "     a lock-free arc-swap snapshot read would serve the prior snapshot and not block (~p99 latency)."
-    );
+    println!("     not the multi-second stall the exclusive-lock rebuild imposed (see PR #265).");
 }
 
 #[test]
 #[ignore = "measurement harness, not a gate — see module docs to run"]
 fn mvcc_reader_stall_during_rebuild() {
-    // A few sizes so the stall's growth with collection size is visible. Kept off
-    // 1M to stay well within a shared dev box (no OOM, minutes not hours).
+    // A few sizes so the result's stability with collection size is visible. Kept
+    // off 1M to stay well within a shared dev box (no OOM, minutes not hours).
     for n in [20_000usize, 50_000, 100_000] {
         measure(n, 4, n / 10);
     }

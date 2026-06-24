@@ -286,12 +286,13 @@ async fn rest_and_grpc_round_trip() {
     server.abort();
 }
 
-/// ADR-0057: reads run behind the shared lock; a write that defers a collection's
-/// index rebuild leaves it stale, and the next read takes the exclusive lock once
-/// to rebuild before serving. This drives many concurrent queries straight at a
-/// deferred rebuild and asserts they all succeed with the correct result — the
-/// server's `search_blocking` cold path (read → `IndexStale` → write-locked
-/// rebuild → retry), exercised under contention.
+/// ADR-0062: reads run behind the shared lock and never block on a rebuild. A write
+/// that defers a collection's rebuild leaves it stale; concurrent reads keep serving
+/// the *prior* snapshot — never an error, never a stall — while the server rebuilds
+/// the index off-lock, and become fresh once it commits. This drives many concurrent
+/// queries straight at a deferred rebuild: every one succeeds with a valid snapshot
+/// (the prior or the rebuilt nearest), and the result converges to the post-write
+/// nearest neighbour.
 #[tokio::test]
 async fn rest_concurrent_reads_survive_a_deferred_rebuild() {
     let tmp = tempfile::tempdir().unwrap();
@@ -369,8 +370,9 @@ async fn rest_concurrent_reads_survive_a_deferred_rebuild() {
         .await
         .unwrap();
 
-    // Fire many concurrent queries at the now-stale collection. Exactly one
-    // rebuilds under the write lock; all must return the correct nearest point.
+    // Fire many concurrent queries at the now-stale collection. Every one must
+    // succeed (no stall, no error) and return a valid snapshot — either the prior
+    // nearest (`a`) or the post-rebuild nearest (`b`, moved to [0.2,…]).
     let mut tasks = Vec::new();
     for _ in 0..16 {
         let http = http.clone();
@@ -385,13 +387,37 @@ async fn rest_concurrent_reads_survive_a_deferred_rebuild() {
                 .unwrap();
             assert_eq!(resp.status(), reqwest::StatusCode::OK);
             let body: serde_json::Value = resp.json().await.unwrap();
-            // `b` moved to [0.2,…], the closest point to the query.
-            assert_eq!(body["matches"][0]["id"], "b");
+            let id = body["matches"][0]["id"].as_str().unwrap().to_owned();
+            assert!(id == "a" || id == "b", "valid snapshot, got {id}");
         }));
     }
     for t in tasks {
         t.await.unwrap();
     }
+
+    // The off-lock rebuild converges: reads become fresh, with `b` now nearest.
+    let mut latest = String::new();
+    for _ in 0..250 {
+        let body: serde_json::Value = http
+            .post(format!("{base}/v1/collections/items/query"))
+            .bearer_auth(key)
+            .json(&serde_json::json!({"vector": [0.15, 0.0, 0.0, 0.0], "k": 1}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        latest = body["matches"][0]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if latest == "b" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(latest, "b", "reads converge on the rebuilt index");
 
     server.abort();
 }
