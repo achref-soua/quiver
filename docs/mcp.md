@@ -14,6 +14,10 @@ QUIVER_ENCRYPTION_KEY=<64-hex> quiver mcp --data-dir ./data
 
 # Development only — no encryption-at-rest:
 quiver mcp --data-dir ./data --insecure
+
+# Enable the text tools (upsert_text / search_text): point at a config with
+# [embedding.<collection>] tables (the same file `quiver serve` uses).
+QUIVER_ENCRYPTION_KEY=<64-hex> quiver mcp --data-dir ./data --config quiver.toml
 ```
 
 The process reads requests on stdin and writes responses on stdout, so it is
@@ -37,10 +41,27 @@ launched by an MCP-capable client (e.g. an agent runtime) as a subprocess.
 | `delete_collection` | `collection` | Drop a whole collection and its points (reports whether it existed) |
 | `database_stats` | — | Whole-database overview: collection count, total points, per-collection summary, and snapshot status (`manifest_version`, `disk_bytes`) |
 | `snapshot` | `destination` | Take a consistent online backup of the whole database into a server-local directory (ADR-0050) |
+| `upsert_text` | `collection`, `id`, `text`, `payload?` | Embed `text` server-side and upsert it as a point, co-populating the BM25 full-text field (requires a provider — see below) |
+| `search_text` | `collection`, `text`, `k?`, `filter?`, `rerank?`, `rrf_k0?` | Embed the query server-side and run a hybrid dense+BM25 search, optionally reranking (requires a provider — see below) |
 
 `filter` is a Quiver [payload filter](api/wire-protocol.md) tree, e.g.
 `{"eq": {"field": "color", "value": "blue"}}`. The full JSON-Schema for each
 tool is returned by the standard `tools/list` request.
+
+## Text tools (server-side embedding)
+
+`upsert_text` / `search_text` let an agent store and query documents by **text**,
+with Quiver embedding them server-side (ADR-0047/0058) — the agent never runs an
+embedding model itself. They require an embedding provider for the collection,
+configured exactly as for `quiver serve`: an `[embedding.<collection>]` table
+(and an optional `[rerank.<collection>]` for `search_text(rerank=true)`) in the
+config passed via `quiver mcp --config <path>` (default `quiver.toml`). See
+[Server-side embedding](../features/embedding.md) for the provider table format
+and secret handling (API keys are referenced by env-var name, never stored).
+
+Both tools are always advertised by `tools/list`; with no provider configured
+they return an `isError` result explaining how to enable them, so an agent can
+discover the capability.
 
 ## Protocol notes
 
@@ -49,4 +70,6 @@ tool is returned by the standard `tools/list` request.
   `isError: true` and a human-readable message in the content, so the agent can
   read and recover from them. Malformed JSON-RPC (unknown method, missing tool
   name) returns a JSON-RPC error object instead.
-- Embeddings are produced by the caller — Quiver stays model-agnostic.
+- Embeddings are produced by the caller for `upsert` / `search` — Quiver stays
+  model-agnostic — or, with a configured provider, server-side via the
+  `upsert_text` / `search_text` tools.

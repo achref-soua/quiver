@@ -25,6 +25,7 @@ The core (storage, indexes, kernels, query planner, on-disk format, wire protoco
 | `quiver-query` | Query planner; hybrid filtered search (vector + metadata predicate + optional BM25); top-k merge & re-rank | — |
 | `quiver-proto` | Wire types: gRPC service (`tonic`/`prost`), REST DTOs, OpenAPI generation | `tonic`, `prost`, `serde` |
 | `quiver-embed` | Embeddable in-process database handle — the clean Rust API over core+index+query+crypto | — |
+| `quiver-providers` | Edge embedding/rerank adapters (OpenAI-compatible/Cohere/fake) shared by the network and MCP servers (ADR-0047/0058) | `ureq`, `figment` |
 | `quiver-server` | The daemon: `axum` REST + `tonic` gRPC, auth, RBAC, audit, query cost limits (ADR-0040), config, observability | `axum`, `tonic`, `tokio`, `tracing` |
 | `quiver-tui` | The `ratatui` cockpit (API client; works local or remote) | `ratatui`, `crossterm` |
 | `quiver-mcp` | MCP server exposing Quiver as agent tools | MCP SDK / `rmcp` |
@@ -44,11 +45,15 @@ flowchart TD
   query --> core
   embed[quiver-embed] --> query
   embed --> crypto
+  providers[quiver-providers]
   server[quiver-server] --> embed
   server --> proto
   server --> crypto
+  server --> providers
   tui[quiver-tui] --> proto
-  mcp[quiver-mcp] --> proto
+  mcp[quiver-mcp] --> embed
+  mcp --> crypto
+  mcp --> providers
   cli[quiver-cli] --> server
   cli --> tui
   cli --> mcp
@@ -73,7 +78,7 @@ Both ship in one static binary; `quiver-server` is a thin network/policy shell o
 ## Cross-cutting concerns
 
 - **Security layers:** TLS/mTLS in transit (`quiver-crypto`/`rustls`); envelope encryption at rest (per-collection DEK wrapped by a master key, AEAD on segment pages); optional client-side payload encryption (opaque ciphertext to the server); API-key scopes + RBAC + tenant isolation; append-only audit log; crypto-shredding by DEK destruction. See [`../security/threat-model.md`](../security/threat-model.md) and [`../security/crypto.md`](../security/crypto.md).
-- **Concurrency:** single-writer, many-reader. The server guards the engine with a reader–writer lock (ADR-0057): searches take the shared lock and run **in parallel**, writes take the exclusive lock, and a read that finds a collection's index stale (a prior write deferred its rebuild) takes the write lock once to rebuild before serving concurrently again. Durability and the `kill -9` crash gate are unchanged; the fully lock-free arc-swap snapshot path is the staged successor.
+- **Concurrency:** single-writer, many-reader. The server guards the engine with a reader–writer lock (ADR-0057): searches take the shared lock and run **in parallel**, writes take the exclusive lock. A read that finds a collection's index stale (a prior write deferred its rebuild) serves the **prior** snapshot and schedules an **off-lock** rebuild (ADR-0062) — the inputs are captured under the shared lock, the new index is built with no lock held, and it is swapped in under a brief write lock — so a rebuild **never stalls concurrent readers** (measured: a 100k-vector rebuild that blocked every read for ~77 s now keeps reads in the sub-millisecond tail). Reads are then snapshot-isolated and eventually consistent across a rebuild window; embedded `&mut` callers still rebuild synchronously for read-your-writes. Durability and the `kill -9` crash gate are unchanged.
 - **Observability:** OpenTelemetry-compatible `tracing` spans across server→query→index→core; Prometheus `/metrics`; structured logs; `/healthz` + `/readyz`.
 - **Configuration:** typed, validated config with secure defaults; secrets via env + KMS pattern (see ADR-0013).
 

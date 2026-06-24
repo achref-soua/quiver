@@ -64,7 +64,7 @@ The same flow is available over [REST & gRPC](api/rest-grpc.md), the
 ```bash
 just build            # compile the workspace
 just verify           # the full local quality gate (lint · test · doc · deny · audit)
-cargo run -p quiver-cli -- --help
+cargo run -p quiverdb-cli -- --help
 ```
 
 `just verify` is the authoritative gate (the CI workflows are manual-only by

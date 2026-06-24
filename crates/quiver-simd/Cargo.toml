@@ -1,5 +1,5 @@
 [package]
-name = "quiver-simd"
+name = "quiverdb-simd"
 description = "SIMD distance kernels for Quiver."
 version.workspace = true
 edition.workspace = true
@@ -29,3 +29,6 @@ harness = false
 
 [lints]
 workspace = true
+
+[lib]
+name = "quiver_simd"

@@ -8,7 +8,64 @@ Quiver is pre-1.0: minor releases ship coherent, owner-gated feature sets and
 may include pre-1.0 API refinements. See [`docs/roadmap.md`](docs/roadmap.md)
 for the per-release rationale and Definitions of Done.
 
-## [Unreleased]
+## [0.22.0] — 2026-06-24
+
+### Added
+
+- Benchmark dimensions (ADR-0061): the v0.22.0 SIFT1M run reports **recall at
+  depth 1 / 10 / 100**, a **saturated-concurrency** sweep (1-thread vs 8-thread
+  QPS — up to 1.76× at ef=256), a **quantization trade-off** (in-memory HNSW vs
+  disk-Vamana + PQ, showing the recall@100 tail collapse), and a **filtered
+  selectivity** sweep (the planner's pre-filter/post-filter recall valley). Every
+  figure traces to a committed CSV in `docs/benchmarks/results/comparison-v0.22.0/`;
+  absolute serving-RAM and full-field saturated QPS stay reference-hardware-pending,
+  never fabricated.
+- The "Quiver, Explained" field guide is expanded to v0.22.0 with a whole-system
+  architecture diagram, the off-lock-rebuild timeline, the new benchmark figures,
+  and a cockpit walkthrough; its standalone figures are now committed under
+  `docs/assets/explained-figures/`.
+- Interactive TUI cockpit (ADR-0060): the retro cockpit gains a **query runner**
+  (`/`) — type a query, run a server-side embed-and-search, inspect any result's
+  payload, and recall recent searches — plus a modal keybinding-help overlay
+  (`?` / `F1`), a live theme toggle (`Ctrl-t`, Bronze ↔ Slate), and an
+  ingest-rate sparkline alongside the points trend. Key handling is refactored
+  into a pure, table-tested dispatcher with network I/O pushed to the edge; every
+  screen renders to a buffer and is asserted with ratatui's `TestBackend`. New
+  committed screenshots (`search`, `help`, `theme-slate`) regenerate from the
+  real render via `just tui-shots`.
+- OpenTelemetry traces exporter (ADR-0059): opt-in behind the `otlp` cargo
+  feature and a runtime endpoint (`QUIVER_OTLP_ENDPOINT` / `[otlp]` in
+  `quiver.toml`), exporting the existing `#[tracing::instrument]` spans over
+  OTLP/gRPC to a collector (Jaeger/Tempo/Grafana). Off by default — no new
+  dependencies in a normal build; the OTLP/gRPC transport reuses the in-tree
+  `tonic`. A failed exporter degrades to `fmt`-only rather than failing startup.
+- MCP text tools (ADR-0058): `upsert_text` and `search_text` over the MCP server,
+  so an AI agent can store and search documents by text — Quiver embeds them
+  server-side — without running an embedding model itself. Configured with
+  `quiver mcp --config <quiver.toml>` (`[embedding.<collection>]` /
+  `[rerank.<collection>]` tables, the same surface as `quiver serve`); `search_text`
+  optionally reranks. This brings the MCP surface to full provider parity with
+  REST, gRPC, and the SDKs.
+
+### Changed
+
+- Index rebuilds run **off the exclusive lock** (ADR-0062): a write that defers a
+  collection's rebuild no longer stalls concurrent reads. The server serves the
+  prior snapshot while it rebuilds the index off-lock — captured under the shared
+  read lock, built with no lock held, swapped in under a brief write lock — so a
+  rebuild that previously blocked every read for the whole build (measured ~8 s at
+  20k vectors, ~30 s at 50k, ~77 s at 100k) now keeps reads in the sub-millisecond
+  tail. Server reads are snapshot-isolated and eventually consistent across a
+  rebuild window; embedded `&mut` searches still rebuild synchronously for
+  read-your-writes. Durability and the crash-recovery gate are unchanged.
+- The embedding/rerank provider seam moved from `quiver-server` into a new lean
+  `quiver-providers` crate (ADR-0058) shared by the network and MCP servers; the
+  server re-exports the types, so its public API is unchanged.
+- Crates are now published under the `quiverdb-*` namespace (ADR-0056): each
+  package is renamed `quiverdb-<crate>` while its library/extern name stays
+  `quiver_<crate>` and the binary stays `quiver`, so source, imports, and
+  `cargo install --path` are unchanged. This unblocks the (owner-gated) crates.io
+  publish job, since `quiver-core` / `quiver-cli` are held by unrelated crates.
 
 ## [0.21.0] — 2026-06-23
 
@@ -270,7 +327,8 @@ for the per-release rationale and Definitions of Done.
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/achref-soua/quiver/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/achref-soua/quiver/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/achref-soua/quiver/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/achref-soua/quiver/compare/v0.19.0...v0.20.0

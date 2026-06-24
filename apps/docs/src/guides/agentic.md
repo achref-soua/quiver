@@ -39,6 +39,7 @@ agent's memory is sealed on disk:
 | `get` | Fetch one point by id |
 | `delete` | Delete a point by id |
 | `upsert_document` / `search_multi_vector` / `delete_document` | Multi-vector (ColBERT) late-interaction documents |
+| `upsert_text` / `search_text` | Store/query by **text** — Quiver embeds it server-side (needs a provider; run `quiver mcp --config quiver.toml`) |
 
 All calls go through the same authorized op layer and cost limits (ADR-0040) as
 REST/gRPC, so an agent cannot exceed the server's guardrails.
@@ -57,6 +58,12 @@ A research assistant maintaining its own long-term memory:
 
 Because Quiver is model-agnostic, the **agent owns the embedding step** — pass
 the float vectors it produces. The server stores, filters, and ranks.
+
+Or let Quiver do the embedding: configure an `[embedding.<collection>]` provider
+(ADR-0047/0058), launch `quiver mcp --config quiver.toml`, and the agent can use
+`upsert_text` / `search_text` to store and query by text directly — no client-side
+model. `search_text(rerank=true)` additionally reranks in one call when a
+`[rerank.<collection>]` provider is set.
 
 ## Tips
 

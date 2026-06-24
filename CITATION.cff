@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use Quiver in your research or product, please cite it as below."
+title: "Quiver: a security-first, memory-frugal vector database"
+abstract: >-
+  Quiver is an open-source vector database written in Rust. It offers
+  approximate-nearest-neighbour search with encryption-at-rest on by default,
+  disk-resident indexes plus quantization for a small memory footprint, and a
+  single static binary that runs embedded or as a server, with REST/gRPC, an
+  MCP server for AI agents, and a terminal cockpit.
+type: software
+authors:
+  - family-names: Soua
+    given-names: Achref
+    email: achref.soua@outlook.com
+repository-code: "https://github.com/achref-soua/quiver"
+url: "https://github.com/achref-soua/quiver"
+license: AGPL-3.0-only
+keywords:
+  - vector-database
+  - approximate-nearest-neighbor
+  - ann
+  - rust
+  - embeddings
+  - retrieval-augmented-generation
+  - hnsw
+  - diskann

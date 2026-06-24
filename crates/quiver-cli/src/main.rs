@@ -75,6 +75,11 @@ enum Command {
         /// Run without encryption-at-rest (development only).
         #[arg(long, env = "QUIVER_INSECURE", default_value_t = false)]
         insecure: bool,
+        /// Quiver config file supplying [embedding.*]/[rerank.*] provider tables
+        /// for the upsert_text/search_text tools. A missing file is fine — those
+        /// tools are then advertised but report no provider configured.
+        #[arg(long, env = "QUIVER_CONFIG", default_value = "quiver.toml")]
+        config: PathBuf,
     },
     /// Administrative commands (imports, collections, keys).
     Admin {
@@ -168,9 +173,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve => {
-            quiver_server::init_tracing();
             let config = quiver_server::Config::load()?;
-            quiver_server::run(config).await?;
+            quiver_server::init_observability(&config);
+            let result = quiver_server::run(config).await;
+            // Flush any batched OTLP spans before exiting, even on error.
+            quiver_server::shutdown_observability();
+            result?;
         }
         Command::Tui { url, api_key } => {
             quiver_tui::run(quiver_tui::TuiOptions {
@@ -183,8 +191,14 @@ async fn main() -> anyhow::Result<()> {
             data_dir,
             encryption_key,
             insecure,
+            config,
         } => {
-            quiver_mcp::run(&data_dir, encryption_key.as_deref(), insecure)?;
+            quiver_mcp::run_with_config(
+                &data_dir,
+                encryption_key.as_deref(),
+                insecure,
+                Some(&config),
+            )?;
         }
         Command::Admin { command } => match *command {
             AdminCommand::Import {

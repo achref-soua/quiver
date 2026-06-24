@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Concurrent reads (ADR-0057): the `&self` `*_snapshot` reads serve a
-//! collection's current immutable snapshot, so a server can run many searches in
-//! parallel behind a shared lock and take the exclusive lock only to rebuild a
-//! deferred index. These tests pin the snapshot/`ensure_indexed` contract and
-//! prove a built snapshot is safe to share across threads with no lock at all.
+//! Concurrent reads (ADR-0057 / ADR-0062): the `&self` `*_snapshot` reads serve a
+//! collection's current immutable snapshot — and keep serving the *prior* snapshot
+//! when a write defers a rebuild, so a server runs many searches in parallel behind
+//! a shared lock and never blocks them on a rebuild. These tests pin that
+//! serve-prior contract and prove a built snapshot is safe to share across threads
+//! with no lock at all.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
 
-use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, Error, SearchParams};
+use quiver_embed::{Database, Descriptor, DistanceMetric, Dtype, SearchParams};
 use serde_json::json;
 
 // Seed a built, fresh HNSW collection of 64 points along the x-axis.
@@ -28,7 +29,7 @@ fn seed(db: &mut Database) {
 }
 
 #[test]
-fn snapshot_read_signals_stale_until_ensure_indexed() {
+fn snapshot_serves_prior_until_rebuilt() {
     let tmp = tempfile::tempdir().unwrap();
     let mut db = Database::open(tmp.path()).unwrap();
     seed(&mut db);
@@ -39,30 +40,34 @@ fn snapshot_read_signals_stale_until_ensure_indexed() {
         .search_snapshot("c", &q, &SearchParams::default())
         .unwrap();
     assert!(!hits.is_empty());
+    assert!(!db.needs_rebuild("c").unwrap());
 
     // An HNSW in-place update can't be absorbed incrementally, so it defers the
     // rebuild and the index goes stale.
     db.upsert("c", "p3", &[100.0, 1.0, 0.0, 0.0], &json!({ "i": 3 }))
         .unwrap();
 
-    // The `&self` snapshot read now *reports* stale instead of mutating to rebuild
-    // — exactly the signal a reader holding only a shared lock needs.
-    assert!(matches!(
-        db.search_snapshot("c", &q, &SearchParams::default()),
-        Err(Error::IndexStale)
-    ));
-
-    // The single writer resolves it; the snapshot read serves again.
-    db.ensure_indexed("c").unwrap();
+    // The `&self` snapshot read keeps serving the PRIOR snapshot (no error, no
+    // mutation), so a reader holding only the shared lock never blocks on the
+    // rebuild (ADR-0062); the deferral is reported separately via `needs_rebuild`.
+    assert!(db.needs_rebuild("c").unwrap());
     assert!(
         !db.search_snapshot("c", &q, &SearchParams::default())
             .unwrap()
             .is_empty()
     );
 
-    // The `&mut self` convenience wrappers hide the whole dance (used by embedded,
-    // single-threaded callers and as the server's cold-path retry). This exercises
-    // the shared `search_with_retry` path for the dense, hybrid, and the wrapper.
+    // The single writer resolves it; afterward the read is fresh and not stale.
+    db.ensure_indexed("c").unwrap();
+    assert!(!db.needs_rebuild("c").unwrap());
+    assert!(
+        !db.search_snapshot("c", &q, &SearchParams::default())
+            .unwrap()
+            .is_empty()
+    );
+
+    // The `&mut self` convenience wrappers give embedded callers read-your-writes:
+    // they rebuild a deferred index before reading, for the dense and hybrid paths.
     db.upsert("c", "p4", &[200.0, 1.0, 0.0, 0.0], &json!({ "i": 4 }))
         .unwrap();
     assert!(
@@ -70,6 +75,7 @@ fn snapshot_read_signals_stale_until_ensure_indexed() {
             .unwrap()
             .is_empty()
     );
+    assert!(!db.needs_rebuild("c").unwrap());
     db.upsert("c", "p5", &[300.0, 1.0, 0.0, 0.0], &json!({ "i": 5 }))
         .unwrap();
     assert!(

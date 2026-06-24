@@ -1,0 +1,28 @@
+[package]
+name = "quiverdb-providers"
+description = "Opt-in, provider-agnostic embedding & rerank adapters shared by the Quiver server and MCP server (ADR-0047/0058)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+figment = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ureq = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
+
+[lib]
+name = "quiver_providers"

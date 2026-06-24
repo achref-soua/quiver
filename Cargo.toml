@@ -7,7 +7,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.21.0"
+version = "0.22.0"
 edition = "2024"
 # MSRV: 1.88 — the minimum the dependency tree supports (ratatui 0.30's
 # `ratatui-core`/`-widgets`/`-crossterm`). Bumped from 1.85 when updating ratatui
@@ -39,17 +39,18 @@ todo = "warn"
 [workspace.dependencies]
 # Internal crates (path deps with a version so `cargo deny` sees no wildcard),
 # referenced as `quiver-x = { workspace = true }`.
-quiver-core = { path = "crates/quiver-core", version = "0.21" }
-quiver-crypto = { path = "crates/quiver-crypto", version = "0.21" }
-quiver-embed = { path = "crates/quiver-embed", version = "0.21" }
-quiver-import = { path = "crates/quiver-import", version = "0.21" }
-quiver-index = { path = "crates/quiver-index", version = "0.21" }
-quiver-mcp = { path = "crates/quiver-mcp", version = "0.21" }
-quiver-proto = { path = "crates/quiver-proto", version = "0.21" }
-quiver-query = { path = "crates/quiver-query", version = "0.21" }
-quiver-server = { path = "crates/quiver-server", version = "0.21" }
-quiver-simd = { path = "crates/quiver-simd", version = "0.21" }
-quiver-tui = { path = "crates/quiver-tui", version = "0.21" }
+quiver-core = { path = "crates/quiver-core", version = "0.22", package = "quiverdb-core" }
+quiver-crypto = { path = "crates/quiver-crypto", version = "0.22", package = "quiverdb-crypto" }
+quiver-embed = { path = "crates/quiver-embed", version = "0.22", package = "quiverdb-embed" }
+quiver-import = { path = "crates/quiver-import", version = "0.22", package = "quiverdb-import" }
+quiver-index = { path = "crates/quiver-index", version = "0.22", package = "quiverdb-index" }
+quiver-mcp = { path = "crates/quiver-mcp", version = "0.22", package = "quiverdb-mcp" }
+quiver-proto = { path = "crates/quiver-proto", version = "0.22", package = "quiverdb-proto" }
+quiver-providers = { path = "crates/quiver-providers", version = "0.22", package = "quiverdb-providers" }
+quiver-query = { path = "crates/quiver-query", version = "0.22", package = "quiverdb-query" }
+quiver-server = { path = "crates/quiver-server", version = "0.22", package = "quiverdb-server" }
+quiver-simd = { path = "crates/quiver-simd", version = "0.22", package = "quiverdb-simd" }
+quiver-tui = { path = "crates/quiver-tui", version = "0.22", package = "quiverdb-tui" }
 
 anyhow = "1"
 axum = "0.8"
@@ -115,6 +116,17 @@ tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# OpenTelemetry traces export (ADR-0059), opt-in behind quiver-server's `otlp`
+# feature and an endpoint at runtime — off by default. The OTLP/gRPC transport
+# reuses the tonic/prost already in the tree (no reqwest). cargo-deny verified
+# clean over the full opentelemetry tree even with the feature off.
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "grpc-tonic",
+    "trace",
+] }
+tracing-opentelemetry = "0.33"
 
 # Retro terminal cockpit (quiver-tui): ratatui renders; crossterm drives input
 # (its version is pinned to the one ratatui re-exports so they share a single

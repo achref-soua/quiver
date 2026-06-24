@@ -33,7 +33,7 @@ For the deeper deterministic guarantees, see also:
   `page::any_body_roundtrips` (raise the case count with `PROPTEST_CASES=8192`).
 - **Fuzzers** — `just fuzz filter_json|page_decode|wal_decode` (see
   [`docs/security/fuzzing.md`](../security/fuzzing.md)).
-- **Crash recovery** — `cargo test -p quiver-core --test crash_recovery`
+- **Crash recovery** — `cargo test -p quiverdb-core --test crash_recovery`
   (run isolated; it flakes under the parallel gate).
 
 ## Surfaces × operations
@@ -148,7 +148,7 @@ acceptance run covers PQ where the index supports it.
 | --- | --- | --- |
 | Qdrant | ✅ `admin.rs` + `acceptance.sh` | ✅ `live.rs` (hermetic HTTP); 🖐 real server |
 | Chroma | ✅ `lib.rs` parse tests | ✅ `live.rs` (hermetic HTTP); 🖐 real server |
-| pgvector | ✅ `lib.rs` parse tests | ✅ `live.rs` connection-error path; 🖐 `cargo test -p quiver-import -- --ignored` with `QUIVER_PG_TEST_URL` |
+| pgvector | ✅ `lib.rs` parse tests | ✅ `live.rs` connection-error path; 🖐 `cargo test -p quiverdb-import -- --ignored` with `QUIVER_PG_TEST_URL` |
 
 ## Replication
 
