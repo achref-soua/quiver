@@ -6,8 +6,8 @@ launch-time task.
 
 ## Python
 
-Install from [`sdks/python`](https://github.com/achref-soua/quiver/tree/main/sdks/python)
-(`pip install ./sdks/python`):
+Install from PyPI as [`quiver-client`](https://pypi.org/project/quiver-client/)
+(`pip install quiver-client`; or `pip install ./sdks/python` from a checkout):
 
 ```python
 from quiver import Client, Point
@@ -30,7 +30,7 @@ q.hybrid_search("kb", vector=embed(query), query_text=query, k=10)   # dense ⊕
 ```
 
 **LangChain**, **LlamaIndex**, and **Haystack** adapters ship as extras
-(`pip install "./sdks/python[langchain]"` / `[llamaindex]` / `[haystack]`), so any
+(`pip install "quiver-client[langchain]"` / `[llamaindex]` / `[haystack]`), so any
 Quiver index — including the memory-frugal disk path — backs a retriever or
 `DocumentStore`, with metadata filters mapped onto Quiver's exact pre-filter. Pass
 `hybrid=True` to any of them for `dense ⊕ BM25` retrieval.
@@ -42,8 +42,9 @@ retrieve → rerank step of a RAG pipeline.
 
 ## TypeScript
 
-Install from [`sdks/typescript`](https://github.com/achref-soua/quiver/tree/main/sdks/typescript)
-(`pnpm add ./sdks/typescript`), dependency-free over the global `fetch`:
+Install from npm as [`quiver-client`](https://www.npmjs.com/package/quiver-client)
+(`npm install quiver-client`; or `pnpm add ./sdks/typescript` from a checkout),
+dependency-free over the global `fetch`:
 
 ```ts
 import { Client } from "quiver-client";
