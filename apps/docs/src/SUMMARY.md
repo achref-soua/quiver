@@ -18,6 +18,7 @@
 # Features
 
 - [Indexing & memory frugality](features/indexing.md)
+- [Concurrency & the off-lock rebuild](features/concurrency.md)
 - [Hybrid (dense + sparse) search](features/hybrid-search.md)
 - [Server-side embedding & reranking](features/embedding.md)
 - [Multi-vector / late interaction](features/multi-vector.md)

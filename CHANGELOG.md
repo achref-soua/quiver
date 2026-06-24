@@ -8,10 +8,22 @@ Quiver is pre-1.0: minor releases ship coherent, owner-gated feature sets and
 may include pre-1.0 API refinements. See [`docs/roadmap.md`](docs/roadmap.md)
 for the per-release rationale and Definitions of Done.
 
-## [Unreleased]
+## [0.22.0] — 2026-06-24
 
 ### Added
 
+- Benchmark dimensions (ADR-0061): the v0.22.0 SIFT1M run reports **recall at
+  depth 1 / 10 / 100**, a **saturated-concurrency** sweep (1-thread vs 8-thread
+  QPS — up to 1.76× at ef=256), a **quantization trade-off** (in-memory HNSW vs
+  disk-Vamana + PQ, showing the recall@100 tail collapse), and a **filtered
+  selectivity** sweep (the planner's pre-filter/post-filter recall valley). Every
+  figure traces to a committed CSV in `docs/benchmarks/results/comparison-v0.22.0/`;
+  absolute serving-RAM and full-field saturated QPS stay reference-hardware-pending,
+  never fabricated.
+- The "Quiver, Explained" field guide is expanded to v0.22.0 with a whole-system
+  architecture diagram, the off-lock-rebuild timeline, the new benchmark figures,
+  and a cockpit walkthrough; its standalone figures are now committed under
+  `docs/assets/explained-figures/`.
 - Interactive TUI cockpit (ADR-0060): the retro cockpit gains a **query runner**
   (`/`) — type a query, run a server-side embed-and-search, inspect any result's
   payload, and recall recent searches — plus a modal keybinding-help overlay
@@ -315,7 +327,8 @@ for the per-release rationale and Definitions of Done.
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/achref-soua/quiver/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/achref-soua/quiver/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/achref-soua/quiver/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/achref-soua/quiver/compare/v0.19.0...v0.20.0
