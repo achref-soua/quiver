@@ -17,13 +17,15 @@ for the per-release rationale and Definitions of Done.
   publishes an immutable `CollectionSnapshot` (the base index plus a small overlay
   of writes since the last rebuild) into an `arc-swap` cell; a reader `load()`s it
   and merges base ⊕ overlay **without taking any lock**, so reads no longer block
-  on a concurrent writer's exclusive lock. This increment 1 serves **pure-vector**
-  reads (no payload filter); filtered/hybrid reads over the snapshot return an
-  explicit error under the flag (they land in increment 2). Durability and the
-  `kill -9` crash gate are unchanged — MVCC changes visibility, not durability.
-  Justified by a measured read-during-write contention sweep
-  (`docs/benchmarks/results/read-during-write.md`): a single concurrent writer of
-  small upserts already retains only ~0.10× of read throughput under the `RwLock`.
+  on a concurrent writer's exclusive lock. Reads served from the snapshot now cover
+  **pure-vector, payload/vector, filtered (exact pre-filter and post-filter), and
+  hybrid (dense ⊕ sparse/BM25)** — reusing the same store-fetch and RRF logic as
+  the locked path. Durability and the `kill -9` crash gate are unchanged — MVCC
+  changes visibility, not durability. Justified by a measured read-during-write
+  contention sweep (`docs/benchmarks/results/read-during-write.md`): a single
+  concurrent writer of small upserts already retains only ~0.10× of read throughput
+  under the `RwLock`. Remaining (increment 3): a `loom` model and a
+  dedicated-hardware benchmark, then MVCC becomes the default.
 - Read-during-write contention sweep now measures a grid of write pressure
   (writer-thread counts × upsert batch sizes), recording the retained-read-QPS
   ceiling that gates the MVCC build.

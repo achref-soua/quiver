@@ -143,7 +143,8 @@ fn locked_search_routes_through_snapshot_with_payload() {
         .unwrap();
     assert_eq!(hits[0].id, "p0");
     assert_eq!(hits[0].payload, Some(json!({ "i": 0 }))); // payload enriched
-    // A filter is the explicit increment-2 limitation: rejected, not silently wrong.
+    // Increment 2: a filter is served over the snapshot (post-filter path here, as
+    // "i" is not a declared filterable field) — exact, not rejected.
     let filtered = SearchParams {
         filter: Some(quiver_embed::Filter::Eq {
             field: "i".into(),
@@ -151,7 +152,85 @@ fn locked_search_routes_through_snapshot_with_payload() {
         }),
         ..SearchParams::default()
     };
-    assert!(db.search("c", &vec_for(0), &filtered).is_err());
+    let fhits = db.search("c", &vec_for(0), &filtered).unwrap();
+    assert_eq!(fhits.len(), 1);
+    assert_eq!(fhits[0].id, "p0");
+}
+
+#[test]
+fn filtered_and_hybrid_over_snapshot() {
+    use quiver_embed::{Filter, FilterableField};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = Database::open(tmp.path()).unwrap();
+    db.set_mvcc_reads(true);
+
+    // A declared filterable field exercises the exact small-candidate pre-filter
+    // branch (candidate_ids returns a set), served identically under MVCC.
+    let desc = Descriptor::new(DIM as u32, Dtype::F32, DistanceMetric::L2)
+        .with_filterable(vec![FilterableField::numeric("bucket")]);
+    db.create_collection("f", desc).unwrap();
+    for i in 0..40u32 {
+        db.upsert(
+            "f",
+            &format!("p{i}"),
+            &vec_for(i),
+            &json!({ "bucket": i % 4 }),
+        )
+        .unwrap();
+    }
+    db.ensure_indexed("f").unwrap();
+    let res = db
+        .search(
+            "f",
+            &vec_for(0),
+            &SearchParams {
+                filter: Some(Filter::Eq {
+                    field: "bucket".into(),
+                    value: json!(0),
+                }),
+                ..SearchParams::default()
+            },
+        )
+        .unwrap();
+    assert!(!res.is_empty());
+    for m in &res {
+        assert_eq!(m.payload.as_ref().unwrap()["bucket"], json!(0));
+    }
+
+    // Hybrid (dense + BM25 text) over the snapshot: the dense side comes from the
+    // lock-free snapshot, the text side from the (still maintained) sparse index.
+    db.create_collection(
+        "h",
+        Descriptor::new(DIM as u32, Dtype::F32, DistanceMetric::L2),
+    )
+    .unwrap();
+    for i in 0..20u32 {
+        db.upsert(
+            "h",
+            &format!("d{i}"),
+            &vec_for(i),
+            &json!({ "__quiver_text__": format!("alpha bravo document {i}") }),
+        )
+        .unwrap();
+    }
+    db.ensure_indexed("h").unwrap();
+    let hyb = db
+        .hybrid_search(
+            "h",
+            Some(&vec_for(0)),
+            None,
+            Some("alpha"),
+            &SearchParams {
+                with_payload: false,
+                ..SearchParams::default()
+            },
+            quiver_embed::DEFAULT_RRF_K0,
+        )
+        .unwrap();
+    assert!(
+        !hyb.is_empty(),
+        "hybrid over the snapshot returned no results"
+    );
 }
 
 #[test]
