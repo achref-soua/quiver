@@ -1,0 +1,11 @@
+competitor,dataset,param_name,param_value,build_s,index_disk_mb,rss_mb,recall_at_10,recall_at_1,recall_at_100,qps_1t,qps_nt,concurrency,p50_ms,p95_ms,p99_ms,recall_stdev,qps_stdev,config,notes,error
+quiver,siftsmall,ef_search,64,0.27243235299829394,,,0.0,0.0,0.0,0.0,1165.709493031873,8,0.0,0.0,0.0,0.0,0.0,"{'writers': 0, 'batch': 0, 'ratio': 1.0}",read_only,
+quiver,siftsmall,ef_search,64,0.27243235299829394,,,0.0,0.0,0.0,0.0,970.8374290802101,8,0.0,0.0,0.0,0.0,0.0,"{'writers': 1, 'batch': 1, 'ratio': 0.833, 'writes_per_s': 96.7}",read_during_write w1 b1,
+quiver,siftsmall,ef_search,64,0.27243235299829394,,,0.0,0.0,0.0,0.0,872.0135736616969,8,0.0,0.0,0.0,0.0,0.0,"{'writers': 1, 'batch': 64, 'ratio': 0.748, 'writes_per_s': 86.0}",read_during_write w1 b64,
+quiver,siftsmall,ef_search,64,0.27243235299829394,,,0.0,0.0,0.0,0.0,642.5029505392587,8,0.0,0.0,0.0,0.0,0.0,"{'writers': 1, 'batch': 512, 'ratio': 0.551, 'writes_per_s': 47.8}",read_during_write w1 b512,
+quiver,siftsmall,ef_search,64,0.27243235299829394,,,0.0,0.0,0.0,0.0,117.20152416760094,8,0.0,0.0,0.0,0.0,0.0,"{'writers': 2, 'batch': 1, 'ratio': 0.101, 'writes_per_s': 500.5}",read_during_write w2 b1,
+quiver,siftsmall,ef_search,64,0.27243235299829394,,,0.0,0.0,0.0,0.0,547.594447707785,8,0.0,0.0,0.0,0.0,0.0,"{'writers': 2, 'batch': 64, 'ratio': 0.47, 'writes_per_s': 218.4}",read_during_write w2 b64,
+quiver,siftsmall,ef_search,64,0.27243235299829394,,,0.0,0.0,0.0,0.0,384.6779437494935,8,0.0,0.0,0.0,0.0,0.0,"{'writers': 2, 'batch': 512, 'ratio': 0.33, 'writes_per_s': 71.4}",read_during_write w2 b512,
+quiver,siftsmall,ef_search,64,0.27243235299829394,,,0.0,0.0,0.0,0.0,5.474127280491563,8,0.0,0.0,0.0,0.0,0.0,"{'writers': 4, 'batch': 1, 'ratio': 0.005, 'writes_per_s': 578.8}",read_during_write w4 b1,
+quiver,siftsmall,ef_search,64,0.27243235299829394,,,0.0,0.0,0.0,0.0,40.538797194129536,8,0.0,0.0,0.0,0.0,0.0,"{'writers': 4, 'batch': 64, 'ratio': 0.035, 'writes_per_s': 426.0}",read_during_write w4 b64,
+quiver,siftsmall,ef_search,64,0.27243235299829394,,,0.0,0.0,0.0,0.0,199.29834320706166,8,0.0,0.0,0.0,0.0,0.0,"{'writers': 4, 'batch': 512, 'ratio': 0.171, 'writes_per_s': 86.5}",read_during_write w4 b512,
