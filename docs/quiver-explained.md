@@ -495,7 +495,27 @@ The stall tracks the rebuild duration and is **four to five orders of magnitude*
 
 The seconds-long stall collapses to the cost of serving the prior snapshot (sub-millisecond) plus a brief swap. No `unsafe`, no lock-free data structure, no `loom` — just `Arc` and the existing `RwLock`.
 
-This moves read *visibility*: a server read may briefly miss a write committed a millisecond ago (snapshot isolation, sanctioned by ADR-0053), but never a half-applied one, and the WAL-fsync acknowledgement of §5.1 is byte-for-byte unchanged. Embedded `&mut` callers still rebuild synchronously, so an in-process program always reads its own writes. The fully **lock-free** path — reads proceeding *during* the swap over an atomically-swapped snapshot (arc-swap + epoch reclamation) — remains designed and staged in ADR-0053; the measurement showed the seconds were in the rebuild's *lock scope*, not the read's lock *acquire*, so Quiver fixed the former first.
+This moves read *visibility*: a server read may briefly miss a write committed a millisecond ago (snapshot isolation, sanctioned by ADR-0053), but never a half-applied one, and the WAL-fsync acknowledgement of §5.1 is byte-for-byte unchanged. Embedded `&mut` callers still rebuild synchronously, so an in-process program always reads its own writes. That fixed the rebuild's *lock scope*; §5.5 closes the remaining gap — the *write's* lock window.
+
+## 5.5 Reads that never wait on a writer — lock-free MVCC
+
+The off-lock rebuild keeps reads off the *rebuild*. But an ordinary write still takes the exclusive lock for its in-memory index mutation plus one WAL fsync — and under a `RwLock` that blocks every concurrent read for the window. We measured the cost with the contention sweep (`quiver_bench.contention_sweep`, SIFTSMALL, dev box — the *ratio* is the honest signal, absolute QPS is client-bound). A **single** concurrent writer of small upserts already retains only ~0.10× of read throughput; a **second** collapses it to near zero — every writer's exclusive-lock acquisition starves the readers. The penalty grows with write *concurrency*, not bytes written.
+
+So Quiver moved reads off the writer's lock entirely (ADR-0064), behind a default-off `QUIVER_MVCC_READS` flag. The hard part: the indexes are mutated *in place*, so a reader cannot just share the live index by `Arc` — that is a data race. The fix borrows the FreshDiskANN base+delta idea, one level up, at the *serving* layer:
+
+> **Publish an immutable snapshot; carry recent writes in a small overlay.** The single writer publishes a **`CollectionSnapshot`** — the base index as of the last rebuild, plus a small **overlay** of the writes since (recent vectors and tombstones) — into an **`arc-swap`** cell. A reader **`load()`s** it with no lock at all, searches the base, brute-scans the tiny overlay, drops tombstones, and merges by the metric. Reclamation is the `Arc` refcount — no `unsafe`, no epoch GC. A read is snapshot-isolated: it sees one consistent `(base, overlay)` pair, and a write that lands mid-read is simply the next snapshot. The overlay is bounded by the rebuild cadence, so republishing it per write costs O(overlay), never O(index).
+
+At the server, each collection's snapshot cell is cached **outside** the database lock — the cache changes only on create/drop, never on a data write — so a **pure-vector** query loads it and searches with no lock, and never blocks on a writer. Payload, filtered, and hybrid reads keep the read lock for the store fetch (the store is not safe to read lock-free under a concurrent writer), but they too serve from the snapshot.
+
+The proof is the same sweep on the same box, `QUIVER_MVCC_READS` **off → on**:
+
+| readers vs.   | batch 1 (off→on)  | batch 64 (off→on) | batch 512 (off→on) |
+|---|---|---|---|
+| **1 writer**  | 0.80× → 0.87×     | 0.66× → 0.71×     | 0.50× → 0.74×      |
+| **2 writers** | **0.00× → 0.79×** | 0.35× → 0.75×     | 0.30× → 0.75×      |
+| **4 writers** | **0.01× → 0.67×** | 0.06× → 0.69×     | 0.07× → 0.71×      |
+
+The multi-writer collapse is gone: where the `RwLock` starved readers to near zero, MVCC holds **~0.65×–0.79×** retained read-QPS — reads proceed *during* writes. Durability is untouched: MVCC changes *visibility, not durability* — the overlay is derived from the same WAL the store replays, and the `kill -9` gate holds by construction. It ships **opt-in**: the proven `RwLock` path stays the default until the win is confirmed on dedicated hardware (on a shared dev box only the ratio is honest; the absolute QPS is reference-hardware-pending).
 
 ---
 
@@ -725,7 +745,7 @@ Everything above ships in **one static binary**. For source and registry distrib
 
 ## 9.8 The roads not (yet) taken
 
-Two large capabilities are *designed* — as architecture records — but deliberately unbuilt until the single-node story is unbeatable: **distributed/sharded mode** (hash sharding + scatter-gather + per-shard Raft for write HA) and **GPU acceleration** (behind the index trait, CPU-default). A third — **concurrent reads** — has taken its first real step: reads now run in parallel behind a reader–writer lock (§5.3) with the off-lock rebuild of §5.4, and the fully **lock-free MVCC** path (versioned arc-swap snapshots so reads never wait on the writer at all) staged as the successor. Each ships as a design ADR first; none compromises the single static binary.
+Two large capabilities are *designed* — as architecture records — but deliberately unbuilt until the single-node story is unbeatable: **distributed/sharded mode** (hash sharding + scatter-gather + per-shard Raft for write HA) and **GPU acceleration** (behind the index trait, CPU-default). A third — **concurrent reads** — is now *built end to end*: reads run in parallel behind a reader–writer lock (§5.3), rebuilds run off the exclusive lock (§5.4), and the fully **lock-free MVCC** read path (§5.5, ADR-0064) — an `arc-swap` snapshot plus a small overlay, so pure-vector reads never wait on the writer at all — ships **opt-in** (`QUIVER_MVCC_READS`), with the proven `RwLock` path the default until it is validated on dedicated hardware. Each began as a design ADR; none compromises the single static binary.
 
 To make the sharding shape concrete (designed, not built — ADR-0051): suppose the movie catalogue outgrows one node. Hash each point's id into one of three **shards**, each an ordinary Quiver node owning ~⅓ of the vectors. A write routes to the owning shard; a query is a **scatter-gather** — the coordinator sends the query vector to all three in parallel, each returns its local top-*k*, and the coordinator merges them by exact distance into a global top-*k* (the same approximate-then-re-rank shape, one level up). Write availability would come from a small per-shard Raft group. It stays on paper because per-shard consensus is a multi-quarter commitment, and Quiver's rule is to be unbeatable at one node first — the §5.4 off-lock rebuild is exactly the kind of intra-node win that buys time before reaching for distribution.
 
@@ -755,6 +775,8 @@ To make the sharding shape concrete (designed, not built — ADR-0051): suppose 
 - **MCP (Model Context Protocol)** — a standard that lets AI agents call tools; Quiver exposes itself as such tools.
 - **RwLock / concurrent reads** — a reader–writer lock: many searches run in parallel, a write takes the exclusive lock.
 - **Off-lock rebuild** — rebuilding a stale index without the exclusive lock; the prior index is served while the new one builds, then swapped in (ADR-0062).
+- **Lock-free MVCC reads** — serving reads from an `arc-swap` snapshot (base index + a small overlay of recent writes) with no lock, so reads never block on the writer (§5.5, ADR-0064; opt-in via `QUIVER_MVCC_READS`).
+- **Overlay** — the small, immutable set of writes (recent vectors + tombstones) layered on a published base index so an MVCC read stays fresh without rebuilding the index.
 - **Snapshot isolation / MVCC** — a read sees one consistent version; it may miss a just-committed write but never a half-applied one.
 - **Saturated throughput (NT)** — QPS under many concurrent client threads vs one (1T) — the test for whether parallel reads help.
 - **Selectivity** — the fraction of a collection a filter keeps; decides pre-filter (selective) vs post-filter (broad).
