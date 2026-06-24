@@ -98,6 +98,14 @@ class CompetitorAdapter(ABC):
     def query_one(self, query: "import numpy; numpy.ndarray", k: int, param: int) -> list[int]:
         """Run a single query and return a list of (up to k) retrieved IDs."""
 
+    def cold_reopen(self) -> None:
+        """Restart the system on its existing data so RSS reflects the *serving*
+        footprint, not the build's allocator high-water mark. No-op by default;
+        adapters that own their server process override it. Called once after
+        ``build`` and before the sweep (so the per-param ``sample_rss`` reads a
+        cold-reopened process). For an externally-managed server this is the
+        operator's job (see the reference-hardware runbook)."""
+
     def sample_rss(self) -> float | None:
         """Sample the system's current RSS in MB. Override in subclasses."""
         return None
