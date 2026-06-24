@@ -62,6 +62,15 @@ Dockerfile and deployment scaffolding.
 Run asynchronous read replicas by pointing a follower at a leader with
 `QUIVER_LEADER_URL` (and `QUIVER_LEADER_API_KEY`). See [Replication](features/replication.md).
 
+## Lock-free reads (experimental)
+
+Set `QUIVER_MVCC_READS=1` to serve reads of single-vector, in-memory collections
+from a lock-free MVCC snapshot so they no longer block on a concurrent writer's
+exclusive lock (ADR-0064). It is **default-off and staged**: increment 1 serves
+pure-vector reads only — filtered and hybrid queries return an error under the
+flag — so leave it off for those workloads. See
+[Concurrency](features/concurrency.md).
+
 ## Observability
 
 Quiver exposes structured logs and metrics; see
