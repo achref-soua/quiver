@@ -28,17 +28,19 @@
 //! over-fetches from the ANN index and post-filters. Both arms re-check the full
 //! filter, so results are exact regardless of which path runs.
 //!
-//! ## Concurrency (ADR-0057)
+//! ## Concurrency (ADR-0057 / ADR-0062)
 //! Single-writer. Writes take `&mut self`. Reads come in two flavors: the
 //! `&mut self` convenience methods (`search`, `hybrid_search`,
-//! `search_multi_vector`) rebuild a stale index in place and are ideal for
-//! embedded, single-threaded use; the `&self` `*_snapshot` methods read the
-//! current immutable snapshot and run **concurrently**, returning
-//! [`Error::IndexStale`] if a prior write deferred the index rebuild so a server
-//! can hand off to its single writer ([`Database::ensure_indexed`]) and retry.
-//! A server therefore serves concurrent reads behind a reader–writer lock and
-//! takes the exclusive lock only for writes and the occasional rebuild. The
-//! fully lock-free arc-swap snapshot model is the staged successor (ADR-0057).
+//! `search_multi_vector`) rebuild a stale index in place and so give embedded,
+//! single-threaded callers read-your-writes; the `&self` `*_snapshot` methods
+//! read the current immutable snapshot and run **concurrently**, serving the
+//! *prior* snapshot when a write deferred a rebuild (snapshot-isolated, slightly
+//! stale). A server therefore serves concurrent reads behind a reader–writer lock,
+//! and rebuilds **off** the exclusive lock (ADR-0062): it captures the rebuild
+//! inputs under the shared lock ([`Database::snapshot_rebuild_inputs`]), builds the
+//! new index with no lock held ([`RebuildInputs::build`]), and installs it under a
+//! brief write lock ([`Database::commit_rebuild`]) — so a rebuild never stalls
+//! concurrent readers.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -89,14 +91,6 @@ pub enum Error {
     /// The requested index / metric combination is not supported.
     #[error("unsupported configuration: {0}")]
     Unsupported(&'static str),
-    /// A read found the collection's index stale (a prior write deferred its
-    /// rebuild). An internal control signal, never surfaced to a client: the
-    /// `&self` `*_snapshot` reads return it so a caller holding only a shared
-    /// lock can hand off to a single writer for the rebuild, then retry. The
-    /// `&mut self` convenience methods and the server's read path both catch it,
-    /// call [`Database::ensure_indexed`], and retry (ADR-0057).
-    #[error("index rebuild required")]
-    IndexStale,
     /// A durable index snapshot could not be restored (ADR-0025); the caller
     /// falls back to rebuilding from the store, so this does not surface to users.
     #[error(transparent)]
@@ -282,6 +276,14 @@ struct CollectionHandle {
     int_to_ext: Vec<String>,
     ext_to_int: HashMap<String, u64>,
     stale: bool,
+    // Monotonic per-collection write counter, bumped every time a write defers a
+    // rebuild (`mark_stale`). An off-lock rebuild (ADR-0062) captures it before
+    // building and re-checks it at commit: if it advanced, a write landed during
+    // the build, so the freshly built index is already behind — the commit installs
+    // it (still newer than the prior snapshot) but leaves the handle stale so the
+    // next rebuild catches up. Wrapping is fine: equality, not ordering, is what the
+    // commit checks.
+    write_gen: u64,
     // For a multi-vector (ColBERT) collection: each document id mapped to its
     // token count, so a re-rank can gather all of a document's token rows
     // (`<doc-id><US><ordinal>`) and `document_count` is O(1). `None` for a
@@ -301,6 +303,26 @@ struct CollectionHandle {
 // single-vector, server-searchable collections run hybrid search (ADR-0045).
 fn uses_sparse_index(descriptor: &Descriptor) -> bool {
     !descriptor.multivector && descriptor.vector_encryption != VectorEncryption::ClientSide
+}
+
+// Mark a collection's index stale: a write the index could not absorb in place
+// defers a full rebuild. Also bumps the write generation (every staleness-marking
+// write is a write).
+fn mark_stale(handle: &mut CollectionHandle) {
+    handle.stale = true;
+    bump_write_gen(handle);
+}
+
+// Bump a collection's monotonic write generation. Called on **every** write that
+// touches the store — including writes that land while the index is already stale,
+// which the incremental maintenance skips. The off-lock rebuild (ADR-0062) captures
+// this before scanning and re-checks it at commit: if it advanced, a write landed
+// during the build, so the freshly built index is already behind and the commit
+// leaves the collection stale for the next rebuild. Wrapping is fine — the commit
+// checks equality, not ordering — and over-counting is harmless (at worst one extra
+// rebuild); only *missing* a bump could lose a write.
+fn bump_write_gen(handle: &mut CollectionHandle) {
+    handle.write_gen = handle.write_gen.wrapping_add(1);
 }
 
 /// An in-process Quiver database over one data directory.
@@ -349,6 +371,7 @@ impl Database {
                 int_to_ext: Vec::new(),
                 ext_to_int: HashMap::new(),
                 stale: true,
+                write_gen: 0,
                 docs: None,
                 // Populated by `load_index` / `rebuild_index` from the store.
                 sparse: None,
@@ -379,6 +402,7 @@ impl Database {
                 int_to_ext: Vec::new(),
                 ext_to_int: HashMap::new(),
                 stale: false,
+                write_gen: 0,
                 docs,
                 sparse,
             },
@@ -461,6 +485,7 @@ impl Database {
                         int_to_ext: Vec::new(),
                         ext_to_int: HashMap::new(),
                         stale: false,
+                        write_gen: 0,
                         docs,
                         sparse: None,
                     },
@@ -473,7 +498,7 @@ impl Database {
         } else if let Some(id) = target
             && let Some(handle) = self.collections.values_mut().find(|h| h.id == id)
         {
-            handle.stale = true;
+            mark_stale(handle);
         }
         Ok(())
     }
@@ -618,7 +643,7 @@ impl Database {
             .collections
             .get_mut(collection)
             .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
-        handle.stale = true;
+        mark_stale(handle);
         Ok(records.len() as u64)
     }
 
@@ -725,22 +750,64 @@ impl Database {
         Ok(())
     }
 
-    // Run a `&self` snapshot read; if it reports a deferred index rebuild
-    // ([`Error::IndexStale`]), rebuild once (mutably) and retry. The shared retry
-    // path behind the `&mut self` `search`/`hybrid_search`/`search_multi_vector`
-    // convenience methods (ADR-0057).
-    fn search_with_retry<T>(
-        &mut self,
-        collection: &str,
-        mut attempt: impl FnMut(&Self) -> Result<T>,
-    ) -> Result<T> {
-        match attempt(self) {
-            Err(Error::IndexStale) => {
-                self.ensure_indexed(collection)?;
-                attempt(self)
-            }
-            other => other,
+    /// Whether a collection's index is stale — a prior write deferred its rebuild.
+    /// The server reads this to schedule an **off-lock** rebuild (ADR-0062) without
+    /// holding the exclusive lock; embedded callers never need it (the `&mut self`
+    /// searches rebuild synchronously via [`Database::ensure_indexed`]).
+    pub fn needs_rebuild(&self, collection: &str) -> Result<bool> {
+        Ok(self.handle(collection)?.stale)
+    }
+
+    /// Capture everything an off-lock rebuild needs (ADR-0062): under the shared
+    /// read lock the caller already holds, scan the collection's live rows and
+    /// record the write generation. Returns `None` when the index is already fresh
+    /// (nothing to rebuild). The expensive build then runs with **no lock** via
+    /// [`RebuildInputs::build`], and [`Database::commit_rebuild`] installs it.
+    pub fn snapshot_rebuild_inputs(&self, collection: &str) -> Result<Option<RebuildInputs>> {
+        let handle = self.handle(collection)?;
+        if !handle.stale {
+            return Ok(None);
         }
+        let scan = scan_collection(&self.store, handle)?;
+        Ok(Some(RebuildInputs {
+            collection: collection.to_owned(),
+            descriptor: handle.descriptor.clone(),
+            scan,
+            write_gen: handle.write_gen,
+        }))
+    }
+
+    /// Install an index built off-lock (ADR-0062) under the brief exclusive lock the
+    /// caller holds. Returns whether the collection is **still** stale: if a write
+    /// landed during the build (the write generation advanced), the fresh index is
+    /// already behind, so it is installed (still newer than the prior snapshot) but
+    /// the handle stays stale for the next rebuild. A collection dropped or replaced
+    /// during the build is ignored (`Ok(false)`) — the build is discarded.
+    pub fn commit_rebuild(&mut self, rebuilt: RebuiltIndex) -> Result<bool> {
+        let store = &self.store;
+        let Some(handle) = self.collections.get_mut(&rebuilt.collection) else {
+            return Ok(false);
+        };
+        match rebuilt.kind {
+            RebuiltKind::Ready(index) => handle.index = *index,
+            RebuiltKind::Disk { graph, pq } => {
+                // Drop the prior index before sealing the artifact in place: its
+                // `mmap` assumes an immutable file. Safe under the write lock — no
+                // read can observe the momentary empty index.
+                handle.index = empty_index(&handle.descriptor);
+                let disk = write_disk_index(store, handle.id, &graph, &pq)?;
+                handle.index = CollectionIndex::Disk(Some(FreshDiskVamana::new(disk)?));
+            }
+        }
+        handle.int_to_ext = rebuilt.int_to_ext;
+        handle.ext_to_int = rebuilt.ext_to_int;
+        handle.docs = rebuilt.docs;
+        handle.sparse = rebuilt.sparse;
+        // Clear stale only if no write landed since the inputs were captured;
+        // otherwise leave it set so the driver rebuilds again for the newer write.
+        let still_stale = handle.write_gen != rebuilt.write_gen;
+        handle.stale = still_stale;
+        Ok(still_stale)
     }
 
     /// Search a collection for the nearest points to `query`, optionally
@@ -751,19 +818,20 @@ impl Database {
         query: &[f32],
         params: &SearchParams,
     ) -> Result<Vec<Match>> {
-        // Snapshot read first; rebuild once and retry if a prior write deferred the
-        // index (ADR-0057). The server runs the same dance across an `RwLock`, so
-        // the hot, fresh path stays lock-free for concurrent readers.
-        self.search_with_retry(collection, |db| {
-            db.search_snapshot(collection, query, params)
-        })
+        // Embedded read-your-writes: rebuild a deferred index first (synchronously),
+        // then read the now-fresh snapshot. The server instead serves the prior
+        // snapshot and rebuilds off-lock (ADR-0062), so concurrent readers never
+        // block on a writer's rebuild.
+        self.ensure_indexed(collection)?;
+        self.search_snapshot(collection, query, params)
     }
 
     /// Search a collection's **current immutable snapshot** for the nearest points
     /// to `query`, optionally post-filtered by payload predicate. Takes `&self`, so
-    /// many readers run concurrently. Returns [`Error::IndexStale`] when a prior
-    /// write deferred this collection's index rebuild — the caller rebuilds via
-    /// [`Database::ensure_indexed`] and retries (ADR-0057).
+    /// many readers run concurrently. When a prior write deferred this collection's
+    /// rebuild, it serves the **prior** snapshot (a snapshot-isolated, slightly stale
+    /// read — ADR-0062/0053); the caller schedules a rebuild via
+    /// [`Database::needs_rebuild`].
     pub fn search_snapshot(
         &self,
         collection: &str,
@@ -772,9 +840,6 @@ impl Database {
     ) -> Result<Vec<Match>> {
         require_single_vector(self.handle(collection)?)?;
         require_server_searchable(self.handle(collection)?)?;
-        if self.handle(collection)?.stale {
-            return Err(Error::IndexStale);
-        }
 
         let handle = self.handle(collection)?;
 
@@ -870,22 +935,24 @@ impl Database {
         params: &SearchParams,
         rrf_k0: f32,
     ) -> Result<Vec<Match>> {
-        // Snapshot read first, rebuild-and-retry on a deferred index (ADR-0057).
-        self.search_with_retry(collection, |db| {
-            db.hybrid_search_snapshot(
-                collection,
-                dense_query,
-                sparse_query,
-                text_query,
-                params,
-                rrf_k0,
-            )
-        })
+        // Embedded read-your-writes: rebuild a deferred index synchronously, then
+        // read the fresh snapshot (the server serves the prior snapshot and rebuilds
+        // off-lock — ADR-0062).
+        self.ensure_indexed(collection)?;
+        self.hybrid_search_snapshot(
+            collection,
+            dense_query,
+            sparse_query,
+            text_query,
+            params,
+            rrf_k0,
+        )
     }
 
     /// Hybrid search over the collection's current immutable snapshot (`&self`, so
-    /// readers run concurrently). Returns [`Error::IndexStale`] when a prior write
-    /// deferred the index rebuild; the caller rebuilds and retries (ADR-0057).
+    /// readers run concurrently). When a prior write deferred the rebuild, it serves
+    /// the **prior** snapshot (snapshot-isolated, slightly stale — ADR-0062/0053);
+    /// the caller schedules a rebuild via [`Database::needs_rebuild`].
     pub fn hybrid_search_snapshot(
         &self,
         collection: &str,
@@ -901,9 +968,6 @@ impl Database {
             return Err(Error::Unsupported(
                 "hybrid_search requires a dense query, a sparse query, or a text query",
             ));
-        }
-        if self.handle(collection)?.stale {
-            return Err(Error::IndexStale);
         }
         let handle = self.handle(collection)?;
 
@@ -1225,19 +1289,19 @@ impl Database {
         query_tokens: &[Vec<f32>],
         params: &SearchParams,
     ) -> Result<Vec<DocumentMatch>> {
-        // Snapshot read first, rebuild-and-retry on a deferred index (ADR-0057). A
-        // small corpus is scored exactly and never returns `IndexStale`, so the
-        // mutable rebuild only runs for a large corpus whose ANN index went stale.
-        self.search_with_retry(collection, |db| {
-            db.search_multi_vector_snapshot(collection, query_tokens, params)
-        })
+        // Embedded read-your-writes: rebuild a deferred index synchronously, then
+        // read the fresh snapshot (the server serves the prior snapshot and rebuilds
+        // off-lock — ADR-0062).
+        self.ensure_indexed(collection)?;
+        self.search_multi_vector_snapshot(collection, query_tokens, params)
     }
 
     /// Multi-vector (late-interaction) search over the collection's current
     /// immutable snapshot (`&self`, so readers run concurrently). A small corpus is
-    /// scored exactly; a large corpus draws candidates from the ANN index and
-    /// returns [`Error::IndexStale`] if a prior write deferred its rebuild, which
-    /// the caller resolves with [`Database::ensure_indexed`] (ADR-0057).
+    /// scored exactly; a large corpus draws candidates from the ANN index, serving
+    /// the **prior** snapshot when a write deferred its rebuild (snapshot-isolated,
+    /// slightly stale — ADR-0062/0053); the caller schedules the rebuild via
+    /// [`Database::needs_rebuild`].
     pub fn search_multi_vector_snapshot(
         &self,
         collection: &str,
@@ -1269,10 +1333,8 @@ impl Database {
                 .unwrap_or_default()
         } else {
             // Large corpus: generate candidates from the token pool. A prior write
-            // may have deferred the ANN index rebuild — signal the caller to do it.
-            if self.handle(collection)?.stale {
-                return Err(Error::IndexStale);
-            }
+            // may have deferred the ANN index rebuild; serve the prior snapshot (the
+            // server schedules an off-lock rebuild — ADR-0062).
             let handle = self.handle(collection)?;
             let per_token_k = params
                 .k
@@ -1735,14 +1797,34 @@ fn build_index(
     ids: &[u64],
     flat: &[f32],
 ) -> Result<CollectionIndex> {
+    Ok(match build_in_memory_index(descriptor, ids, flat)? {
+        Some(index) => index,
+        None => {
+            let (graph, pq) = build_disk_graph_pq(descriptor, ids, flat)?;
+            CollectionIndex::Disk(Some(FreshDiskVamana::new(write_disk_index(
+                store, cid, &graph, &pq,
+            )?)?))
+        }
+    })
+}
+
+// Build the in-memory index for a collection, or `None` for the disk-resident kind
+// whose artifact must be sealed through the store. Pure given the vectors (no
+// store, no I/O), so the off-lock rebuild (ADR-0062) calls it without a lock; the
+// synchronous `build_index` and disk path layer the store I/O on top.
+fn build_in_memory_index(
+    descriptor: &Descriptor,
+    ids: &[u64],
+    flat: &[f32],
+) -> Result<Option<CollectionIndex>> {
     // Client-side-encrypted collections have no server-side index (ADR-0032): the
     // server stores opaque ciphertext it never ranks.
     if descriptor.vector_encryption == VectorEncryption::ClientSide {
-        return Ok(CollectionIndex::None);
+        return Ok(Some(CollectionIndex::None));
     }
     let dim = descriptor.dim as usize;
     let metric = to_index_metric(descriptor.metric);
-    Ok(match descriptor.index.kind {
+    Ok(Some(match descriptor.index.kind {
         IndexKind::Vamana => CollectionIndex::Vamana(Some(FreshVamana::new(Vamana::build(
             ids,
             flat,
@@ -1750,9 +1832,8 @@ fn build_index(
             metric,
             VamanaConfig::default(),
         )?)?)),
-        IndexKind::DiskVamana => CollectionIndex::Disk(Some(FreshDiskVamana::new(
-            build_disk_index(store, cid, descriptor, ids, flat)?,
-        )?)),
+        // The disk-resident artifact is sealed through the store, not here.
+        IndexKind::DiskVamana => return Ok(None),
         IndexKind::Ivf => {
             let cfg = IvfConfig {
                 quantization: descriptor.index.pq_subspaces.map(|m| m as usize),
@@ -1783,18 +1864,17 @@ fn build_index(
             }
             CollectionIndex::Hnsw(h)
         }
-    })
+    }))
 }
 
-// Build the Vamana graph + PQ codebook, write the encrypted disk artifact under
-// the collection's index dir with the store's codec, and open it for queries.
-fn build_disk_index(
-    store: &Store,
-    cid: CollectionId,
+// Build the Vamana graph + PQ codebook for the disk-resident index. Pure (no
+// store, no I/O), so the off-lock rebuild (ADR-0062) does the expensive graph build
+// and PQ training without a lock; `write_disk_index` then seals the result.
+fn build_disk_graph_pq(
     descriptor: &Descriptor,
     ids: &[u64],
     flat: &[f32],
-) -> Result<DiskVamana> {
+) -> Result<(Vamana, ProductQuantizer)> {
     let dim = descriptor.dim as usize;
     let metric = to_index_metric(descriptor.metric);
     let graph = Vamana::build(ids, flat, dim, metric, VamanaConfig::default())?;
@@ -1803,14 +1883,27 @@ fn build_disk_index(
         .pq_subspaces
         .map_or_else(|| default_pq_m(dim), |x| x as usize);
     let pq = ProductQuantizer::train(flat, ids.len(), dim, m, metric, PQ_SEED)?;
+    Ok((graph, pq))
+}
+
+// Seal a prebuilt disk artifact under the collection's index dir with the store's
+// codec, and open it for queries. Overwrites the artifact in place, so the caller
+// must drop any prior `DiskVamana` for this collection first (its mmap assumes an
+// immutable file).
+fn write_disk_index(
+    store: &Store,
+    cid: CollectionId,
+    graph: &Vamana,
+    pq: &ProductQuantizer,
+) -> Result<DiskVamana> {
     let dir = store.index_dir(cid);
     std::fs::create_dir_all(&dir).map_err(quiver_index::DiskError::Io)?;
     let path = dir.join(DISK_INDEX_FILE);
     // Seal the index artifact with the collection's own codec (its DEK under an
-    // envelope key-ring), so a crypto-shred of the collection also makes its
-    // index unreadable. The same owned handle writes and then mmap-opens it.
+    // envelope key-ring), so a crypto-shred of the collection also makes its index
+    // unreadable. The same owned handle writes and then mmap-opens it.
     let codec = store.collection_codec_clone(cid)?;
-    quiver_index::disk::write(&path, &graph, &pq, codec.as_ref())?;
+    quiver_index::disk::write(&path, graph, pq, codec.as_ref())?;
     Ok(DiskVamana::open(&path, codec)?)
 }
 
@@ -1888,6 +1981,9 @@ fn restore_ivf_snapshot(store: &Store, handle: &mut CollectionHandle, blob: &[u8
 // single-vector `upsert` and each token row of a multi-vector `upsert_document`
 // (ADR-0034). A no-op once the handle is stale (a rebuild is already pending).
 fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32]) -> Result<()> {
+    // Every write bumps the generation, even one skipped here because a rebuild is
+    // already pending — an in-flight off-lock rebuild must still notice it (ADR-0062).
+    bump_write_gen(handle);
     if handle.stale {
         return Ok(());
     }
@@ -1946,7 +2042,7 @@ fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32
         handle.ext_to_int.insert(ext_id.to_owned(), internal);
         handle.int_to_ext.push(ext_id.to_owned());
         if pending >= GRAPH_REBUILD_PENDING_FRACTION {
-            handle.stale = true;
+            mark_stale(handle);
         }
     } else if is_live_colbert {
         // ColBERT appends a new token and tombstones the prior copy on an update —
@@ -1965,10 +2061,10 @@ fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32
         handle.ext_to_int.insert(ext_id.to_owned(), internal);
         handle.int_to_ext.push(ext_id.to_owned());
         if crowded {
-            handle.stale = true;
+            mark_stale(handle);
         }
     } else {
-        handle.stale = true;
+        mark_stale(handle);
     }
     Ok(())
 }
@@ -1980,6 +2076,8 @@ fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32
 // The id→internal mapping is kept so a later re-insert allocates afresh. Shared by
 // the single-vector `delete` and each token row of `delete_document` (ADR-0034).
 fn index_delete_point(handle: &mut CollectionHandle, ext_id: &str) {
+    // Every write bumps the generation, even one skipped here (see `index_upsert_point`).
+    bump_write_gen(handle);
     if handle.stale {
         return;
     }
@@ -2004,7 +2102,7 @@ fn index_delete_point(handle: &mut CollectionHandle, ext_id: &str) {
                 crowded = h.deleted_fraction() >= HNSW_REBUILD_DELETED_FRACTION;
             }
             if crowded {
-                handle.stale = true;
+                mark_stale(handle);
             }
         }
         Some(internal) if live_graph => {
@@ -2021,7 +2119,7 @@ fn index_delete_point(handle: &mut CollectionHandle, ext_id: &str) {
                 _ => {}
             }
             if crowded {
-                handle.stale = true;
+                mark_stale(handle);
             }
         }
         Some(internal) if live_colbert => {
@@ -2031,25 +2129,37 @@ fn index_delete_point(handle: &mut CollectionHandle, ext_id: &str) {
                 crowded = c.deleted_fraction() >= HNSW_REBUILD_DELETED_FRACTION;
             }
             if crowded {
-                handle.stale = true;
+                mark_stale(handle);
             }
         }
-        _ => handle.stale = true,
+        _ => mark_stale(handle),
     }
 }
 
-// Rebuild a collection's index from the store's current live rows. For a
-// multi-vector collection it also rebuilds the document grouping (doc id → token
-// count) authoritatively from those live rows.
-fn rebuild_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
+// The product of scanning a collection's live rows: the dense id maps + contiguous
+// vectors, the multi-vector document grouping, and the derived sparse inverted
+// index — everything a rebuild needs from the store, owned so the build can then
+// proceed with no store and no lock (ADR-0062).
+struct RebuildScan {
+    int_to_ext: Vec<String>,
+    ext_to_int: HashMap<String, u64>,
+    flat: Vec<f32>,
+    docs: Option<BTreeMap<String, u32>>,
+    sparse: Option<SparseInvertedIndex>,
+}
+
+// Scan a collection's live rows into a [`RebuildScan`]. Rebuilds the derived sparse
+// inverted index (ADR-0045) and, for a multi-vector collection, the document
+// grouping (doc id → token count) authoritatively from those rows. `&self` on the
+// store, so it runs under a shared read lock.
+fn scan_collection(store: &Store, handle: &CollectionHandle) -> Result<RebuildScan> {
     let multivector = handle.descriptor.multivector;
     let mut int_to_ext = Vec::new();
     let mut ext_to_int = HashMap::new();
     let mut flat: Vec<f32> = Vec::new();
     let mut docs: BTreeMap<String, u32> = BTreeMap::new();
-    // Rebuild the derived sparse inverted index from the same scan (ADR-0045); only
-    // single-vector, server-searchable collections carry one, and only non-empty
-    // payloads are parsed, so non-sparse collections pay nothing here.
+    // Only single-vector, server-searchable collections carry a sparse index, and
+    // only non-empty payloads are parsed, so non-sparse collections pay nothing.
     let mut sparse = uses_sparse_index(&handle.descriptor).then(SparseInvertedIndex::new);
     for (ext_id, record) in store.scan(handle.id)? {
         let internal = int_to_ext.len() as u64;
@@ -2065,17 +2175,96 @@ fn rebuild_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
         ext_to_int.insert(ext_id.clone(), internal);
         int_to_ext.push(ext_id);
     }
-    let ids: Vec<u64> = (0..int_to_ext.len() as u64).collect();
+    Ok(RebuildScan {
+        int_to_ext,
+        ext_to_int,
+        flat,
+        docs: multivector.then_some(docs),
+        sparse,
+    })
+}
+
+// Rebuild a collection's index from the store's current live rows, synchronously
+// under `&mut self` — the embedded/open path. The server's runtime path builds
+// off-lock instead (ADR-0062: `snapshot_rebuild_inputs` → `build` → `commit_rebuild`).
+fn rebuild_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
+    let scan = scan_collection(store, handle)?;
+    let ids: Vec<u64> = (0..scan.int_to_ext.len() as u64).collect();
     // Drop the previous index before rebuilding: a disk index `mmap`s a file we
     // are about to overwrite in place, and the mapping assumes an immutable file.
     handle.index = empty_index(&handle.descriptor);
-    handle.index = build_index(store, handle.id, &handle.descriptor, &ids, &flat)?;
-    handle.int_to_ext = int_to_ext;
-    handle.ext_to_int = ext_to_int;
-    handle.docs = multivector.then_some(docs);
-    handle.sparse = sparse;
+    handle.index = build_index(store, handle.id, &handle.descriptor, &ids, &scan.flat)?;
+    handle.int_to_ext = scan.int_to_ext;
+    handle.ext_to_int = scan.ext_to_int;
+    handle.docs = scan.docs;
+    handle.sparse = scan.sparse;
     handle.stale = false;
     Ok(())
+}
+
+/// A captured, owned snapshot of everything an off-lock rebuild needs (ADR-0062):
+/// the scanned rows, the collection's descriptor, and the write generation at
+/// capture time. Produced under the shared read lock by
+/// [`Database::snapshot_rebuild_inputs`]; [`RebuildInputs::build`] then constructs
+/// the new index with no lock held.
+pub struct RebuildInputs {
+    collection: String,
+    descriptor: Descriptor,
+    scan: RebuildScan,
+    write_gen: u64,
+}
+
+// The built product of a [`RebuildInputs`], ready to install. In-memory indexes are
+// fully built; the disk-resident artifact carries its prebuilt graph + PQ, which
+// `commit_rebuild` seals through the store under the brief write lock (the file
+// write must not race the prior index's `mmap`).
+enum RebuiltKind {
+    Ready(Box<CollectionIndex>),
+    Disk {
+        graph: Box<Vamana>,
+        pq: Box<ProductQuantizer>,
+    },
+}
+
+/// A new index built off-lock from a [`RebuildInputs`], ready for
+/// [`Database::commit_rebuild`] to install under the brief write lock (ADR-0062).
+pub struct RebuiltIndex {
+    collection: String,
+    kind: RebuiltKind,
+    int_to_ext: Vec<String>,
+    ext_to_int: HashMap<String, u64>,
+    docs: Option<BTreeMap<String, u32>>,
+    sparse: Option<SparseInvertedIndex>,
+    write_gen: u64,
+}
+
+impl RebuildInputs {
+    /// Build the new index from the captured rows with **no lock held** — the
+    /// expensive CPU work (graph build, PQ training, HNSW insertion) of an off-lock
+    /// rebuild (ADR-0062). The disk artifact is built in memory here; its file is
+    /// sealed later by `commit_rebuild` under the write lock.
+    pub fn build(self) -> Result<RebuiltIndex> {
+        let ids: Vec<u64> = (0..self.scan.int_to_ext.len() as u64).collect();
+        let kind = match build_in_memory_index(&self.descriptor, &ids, &self.scan.flat)? {
+            Some(index) => RebuiltKind::Ready(Box::new(index)),
+            None => {
+                let (graph, pq) = build_disk_graph_pq(&self.descriptor, &ids, &self.scan.flat)?;
+                RebuiltKind::Disk {
+                    graph: Box::new(graph),
+                    pq: Box::new(pq),
+                }
+            }
+        };
+        Ok(RebuiltIndex {
+            collection: self.collection,
+            kind,
+            int_to_ext: self.scan.int_to_ext,
+            ext_to_int: self.scan.ext_to_int,
+            docs: self.scan.docs,
+            sparse: self.scan.sparse,
+            write_gen: self.write_gen,
+        })
+    }
 }
 
 // Extract a point's sparse vector from its serialized payload, if it carries one

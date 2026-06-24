@@ -7,10 +7,10 @@
 //! `spawn_blocking`. Access is guarded by a reader–writer lock (ADR-0057): reads
 //! take the shared lock and run **concurrently**, writes take the exclusive lock,
 //! and the single-writer model is unchanged (ADR-0002/0006). A read that finds a
-//! collection's index stale (a prior write deferred its rebuild) takes the write
-//! lock once to rebuild via [`Database::ensure_indexed`], then serves concurrently
-//! again. The fully lock-free arc-swap snapshot path is the staged successor
-//! (ADR-0057, "Phased plan").
+//! collection's index stale (a prior write deferred its rebuild) serves the prior
+//! snapshot and schedules an **off-lock** rebuild (ADR-0062): the index is rebuilt
+//! under the shared lock and swapped in under a brief write lock, so a rebuild never
+//! stalls concurrent readers.
 //!
 //! Auth is by scoped API key (Bearer / gRPC `authorization` metadata) with
 //! default-deny RBAC: each key carries a role (read ⊆ write ⊆ admin) and a
@@ -39,12 +39,12 @@ mod rate_limit;
 mod replication;
 mod rest;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use axum_server::tls_rustls::RustlsConfig;
 use figment::Figment;
@@ -541,6 +541,10 @@ pub(crate) struct AppState {
     rate_limiter: Arc<RateLimiter>,
     // Prometheus metrics registry (ADR-0014/0054), scraped at `GET /metrics`.
     metrics: Arc<metrics::Metrics>,
+    // Collections with an off-lock index rebuild in flight (ADR-0062). A search that
+    // observes a deferred rebuild schedules one here, single-flighted so concurrent
+    // readers never kick off duplicate builds for the same collection.
+    rebuilding: Arc<Mutex<HashSet<String>>>,
 }
 
 /// A collection's metadata.
@@ -676,40 +680,95 @@ impl AppState {
         .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))?
     }
 
-    // Run a snapshot read for `collection` (ADR-0057). The hot path takes only the
-    // shared read lock, so concurrent searches run in parallel. If a prior write
-    // deferred this collection's index rebuild, the snapshot read returns
-    // [`quiver_embed::Error::IndexStale`]; we then take the exclusive lock once to
-    // rebuild and run the search while still holding it. `f` is `Fn` because it may
-    // be called twice (fresh attempt, then the post-rebuild retry); it never leaks
-    // `IndexStale` to the caller.
+    // Run a snapshot read for `collection` (ADR-0057/0062). Takes only the shared
+    // read lock, so concurrent searches run in parallel. When a prior write deferred
+    // this collection's rebuild, the snapshot read serves the **prior** snapshot
+    // (snapshot-isolated, slightly stale) rather than blocking, and we schedule an
+    // **off-lock** rebuild so the next read is fresh — the reader never waits on a
+    // rebuild under the exclusive lock.
     async fn search_blocking<T, F>(&self, collection: String, f: F) -> Result<T, Error>
     where
         T: Send + 'static,
-        F: Fn(&Database) -> quiver_embed::Result<T> + Send + 'static,
+        F: FnOnce(&Database) -> quiver_embed::Result<T> + Send + 'static,
     {
         let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || -> Result<T, Error> {
-            {
-                let guard = db
-                    .read()
-                    .map_err(|_| Error::Internal("database lock poisoned".to_owned()))?;
-                match f(&guard) {
-                    Err(quiver_embed::Error::IndexStale) => {}
-                    result => return result.map_err(Error::Engine),
-                }
-            }
-            // Cold path: rebuild the deferred index under the exclusive lock, then
-            // search while still holding it (no window for another writer to
-            // re-stale it between the rebuild and the read).
-            let mut guard = db
-                .write()
+        let coll = collection.clone();
+        let (result, stale) = tokio::task::spawn_blocking(move || -> Result<(T, bool), Error> {
+            let guard = db
+                .read()
                 .map_err(|_| Error::Internal("database lock poisoned".to_owned()))?;
-            guard.ensure_indexed(&collection).map_err(Error::Engine)?;
-            f(&guard).map_err(Error::Engine)
+            let result = f(&guard).map_err(Error::Engine)?;
+            // Report staleness so the caller can schedule a background rebuild; a
+            // missing collection (raced a drop) is simply "nothing to rebuild".
+            let stale = guard.needs_rebuild(&coll).unwrap_or(false);
+            Ok((result, stale))
         })
         .await
-        .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))?
+        .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))??;
+        if stale {
+            self.schedule_rebuild(collection);
+        }
+        Ok(result)
+    }
+
+    // Schedule a single off-lock rebuild for `collection` (ADR-0062), deduplicated
+    // so concurrent readers that all observe the same deferred rebuild start exactly
+    // one. A no-op if one is already in flight.
+    fn schedule_rebuild(&self, collection: String) {
+        {
+            let mut inflight = match self.rebuilding.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if !inflight.insert(collection.clone()) {
+                return; // already rebuilding this collection
+            }
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            state.run_rebuild(&collection).await;
+            if let Ok(mut inflight) = state.rebuilding.lock() {
+                inflight.remove(&collection);
+            }
+        });
+    }
+
+    // Drive a collection's off-lock rebuild to completion (ADR-0062): capture the
+    // inputs under the shared read lock, build with no lock held, install under a
+    // brief write lock, and repeat while a write landed during the build (the commit
+    // reports the collection still stale). Each phase is a `spawn_blocking` so the
+    // CPU-bound build never stalls the async runtime; errors end the attempt (the
+    // collection stays stale and the next read reschedules).
+    async fn run_rebuild(&self, collection: &str) {
+        loop {
+            let db = Arc::clone(&self.db);
+            let coll = collection.to_owned();
+            let inputs = tokio::task::spawn_blocking(move || {
+                let guard = db.read().ok()?;
+                guard.snapshot_rebuild_inputs(&coll).ok().flatten()
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(inputs) = inputs else { return };
+
+            let Ok(Ok(rebuilt)) = tokio::task::spawn_blocking(move || inputs.build()).await else {
+                return;
+            };
+
+            let db = Arc::clone(&self.db);
+            let still_stale = tokio::task::spawn_blocking(move || {
+                let mut guard = db.write().ok()?;
+                guard.commit_rebuild(rebuilt).ok()
+            })
+            .await
+            .ok()
+            .flatten();
+            match still_stale {
+                Some(true) => continue, // a write landed during the build — rebuild again
+                _ => return,
+            }
+        }
     }
 
     // Authorize `action` on `resource`, recording a denial in the audit log
@@ -1498,6 +1557,7 @@ pub async fn serve(
         embed: Arc::new(embed),
         rate_limiter: Arc::new(RateLimiter::new(config.rate_limit)),
         metrics: Arc::new(metrics::Metrics::default()),
+        rebuilding: Arc::new(Mutex::new(HashSet::new())),
     };
 
     // A follower continuously applies the leader's committed-op stream (ADR-0030).
