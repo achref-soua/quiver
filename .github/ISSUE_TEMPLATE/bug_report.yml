@@ -1,0 +1,71 @@
+name: 🐛 Bug report
+description: Report a defect so it can be reproduced and fixed.
+title: "fix: <short description>"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please search existing issues first.
+        **Do not report security vulnerabilities here** — see SECURITY.md.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear and concise description of the bug, and what you expected instead.
+      placeholder: Searching a `disk_vamana` collection returns no results after a bulk upsert…
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal, deterministic steps — commands, config, and a small dataset if relevant.
+      placeholder: |
+        1. `quiver serve` with QUIVER_INSECURE=true
+        2. Create a collection with `index=disk_vamana`
+        3. Bulk-upsert 1000 points, then `search` …
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Quiver version
+      description: Output of `quiver --version` (or the release tag / commit).
+      placeholder: v0.22.0
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface?
+      multiple: true
+      options:
+        - Embedded library
+        - REST API
+        - gRPC API
+        - MCP server
+        - TUI cockpit
+        - Python SDK
+        - TypeScript SDK
+        - Go SDK
+        - CLI / admin
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, and how you run Quiver (binary, Docker, Helm).
+      placeholder: Ubuntu 24.04 · x86_64 · Docker image
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste server/client logs (set `RUST_LOG=debug` if helpful). **Redact secrets and master keys.**
+      render: shell
+    validations:
+      required: false
