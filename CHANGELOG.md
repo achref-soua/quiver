@@ -24,8 +24,13 @@ for the per-release rationale and Definitions of Done.
   changes visibility, not durability. Justified by a measured read-during-write
   contention sweep (`docs/benchmarks/results/read-during-write.md`): a single
   concurrent writer of small upserts already retains only ~0.10× of read throughput
-  under the `RwLock`. Remaining (increment 3): a `loom` model and a
-  dedicated-hardware benchmark, then MVCC becomes the default.
+  under the `RwLock`. At the server, an MVCC-served collection's snapshot cell is
+  cached **outside** the database lock, so a **pure-vector** query loads it and
+  searches with no lock at all — it never blocks on a concurrent writer (payload/
+  filtered/hybrid reads keep the read lock for the store fetch, which is not safe
+  lock-free under a writer, but also serve from the snapshot). Enable with
+  `mvcc_reads = true` (config) or `QUIVER_MVCC_READS=1`. Remaining: a before/after
+  read-during-write benchmark, after which the flag may become the default.
 - Read-during-write contention sweep now measures a grid of write pressure
   (writer-thread counts × upsert batch sizes), recording the retained-read-QPS
   ceiling that gates the MVCC build.

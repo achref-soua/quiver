@@ -69,6 +69,7 @@ async fn rest_and_grpc_round_trip() {
         rerank: Default::default(),
         rate_limit: Default::default(),
         otlp: Default::default(),
+        mvcc_reads: false,
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;
@@ -324,6 +325,7 @@ async fn rest_concurrent_reads_survive_a_deferred_rebuild() {
         rerank: Default::default(),
         rate_limit: Default::default(),
         otlp: Default::default(),
+        mvcc_reads: false,
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

@@ -1073,6 +1073,20 @@ impl Database {
         Ok(self.handle(collection)?.snapshot.clone())
     }
 
+    /// The lock-free serving snapshot cell **only** for a collection that is
+    /// currently MVCC-served (the flag is on and the collection is single-vector,
+    /// server-searchable, and in-memory); otherwise `None`. A server caches the
+    /// returned cell once and `load()`s it to serve pure-vector reads with no lock
+    /// (ADR-0064 increment 3) — the cell self-updates as the writer republishes, so
+    /// it never needs re-fetching under the lock.
+    ///
+    /// # Errors
+    /// Returns [`Error::CollectionNotFound`] if the collection is not loaded.
+    pub fn mvcc_cell(&self, collection: &str) -> Result<Option<SnapshotCell>> {
+        let handle = self.handle(collection)?;
+        Ok(mvcc_served(handle).then(|| handle.snapshot.clone()))
+    }
+
     /// Whether a collection's index is stale — a prior write deferred its rebuild.
     /// The server reads this to schedule an **off-lock** rebuild (ADR-0062) without
     /// holding the exclusive lock; embedded callers never need it (the `&mut self`
