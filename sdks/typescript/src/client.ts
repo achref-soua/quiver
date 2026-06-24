@@ -217,7 +217,12 @@ export class Client {
   readonly #fetch: typeof fetch;
 
   constructor(baseUrl: string = DEFAULT_BASE_URL, opts: ClientOptions = {}) {
-    this.#baseUrl = baseUrl.replace(/\/+$/, "");
+    // Strip trailing slashes with a linear scan rather than a quantified regex
+    // (`/\/+$/`), which static analysis flags as polynomial-backtracking on the
+    // caller-supplied base URL.
+    let end = baseUrl.length;
+    while (end > 0 && baseUrl.charCodeAt(end - 1) === 47 /* "/" */) end--;
+    this.#baseUrl = baseUrl.slice(0, end);
     this.#headers = { "content-type": "application/json" };
     if (opts.apiKey) {
       this.#headers["authorization"] = `Bearer ${opts.apiKey}`;

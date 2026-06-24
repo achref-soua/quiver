@@ -67,6 +67,7 @@ class QuiverAdapter(CompetitorAdapter):
         self._pq_subspaces = pq_subspaces
         self._proc: subprocess.Popen | None = None
         self._tmpdir: tempfile.TemporaryDirectory | None = None
+        self._data_path: str | None = None  # persistent across a cold reopen
         self._client = None
         self._metric = "l2"
 
@@ -83,46 +84,82 @@ class QuiverAdapter(CompetitorAdapter):
             # honest: each config's resident set is its own, not a shared
             # server's cumulative high-water mark. ponytail: live shell, exercised
             # by the isolated wedge run, not a unit test.
-            import os
-            from urllib.parse import urlparse
-
             self._tmpdir = tempfile.TemporaryDirectory()
-            data = self._data_dir or self._tmpdir.name
-            parsed = urlparse(self._url)
-            rest_addr = f"{parsed.hostname or '127.0.0.1'}:{parsed.port or 6333}"
-            grpc_addr = f"{parsed.hostname or '127.0.0.1'}:{(parsed.port or 6333) + 1}"
-            env = {
-                **os.environ,
-                "QUIVER_INSECURE": "true",  # bench server, no real data
-                "QUIVER_DATA_DIR": data,
-                "QUIVER_REST_ADDR": rest_addr,
-                "QUIVER_GRPC_ADDR": grpc_addr,
-            }
-            if self._api_key:
-                env["QUIVER_API_KEYS"] = self._api_key
-            self._proc = subprocess.Popen(
-                ["quiver", "serve"],
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            # Wait for the server to be ready
-            import urllib.request
+            self._data_path = self._data_dir or self._tmpdir.name
+            self._start_proc()
+        self._connect()
 
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                try:
-                    urllib.request.urlopen(f"{self._url}/readyz", timeout=2)
-                    break
-                except Exception:  # noqa: BLE001
-                    time.sleep(0.5)
+    def _start_proc(self) -> None:
+        """Spawn `quiver serve` on the persistent data dir and wait until ready.
+        Reused by `start` and `cold_reopen` so a restart reopens the same data."""
+        import os
+        import urllib.request
+        from urllib.parse import urlparse
 
+        parsed = urlparse(self._url)
+        rest_addr = f"{parsed.hostname or '127.0.0.1'}:{parsed.port or 6333}"
+        grpc_addr = f"{parsed.hostname or '127.0.0.1'}:{(parsed.port or 6333) + 1}"
+        env = {
+            **os.environ,
+            "QUIVER_INSECURE": "true",  # bench server, no real data
+            "QUIVER_DATA_DIR": self._data_path,
+            "QUIVER_REST_ADDR": rest_addr,
+            "QUIVER_GRPC_ADDR": grpc_addr,
+        }
+        if self._api_key:
+            env["QUIVER_API_KEYS"] = self._api_key
+        self._proc = subprocess.Popen(
+            ["quiver", "serve"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                urllib.request.urlopen(f"{self._url}/readyz", timeout=2)
+                return
+            except Exception:  # noqa: BLE001
+                time.sleep(0.5)
+
+    def _connect(self) -> None:
         from quiver import Client  # type: ignore[import]
 
         # Generous timeout: the bulk path defers the whole index build to the
         # first query (the forced rebuild in build()), which on 1M vectors takes
         # well over the SDK's default 30s — especially at 960-d (GIST1M).
         self._client = Client(self._url, api_key=self._api_key, timeout=3600.0)
+
+    def cold_reopen(self) -> None:
+        """Restart the server on its built data so RSS reflects the *serving*
+        footprint, not the build's allocator high-water mark (ADR-0061/0063). The
+        disk-resident index then loads its mmap base instead of rebuilding, so only
+        the PQ codes stay resident — the memory wedge. No-op for an externally
+        managed server (the operator restarts it; see the reference-hardware
+        runbook)."""
+        if not self._start_server or self._proc is None:
+            return
+        # Force a checkpoint so the durable index blob is sealed (ADR-0063): the
+        # snapshot endpoint checkpoints, then copies to a throwaway dir we delete.
+        # ponytail: reuse snapshot to trigger the checkpoint — the copy is wasted
+        # I/O, fine for a one-time wedge prep; add a bare checkpoint endpoint if it
+        # ever costs too much at 10M scale.
+        import os
+        import shutil
+        import tempfile as _tf
+
+        dest = os.path.join(_tf.gettempdir(), f"quiver_ckpt_{os.getpid()}_{time.time_ns()}")
+        try:
+            self._client._send("POST", "/v1/snapshot", {"destination": dest})
+        finally:
+            shutil.rmtree(dest, ignore_errors=True)
+        # Cold reopen: stop the build-heavy process, start a fresh one on the same
+        # data dir (durable load → frugal), reconnect, and let query_sweep's warmup
+        # touch the working set before it samples RSS.
+        self._proc.terminate()
+        self._proc.wait(timeout=30)
+        self._start_proc()
+        self._connect()
 
     def stop(self) -> None:
         if self._client is not None:
@@ -172,6 +209,13 @@ class QuiverAdapter(CompetitorAdapter):
     def query_one(self, query: np.ndarray, k: int, param: int) -> list[int]:
         hits = self._client.search(COLLECTION, query.tolist(), k=k, ef_search=param, with_payload=False)
         return [int(h.id) for h in hits]
+
+    def write_one(self, point_id: str, vector: np.ndarray) -> None:
+        """Upsert a single point — the write-load generator for the read-during-write
+        contention sweep (ADR-0064). One upsert is one WAL fsync, which under the
+        RwLock holds the exclusive lock and blocks concurrent reads; MVCC removes
+        that. Re-upserting an existing id exercises the live incremental update path."""
+        self._client.upsert(COLLECTION, [{"id": point_id, "vector": vector.tolist()}])
 
     def sample_rss(self) -> float | None:
         from urllib.parse import urlparse

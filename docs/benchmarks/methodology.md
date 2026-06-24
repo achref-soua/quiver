@@ -13,7 +13,7 @@ The four-way tradeoff, with **memory as the headline**:
   pass so it never perturbs the throughput numbers.
 - **QPS** — single-thread (`qps_1t`) and **saturated multi-thread** (`qps_nt`, the `--concurrency`
   driver: every query run from an `N`-thread pool — the showcase for concurrent reads, [ADR-0057](../adr/0057-concurrent-reads-rwlock.md)).
-- **Memory footprint** — process **RSS at steady state** after index load and warmup (measured identically for every system).
+- **Memory footprint** — process **RSS at steady state** after index load and warmup (measured identically for every system). For Quiver's own wedge sweep the harness **cold-reopens** the server between build and the sweep (`cold_reopen()`): it checkpoints, restarts the process on the same data dir, and only then samples RSS — so the figure is the *serving* footprint, not the build's allocator high-water mark. With the durable disk index ([ADR-0063](../adr/0063-durable-disk-vamana-index.md)) the reopened `disk_vamana` server loads its `mmap` base instead of rebuilding, so only the PQ codes stay resident — the wedge. For an externally-managed server (the multi-DB comparison) the operator restarts it before sampling, per the [reference-hardware runbook](./reference-hardware-runbook.md).
 - **Build time** and **on-disk index size**.
 - **Quantization memory wedge** (Quiver) — the *same* dataset under `hnsw` / `disk_vamana`+PQ (each
   in a fresh server), recall@{1,10,100} + build + QPS, so the recall/throughput tradeoff is measured
@@ -21,6 +21,10 @@ The four-way tradeoff, with **memory as the headline**:
   is the build's allocator high-water mark, not the cold-reload serving footprint (ADR-0061).
 - **Filtered-selectivity sweep** (Quiver) — recall and QPS as a payload pre-filter keeps `s`% of the
   collection, with recall measured against the *filtered* exact ground truth.
+- **Read-during-write contention** (Quiver) — concurrent read QPS *with* vs *without* a concurrent
+  writer; the retained ratio is the penalty the current `RwLock` imposes (a write's exclusive lock
+  blocks reads) and the measured case for lock-free MVCC reads ([ADR-0064](../adr/0064-mvcc-reads-implementation.md)).
+  See [`results/read-during-write.md`](./results/read-during-write.md).
 
 The headline figure is **recall@10 vs RAM**; the classic figure is the **recall vs QPS** Pareto curve, traced by sweeping `efSearch` / `nprobe` / re-rank depth. The dimensions added in v0.22.0 are catalogued in [ADR-0061](../adr/0061-benchmark-dimensions-v0.22.0.md).
 

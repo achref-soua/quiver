@@ -58,9 +58,22 @@ Fetch into a working folder and pin the SHA-256 of each archive.
 
 ## 4. Quiver
 
+**One command (recommended).** After cloning, the whole §4 measurement — fetch
+dataset, build the disk index, serve it, sample the steady-state serving RSS, and
+emit a verdict + JSON — is automated:
+
 ```powershell
 git clone https://github.com/achref-soua/quiver ; cd quiver
+powershell -ExecutionPolicy Bypass -File scripts\bench-disk-frugality.ps1 -Dataset sift1m
+```
 
+It defaults to `siftsmall` (proves the mechanism in seconds; no download); pass
+`-Dataset sift1m` or `-Dataset gist1m` to see the wedge at scale. Output lands in
+`bench\results\windows-local\`. This is Quiver-only and labelled
+`dev-box · indicative` — it is **not** a published headline. The manual steps
+below are the same thing, broken out, if you want to drive each phase by hand.
+
+```powershell
 # Build the encrypted disk index (RAM-heavy, one-time).
 cargo run --release --example disk_recall -- build C:\data\sift\sift_base.fvecs C:\data\sift.qvx
 

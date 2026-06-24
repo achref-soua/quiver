@@ -481,6 +481,11 @@ impl DcpeCipher {
         if d <= 1 {
             return perm;
         }
+        // A fixed (zero) IV is deliberate and not a hardcoded secret: this
+        // keystream's secrecy comes entirely from `self.shuffle_key`, and the
+        // dimension permutation must be deterministic and reproducible across the
+        // Rust/Python/TypeScript ciphers (cross-language KAT). The per-vector
+        // encryptions above use a random IV; only this key-derived shuffle is fixed.
         let iv = [0u8; IV_LEN];
         let mut rng = KeyStream::new(&self.shuffle_key, &iv);
         for i in (1..d).rev() {
