@@ -1974,8 +1974,11 @@ fn load_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
     // full-RAM rebuild. Any failure falls back to rebuild, so the artifact is never
     // load-bearing for correctness. The derived sparse index is left `None` (as for
     // IVF) and hybrid falls back to the store scan until the next rebuild.
+    // `QUIVER_DISABLE_DURABLE_DISK_INDEX` is an ops kill switch: set it to force the
+    // (always-correct) rebuild path if the durable load is ever suspected.
     if !handle.descriptor.multivector
         && handle.descriptor.index.kind == IndexKind::DiskVamana
+        && std::env::var_os("QUIVER_DISABLE_DURABLE_DISK_INDEX").is_none()
         && let Ok(Some(blob)) = store.read_index_snapshot(handle.id)
         && restore_disk_snapshot(store, handle, &blob).is_ok()
     {

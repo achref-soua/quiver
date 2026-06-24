@@ -6,6 +6,17 @@ full-precision vectors live in the **encrypted on-disk index**, with an exact
 re-rank. This page records what is measured and host-independent, and is explicit
 about what requires reference hardware. We never fabricate results.
 
+> **`v0.23.0`:** the disk index is now **durable** (ADR-0063) — a server
+> *loads* the `mmap`'d base on open instead of rebuilding it from every
+> full-precision vector. Before this, a restarted **server** paid an `O(N)`
+> full-RAM rebuild on open and served from that rebuild's allocator high-water
+> mark, so its post-restart RSS did not reflect the frugal footprint (the
+> benchmark harness measured exactly that). The footprints below were always
+> correct for the *index itself* (the `disk_recall` example opens the artifact
+> directly); the durable load makes the **server** serve from the same frugal
+> path, so the head-to-head serving RSS below is now representative of a real
+> deployment — still reference-hardware-pending for the absolute headline.
+
 ## Measured — SIFTSMALL (10,000 × 128-d, 100 queries, L2)
 
 A real run of `examples/disk_recall` (build the Vamana graph + PQ codebook, write
