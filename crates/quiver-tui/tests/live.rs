@@ -41,6 +41,7 @@ async fn cockpit_reads_live_server_snapshot() {
         rerank: Default::default(),
         rate_limit: Default::default(),
         otlp: Default::default(),
+        mvcc_reads: false,
     };
     tokio::spawn(async move {
         let _ = serve(config, rest, grpc).await;

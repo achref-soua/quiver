@@ -358,6 +358,12 @@ pub struct Config {
     /// Export additionally requires the server's `otlp` build feature.
     #[serde(default)]
     pub otlp: OtlpConfig,
+    /// Lock-free MVCC reads (ADR-0064), **experimental and default-off**. Serves
+    /// reads of single-vector, in-memory collections from an `arc-swap` snapshot so
+    /// pure-vector reads never block on a concurrent writer. Also settable via
+    /// `QUIVER_MVCC_READS`. See `docs/adr/0064-mvcc-reads-implementation.md`.
+    #[serde(default)]
+    pub mvcc_reads: bool,
 }
 
 impl Default for Config {
@@ -381,6 +387,7 @@ impl Default for Config {
             rerank: HashMap::new(),
             rate_limit: RateLimitConfig::default(),
             otlp: OtlpConfig::default(),
+            mvcc_reads: false,
         }
     }
 }
@@ -545,6 +552,18 @@ pub(crate) struct AppState {
     // observes a deferred rebuild schedules one here, single-flighted so concurrent
     // readers never kick off duplicate builds for the same collection.
     rebuilding: Arc<Mutex<HashSet<String>>>,
+    // Lock-free MVCC read cache (ADR-0064 increment 3): cached `arc-swap` snapshot
+    // cells for MVCC-served collections. A pure-vector search loads the cell and
+    // searches it **without taking the database lock**, so it never blocks on a
+    // concurrent writer. Populated under the read lock the first time a collection
+    // is seen fresh; the map itself changes only on create/drop, never on a data
+    // write. Empty unless `QUIVER_MVCC_READS` is on.
+    snapshot_cells: Arc<RwLock<HashMap<String, quiver_embed::SnapshotCell>>>,
+    // Snapshot of the engine's `QUIVER_MVCC_READS` flag, read once at startup. When
+    // on, the writer drives off-lock consolidation rebuilds (ADR-0064 increment 3)
+    // because pure-vector fast-path reads bypass the reader-driven scheduler. Off by
+    // default, so the non-MVCC path is byte-identical.
+    mvcc: bool,
 }
 
 /// A collection's metadata.
@@ -692,6 +711,7 @@ impl AppState {
         F: FnOnce(&Database) -> quiver_embed::Result<T> + Send + 'static,
     {
         let db = Arc::clone(&self.db);
+        let cells = Arc::clone(&self.snapshot_cells);
         let coll = collection.clone();
         let (result, stale) = tokio::task::spawn_blocking(move || -> Result<(T, bool), Error> {
             let guard = db
@@ -701,6 +721,16 @@ impl AppState {
             // Report staleness so the caller can schedule a background rebuild; a
             // missing collection (raced a drop) is simply "nothing to rebuild".
             let stale = guard.needs_rebuild(&coll).unwrap_or(false);
+            // Warm the lock-free read cache (ADR-0064 increment 3): once an
+            // MVCC-served collection is fresh (its base snapshot is published), cache
+            // its cell so subsequent pure-vector reads skip the lock. The cell
+            // self-updates as the writer republishes, so it is never re-fetched.
+            if !stale
+                && let Ok(Some(cell)) = guard.mvcc_cell(&coll)
+                && let Ok(mut map) = cells.write()
+            {
+                map.entry(coll.clone()).or_insert(cell);
+            }
             Ok((result, stale))
         })
         .await
@@ -709,6 +739,34 @@ impl AppState {
             self.schedule_rebuild(collection);
         }
         Ok(result)
+    }
+
+    // The cached lock-free snapshot cell for `collection`, if one has been warmed
+    // (ADR-0064 increment 3). The map read contends only with create/drop, never
+    // with a data write — that is what makes the pure-vector read lock-free.
+    fn cached_cell(&self, collection: &str) -> Option<quiver_embed::SnapshotCell> {
+        self.snapshot_cells.read().ok()?.get(collection).cloned()
+    }
+
+    // After an MVCC-mode data write, schedule an off-lock consolidation rebuild if
+    // the write left the overlay stale (ADR-0064 increment 3): pure-vector fast-path
+    // reads bypass the reader-driven scheduler, so the writer drives consolidation.
+    // A brief read-lock staleness check; the rebuild itself runs off-lock and
+    // single-flighted. No-op (and not called) when MVCC is off.
+    async fn schedule_if_stale(&self, collection: &str) {
+        let db = Arc::clone(&self.db);
+        let coll = collection.to_owned();
+        let stale = tokio::task::spawn_blocking(move || {
+            db.read()
+                .ok()
+                .and_then(|g| g.needs_rebuild(&coll).ok())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        if stale {
+            self.schedule_rebuild(collection.to_owned());
+        }
     }
 
     // Schedule a single off-lock rebuild for `collection` (ADR-0062), deduplicated
@@ -963,6 +1021,13 @@ impl AppState {
             &resource,
             Outcome::of(&result),
         );
+        // Evict the dropped collection's cached lock-free cell (ADR-0064 increment 3)
+        // so a later same-named collection never serves a stale cell.
+        if matches!(result, Ok(true))
+            && let Ok(mut map) = self.snapshot_cells.write()
+        {
+            map.remove(&resource);
+        }
         result
     }
 
@@ -992,6 +1057,9 @@ impl AppState {
             .await;
         self.audit
             .record(principal.actor(), "upsert", &resource, Outcome::of(&result));
+        if self.mvcc && result.is_ok() {
+            self.schedule_if_stale(&resource).await;
+        }
         result
     }
 
@@ -1026,6 +1094,9 @@ impl AppState {
             &resource,
             Outcome::of(&result),
         );
+        if self.mvcc && result.is_ok() {
+            self.schedule_if_stale(&resource).await;
+        }
         result
     }
 
@@ -1077,6 +1148,9 @@ impl AppState {
             &resource,
             Outcome::of(&result),
         );
+        if self.mvcc && result.is_ok() {
+            self.schedule_if_stale(&resource).await;
+        }
         result
     }
 
@@ -1120,6 +1194,36 @@ impl AppState {
         self.authorize(principal, Action::Read, "search", &collection)?;
         self.limits.check_search(k, ef_search)?;
         self.limits.check_vector_len(vector.len())?;
+
+        // Lock-free fast path (ADR-0064 increment 3): a **pure-vector** read of an
+        // MVCC-served collection loads the cached snapshot cell and searches it with
+        // **no database lock**, so it never blocks on a concurrent writer. Payload,
+        // filter, and vector results need the store (behind the lock) and fall
+        // through to `search_blocking`.
+        if filter.is_none()
+            && !with_payload
+            && !with_vector
+            && let Some(cell) = self.cached_cell(&collection)
+        {
+            return tokio::task::spawn_blocking(move || {
+                let matches = cell.load().search(&vector, k, ef_search)?;
+                Ok::<_, quiver_embed::Error>(
+                    matches
+                        .into_iter()
+                        .map(|m| MatchOut {
+                            id: m.id,
+                            score: m.score,
+                            payload: None,
+                            vector: None,
+                        })
+                        .collect(),
+                )
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))?
+            .map_err(Error::Engine);
+        }
+
         let params = SearchParams {
             k,
             filter,
@@ -1547,6 +1651,13 @@ pub async fn serve(
     let embed = EmbedRegistry::from_config(&config.embedding, &config.rerank)
         .map_err(|e| Error::Config(e.to_string()))?;
 
+    // Enable lock-free MVCC reads if requested (ADR-0064): `config.mvcc_reads` or
+    // `QUIVER_MVCC_READS` (the latter also defaults the engine flag at open).
+    if config.mvcc_reads {
+        db.set_mvcc_reads(true);
+    }
+    let mvcc = db.mvcc_reads();
+
     let state = AppState {
         db: Arc::new(RwLock::new(db)),
         keys: Arc::new(config.api_keys.clone()),
@@ -1558,6 +1669,8 @@ pub async fn serve(
         rate_limiter: Arc::new(RateLimiter::new(config.rate_limit)),
         metrics: Arc::new(metrics::Metrics::default()),
         rebuilding: Arc::new(Mutex::new(HashSet::new())),
+        snapshot_cells: Arc::new(RwLock::new(HashMap::new())),
+        mvcc,
     };
 
     // A follower continuously applies the leader's committed-op stream (ADR-0030).

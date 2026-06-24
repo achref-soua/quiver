@@ -56,7 +56,42 @@ structure, no `loom` — just `Arc` and the existing `RwLock`.
   synchronously, so a single-threaded program always sees its own write.
 - **Durability and the `kill -9` crash gate are byte-for-byte unchanged.**
 
-The fully **lock-free** path — reads proceeding *during* the swap over an
-atomically-swapped snapshot (arc-swap + epoch reclamation, ADR-0053) — remains
-designed and staged; the measurement showed the seconds were in the rebuild's
-*lock scope*, not the read's lock *acquire*, so Quiver fixed the former first.
+The fully **lock-free** path — reads proceeding *during* a write over an
+atomically-swapped snapshot (arc-swap, ADR-0053/ADR-0064) — fixed the rebuild's
+*lock scope* first because that was where the seconds were. The remaining cost is
+the write's exclusive-lock *window*.
+
+## Lock-free MVCC reads (experimental, `QUIVER_MVCC_READS`)
+
+A [measured contention sweep](https://github.com/achref-soua/quiver/blob/main/docs/benchmarks/results/read-during-write.md)
+showed that under the `RwLock`, a *single* concurrent writer of small upserts
+already collapses retained read throughput to ~0.10× and four writers starve
+readers to near zero — every writer's exclusive-lock acquisition blocks all
+readers. That justifies moving reads off the writer's lock entirely (ADR-0064).
+
+Set `QUIVER_MVCC_READS=1` to enable the **lock-free read snapshot** for
+single-vector, in-memory collections: the single writer publishes an immutable
+`CollectionSnapshot` (the base index as of the last rebuild plus a small overlay
+of writes since) into an `arc-swap` cell, and a reader `load()`s it without taking
+any lock — searching the base and merging the overlay, snapshot-isolated, never
+torn. Durability and the `kill -9` crash gate are untouched (MVCC changes
+visibility, not durability).
+
+This ships in **staged increments** behind the default-off flag:
+
+- **Increments 1–2 (done):** the snapshot infrastructure and reads over the
+  snapshot — pure-vector, payload/vector enrichment, **filtered** (exact pre-filter
+  and post-filter), and **hybrid** (dense ⊕ sparse/BM25) — all served from the
+  published snapshot, reusing the same store-fetch and RRF logic as the locked path.
+- **Increment 3 (server cutover, done):** the server caches each MVCC-served
+  collection's snapshot cell **outside** the database lock, so a **pure-vector**
+  query loads the cell and searches it with *no lock at all* — it never blocks on a
+  concurrent writer. (Payload, filtered, and hybrid reads still take the read lock
+  for the store fetch — the store is not safe to read lock-free under a writer
+  (ADR-0057) — but they too serve from the snapshot.) The writer drives off-lock
+  consolidation, since fast-path reads bypass the reader-driven scheduler.
+- **Remaining:** a before/after read-during-write benchmark (the ratio is measured
+  on the shared dev box; absolute QPS stays reference-hardware-pending). The flag
+  stays **default-off** until that evidence justifies flipping it.
+
+Leave the flag off (the default) for the proven `RwLock` read path.

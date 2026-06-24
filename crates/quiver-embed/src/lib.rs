@@ -42,9 +42,11 @@
 //! brief write lock ([`Database::commit_rebuild`]) — so a rebuild never stalls
 //! concurrent readers.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use quiver_core::{SecPredicate, SecValue, Store};
 use quiver_index::{
     ColbertConfig, ColbertIndex, DiskVamana, FreshDiskVamana, FreshVamana, Hnsw, HnswConfig, Index,
@@ -253,6 +255,225 @@ impl CollectionIndex {
     }
 }
 
+// === Lock-free MVCC serving snapshot (ADR-0064, increment 1) ===
+//
+// The single writer mutates indexes in place under the write lock, so a reader
+// cannot share the live index by `Arc` and read it lock-free — that is a data
+// race. Instead, in MVCC mode the writer publishes an immutable
+// [`CollectionSnapshot`] (the base index as of the last rebuild + an [`Overlay`]
+// of writes since) into an [`ArcSwap`]; readers `load()` it without a lock. The
+// overlay is index-kind-agnostic and bounded by the rebuild cadence, so it never
+// rewrites the index and a republish costs O(overlay), not O(index). MVCC changes
+// **visibility, not durability**: the WAL-fsync acknowledgement and the `kill -9`
+// crash gate are untouched (the overlay is derived from the same WAL the store
+// already replays).
+
+/// Per-collection lock-free serving snapshot pointer: the single writer
+/// `store`s a new [`CollectionSnapshot`]; readers `load` one without a lock.
+/// (`ArcSwap<T>` stores an `Arc<T>` internally, so this is one `Arc` per load.)
+pub type SnapshotCell = Arc<ArcSwap<CollectionSnapshot>>;
+
+/// Writes accumulated since a [`CollectionSnapshot`]'s base index was published.
+/// A lock-free read brute-scans these recent vectors and merges them with the
+/// base-index search, dropping tombstoned ids. Cloned (O(overlay)) on each write
+/// and reset to empty when a rebuild folds it into a fresh base.
+#[derive(Default, Clone)]
+struct Overlay {
+    // (vector, external id) for points upserted since the base, in id order: the
+    // j-th entry's internal id is `base_len + j`.
+    upserts: Vec<(Arc<[f32]>, String)>,
+    // Internal ids (base or overlay) deleted or superseded since the base; their
+    // hits are dropped from a search.
+    tombstones: HashSet<u64>,
+}
+
+/// An immutable, lock-free-readable view of a single-vector collection (ADR-0064):
+/// the base index as of the last rebuild, the base id map, and the overlay of
+/// writes since. Obtained via [`Database::collection_snapshot`] and read with
+/// [`CollectionSnapshot::search`]; a read is snapshot-isolated — it sees one
+/// consistent `(base, overlay)` pair, and a write that lands mid-read is simply
+/// the next snapshot.
+pub struct CollectionSnapshot {
+    base: Arc<CollectionIndex>,
+    base_int_to_ext: Arc<Vec<String>>,
+    base_len: u64,
+    overlay: Arc<Overlay>,
+    metric: Metric,
+}
+
+impl CollectionSnapshot {
+    // An empty snapshot for a freshly created/opened collection (no base yet); the
+    // writer publishes a real one at the first rebuild. Reading it yields no hits.
+    fn empty(metric: Metric) -> Self {
+        Self {
+            base: Arc::new(CollectionIndex::None),
+            base_int_to_ext: Arc::new(Vec::new()),
+            base_len: 0,
+            overlay: Arc::new(Overlay::default()),
+            metric,
+        }
+    }
+
+    // Map an internal id to its external id: base ids index the base map, overlay
+    // ids (`>= base_len`) index the overlay's upserts.
+    fn ext_id(&self, internal: u64) -> Option<&str> {
+        if internal < self.base_len {
+            self.base_int_to_ext
+                .get(internal as usize)
+                .map(String::as_str)
+        } else {
+            self.overlay
+                .upserts
+                .get((internal - self.base_len) as usize)
+                .map(|(_, e)| e.as_str())
+        }
+    }
+
+    /// Lock-free nearest-neighbor search over the base index merged with the
+    /// overlay (ADR-0064 increment 1) — **pure vector reads**: no payload filter
+    /// and no payload/vector fetch (those need the store and land in increment 2).
+    /// Returns the `k` nearest live points, closest first, scored in the true
+    /// collection metric — identical ordering and scores to the locked
+    /// [`Database::search_snapshot`] path for the same case.
+    ///
+    /// # Errors
+    /// Propagates an index search error.
+    pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Result<Vec<Match>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        // Collect candidates in "smaller is closer" ordering space (uniform across
+        // metrics — `score::ordering_distance`), dropping tombstoned ids.
+        let mut cands: Vec<(f32, u64)> = Vec::new();
+        for n in self.base.search(query, k, ef_search)? {
+            if !self.overlay.tombstones.contains(&n.id) {
+                // `Neighbor.distance` is the reported metric; `report_metric` is its
+                // own inverse (identity for L2, negation for similarities), so it
+                // maps the reported value back to the ordering key.
+                cands.push((report_metric(self.metric, n.distance), n.id));
+            }
+        }
+        for (j, (vector, _)) in self.overlay.upserts.iter().enumerate() {
+            let internal = self.base_len + j as u64;
+            if !self.overlay.tombstones.contains(&internal) {
+                cands.push((ordering_distance(self.metric, query, vector), internal));
+            }
+        }
+        cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+        cands.truncate(k);
+        let mut out = Vec::with_capacity(cands.len());
+        for (ordering, internal) in cands {
+            if let Some(ext) = self.ext_id(internal) {
+                out.push(Match {
+                    id: ext.to_owned(),
+                    score: report_metric(self.metric, ordering),
+                    payload: None,
+                    vector: None,
+                });
+            }
+        }
+        Ok(out)
+    }
+}
+
+// A fresh, empty snapshot cell for a collection's metric — the initial value of
+// `CollectionHandle::snapshot` (the writer publishes a real base at the first
+// rebuild when MVCC is on; left untouched, at one tiny allocation, when off).
+fn empty_snapshot(descriptor: &Descriptor) -> SnapshotCell {
+    let metric = to_index_metric(descriptor.metric);
+    Arc::new(ArcSwap::from_pointee(CollectionSnapshot::empty(metric)))
+}
+
+// Whether a collection *kind* can be served by the lock-free MVCC snapshot path
+// (ADR-0064 increment 1), independent of the flag: single-vector, server-searchable,
+// and an **in-memory** index. Disk-resident indexes are excluded for now — their
+// `mmap` assumes an immutable file, which a superseded snapshot still referencing
+// the old file would violate when a rebuild seals a new one (a later increment
+// versions the file).
+fn mvcc_eligible(descriptor: &Descriptor) -> bool {
+    !descriptor.multivector
+        && descriptor.vector_encryption != VectorEncryption::ClientSide
+        && descriptor.index.kind != IndexKind::DiskVamana
+}
+
+// Whether a collection is *currently* served via the snapshot: eligible and the
+// flag is on.
+fn mvcc_served(handle: &CollectionHandle) -> bool {
+    handle.mvcc && mvcc_eligible(&handle.descriptor)
+}
+
+// Republish a collection's snapshot reusing the immutable base + id map, swapping
+// in a freshly-extended overlay (the per-write O(overlay) cost).
+fn publish_overlay(handle: &CollectionHandle, prior: &CollectionSnapshot, overlay: Arc<Overlay>) {
+    handle.snapshot.store(Arc::new(CollectionSnapshot {
+        base: prior.base.clone(),
+        base_int_to_ext: prior.base_int_to_ext.clone(),
+        base_len: prior.base_len,
+        overlay,
+        metric: prior.metric,
+    }));
+}
+
+// Move a freshly rebuilt index out of `handle.index` into a new published
+// snapshot with an empty overlay (the base now absorbs all prior writes). Leaves
+// `handle.index` empty — in MVCC mode the live base lives in the snapshot.
+fn publish_base(handle: &mut CollectionHandle) {
+    let base = std::mem::replace(&mut handle.index, empty_index(&handle.descriptor));
+    let metric = to_index_metric(handle.descriptor.metric);
+    handle.snapshot.store(Arc::new(CollectionSnapshot {
+        base: Arc::new(base),
+        base_int_to_ext: Arc::new(handle.int_to_ext.clone()),
+        base_len: handle.int_to_ext.len() as u64,
+        overlay: Arc::new(Overlay::default()),
+        metric,
+    }));
+}
+
+// Overlay size at which an MVCC write defers a consolidating rebuild: ~20% churn
+// over the base (the same threshold that already triggers consolidation), with a
+// floor so a tiny base does not rebuild on every write.
+fn overlay_rebuild_threshold(base_len: u64) -> u64 {
+    (base_len / 5).max(1024)
+}
+
+// MVCC-mode single-vector upsert (ADR-0064): append to the published overlay
+// instead of mutating the immutable base, so lock-free readers stay race-free.
+// `ponytail`: republishes per write — O(overlay) each; coalesce per batch if
+// batched upserts under MVCC ever dominate.
+fn overlay_upsert(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32]) {
+    bump_write_gen(handle);
+    let cur = handle.snapshot.load_full();
+    let mut overlay = cur.overlay.as_ref().clone();
+    // An update supersedes the prior copy (in the base or the overlay): tombstone it.
+    if let Some(&old) = handle.ext_to_int.get(ext_id) {
+        overlay.tombstones.insert(old);
+    }
+    let internal = cur.base_len + overlay.upserts.len() as u64;
+    overlay.upserts.push((Arc::from(vector), ext_id.to_owned()));
+    handle.ext_to_int.insert(ext_id.to_owned(), internal);
+    handle.int_to_ext.push(ext_id.to_owned());
+    let crowded = overlay.upserts.len() as u64 >= overlay_rebuild_threshold(cur.base_len);
+    publish_overlay(handle, &cur, Arc::new(overlay));
+    // Defer a consolidating rebuild once the overlay is large (the server runs it
+    // off-lock; the embedded `&mut` search rebuilds synchronously).
+    if crowded {
+        handle.stale = true;
+    }
+}
+
+// MVCC-mode single-vector delete (ADR-0064): tombstone the id in the published
+// overlay; the base stays immutable.
+fn overlay_delete(handle: &mut CollectionHandle, ext_id: &str) {
+    bump_write_gen(handle);
+    let Some(&internal) = handle.ext_to_int.get(ext_id) else {
+        return;
+    };
+    let cur = handle.snapshot.load_full();
+    let mut overlay = cur.overlay.as_ref().clone();
+    overlay.tombstones.insert(internal);
+    publish_overlay(handle, &cur, Arc::new(overlay));
+}
+
 /// On-disk envelope (ADR-0025) for a durable IVF snapshot: the `Ivf` bytes plus
 /// the internal->external id mapping they are addressed by, postcard-encoded and
 /// handed to the store as one opaque blob. On open the envelope is decoded, the
@@ -313,6 +534,15 @@ struct CollectionHandle {
     // the sparse ranking falls back to a full store scan. Built on rebuild from the
     // store and maintained incrementally on upsert/delete; never persisted.
     sparse: Option<SparseInvertedIndex>,
+    // Whether this collection is served via the lock-free MVCC snapshot (ADR-0064);
+    // mirrors the database-wide flag, set at creation and by `set_mvcc_reads`. When
+    // off, the `snapshot` cell is never republished and the in-place RwLock read
+    // path is used — zero overhead.
+    mvcc: bool,
+    // The lock-free serving snapshot cell (ADR-0064). Initialized empty; the writer
+    // publishes a real base at each rebuild and an extended overlay per write when
+    // `mvcc` is on. Never persisted (rebuilt on open).
+    snapshot: SnapshotCell,
 }
 
 // Whether a collection should carry a derived sparse inverted index: only
@@ -345,6 +575,17 @@ fn bump_write_gen(handle: &mut CollectionHandle) {
 pub struct Database {
     store: Store,
     collections: HashMap<String, CollectionHandle>,
+    // Lock-free MVCC reads (ADR-0064), default off. Defaulted from
+    // `QUIVER_MVCC_READS` at open and overridable via `set_mvcc_reads`. When off,
+    // the proven in-place RwLock read path is used with zero overhead.
+    mvcc: bool,
+}
+
+// Whether `QUIVER_MVCC_READS` requests lock-free MVCC reads (ADR-0064).
+fn mvcc_from_env() -> bool {
+    std::env::var("QUIVER_MVCC_READS")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "yes"))
+        .unwrap_or(false)
 }
 
 impl Database {
@@ -372,6 +613,7 @@ impl Database {
 
     // Build the in-memory handles (and their HNSW indexes) over an opened store.
     fn from_store(store: Store) -> Result<Self> {
+        let mvcc = mvcc_from_env();
         let mut collections = HashMap::new();
         for name in store.collection_names() {
             let Some(id) = store.collection_id(&name) else {
@@ -380,6 +622,7 @@ impl Database {
             let Some(descriptor) = store.descriptor(id).cloned() else {
                 continue;
             };
+            let snapshot = empty_snapshot(&descriptor);
             let mut handle = CollectionHandle {
                 id,
                 index: empty_index(&descriptor),
@@ -391,11 +634,24 @@ impl Database {
                 docs: None,
                 // Populated by `load_index` / `rebuild_index` from the store.
                 sparse: None,
+                mvcc,
+                snapshot,
             };
             load_index(&store, &mut handle)?;
+            // MVCC mode: the lock-free base lives in the snapshot, which `load_index`
+            // does not populate. Force a rebuild on first read so the base is
+            // published (a restored durable IVF would otherwise leave the snapshot
+            // empty); MVCC trades the durable-index fast reopen for the snapshot.
+            if mvcc_served(&handle) {
+                handle.stale = true;
+            }
             collections.insert(name, handle);
         }
-        Ok(Self { store, collections })
+        Ok(Self {
+            store,
+            collections,
+            mvcc,
+        })
     }
 
     /// Create a collection. Errors if the name already exists, or if the index
@@ -409,6 +665,8 @@ impl Database {
         // maintained incrementally from the first upsert (an empty index allocates
         // nothing until a sparse vector arrives).
         let sparse = uses_sparse_index(&descriptor).then(SparseInvertedIndex::new);
+        let snapshot = empty_snapshot(&descriptor);
+        let mvcc = self.mvcc;
         self.collections.insert(
             name.to_owned(),
             CollectionHandle {
@@ -421,6 +679,8 @@ impl Database {
                 write_gen: 0,
                 docs,
                 sparse,
+                mvcc,
+                snapshot,
             },
         );
         Ok(())
@@ -490,6 +750,8 @@ impl Database {
             {
                 let docs = descriptor.multivector.then(BTreeMap::new);
                 let index = empty_index(&descriptor);
+                let snapshot = empty_snapshot(&descriptor);
+                let mvcc = self.mvcc;
                 // Replicated writes mark the handle stale, so the next read rebuilds
                 // the inverted index from the replicated store.
                 self.collections.insert(
@@ -504,6 +766,8 @@ impl Database {
                         write_gen: 0,
                         docs,
                         sparse: None,
+                        mvcc,
+                        snapshot,
                     },
                 );
             }
@@ -762,8 +1026,65 @@ impl Database {
                 .get_mut(collection)
                 .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
             rebuild_index(store, handle)?;
+            // MVCC mode: publish the freshly rebuilt base as the new lock-free
+            // snapshot (an empty overlay; the base now absorbs all prior writes).
+            // The sync rebuild holds `&mut self`, so no write races it.
+            if mvcc_served(handle) {
+                publish_base(handle);
+            }
         }
         Ok(())
+    }
+
+    /// Enable or disable lock-free MVCC reads (ADR-0064) at runtime — the server
+    /// sets this from `QUIVER_MVCC_READS`. Default off: the proven RwLock read path
+    /// stays the default until MVCC is loom- and benchmark-validated (increments
+    /// 2–3). Applies to every loaded collection; a collection's first rebuild after
+    /// enabling publishes its base snapshot.
+    pub fn set_mvcc_reads(&mut self, on: bool) {
+        self.mvcc = on;
+        for handle in self.collections.values_mut() {
+            handle.mvcc = on;
+            // A toggle either direction forces a rebuild on the next read of an
+            // eligible collection: turning on publishes the base snapshot; turning
+            // off repopulates the in-place `handle.index` that MVCC mode left empty.
+            if mvcc_eligible(&handle.descriptor) {
+                handle.stale = true;
+            }
+        }
+    }
+
+    /// Whether lock-free MVCC reads are enabled (ADR-0064).
+    #[must_use]
+    pub fn mvcc_reads(&self) -> bool {
+        self.mvcc
+    }
+
+    /// The lock-free serving snapshot cell for a collection (ADR-0064), for a
+    /// reader to `load()` without taking any lock — the basis of reads that proceed
+    /// during writes. Only republished for an MVCC-served collection (single-vector,
+    /// server-searchable, in-memory index, with MVCC enabled); otherwise it stays
+    /// the initial empty snapshot and callers use the locked [`Database::search`]
+    /// path. The cell outlives `&self`, so a reader can hold and re-`load` it.
+    ///
+    /// # Errors
+    /// Returns [`Error::CollectionNotFound`] if the collection is not loaded.
+    pub fn collection_snapshot(&self, collection: &str) -> Result<SnapshotCell> {
+        Ok(self.handle(collection)?.snapshot.clone())
+    }
+
+    /// The lock-free serving snapshot cell **only** for a collection that is
+    /// currently MVCC-served (the flag is on and the collection is single-vector,
+    /// server-searchable, and in-memory); otherwise `None`. A server caches the
+    /// returned cell once and `load()`s it to serve pure-vector reads with no lock
+    /// (ADR-0064 increment 3) — the cell self-updates as the writer republishes, so
+    /// it never needs re-fetching under the lock.
+    ///
+    /// # Errors
+    /// Returns [`Error::CollectionNotFound`] if the collection is not loaded.
+    pub fn mvcc_cell(&self, collection: &str) -> Result<Option<SnapshotCell>> {
+        let handle = self.handle(collection)?;
+        Ok(mvcc_served(handle).then(|| handle.snapshot.clone()))
     }
 
     /// Whether a collection's index is stale — a prior write deferred its rebuild.
@@ -823,6 +1144,15 @@ impl Database {
         // otherwise leave it set so the driver rebuilds again for the newer write.
         let still_stale = handle.write_gen != rebuilt.write_gen;
         handle.stale = still_stale;
+        // MVCC mode: publish the new base as the lock-free snapshot with an empty
+        // overlay. If a write landed during the build (`still_stale`), it is briefly
+        // invisible to snapshot reads until the next rebuild folds it in — the same
+        // eventual-consistency window the locked off-lock path already serves
+        // (ADR-0062), with no double-count (the base is the sole source). The
+        // single-writer's exclusive lock makes the swap race-free.
+        if mvcc_served(handle) {
+            publish_base(handle);
+        }
         Ok(still_stale)
     }
 
@@ -858,6 +1188,15 @@ impl Database {
         require_server_searchable(self.handle(collection)?)?;
 
         let handle = self.handle(collection)?;
+
+        // MVCC mode (ADR-0064): the immutable base index lives in the published
+        // snapshot, not `handle.index`. Serve the read from the snapshot — the
+        // base-index search merged lock-free with the overlay of recent writes —
+        // reusing the same pre-filter planning and store-fetch enrichment as the
+        // locked path; only the dense candidate source differs.
+        if mvcc_served(handle) {
+            return self.search_snapshot_mvcc(handle, query, params);
+        }
 
         // Hybrid planning: if the filter narrows to a small, secondary-indexed
         // candidate set, scan those rows exactly instead of post-filtering ANN
@@ -920,6 +1259,93 @@ impl Database {
             out.push(Match {
                 id: ext_id.clone(),
                 score: neighbor.distance,
+                payload: if params.with_payload {
+                    payload_value
+                } else {
+                    None
+                },
+                vector: if params.with_vector {
+                    record.map(|r| r.vector)
+                } else {
+                    None
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    // Serve `search_snapshot` for an MVCC-served collection (ADR-0064 increment 2):
+    // the dense candidates come from the lock-free snapshot (base ⊕ overlay), and
+    // everything else — the exact small-candidate pre-filter, post-filter, and
+    // payload/vector enrichment — reuses the same store-only logic as the locked
+    // path, so filtered and unfiltered reads are both exact.
+    fn search_snapshot_mvcc(
+        &self,
+        handle: &CollectionHandle,
+        query: &[f32],
+        params: &SearchParams,
+    ) -> Result<Vec<Match>> {
+        // Exact pre-filter for a small, secondary-indexed candidate set (store-only,
+        // index-independent — identical to the locked path).
+        if let Some(filter) = &params.filter
+            && let Some(candidates) = candidate_ids(
+                &self.store,
+                handle.id,
+                filter,
+                &handle.descriptor.filterable,
+            )?
+            && candidates.len() <= FULL_SCAN_THRESHOLD
+        {
+            return self.exact_filtered_search(
+                handle.id,
+                &handle.descriptor,
+                query,
+                params,
+                filter,
+                &candidates,
+            );
+        }
+
+        // Otherwise: dense candidates from the lock-free snapshot (overfetched when
+        // filtering, to survive the post-filter), then post-filter + enrich by a
+        // store fetch on the result ids.
+        let fetch = if params.filter.is_some() {
+            params
+                .k
+                .saturating_mul(FILTER_OVERFETCH)
+                .max(params.ef_search)
+        } else {
+            params.k
+        };
+        let dense = handle
+            .snapshot
+            .load()
+            .search(query, fetch, params.ef_search)?;
+        let need_record = params.filter.is_some() || params.with_payload || params.with_vector;
+        let mut out = Vec::with_capacity(params.k);
+        for m in dense {
+            if out.len() >= params.k {
+                break;
+            }
+            let record = if need_record {
+                self.store.get(handle.id, &m.id)?
+            } else {
+                None
+            };
+            let payload_value: Option<Value> = match &record {
+                Some(r) if params.filter.is_some() || params.with_payload => {
+                    Some(serde_json::from_slice(&r.payload)?)
+                }
+                _ => None,
+            };
+            if let Some(filter) = &params.filter
+                && !filter.matches(payload_value.as_ref().unwrap_or(&Value::Null))
+            {
+                continue;
+            }
+            out.push(Match {
+                id: m.id,
+                score: m.score,
                 payload: if params.with_payload {
                     payload_value
                 } else {
@@ -1041,8 +1467,27 @@ impl Database {
         ef_search: usize,
         filter: Option<&Filter>,
     ) -> Result<Vec<String>> {
-        let raw = handle.index.search(query, depth, ef_search.max(depth))?;
         let mut ids = Vec::new();
+        // MVCC mode (ADR-0064): the dense candidates come from the lock-free
+        // snapshot (base ⊕ overlay), with ext ids already resolved; the sparse/BM25
+        // sides and the filter re-check are unchanged.
+        if mvcc_served(handle) {
+            for m in handle
+                .snapshot
+                .load()
+                .search(query, depth, ef_search.max(depth))?
+            {
+                if !self.passes_filter(handle.id, &m.id, filter)? {
+                    continue;
+                }
+                ids.push(m.id);
+                if ids.len() >= depth {
+                    break;
+                }
+            }
+            return Ok(ids);
+        }
+        let raw = handle.index.search(query, depth, ef_search.max(depth))?;
         for neighbor in raw {
             let Some(ext_id) = handle.int_to_ext.get(neighbor.id as usize) else {
                 continue;
@@ -2104,6 +2549,13 @@ fn restore_ivf_snapshot(store: &Store, handle: &mut CollectionHandle, blob: &[u8
 // single-vector `upsert` and each token row of a multi-vector `upsert_document`
 // (ADR-0034). A no-op once the handle is stale (a rebuild is already pending).
 fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32]) -> Result<()> {
+    // MVCC mode: append to the published overlay instead of mutating the immutable
+    // base index (ADR-0064), keeping lock-free readers race-free. Bumps the write
+    // generation itself.
+    if mvcc_served(handle) {
+        overlay_upsert(handle, ext_id, vector);
+        return Ok(());
+    }
     // Every write bumps the generation, even one skipped here because a rebuild is
     // already pending — an in-flight off-lock rebuild must still notice it (ADR-0062).
     bump_write_gen(handle);
@@ -2199,6 +2651,12 @@ fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32
 // The id→internal mapping is kept so a later re-insert allocates afresh. Shared by
 // the single-vector `delete` and each token row of `delete_document` (ADR-0034).
 fn index_delete_point(handle: &mut CollectionHandle, ext_id: &str) {
+    // MVCC mode: tombstone the id in the published overlay (ADR-0064); the base
+    // stays immutable. Bumps the write generation itself.
+    if mvcc_served(handle) {
+        overlay_delete(handle, ext_id);
+        return;
+    }
     // Every write bumps the generation, even one skipped here (see `index_upsert_point`).
     bump_write_gen(handle);
     if handle.stale {
