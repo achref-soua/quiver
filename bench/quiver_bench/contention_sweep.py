@@ -22,8 +22,12 @@ Run against a freshly built server (the adapter starts one)::
 
     uv run --project bench python -m quiver_bench.contention_sweep \
         --dataset siftsmall --workers 8 --duration 4 \
-        --writers 1,2,4 --batches 1,64,512 \
+        --writers 1,2,4 --batches 1,64,512 --mvcc both \
         --out docs/benchmarks/results/contention
+
+`--mvcc both` runs the grid with `QUIVER_MVCC_READS` off and on (a fresh server
+each) — the before/after that shows whether lock-free reads (ADR-0064) remove the
+penalty. Pure-vector reads (the sweep's `query_one`) take the lock-free fast path.
 
 QPS on a shared dev box is indicative, not authoritative — the reference-hardware
 figure stays pending (we never fabricate it). The *ratio* is the honest signal.
@@ -107,6 +111,7 @@ def run_contention(
     ef_search: int,
     writer_counts: list[int],
     batch_sizes: list[int],
+    mvcc: bool = False,
 ) -> list[BenchResult]:
     """Build, then measure read QPS read-only and across a grid of write pressure:
     `writer_counts` (write *concurrency*) × `batch_sizes` (write *size* per upsert).
@@ -161,8 +166,15 @@ def run_contention(
         # Baseline: readers only, measured once. Every cell's ratio is vs this.
         r0, _, e0 = _drive(read_fn, workers, duration_s)
         read_only_qps = r0 / e0 if e0 > 0 else 0.0
-        log.info("read-only baseline: %.0f QPS (%d readers)", read_only_qps, workers)
-        results = [result("read_only", read_only_qps, {"writers": 0, "batch": 0, "ratio": 1.0})]
+        log.info(
+            "[mvcc=%s] read-only baseline: %.0f QPS (%d readers)",
+            mvcc,
+            read_only_qps,
+            workers,
+        )
+        results = [
+            result("read_only", read_only_qps, {"writers": 0, "batch": 0, "ratio": 1.0, "mvcc": mvcc})
+        ]
 
         # Grid: read QPS retained under each (writers × batch) write pressure.
         for nw, batch in itertools.product(writer_counts, batch_sizes):
@@ -171,7 +183,8 @@ def run_contention(
             ratio = qps / read_only_qps if read_only_qps > 0 else 0.0
             writes_per_s = w1 / e1 if e1 > 0 else 0.0
             log.info(
-                "writers=%d batch=%-4d | %.0f QPS | retained %.2fx | %.0f writes/s (%.0f pts/s)",
+                "[mvcc=%s] writers=%d batch=%-4d | %.0f QPS | retained %.2fx | %.0f writes/s (%.0f pts/s)",
+                mvcc,
                 nw,
                 batch,
                 qps,
@@ -181,10 +194,15 @@ def run_contention(
             )
             results.append(
                 result(
-                    f"read_during_write w{nw} b{batch}",
+                    f"read_during_write w{nw} b{batch} mvcc={mvcc}",
                     qps,
-                    {"writers": nw, "batch": batch, "ratio": round(ratio, 3),
-                     "writes_per_s": round(writes_per_s, 1)},
+                    {
+                        "writers": nw,
+                        "batch": batch,
+                        "ratio": round(ratio, 3),
+                        "writes_per_s": round(writes_per_s, 1),
+                        "mvcc": mvcc,
+                    },
                 )
             )
         return results
@@ -214,28 +232,61 @@ def main(argv: list[str] | None = None) -> int:
         default="1,64,512",
         help="comma-separated upsert batch sizes (write-size sweep)",
     )
+    p.add_argument(
+        "--mvcc",
+        default="both",
+        choices=["off", "on", "both"],
+        help="run with QUIVER_MVCC_READS off, on, or both (the before/after, ADR-0064)",
+    )
     args = p.parse_args(argv)
 
     writer_counts = [int(x) for x in args.writers.split(",") if x]
     batch_sizes = [int(x) for x in args.batches.split(",") if x]
+    modes = {"off": [False], "on": [True], "both": [False, True]}[args.mvcc]
 
     ds = _load_dataset(args.dataset, args.datasets_dir)
-    adapter = QuiverAdapter(url=args.quiver_url, api_key=args.quiver_key, start_server=True)
-    results = run_contention(
-        adapter,
-        ds.base,
-        ds.queries,
-        args.dataset,
-        workers=args.workers,
-        duration_s=args.duration,
-        ef_search=args.ef,
-        writer_counts=writer_counts,
-        batch_sizes=batch_sizes,
-    )
+    results: list[BenchResult] = []
+    for mvcc in modes:
+        # A fresh server per mode so the MVCC flag is applied at open and the data
+        # dir is clean (the adapter starts its own process).
+        adapter = QuiverAdapter(
+            url=args.quiver_url, api_key=args.quiver_key, start_server=True, mvcc=mvcc
+        )
+        results += run_contention(
+            adapter,
+            ds.base,
+            ds.queries,
+            args.dataset,
+            workers=args.workers,
+            duration_s=args.duration,
+            ef_search=args.ef,
+            writer_counts=writer_counts,
+            batch_sizes=batch_sizes,
+            mvcc=mvcc,
+        )
+
     args.out.mkdir(parents=True, exist_ok=True)
     _write_csv(results, args.out / "contention_sweep.csv")
     log.info("wrote %s", args.out / "contention_sweep.csv")
+    _log_before_after(results)
     return 0
+
+
+def _log_before_after(results: list[BenchResult]) -> None:
+    """Log a per-cell retained-ratio before/after table when both modes ran. The
+    ratio is the honest signal on a shared dev box; absolute QPS is
+    reference-hardware-pending (the dev box is WSL2 and the Python client is itself
+    a concurrency ceiling)."""
+    off = {(r.config["writers"], r.config["batch"]): r.config["ratio"] for r in results if not r.config.get("mvcc") and r.notes.startswith("read_during_write")}
+    on = {(r.config["writers"], r.config["batch"]): r.config["ratio"] for r in results if r.config.get("mvcc") and r.notes.startswith("read_during_write")}
+    if not off or not on:
+        return
+    log.info("retained read-QPS ratio — RwLock (off) vs MVCC (on), same box:")
+    log.info("  writers  batch |   off  ->   on")
+    for key in sorted(off):
+        if key in on:
+            nw, batch = key
+            log.info("  %7d  %5d | %5.2fx -> %5.2fx", nw, batch, off[key], on[key])
 
 
 if __name__ == "__main__":  # pragma: no cover
