@@ -269,6 +269,22 @@ struct IndexEnvelope {
 // `Ivf` snapshot version); a mismatch falls back to a rebuild.
 const INDEX_ENVELOPE_VERSION: u16 = 1;
 
+/// On-disk envelope (ADR-0063) for a durable DiskVamana snapshot. Unlike the IVF
+/// envelope, the bulk (graph + full vectors) stays in the immutable `mmap`-ed
+/// base file (`vamana.qvx`); this blob carries only what ties that base to the
+/// live state — the base point count (validated against the opened file), the
+/// FreshDiskANN tombstones, and the id map. The delta vectors are *not* stored:
+/// the delta ids are implied as `[base_row_count, int_to_ext.len())` and their
+/// vectors re-fetched from the store on open, so the blob stays O(delta ids), not
+/// O(N) vectors. A decode/version/validation error means "rebuild from the store".
+#[derive(Serialize, Deserialize)]
+struct DiskEnvelope {
+    version: u16,
+    int_to_ext: Vec<String>,
+    base_row_count: u64,
+    deleted_ids: Vec<u64>,
+}
+
 struct CollectionHandle {
     id: CollectionId,
     descriptor: Descriptor,
@@ -1491,6 +1507,19 @@ impl Database {
                     ivf: ivf.snapshot()?,
                 };
                 snapshots.insert(handle.id, postcard::to_allocvec(&envelope)?);
+            } else if let CollectionIndex::Disk(Some(fresh)) = &handle.index {
+                // Durable DiskVamana (ADR-0063): the base file is already on disk
+                // (sealed at build/consolidation); seal only the tiny tie-to-live
+                // blob. The derived sparse index is not persisted (as for IVF); on
+                // reopen the durable load leaves it `None` and hybrid search falls
+                // back to the store scan until the next rebuild — correct, not fast.
+                let envelope = DiskEnvelope {
+                    version: INDEX_ENVELOPE_VERSION,
+                    int_to_ext: handle.int_to_ext.clone(),
+                    base_row_count: fresh.base_len() as u64,
+                    deleted_ids: fresh.deleted_ids(),
+                };
+                snapshots.insert(handle.id, postcard::to_allocvec(&envelope)?);
             }
         }
         self.store.checkpoint_with_index_snapshots(&snapshots)?;
@@ -1903,7 +1932,27 @@ fn write_disk_index(
     // envelope key-ring), so a crypto-shred of the collection also makes its index
     // unreadable. The same owned handle writes and then mmap-opens it.
     let codec = store.collection_codec_clone(cid)?;
-    quiver_index::disk::write(&path, graph, pq, codec.as_ref())?;
+    // Atomic publish (ADR-0063): write to a temp file, fsync it (disk::write does
+    // the file sync), rename over the live name, then fsync the dir. A crash mid
+    // write leaves the previous complete base or none — never a torn file that the
+    // durable load path could `mmap` and serve. The caller has already dropped any
+    // prior `DiskVamana` (its mmap assumed the old inode), so the rename is safe.
+    let tmp = dir.join(format!("{DISK_INDEX_FILE}.tmp"));
+    quiver_index::disk::write(&tmp, graph, pq, codec.as_ref())?;
+    std::fs::rename(&tmp, &path).map_err(quiver_index::DiskError::Io)?;
+    let _ = std::fs::File::open(&dir).and_then(|f| f.sync_all());
+    open_disk_index(store, cid, codec)
+}
+
+// Open a collection's sealed disk base (`vamana.qvx`) for queries, decrypting with
+// its codec. Errors (absent/torn/wrong-codec file) propagate so the durable load
+// path can fall back to a rebuild (ADR-0063).
+fn open_disk_index(
+    store: &Store,
+    cid: CollectionId,
+    codec: Box<dyn PageCodec>,
+) -> Result<DiskVamana> {
+    let path = store.index_dir(cid).join(DISK_INDEX_FILE);
     Ok(DiskVamana::open(&path, codec)?)
 }
 
@@ -1913,7 +1962,7 @@ fn write_disk_index(
 // or restoring it falls back to the authoritative rebuild.
 fn load_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
     // Multi-vector collections always rebuild on open, so the document grouping is
-    // derived from the live rows; the IVF snapshot fast-path stays single-vector.
+    // derived from the live rows; the snapshot fast-paths stay single-vector.
     if !handle.descriptor.multivector
         && handle.descriptor.index.kind == IndexKind::Ivf
         && let Ok(Some(blob)) = store.read_index_snapshot(handle.id)
@@ -1921,7 +1970,81 @@ fn load_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
     {
         return Ok(());
     }
+    // Durable DiskVamana (ADR-0063): mmap the frugal base instead of an O(N)
+    // full-RAM rebuild. Any failure falls back to rebuild, so the artifact is never
+    // load-bearing for correctness. The derived sparse index is left `None` (as for
+    // IVF) and hybrid falls back to the store scan until the next rebuild.
+    // `QUIVER_DISABLE_DURABLE_DISK_INDEX` is an ops kill switch: set it to force the
+    // (always-correct) rebuild path if the durable load is ever suspected.
+    if !handle.descriptor.multivector
+        && handle.descriptor.index.kind == IndexKind::DiskVamana
+        && std::env::var_os("QUIVER_DISABLE_DURABLE_DISK_INDEX").is_none()
+        && let Ok(Some(blob)) = store.read_index_snapshot(handle.id)
+        && restore_disk_snapshot(store, handle, &blob).is_ok()
+    {
+        return Ok(());
+    }
     rebuild_index(store, handle)
+}
+
+// Restore a DiskVamana from its durable snapshot (ADR-0063): `mmap` the immutable
+// base file, rebuild the in-memory FreshDiskANN delta from the store by the implied
+// delta ids, re-apply the tombstones, then replay the post-checkpoint WAL tail. Any
+// problem — absent/torn/mismatched base, a missing delta row — returns an error so
+// the caller falls back to an authoritative rebuild.
+fn restore_disk_snapshot(store: &Store, handle: &mut CollectionHandle, blob: &[u8]) -> Result<()> {
+    let envelope: DiskEnvelope = postcard::from_bytes(blob)?;
+    if envelope.version != INDEX_ENVELOPE_VERSION {
+        return Err(Error::Unsupported(
+            "unsupported disk index snapshot version",
+        ));
+    }
+    let base = open_disk_index(store, handle.id, store.collection_codec_clone(handle.id)?)?;
+    // The blob's base count must match the opened file, or the (base, blob) pair is
+    // inconsistent (e.g. a base torn or replaced after the blob was sealed).
+    if base.len() as u64 != envelope.base_row_count {
+        return Err(Error::Unsupported(
+            "disk base count disagrees with snapshot",
+        ));
+    }
+    handle.ext_to_int = envelope
+        .int_to_ext
+        .iter()
+        .enumerate()
+        .map(|(i, ext)| (ext.clone(), i as u64))
+        .collect();
+    handle.int_to_ext = envelope.int_to_ext;
+    let mut fresh = FreshDiskVamana::new(base)?;
+    // Reconstruct the delta: the ids above the base were inserted since the last
+    // consolidation; their vectors live in the store, fetched by id (a row that
+    // died this window is simply absent and need not enter the delta).
+    for internal in envelope.base_row_count..handle.int_to_ext.len() as u64 {
+        let ext = &handle.int_to_ext[internal as usize];
+        if let Some(record) = store.get(handle.id, ext)? {
+            fresh.insert(internal, &record.vector)?;
+        }
+    }
+    for id in envelope.deleted_ids {
+        fresh.mark_deleted(id);
+    }
+    handle.index = CollectionIndex::Disk(Some(fresh));
+    handle.stale = false;
+    replay_recovery_tail(store, handle)
+}
+
+// Catch a restored index up to the store's current state by replaying the
+// post-checkpoint WAL tail through the shared incremental apply path (ADR-0025/0063):
+// tombstones first, then active-buffer upserts, so a row shadowed this window ends
+// with its new vector. Bounded by the checkpoint cadence, not the collection size.
+fn replay_recovery_tail(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
+    let tail = store.recovery_tail(handle.id)?;
+    for ext in &tail.deleted {
+        index_delete_point(handle, ext);
+    }
+    for (ext, record) in tail.upserts {
+        index_upsert_point(handle, &ext, &record.vector)?;
+    }
+    Ok(())
 }
 
 // Restore an IVF from its snapshot envelope and catch it up to the store's
@@ -3079,6 +3202,146 @@ mod tests {
             .search("v", &[7.0, 1.0, 2.0, 3.0], &SearchParams::default())
             .unwrap();
         assert_eq!(res[0].id, "p7");
+    }
+
+    // ADR-0063: a DiskVamana collection reopens by loading its frugal mmap base +
+    // replaying the WAL tail, not by an O(N) full-RAM rebuild. Proven structurally:
+    // the on-disk base keeps its checkpoint row count after reopen (a rebuild would
+    // rewrite it to include the post-checkpoint inserts).
+    #[test]
+    fn disk_index_loads_from_snapshot_without_rebuild_on_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cid;
+        {
+            let mut db = open(tmp.path());
+            db.create_collection("d", desc_with(IndexKind::DiskVamana))
+                .unwrap();
+            for i in 0..100u32 {
+                db.upsert(
+                    "d",
+                    &format!("p{i}"),
+                    &[i as f32, 0.0, 0.0, 0.0],
+                    &json!({}),
+                )
+                .unwrap();
+            }
+            // Force the deferred build so the base file + checkpoint blob exist.
+            db.search("d", &[1.0, 0.0, 0.0, 0.0], &SearchParams::default())
+                .unwrap();
+            db.checkpoint().unwrap();
+            // 15 more after the checkpoint (< the 20% consolidation threshold): they
+            // land in the in-memory delta + the WAL tail, not the base file.
+            for i in 100..115u32 {
+                db.upsert(
+                    "d",
+                    &format!("p{i}"),
+                    &[i as f32, 0.0, 0.0, 0.0],
+                    &json!({}),
+                )
+                .unwrap();
+            }
+            cid = db.collections["d"].id;
+            let base = open_disk_index(
+                &db.store,
+                cid,
+                db.store.collection_codec_clone(cid).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(base.len(), 100, "base sealed at the checkpoint count");
+        }
+
+        let mut db = open(tmp.path());
+        // A base point and a post-checkpoint (WAL-tail-replayed) point are both found.
+        assert_eq!(
+            db.search("d", &[50.0, 0.0, 0.0, 0.0], &SearchParams::default())
+                .unwrap()[0]
+                .id,
+            "p50",
+        );
+        assert_eq!(
+            db.search("d", &[110.0, 0.0, 0.0, 0.0], &SearchParams::default())
+                .unwrap()[0]
+                .id,
+            "p110",
+            "post-checkpoint insert survived reopen via WAL-tail replay",
+        );
+        // Loaded, not rebuilt: the base file still holds exactly the 100 checkpoint
+        // rows. A rebuild on open would have rewritten it over all 115 live rows.
+        let base = open_disk_index(
+            &db.store,
+            cid,
+            db.store.collection_codec_clone(cid).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            base.len(),
+            100,
+            "reopen loaded the base; it was not rebuilt"
+        );
+    }
+
+    // ADR-0063: the durable artifact is never load-bearing for correctness — a
+    // missing/torn base falls back to an authoritative rebuild that still answers.
+    #[test]
+    fn disk_index_falls_back_to_rebuild_when_base_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_path;
+        {
+            let mut db = open(tmp.path());
+            db.create_collection("d", desc_with(IndexKind::DiskVamana))
+                .unwrap();
+            for i in 0..60u32 {
+                db.upsert(
+                    "d",
+                    &format!("p{i}"),
+                    &[i as f32, 0.0, 0.0, 0.0],
+                    &json!({}),
+                )
+                .unwrap();
+            }
+            db.search("d", &[1.0, 0.0, 0.0, 0.0], &SearchParams::default())
+                .unwrap();
+            db.checkpoint().unwrap();
+            let cid = db.collections["d"].id;
+            base_path = db.store.index_dir(cid).join(DISK_INDEX_FILE);
+        }
+        // Simulate a lost base: remove the file the snapshot references.
+        std::fs::remove_file(&base_path).unwrap();
+        {
+            let mut db = open(tmp.path());
+            assert_eq!(
+                db.search("d", &[25.0, 0.0, 0.0, 0.0], &SearchParams::default())
+                    .unwrap()[0]
+                    .id,
+                "p25",
+                "rebuild fallback still answers correctly after a lost base",
+            );
+            // The fallback rebuild re-seals the base, and a subsequent checkpoint
+            // refreshes the snapshot blob to match it.
+            assert!(
+                base_path.exists(),
+                "the fallback rebuild re-sealed the base file"
+            );
+            db.checkpoint().unwrap();
+        }
+        // Simulate a torn base: truncate the file mid-way. `DiskVamana::open`'s
+        // per-page checks reject it, so the load falls back to a rebuild.
+        let len = std::fs::metadata(&base_path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&base_path)
+            .unwrap()
+            .set_len(len / 2)
+            .unwrap();
+
+        let mut db = open(tmp.path());
+        assert_eq!(
+            db.search("d", &[25.0, 0.0, 0.0, 0.0], &SearchParams::default())
+                .unwrap()[0]
+                .id,
+            "p25",
+            "rebuild fallback still answers correctly after a torn base",
+        );
     }
 
     #[test]

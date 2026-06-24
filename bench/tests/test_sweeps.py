@@ -238,3 +238,24 @@ def test_sweep_files_excluded_from_competitor_matrix(tmp_path):
     data = _load_results(tmp_path)
     # The quant sweep must NOT show up as a quiver competitor entry.
     assert set(data) == {"faiss"}
+
+
+# ── cold-reopen RSS hook (ADR-0063) ──────────────────────────────────────────
+
+def test_base_cold_reopen_is_a_noop():
+    # The default hook is callable and does nothing — competitors that do not own
+    # their server process inherit it unchanged.
+    adapter = _PerfectAdapter(np.zeros((1, 4), dtype=np.float32))
+    assert adapter.cold_reopen() is None
+
+
+def test_quiver_cold_reopen_noop_without_managed_server():
+    # With start_server=False the adapter does not own the process, so cold_reopen
+    # must be a no-op (the operator restarts an external server) and never touch a
+    # missing process handle.
+    from quiver_bench.competitors.quiver_adapter import QuiverAdapter
+
+    adapter = QuiverAdapter(start_server=False)
+    assert adapter._proc is None
+    adapter.cold_reopen()  # must not raise
+    assert adapter._proc is None

@@ -117,8 +117,18 @@ fn serve(index_path: &Path, query_path: &Path, gt_path: &Path) -> Result<(), Box
         std::io::stdout().flush()?;
     }
     // Hold at steady state (only PQ codes resident) so the resident-set memory
-    // can be sampled, when run interactively.
-    if std::io::stdin().is_terminal() {
+    // can be sampled. `QUIVER_DISK_HOLD_SECS` makes the hold deterministic for a
+    // scripted sampler (no TTY needed — e.g. scripts/bench-disk-frugality.ps1);
+    // otherwise an interactive run waits for Enter.
+    // ponytail: env hold over a CLI flag — the example's arg parsing is positional.
+    if let Some(secs) = env::var("QUIVER_DISK_HOLD_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        println!("\nindex loaded; holding {secs}s for RSS sampling");
+        std::io::stdout().flush()?;
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+    } else if std::io::stdin().is_terminal() {
         println!("\nindex loaded; sample this process's RSS now, then press Enter to exit");
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).ok();

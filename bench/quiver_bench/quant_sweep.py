@@ -96,6 +96,10 @@ def run_quant_sweep(
             t0 = time.perf_counter()
             build_s, disk_mb = adapter.build(ds.base, metric="l2")
             log.info("[%s] built in %.1fs", label, build_s)
+            # Cold-reopen so RSS reflects the serving footprint, not the build's
+            # allocator high-water mark — the disk path then loads its mmap base
+            # instead of rebuilding (ADR-0063). No-op for an external server.
+            adapter.cold_reopen()
             sweep = adapter.query_sweep(ds.queries, ds.ground_truth, K, ef_sweep, reps=3)
             for r in sweep:
                 r.dataset = dataset_name
