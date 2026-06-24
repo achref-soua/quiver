@@ -1,6 +1,9 @@
 # ADR-0053: Lock-free MVCC reads (design only)
 
-- **Status:** Proposed (design only — not implemented; gated on explicit owner go-ahead)
+- **Status:** Accepted (high-level design) → implementation design in
+  [ADR-0064](0064-mvcc-reads-implementation.md), which resolves the in-place
+  index-mutation tension this ADR left open and stages the build. Implemented in
+  increments behind a default-off `QUIVER_MVCC_READS` flag from `v0.24.0`.
 - **Date:** 2026-06-23
 - **Deciders:** Achref Soua
 
