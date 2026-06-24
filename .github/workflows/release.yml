@@ -159,11 +159,26 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          # Idempotent: a crate version already on crates.io is skipped (so a
+          # re-run after a partial publish succeeds instead of failing). The
+          # cargo call is the `if` condition so `bash -e` does not abort on the
+          # expected "already uploaded" failure before the skip check runs.
           for crate in quiverdb-core quiverdb-simd quiverdb-proto quiverdb-providers quiverdb-query \
                        quiverdb-crypto quiverdb-index quiverdb-embed quiverdb-import quiverdb-tui \
                        quiverdb-mcp quiverdb-server quiverdb-cli; do
             echo "::group::publish ${crate}"
-            cargo publish -p "${crate}"
+            if out=$(cargo publish -p "${crate}" 2>&1); then
+              printf '%s\n' "${out}"
+              echo "→ published ${crate}"
+            else
+              printf '%s\n' "${out}"
+              if printf '%s' "${out}" | grep -qiE "already (uploaded|exists)"; then
+                echo "→ ${crate} already on crates.io, skipping"
+              else
+                echo "::error::cargo publish failed for ${crate}"
+                exit 1
+              fi
+            fi
             echo "::endgroup::"
           done
 
@@ -184,7 +199,8 @@ jobs:
         run: |
           uv build
           uvx twine check dist/*
-          uv publish
+          # --check-url skips files already on PyPI, so a re-run is idempotent.
+          uv publish --check-url https://pypi.org/simple/
 
   publish-npm:
     name: publish npm
@@ -196,9 +212,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
+        with:
+          version: "11.6.0" # matches packageManager; pnpm 11 needs Node >= 22.13
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
       - name: Build + publish the TypeScript SDK
         working-directory: sdks/typescript
@@ -207,4 +225,10 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm build
-          npm publish --access public
+          # Idempotent: skip if this version is already on npm.
+          ver=$(node -p "require('./package.json').version")
+          if npm view "quiver-client@${ver}" version >/dev/null 2>&1; then
+            echo "quiver-client@${ver} already on npm, skipping"
+          else
+            npm publish --access public
+          fi

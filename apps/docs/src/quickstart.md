@@ -33,16 +33,19 @@ any point.
 ## Install the CLI
 
 ```bash
-# install the `quiver` binary from the cloned repo:
+# from crates.io (the `quiver` binary, published as quiverdb-cli):
+cargo install quiverdb-cli
+# …or from a cloned repo:
 cargo install --path crates/quiver-cli
+
 quiver serve                   # gRPC + REST, encrypted by default
 quiver tui                     # the cockpit
 quiver mcp                     # MCP server (stdio) for AI agents
 ```
 
-> **Heads-up:** the `quiver-cli` crate currently on crates.io is an unrelated
-> third-party project — install from this repository (above), not with
-> `cargo install quiver-cli`.
+> **Heads-up:** Quiver's CLI publishes as **`quiverdb-cli`** — the `quiver-cli`
+> name on crates.io is an unrelated third-party project, which is why the
+> `quiverdb-*` namespace is used (ADR-0056).
 
 ## Your first query (Python)
 

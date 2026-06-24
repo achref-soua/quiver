@@ -109,6 +109,16 @@ quiver tui              # the retro cockpit
 quiver mcp              # MCP server (stdio) so AI agents can drive Quiver
 ```
 
+**Or install from a package registry:**
+
+```bash
+cargo install quiverdb-cli          # the `quiver` binary, from crates.io
+pip install quiver-client           # the Python SDK, from PyPI
+npm install quiver-client           # the TypeScript SDK, from npm
+```
+
+The crates publish under the `quiverdb-*` namespace ([ADR-0056](./docs/adr/0056-packaging-and-distribution.md)) — `cargo install quiverdb-cli` installs the same `quiver` binary the script above downloads. (The pre-built binary is the fastest path; `cargo install` compiles from source.)
+
 **Build from source** (requires rustup stable + `just` + `uv`):
 
 ```bash
@@ -134,8 +144,9 @@ just verify           # the full local quality gate (lint · test · doc · deny
 cargo run -p quiverdb-cli -- --help
 ```
 
-> **Heads-up:** the `quiver-cli` crate currently on crates.io is an unrelated
-> third-party project — use the install script above or build from source.
+> **Heads-up:** Quiver's CLI publishes as **`quiverdb-cli`** (`cargo install quiverdb-cli`) — the
+> `quiver-cli` name on crates.io is an unrelated third-party project, which is why the `quiverdb-*`
+> namespace is used ([ADR-0056](./docs/adr/0056-packaging-and-distribution.md)).
 
 The [MCP server](./docs/mcp.md) exposes `create_collection`, `upsert`, `search`,
 `get`, `delete`, and the multi-vector `upsert_document` / `search_multi_vector` /
@@ -163,7 +174,7 @@ The `ci` (fmt · clippy · test · doc) and `security` (deny · audit · gitleak
 
 ## SDK & benchmarks
 
-The **Python SDK** lives in [`sdks/python`](./sdks/python) (`pip install ./sdks/python`):
+The **Python SDK** is on PyPI as [`quiver-client`](https://pypi.org/project/quiver-client/) (`pip install quiver-client`; or `pip install ./sdks/python` from a checkout):
 
 ```python
 from quiver import Client, Point
@@ -174,7 +185,7 @@ with Client("http://127.0.0.1:6333", api_key="…") as q:
     hits = q.search("items", [0.1, 0.2, 0.3], k=5)
 ```
 
-The **TypeScript SDK** lives in [`sdks/typescript`](./sdks/typescript) (`pnpm add ./sdks/typescript`), dependency-free over the global `fetch`, and can pick the memory-frugal disk index:
+The **TypeScript SDK** is on npm as [`quiver-client`](https://www.npmjs.com/package/quiver-client) (`npm install quiver-client`; or `pnpm add ./sdks/typescript` from a checkout), dependency-free over the global `fetch`, and can pick the memory-frugal disk index:
 
 ```ts
 import { Client } from "quiver-client";
@@ -185,7 +196,7 @@ await q.upsert("items", [{ id: "a", vector: [0.1, 0.2, 0.3], payload: { tag: "x"
 const hits = await q.search("items", [0.1, 0.2, 0.3], { k: 5 });
 ```
 
-A **LangChain** `VectorStore` adapter ships in `quiver.langchain` (`pip install "./sdks/python[langchain]"`), and a **LlamaIndex** `VectorStore` in `quiver.llamaindex` (`pip install "./sdks/python[llamaindex]"`) — so any Quiver index, including the memory-frugal disk path, backs a LangChain or LlamaIndex retriever. The LlamaIndex adapter maps `MetadataFilters` onto Quiver's hybrid pre-filter. A synchronous `Client` and an async `AsyncClient` share one contract, with batched-upsert/scan/delete-by-filter helpers for ingestion and erasure.
+A **LangChain** `VectorStore` adapter ships in `quiver.langchain` (`pip install "quiver-client[langchain]"`), and a **LlamaIndex** `VectorStore` in `quiver.llamaindex` (`pip install "quiver-client[llamaindex]"`) — so any Quiver index, including the memory-frugal disk path, backs a LangChain or LlamaIndex retriever. The LlamaIndex adapter maps `MetadataFilters` onto Quiver's hybrid pre-filter. A synchronous `Client` and an async `AsyncClient` share one contract, with batched-upsert/scan/delete-by-filter helpers for ingestion and erasure.
 
 **Using Quiver in RAG / agents.** End-to-end guides — [RAG](./apps/docs/src/guides/rag.md) (chunk → embed → filtered search → rerank → answer), [agentic patterns over MCP](./apps/docs/src/guides/agentic.md), and [tuning for RAG](./apps/docs/src/guides/tuning.md) (index/quantizer/recall-RAM) — plus a runnable [`examples/rag/quickstart.py`](./examples/rag/quickstart.py) that needs no API key.
 
