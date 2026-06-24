@@ -34,6 +34,10 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal test-only dev-dependencies are pinned by path with no version (so
+# `cargo publish` omits them and cross-crate dev-dep cycles stay publishable);
+# allow those version-less *path* deps while still denying registry wildcards.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
