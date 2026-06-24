@@ -72,6 +72,7 @@ fn base_config(
         rerank: Default::default(),
         rate_limit: Default::default(),
         otlp: Default::default(),
+        mvcc_reads: false,
     }
 }
 
@@ -104,6 +105,7 @@ async fn replicate_streams_a_snapshot_then_the_live_tail() {
         rerank: Default::default(),
         rate_limit: Default::default(),
         otlp: Default::default(),
+        mvcc_reads: false,
     };
     tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

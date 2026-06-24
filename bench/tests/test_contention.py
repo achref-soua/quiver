@@ -40,3 +40,18 @@ def test_drive_runs_reader_and_writer_concurrently():
     nreads, nwrites, _ = _drive(read_fn, workers=2, duration_s=0.2, write_fn=write_fn)
     assert nreads > 0 and nwrites > 0  # both ran
     assert nwrites == writes["n"]
+
+
+def test_drive_sums_across_multiple_writers():
+    writes = {"n": 0}
+    wlock = threading.Lock()
+
+    def write_fn() -> None:
+        with wlock:
+            writes["n"] += 1
+
+    nreads, nwrites, _ = _drive(
+        lambda: None, workers=1, duration_s=0.2, write_fn=write_fn, n_writers=4
+    )
+    assert nreads > 0 and nwrites > 0
+    assert nwrites == writes["n"]  # every write from all 4 writer threads counted

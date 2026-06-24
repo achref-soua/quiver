@@ -2311,7 +2311,7 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quiverdb-cli"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2332,7 +2332,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-core"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "crc32c",
  "memmap2",
@@ -2347,7 +2347,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-crypto"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "base64",
  "chacha20 0.9.1",
@@ -2365,8 +2365,9 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-embed"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
+ "arc-swap",
  "postcard",
  "quiverdb-core",
  "quiverdb-index",
@@ -2379,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-import"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "postgres",
  "quiverdb-embed",
@@ -2394,7 +2395,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-index"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "memmap2",
  "postcard",
@@ -2408,7 +2409,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-mcp"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "quiverdb-crypto",
@@ -2423,7 +2424,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-proto"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -2434,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-providers"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "figment",
  "serde",
@@ -2446,7 +2447,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-query"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "rust-stemmers",
  "serde",
@@ -2455,7 +2456,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-server"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -2489,7 +2490,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-simd"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "criterion",
  "serde",
@@ -2497,7 +2498,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-tui"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "crossterm",

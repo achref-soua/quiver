@@ -55,11 +55,15 @@ class QuiverAdapter(CompetitorAdapter):
         data_dir: str | None = None,
         index: str | None = None,
         pq_subspaces: int | None = None,
+        mvcc: bool = False,
     ) -> None:
         self._url = url
         self._api_key = api_key
         self._start_server = start_server
         self._data_dir = data_dir
+        # Start the server with lock-free MVCC reads (QUIVER_MVCC_READS, ADR-0064):
+        # the before/after knob for the read-during-write contention benchmark.
+        self._mvcc = mvcc
         # Index structure + quantization for the memory-wedge sweep. None keeps the
         # server default (in-memory HNSW, exact vectors); "ivf"/"disk_vamana" with
         # pq_subspaces trade recall for a smaller resident footprint.
@@ -106,6 +110,8 @@ class QuiverAdapter(CompetitorAdapter):
             "QUIVER_REST_ADDR": rest_addr,
             "QUIVER_GRPC_ADDR": grpc_addr,
         }
+        if self._mvcc:
+            env["QUIVER_MVCC_READS"] = "true"
         if self._api_key:
             env["QUIVER_API_KEYS"] = self._api_key
         self._proc = subprocess.Popen(
@@ -210,12 +216,16 @@ class QuiverAdapter(CompetitorAdapter):
         hits = self._client.search(COLLECTION, query.tolist(), k=k, ef_search=param, with_payload=False)
         return [int(h.id) for h in hits]
 
-    def write_one(self, point_id: str, vector: np.ndarray) -> None:
-        """Upsert a single point — the write-load generator for the read-during-write
-        contention sweep (ADR-0064). One upsert is one WAL fsync, which under the
-        RwLock holds the exclusive lock and blocks concurrent reads; MVCC removes
-        that. Re-upserting an existing id exercises the live incremental update path."""
-        self._client.upsert(COLLECTION, [{"id": point_id, "vector": vector.tolist()}])
+    def write_batch(self, point_ids: list[str], vectors: list[np.ndarray]) -> None:
+        """Upsert a batch of points in one request — the write-load generator for the
+        read-during-write contention sweep (ADR-0064). One upsert request is one WAL
+        fsync (bulk batches one fsync, ADR-0038), and under the RwLock it holds the
+        exclusive lock for that whole window, blocking concurrent reads; MVCC removes
+        that. A larger batch is a longer exclusive-lock window (the write-*size*
+        pressure dimension); re-upserting existing ids exercises the live incremental
+        update path."""
+        points = [{"id": pid, "vector": v.tolist()} for pid, v in zip(point_ids, vectors)]
+        self._client.upsert(COLLECTION, points)
 
     def sample_rss(self) -> float | None:
         from urllib.parse import urlparse
