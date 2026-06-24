@@ -36,7 +36,9 @@ class BenchResult:
     rss_mb: float | None = None
 
     # Query quality + throughput (mean over reps)
-    recall_at_10: float = 0.0
+    recall_at_10: float = 0.0  # headline recall, measured at the timed k
+    recall_at_1: float = 0.0  # precision@1 — top hit correct
+    recall_at_100: float = 0.0  # deep recall — from one extra untimed k=100 pass
     qps_1t: float = 0.0
     # Saturated throughput from the concurrent driver (None = not measured).
     qps_nt: float | None = None
@@ -126,11 +128,16 @@ class CompetitorAdapter(ABC):
     ) -> list[BenchResult]:
         """Run the full ef/nprobe sweep and return one BenchResult per param.
 
-        When ``concurrency > 1``, each operating point also gets a saturated-QPS
-        pass (``qps_nt``) from ``query_concurrent``; single-thread QPS is always
-        measured."""
+        The timed loop runs at the report ``k`` so QPS/latency stay comparable to
+        prior runs; ``recall_at_1`` and ``recall_at_10`` come free from that same
+        retrieval. ``recall_at_100`` needs the deeper neighbour set, so it is
+        measured in one extra **untimed** pass (``k=100``) that never touches the
+        QPS figures. When ``concurrency > 1`` each point also gets a saturated-QPS
+        pass (``qps_nt``) from ``query_concurrent``."""
         from ..metrics import mean_recall_at_k, percentile
 
+        deep_k = max(k, 100)
+        truth = [row.tolist() for row in ground_truth]
         results = []
         for param in params:
             self.warmup(queries, k, param)
@@ -138,6 +145,7 @@ class CompetitorAdapter(ABC):
 
             rep_recalls: list[float] = []
             rep_qps: list[float] = []
+            rep_recalls_at_1: list[float] = []
             all_latencies: list[float] = []
 
             for _ in range(reps):
@@ -149,10 +157,18 @@ class CompetitorAdapter(ABC):
                     latencies_ms.append((time.perf_counter() - t0) * 1000.0)
                     retrieved.append(ids)
                 total_s = sum(latencies_ms) / 1000.0
-                truth = [row.tolist() for row in ground_truth]
                 rep_recalls.append(mean_recall_at_k(retrieved, truth, k))
+                rep_recalls_at_1.append(mean_recall_at_k(retrieved, truth, 1))
                 rep_qps.append(len(latencies_ms) / total_s if total_s > 0 else 0.0)
                 all_latencies.extend(latencies_ms)
+
+            # One untimed deep pass for recall@100 (the wider neighbour set the
+            # timed k=10 query never retrieves). Skipped when k already ≥ 100.
+            if deep_k > k:
+                deep = [self.query_one(q, deep_k, param) for q in queries]
+            else:
+                deep = retrieved
+            recall_at_100 = mean_recall_at_k(deep, truth, 100)
 
             import statistics
 
@@ -175,6 +191,8 @@ class CompetitorAdapter(ABC):
                     param_value=param,
                     rss_mb=rss,
                     recall_at_10=round(recall_mean, 4),
+                    recall_at_1=round(statistics.mean(rep_recalls_at_1), 4),
+                    recall_at_100=round(recall_at_100, 4),
                     qps_1t=round(qps_mean, 1),
                     qps_nt=qps_nt,
                     concurrency=concurrency,

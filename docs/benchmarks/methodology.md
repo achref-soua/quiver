@@ -8,12 +8,21 @@ The recall ↔ latency ↔ memory tradeoffs and the tunable knobs for each quant
 
 The four-way tradeoff, with **memory as the headline**:
 
-- **Recall@k** (primary `k=10`) against exact ground truth.
-- **QPS** — single-thread and saturated multi-thread.
+- **Recall@k** at `k = 1, 10, 100` against exact ground truth (primary `k=10`). recall@1 is
+  precision of the top hit; recall@100 is the wide-neighbour recall measured in one extra untimed
+  pass so it never perturbs the throughput numbers.
+- **QPS** — single-thread (`qps_1t`) and **saturated multi-thread** (`qps_nt`, the `--concurrency`
+  driver: every query run from an `N`-thread pool — the showcase for concurrent reads, [ADR-0057](../adr/0057-concurrent-reads-rwlock.md)).
 - **Memory footprint** — process **RSS at steady state** after index load and warmup (measured identically for every system).
 - **Build time** and **on-disk index size**.
+- **Quantization memory wedge** (Quiver) — the *same* dataset under `hnsw` / `disk_vamana`+PQ (each
+  in a fresh server), recall@{1,10,100} + build + QPS, so the recall/throughput tradeoff is measured
+  side by side. The **absolute serving-RAM** figure stays reference-hardware-pending: post-build RSS
+  is the build's allocator high-water mark, not the cold-reload serving footprint (ADR-0061).
+- **Filtered-selectivity sweep** (Quiver) — recall and QPS as a payload pre-filter keeps `s`% of the
+  collection, with recall measured against the *filtered* exact ground truth.
 
-The headline figure is **recall@10 vs RAM**; the classic figure is the **recall vs QPS** Pareto curve, traced by sweeping `efSearch` / `nprobe` / re-rank depth.
+The headline figure is **recall@10 vs RAM**; the classic figure is the **recall vs QPS** Pareto curve, traced by sweeping `efSearch` / `nprobe` / re-rank depth. The dimensions added in v0.22.0 are catalogued in [ADR-0061](../adr/0061-benchmark-dimensions-v0.22.0.md).
 
 ## Datasets
 
@@ -31,9 +40,13 @@ Ground truth is the provided exact neighbors, or brute-forced with the SIMD kern
 `ann-benchmarks`-style, in `bench/`:
 
 1. Build the index (record build time + RSS + disk size). **Build time is *time-until-queryable*** — for Quiver this means ingest via the bulk endpoint (`POST …/points:bulk`) plus the deferred index build, which the harness forces with one query inside the timer so the number is comparable to competitors whose build includes index construction ([ADR-0055](../adr/0055-benchmark-v0.20.0-bulk-build.md)).
-2. Warm up (discard), then run the query set single- and multi-threaded.
-3. Sweep the quality knob to trace the recall–QPS curve; record p50/p95/p99 latency at each operating point.
-4. Emit raw **CSV** + the exact config used.
+2. Warm up (discard), then run the query set single-threaded, and — when `--concurrency N > 1` — a
+   saturated `N`-thread pass for `qps_nt`.
+3. Sweep the quality knob to trace the recall–QPS curve; record recall@{1,10,100} and p50/p95/p99
+   latency at each operating point.
+4. Emit raw **CSV** + the exact config used. The Quiver-only `quant_sweep` and `filter_sweep`
+   modules emit their own CSVs (`quant_sweep.csv`, `filter_sweep.csv`), folded into the report as the
+   memory-wedge and filtered-selectivity sections.
 
 ## Fair comparison vs Qdrant & LanceDB
 

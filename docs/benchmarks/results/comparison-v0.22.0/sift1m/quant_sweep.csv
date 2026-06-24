@@ -1,0 +1,5 @@
+competitor,dataset,param_name,param_value,build_s,index_disk_mb,rss_mb,recall_at_10,recall_at_1,recall_at_100,qps_1t,qps_nt,concurrency,p50_ms,p95_ms,p99_ms,recall_stdev,qps_stdev,config,notes,error
+quiver,sift1m,ef_search,64,618.7801259699918,,2033.46875,0.9581,0.966,0.9182,1143.9,,1,0.861,1.047,1.211,0.0,5.9,"{'index': 'hnsw', 'pq_subspaces': None}",hnsw,
+quiver,sift1m,ef_search,128,618.7801259699918,,2033.46875,0.9864,0.9835,0.9439,882.8,,1,1.119,1.344,1.547,0.0,7.2,"{'index': 'hnsw', 'pq_subspaces': None}",hnsw,
+quiver,sift1m,ef_search,64,1025.4521379039797,,1591.8359375,0.9119,0.9495,0.6304,867.6,,1,1.109,1.466,1.786,0.0,7.6,"{'index': 'disk_vamana', 'pq_subspaces': 16}",disk_vamana+pq16,
+quiver,sift1m,ef_search,128,1025.4521379039797,,2173.7109375,0.9662,0.9735,0.7093,597.7,,1,1.61,2.128,2.61,0.0,3.7,"{'index': 'disk_vamana', 'pq_subspaces': 16}",disk_vamana+pq16,
