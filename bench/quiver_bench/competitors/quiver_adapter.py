@@ -173,6 +173,13 @@ class QuiverAdapter(CompetitorAdapter):
         hits = self._client.search(COLLECTION, query.tolist(), k=k, ef_search=param, with_payload=False)
         return [int(h.id) for h in hits]
 
+    def write_one(self, point_id: str, vector: np.ndarray) -> None:
+        """Upsert a single point — the write-load generator for the read-during-write
+        contention sweep (ADR-0064). One upsert is one WAL fsync, which under the
+        RwLock holds the exclusive lock and blocks concurrent reads; MVCC removes
+        that. Re-upserting an existing id exercises the live incremental update path."""
+        self._client.upsert(COLLECTION, [{"id": point_id, "vector": vector.tolist()}])
+
     def sample_rss(self) -> float | None:
         from urllib.parse import urlparse
 

@@ -21,6 +21,10 @@ The four-way tradeoff, with **memory as the headline**:
   is the build's allocator high-water mark, not the cold-reload serving footprint (ADR-0061).
 - **Filtered-selectivity sweep** (Quiver) — recall and QPS as a payload pre-filter keeps `s`% of the
   collection, with recall measured against the *filtered* exact ground truth.
+- **Read-during-write contention** (Quiver) — concurrent read QPS *with* vs *without* a concurrent
+  writer; the retained ratio is the penalty the current `RwLock` imposes (a write's exclusive lock
+  blocks reads) and the measured case for lock-free MVCC reads ([ADR-0064](../adr/0064-mvcc-reads-implementation.md)).
+  See [`results/read-during-write.md`](./results/read-during-write.md).
 
 The headline figure is **recall@10 vs RAM**; the classic figure is the **recall vs QPS** Pareto curve, traced by sweeping `efSearch` / `nprobe` / re-rank depth. The dimensions added in v0.22.0 are catalogued in [ADR-0061](../adr/0061-benchmark-dimensions-v0.22.0.md).
 
