@@ -1178,34 +1178,10 @@ impl Database {
         // MVCC mode (ADR-0064): the immutable base index lives in the published
         // snapshot, not `handle.index`. Serve the read from the snapshot — the
         // base-index search merged lock-free with the overlay of recent writes —
-        // then enrich payload/vector by a store fetch on the result ids (the same
-        // `&self` fetch the locked path uses). A payload *filter* needs the
-        // pre-filter planning that lands in increment 2; reject it explicitly rather
-        // than return silently wrong results.
+        // reusing the same pre-filter planning and store-fetch enrichment as the
+        // locked path; only the dense candidate source differs.
         if mvcc_served(handle) {
-            if params.filter.is_some() {
-                return Err(Error::Unsupported(
-                    "QUIVER_MVCC_READS (increment 1) serves unfiltered search only; \
-                     filtered reads land in increment 2 — disable the flag for filtered queries",
-                ));
-            }
-            let mut hits = handle
-                .snapshot
-                .load()
-                .search(query, params.k, params.ef_search)?;
-            if params.with_payload || params.with_vector {
-                for m in &mut hits {
-                    if let Some(record) = self.store.get(handle.id, &m.id)? {
-                        if params.with_payload {
-                            m.payload = Some(serde_json::from_slice(&record.payload)?);
-                        }
-                        if params.with_vector {
-                            m.vector = Some(record.vector);
-                        }
-                    }
-                }
-            }
-            return Ok(hits);
+            return self.search_snapshot_mvcc(handle, query, params);
         }
 
         // Hybrid planning: if the filter narrows to a small, secondary-indexed
@@ -1284,6 +1260,93 @@ impl Database {
         Ok(out)
     }
 
+    // Serve `search_snapshot` for an MVCC-served collection (ADR-0064 increment 2):
+    // the dense candidates come from the lock-free snapshot (base ⊕ overlay), and
+    // everything else — the exact small-candidate pre-filter, post-filter, and
+    // payload/vector enrichment — reuses the same store-only logic as the locked
+    // path, so filtered and unfiltered reads are both exact.
+    fn search_snapshot_mvcc(
+        &self,
+        handle: &CollectionHandle,
+        query: &[f32],
+        params: &SearchParams,
+    ) -> Result<Vec<Match>> {
+        // Exact pre-filter for a small, secondary-indexed candidate set (store-only,
+        // index-independent — identical to the locked path).
+        if let Some(filter) = &params.filter
+            && let Some(candidates) = candidate_ids(
+                &self.store,
+                handle.id,
+                filter,
+                &handle.descriptor.filterable,
+            )?
+            && candidates.len() <= FULL_SCAN_THRESHOLD
+        {
+            return self.exact_filtered_search(
+                handle.id,
+                &handle.descriptor,
+                query,
+                params,
+                filter,
+                &candidates,
+            );
+        }
+
+        // Otherwise: dense candidates from the lock-free snapshot (overfetched when
+        // filtering, to survive the post-filter), then post-filter + enrich by a
+        // store fetch on the result ids.
+        let fetch = if params.filter.is_some() {
+            params
+                .k
+                .saturating_mul(FILTER_OVERFETCH)
+                .max(params.ef_search)
+        } else {
+            params.k
+        };
+        let dense = handle
+            .snapshot
+            .load()
+            .search(query, fetch, params.ef_search)?;
+        let need_record = params.filter.is_some() || params.with_payload || params.with_vector;
+        let mut out = Vec::with_capacity(params.k);
+        for m in dense {
+            if out.len() >= params.k {
+                break;
+            }
+            let record = if need_record {
+                self.store.get(handle.id, &m.id)?
+            } else {
+                None
+            };
+            let payload_value: Option<Value> = match &record {
+                Some(r) if params.filter.is_some() || params.with_payload => {
+                    Some(serde_json::from_slice(&r.payload)?)
+                }
+                _ => None,
+            };
+            if let Some(filter) = &params.filter
+                && !filter.matches(payload_value.as_ref().unwrap_or(&Value::Null))
+            {
+                continue;
+            }
+            out.push(Match {
+                id: m.id,
+                score: m.score,
+                payload: if params.with_payload {
+                    payload_value
+                } else {
+                    None
+                },
+                vector: if params.with_vector {
+                    record.map(|r| r.vector)
+                } else {
+                    None
+                },
+            });
+        }
+        Ok(out)
+    }
+
     /// Hybrid search (ADR-0043/0046): fuse up to three rankings with Reciprocal
     /// Rank Fusion — a dense ANN ranking, a sparse inverted-index dot-product
     /// ranking (`sparse_query`), and a BM25 full-text ranking (`text_query`, scored
@@ -1332,15 +1395,6 @@ impl Database {
         if dense_query.is_none() && sparse_query.is_none() && text_query.is_none() {
             return Err(Error::Unsupported(
                 "hybrid_search requires a dense query, a sparse query, or a text query",
-            ));
-        }
-        // MVCC mode (ADR-0064): hybrid over the snapshot lands in increment 2; the
-        // base index lives in the snapshot, not `handle.index`, so the locked path
-        // below cannot serve it. Explicit limitation of the experimental flag.
-        if mvcc_served(self.handle(collection)?) {
-            return Err(Error::Unsupported(
-                "QUIVER_MVCC_READS (increment 1) serves pure-vector search only; \
-                 hybrid search lands in increment 2 — disable the flag for hybrid queries",
             ));
         }
         let handle = self.handle(collection)?;
@@ -1399,8 +1453,27 @@ impl Database {
         ef_search: usize,
         filter: Option<&Filter>,
     ) -> Result<Vec<String>> {
-        let raw = handle.index.search(query, depth, ef_search.max(depth))?;
         let mut ids = Vec::new();
+        // MVCC mode (ADR-0064): the dense candidates come from the lock-free
+        // snapshot (base ⊕ overlay), with ext ids already resolved; the sparse/BM25
+        // sides and the filter re-check are unchanged.
+        if mvcc_served(handle) {
+            for m in handle
+                .snapshot
+                .load()
+                .search(query, depth, ef_search.max(depth))?
+            {
+                if !self.passes_filter(handle.id, &m.id, filter)? {
+                    continue;
+                }
+                ids.push(m.id);
+                if ids.len() >= depth {
+                    break;
+                }
+            }
+            return Ok(ids);
+        }
+        let raw = handle.index.search(query, depth, ef_search.max(depth))?;
         for neighbor in raw {
             let Some(ext_id) = handle.int_to_ext.get(neighbor.id as usize) else {
                 continue;

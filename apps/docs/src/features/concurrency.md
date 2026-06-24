@@ -79,12 +79,13 @@ visibility, not durability).
 
 This ships in **staged increments** behind the default-off flag:
 
-- **Increment 1 (now):** the snapshot infrastructure and lock-free **pure-vector**
-  reads (no payload filter). Filtered and hybrid reads over the snapshot return an
-  explicit error under the flag rather than silently wrong results.
-- **Increments 2–3 (staged):** filtered/payload/hybrid reads over the snapshot, a
-  `loom` model of the publish/load, and a before/after read-during-write benchmark
-  on dedicated hardware — after which MVCC becomes the default and the `RwLock`
-  read path retires.
+- **Increments 1–2 (now):** the snapshot infrastructure and lock-free reads over
+  the snapshot — pure-vector, payload/vector enrichment, **filtered** (exact
+  pre-filter and post-filter), and **hybrid** (dense ⊕ sparse/BM25) — all served
+  from the published snapshot, reusing the same store-fetch and RRF logic as the
+  locked path.
+- **Increment 3 (staged):** a `loom` model of the publish/load and a before/after
+  read-during-write benchmark on dedicated hardware — after which MVCC becomes the
+  default and the `RwLock` read path retires.
 
 Leave the flag off (the default) for the proven `RwLock` read path.
