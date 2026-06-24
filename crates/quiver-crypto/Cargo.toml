@@ -25,7 +25,10 @@ thiserror = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-quiver-embed = { workspace = true }
+# Path-only (no version) so `cargo publish` omits this internal dev-dependency.
+# quiver-embed depends on quiver-crypto, so a versioned dev-dep would be an
+# unpublishable cycle on crates.io; tests still resolve it via the path.
+quiver-embed = { path = "../quiver-embed", package = "quiverdb-embed" }
 tempfile = { workspace = true }
 
 [lints]
