@@ -1,5 +1,5 @@
 [package]
-name = "quiver-crypto"
+name = "quiverdb-crypto"
 description = "Audited-cryptography wrappers for Quiver (no custom primitives)."
 version.workspace = true
 edition.workspace = true
@@ -30,3 +30,6 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[lib]
+name = "quiver_crypto"

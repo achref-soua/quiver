@@ -53,23 +53,56 @@ class QuiverAdapter(CompetitorAdapter):
         *,
         start_server: bool = False,
         data_dir: str | None = None,
+        index: str | None = None,
+        pq_subspaces: int | None = None,
     ) -> None:
         self._url = url
         self._api_key = api_key
         self._start_server = start_server
         self._data_dir = data_dir
+        # Index structure + quantization for the memory-wedge sweep. None keeps the
+        # server default (in-memory HNSW, exact vectors); "ivf"/"disk_vamana" with
+        # pq_subspaces trade recall for a smaller resident footprint.
+        self._index = index
+        self._pq_subspaces = pq_subspaces
         self._proc: subprocess.Popen | None = None
         self._tmpdir: tempfile.TemporaryDirectory | None = None
         self._client = None
         self._metric = "l2"
 
+    @property
+    def config_label(self) -> str:
+        """Short human label for this adapter's index/quantization config."""
+        idx = self._index or "hnsw"
+        return f"{idx}+pq{self._pq_subspaces}" if self._pq_subspaces else idx
+
     def start(self) -> None:
         if self._start_server:
+            # `quiver serve` is configured by environment, not flags. A fresh
+            # process + data dir per config is what makes the memory-wedge RSS
+            # honest: each config's resident set is its own, not a shared
+            # server's cumulative high-water mark. ponytail: live shell, exercised
+            # by the isolated wedge run, not a unit test.
+            import os
+            from urllib.parse import urlparse
+
             self._tmpdir = tempfile.TemporaryDirectory()
             data = self._data_dir or self._tmpdir.name
-            key = self._api_key or "bench-key"
+            parsed = urlparse(self._url)
+            rest_addr = f"{parsed.hostname or '127.0.0.1'}:{parsed.port or 6333}"
+            grpc_addr = f"{parsed.hostname or '127.0.0.1'}:{(parsed.port or 6333) + 1}"
+            env = {
+                **os.environ,
+                "QUIVER_INSECURE": "true",  # bench server, no real data
+                "QUIVER_DATA_DIR": data,
+                "QUIVER_REST_ADDR": rest_addr,
+                "QUIVER_GRPC_ADDR": grpc_addr,
+            }
+            if self._api_key:
+                env["QUIVER_API_KEYS"] = self._api_key
             self._proc = subprocess.Popen(
-                ["quiver", "serve", "--data-dir", data, "--api-key", key, "--insecure"],
+                ["quiver", "serve"],
+                env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -79,7 +112,7 @@ class QuiverAdapter(CompetitorAdapter):
             deadline = time.time() + 30
             while time.time() < deadline:
                 try:
-                    urllib.request.urlopen(f"{self._url}/healthz", timeout=2)
+                    urllib.request.urlopen(f"{self._url}/readyz", timeout=2)
                     break
                 except Exception:  # noqa: BLE001
                     time.sleep(0.5)
@@ -110,7 +143,13 @@ class QuiverAdapter(CompetitorAdapter):
             self._client.delete_collection(COLLECTION)
         except Exception:  # noqa: BLE001
             pass
-        self._client.create_collection(COLLECTION, dim=dim, metric=metric)
+        self._client.create_collection(
+            COLLECTION,
+            dim=dim,
+            metric=metric,
+            index=self._index,
+            pq_subspaces=self._pq_subspaces,
+        )
 
         # Bulk-ingest path (ADR-0045): each request hits POST …/points:bulk, which
         # does one WAL fsync and marks the index stale, deferring the index build.

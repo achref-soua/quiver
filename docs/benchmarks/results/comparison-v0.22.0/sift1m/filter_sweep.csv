@@ -1,0 +1,6 @@
+competitor,dataset,param_name,param_value,build_s,index_disk_mb,rss_mb,recall_at_10,recall_at_1,recall_at_100,qps_1t,qps_nt,concurrency,p50_ms,p95_ms,p99_ms,recall_stdev,qps_stdev,config,notes,error
+quiver,sift1m,selectivity_pct,1,0.0,,,0.9999,0.0,0.0,6.9,,1,142.281,156.089,167.095,0.0,0.0,"{'selectivity_pct': 1, 'ef_search': 128}",sel=1%,
+quiver,sift1m,selectivity_pct,5,0.0,,,0.6179,0.0,0.0,7.3,,1,134.605,147.005,156.406,0.0,0.0,"{'selectivity_pct': 5, 'ef_search': 128}",sel=5%,
+quiver,sift1m,selectivity_pct,25,0.0,,,0.9697,0.0,0.0,5.2,,1,189.172,205.4,231.441,0.0,0.0,"{'selectivity_pct': 25, 'ef_search': 128}",sel=25%,
+quiver,sift1m,selectivity_pct,50,0.0,,,0.9809,0.0,0.0,4.0,,1,253.602,273.676,319.82,0.0,0.0,"{'selectivity_pct': 50, 'ef_search': 128}",sel=50%,
+quiver,sift1m,selectivity_pct,100,0.0,,,0.9863,0.0,0.0,878.0,,1,1.119,1.379,1.659,0.0,0.0,"{'selectivity_pct': 100, 'ef_search': 128}",sel=100%,

@@ -65,6 +65,7 @@ async fn multivector_round_trip() {
         embedding: Default::default(),
         rerank: Default::default(),
         rate_limit: Default::default(),
+        otlp: Default::default(),
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;
@@ -266,6 +267,7 @@ async fn colbert_index_round_trip() {
         embedding: Default::default(),
         rerank: Default::default(),
         rate_limit: Default::default(),
+        otlp: Default::default(),
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

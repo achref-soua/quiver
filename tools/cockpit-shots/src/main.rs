@@ -12,7 +12,8 @@
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 use image::{Rgb, RgbImage};
 use quiver_tui::{
-    Activity, Dashboard, Severity, render_constellation_demo, render_dashboard, render_logo,
+    Activity, Dashboard, Severity, cycle_theme, render_constellation_demo, render_dashboard,
+    render_help, render_logo, render_search_demo,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -100,7 +101,7 @@ fn build_arrowhead_grid() -> Vec<[Option<[u8; 3]>; 7]> {
     const VC: i32 = 3;
     const T: i32 = 2;
 
-    let accent    = [0x3F_u8, 0xB6, 0xA8];
+    let accent = [0x3F_u8, 0xB6, 0xA8];
     let accent_hi = [0x8E_u8, 0xE9, 0xDC];
     let accent_lo = [0x21_u8, 0x6B, 0x61];
 
@@ -150,10 +151,11 @@ fn draw_icon(size: u32) -> RgbImage {
             }
             let col = (lx / cell_w) as usize;
             let sub = (ly / cell_h) as usize;
-            if col < VW && sub < SUBH {
-                if let Some(color) = grid[sub][col] {
-                    img.put_pixel(x, y, Rgb(color));
-                }
+            if col < VW
+                && sub < SUBH
+                && let Some(color) = grid[sub][col]
+            {
+                img.put_pixel(x, y, Rgb(color));
             }
         }
     }
@@ -171,11 +173,11 @@ fn gen_icons(out_dir: &str) {
 
 // ── colour palette — exact 24-bit theme values ────────────────────────────────
 
-const BRONZE: Color = Color::Rgb(205, 127, 50);     // #CD7F32  theme CHROME
-const VERDIGRIS: Color = Color::Rgb(63, 182, 168);  // #3FB6A8  theme ACCENT
+const BRONZE: Color = Color::Rgb(205, 127, 50); // #CD7F32  theme CHROME
+const VERDIGRIS: Color = Color::Rgb(63, 182, 168); // #3FB6A8  theme ACCENT
 const DARK_GRAY: Color = Color::Rgb(90, 90, 90);
 const LIGHT_GRAY: Color = Color::Rgb(180, 180, 180);
-const GREEN: Color = Color::Rgb(143, 179, 57);      // #8FB339  theme OK
+const GREEN: Color = Color::Rgb(143, 179, 57); // #8FB339  theme OK
 const WHITE: Color = Color::Rgb(230, 230, 230);
 
 /// Banner with the V as a verdigris arrowhead, matching the TUI logo and
@@ -285,19 +287,14 @@ fn render_installer() -> Buffer {
     lines.push(step_line("🔒", "Verifying SHA-256 checksum..."));
     lines.push(ok_line("Checksum verified."));
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "  ┌──────────────────────────────────────────────┐",
-            Style::default().fg(DARK_GRAY),
-        ),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "  ┌──────────────────────────────────────────────┐",
+        Style::default().fg(DARK_GRAY),
+    )]));
     lines.push(Line::from(vec![
         Span::styled("  │  ", Style::default().fg(DARK_GRAY)),
         Span::styled("✔  Quiver v0.17.2 installed!", Style::default().fg(GREEN)),
-        Span::styled(
-            "                │",
-            Style::default().fg(DARK_GRAY),
-        ),
+        Span::styled("                │", Style::default().fg(DARK_GRAY)),
     ]));
     lines.push(Line::from(vec![
         Span::styled("  │  ", Style::default().fg(DARK_GRAY)),
@@ -306,16 +303,17 @@ fn render_installer() -> Buffer {
             Style::default().fg(LIGHT_GRAY),
         ),
     ]));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "  └──────────────────────────────────────────────┘",
-            Style::default().fg(DARK_GRAY),
-        ),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "  └──────────────────────────────────────────────┘",
+        Style::default().fg(DARK_GRAY),
+    )]));
     lines.push(Line::raw(""));
     lines.push(Line::styled("  Next steps:", Style::default().fg(WHITE)));
     for (cmd, comment) in [
-        ("quiver demo  ", "# zero-config: seed vectors + open cockpit"),
+        (
+            "quiver demo  ",
+            "# zero-config: seed vectors + open cockpit",
+        ),
         ("quiver serve ", "# start the server (gRPC + REST on :6333)"),
         ("quiver tui   ", "# open the retro cockpit"),
         ("quiver update", "# self-update to the latest release"),
@@ -396,9 +394,32 @@ fn main() {
         &font,
         "docs/assets/cockpit/constellation.png",
     );
+    render_png(
+        &render_search_demo(120, 36),
+        &font,
+        "docs/assets/cockpit/search.png",
+    );
+    render_png(&render_help(120, 36), &font, "docs/assets/cockpit/help.png");
 
-    render_png(&render_installer(), &font, "docs/assets/cockpit/installer.png");
-    render_png(&render_demo_start(), &font, "docs/assets/cockpit/demo-start.png");
+    // The alternate Slate palette (the Ctrl-t toggle), on the same demo dashboard.
+    cycle_theme();
+    render_png(
+        &render_dashboard(120, 36, &Dashboard::demo()),
+        &font,
+        "docs/assets/cockpit/theme-slate.png",
+    );
+    cycle_theme(); // back to Bronze for the remaining shots
+
+    render_png(
+        &render_installer(),
+        &font,
+        "docs/assets/cockpit/installer.png",
+    );
+    render_png(
+        &render_demo_start(),
+        &font,
+        "docs/assets/cockpit/demo-start.png",
+    );
 
     let mut offline = Dashboard::demo();
     offline.collections.clear();

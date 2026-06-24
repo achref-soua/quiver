@@ -38,10 +38,39 @@ error rate, latency p50/p95/p99, and the security counters). See
 ## Tracing
 
 Engine-facing server operations carry `#[tracing::instrument]` spans with
-secret-free fields (collection, `k`, counts — never vectors or payloads). Spans
-are OpenTelemetry-exportable: attach a `tracing-opentelemetry` OTLP layer at
-startup to ship them to a collector (the exporter is an opt-in layer, not a
-bundled dependency).
+secret-free fields (collection, `k`, counts — never vectors or payloads). By
+default they go to the `RUST_LOG`-filtered `fmt` logger.
+
+### OpenTelemetry export (OTLP) — opt-in (ADR-0059)
+
+To ship spans to an OTLP collector (Jaeger, Tempo, Grafana, …), build the server
+with the `otlp` feature and point it at a collector. The feature is **off by
+default**, so a normal build links none of the OpenTelemetry crates; even with
+the feature compiled in, export stays off until an endpoint is configured.
+
+```bash
+# Build with the exporter compiled in.
+cargo build -p quiverdb-cli --release --features otlp
+
+# Enable it at runtime (OTLP/gRPC, default collector port 4317).
+QUIVER_OTLP_ENDPOINT=http://localhost:4317 \
+QUIVER_OTLP_SERVICE_NAME=quiver \
+quiver serve
+```
+
+Equivalently, a `[otlp]` table in `quiver.toml`:
+
+```toml
+[otlp]
+endpoint = "http://localhost:4317"   # empty / omitted = disabled
+service_name = "quiver"
+timeout_secs = 10
+```
+
+The transport is OTLP/gRPC (reusing the `tonic` already in the tree, so no extra
+HTTP stack). Spans are batched and flushed on shutdown. A failure to build the
+exporter logs a warning and falls back to `fmt`-only — telemetry never takes the
+server down.
 
 ## Health
 

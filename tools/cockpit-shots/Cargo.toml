@@ -10,7 +10,7 @@ publish = false
 description = "Dev-only: render the Quiver cockpit screens to PNG screenshots."
 
 [dependencies]
-quiver-tui = { path = "../../crates/quiver-tui" }
+quiver-tui = { path = "../../crates/quiver-tui", package = "quiverdb-tui" }
 ratatui = "0.30"
 image = "0.25"
 ab_glyph = "0.2"

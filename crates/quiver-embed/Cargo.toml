@@ -1,5 +1,5 @@
 [package]
-name = "quiver-embed"
+name = "quiverdb-embed"
 description = "The embeddable, in-process Quiver database handle."
 version.workspace = true
 edition.workspace = true
@@ -25,3 +25,6 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[lib]
+name = "quiver_embed"

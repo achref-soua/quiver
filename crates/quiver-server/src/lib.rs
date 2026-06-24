@@ -7,10 +7,10 @@
 //! `spawn_blocking`. Access is guarded by a reader–writer lock (ADR-0057): reads
 //! take the shared lock and run **concurrently**, writes take the exclusive lock,
 //! and the single-writer model is unchanged (ADR-0002/0006). A read that finds a
-//! collection's index stale (a prior write deferred its rebuild) takes the write
-//! lock once to rebuild via [`Database::ensure_indexed`], then serves concurrently
-//! again. The fully lock-free arc-swap snapshot path is the staged successor
-//! (ADR-0057, "Phased plan").
+//! collection's index stale (a prior write deferred its rebuild) serves the prior
+//! snapshot and schedules an **off-lock** rebuild (ADR-0062): the index is rebuilt
+//! under the shared lock and swapped in under a brief write lock, so a rebuild never
+//! stalls concurrent readers.
 //!
 //! Auth is by scoped API key (Bearer / gRPC `authorization` metadata) with
 //! default-deny RBAC: each key carries a role (read ⊆ write ⊆ admin) and a
@@ -31,20 +31,20 @@
 
 mod audit;
 mod auth;
-mod embed_provider;
 mod error;
 mod grpc;
 mod metrics;
+mod otlp;
 mod rate_limit;
 mod replication;
 mod rest;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use axum_server::tls_rustls::RustlsConfig;
 use figment::Figment;
@@ -64,11 +64,14 @@ use quiver_embed::{
 use quiver_query::Filter;
 
 pub use auth::{Action, ApiKey, CollectionScope};
-pub use embed_provider::{
+pub use error::Error;
+pub use otlp::OtlpConfig;
+// The embedding/rerank seam lives in its own lean crate (ADR-0058) so the MCP
+// server can share it; re-exported here so the server's public API is unchanged.
+pub use quiver_providers::{
     EmbedRegistry, EmbeddingConfig, EmbeddingProvider, ProviderError, ProviderKind, RerankConfig,
     RerankProvider,
 };
-pub use error::Error;
 pub use rate_limit::{RateDecision, RateLimitConfig, RateLimitSnapshot, RateLimiter};
 
 use audit::{AuditLog, Outcome};
@@ -350,6 +353,11 @@ pub struct Config {
     /// `requests_per_second = 0` (the default) disables it.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Opt-in OpenTelemetry traces export (ADR-0059). Set an `[otlp]` table or the
+    /// `QUIVER_OTLP_*` env vars; an empty `endpoint` (the default) disables it.
+    /// Export additionally requires the server's `otlp` build feature.
+    #[serde(default)]
+    pub otlp: OtlpConfig,
 }
 
 impl Default for Config {
@@ -372,6 +380,7 @@ impl Default for Config {
             embedding: HashMap::new(),
             rerank: HashMap::new(),
             rate_limit: RateLimitConfig::default(),
+            otlp: OtlpConfig::default(),
         }
     }
 }
@@ -393,6 +402,8 @@ impl Config {
             .rate_limit
             .apply_env_overrides()
             .map_err(Error::Config)?;
+        // Same for the flat `QUIVER_OTLP_*` keys (ADR-0059).
+        config.otlp.apply_env_overrides().map_err(Error::Config)?;
         Ok(config)
     }
 
@@ -530,6 +541,10 @@ pub(crate) struct AppState {
     rate_limiter: Arc<RateLimiter>,
     // Prometheus metrics registry (ADR-0014/0054), scraped at `GET /metrics`.
     metrics: Arc<metrics::Metrics>,
+    // Collections with an off-lock index rebuild in flight (ADR-0062). A search that
+    // observes a deferred rebuild schedules one here, single-flighted so concurrent
+    // readers never kick off duplicate builds for the same collection.
+    rebuilding: Arc<Mutex<HashSet<String>>>,
 }
 
 /// A collection's metadata.
@@ -665,40 +680,95 @@ impl AppState {
         .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))?
     }
 
-    // Run a snapshot read for `collection` (ADR-0057). The hot path takes only the
-    // shared read lock, so concurrent searches run in parallel. If a prior write
-    // deferred this collection's index rebuild, the snapshot read returns
-    // [`quiver_embed::Error::IndexStale`]; we then take the exclusive lock once to
-    // rebuild and run the search while still holding it. `f` is `Fn` because it may
-    // be called twice (fresh attempt, then the post-rebuild retry); it never leaks
-    // `IndexStale` to the caller.
+    // Run a snapshot read for `collection` (ADR-0057/0062). Takes only the shared
+    // read lock, so concurrent searches run in parallel. When a prior write deferred
+    // this collection's rebuild, the snapshot read serves the **prior** snapshot
+    // (snapshot-isolated, slightly stale) rather than blocking, and we schedule an
+    // **off-lock** rebuild so the next read is fresh — the reader never waits on a
+    // rebuild under the exclusive lock.
     async fn search_blocking<T, F>(&self, collection: String, f: F) -> Result<T, Error>
     where
         T: Send + 'static,
-        F: Fn(&Database) -> quiver_embed::Result<T> + Send + 'static,
+        F: FnOnce(&Database) -> quiver_embed::Result<T> + Send + 'static,
     {
         let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || -> Result<T, Error> {
-            {
-                let guard = db
-                    .read()
-                    .map_err(|_| Error::Internal("database lock poisoned".to_owned()))?;
-                match f(&guard) {
-                    Err(quiver_embed::Error::IndexStale) => {}
-                    result => return result.map_err(Error::Engine),
-                }
-            }
-            // Cold path: rebuild the deferred index under the exclusive lock, then
-            // search while still holding it (no window for another writer to
-            // re-stale it between the rebuild and the read).
-            let mut guard = db
-                .write()
+        let coll = collection.clone();
+        let (result, stale) = tokio::task::spawn_blocking(move || -> Result<(T, bool), Error> {
+            let guard = db
+                .read()
                 .map_err(|_| Error::Internal("database lock poisoned".to_owned()))?;
-            guard.ensure_indexed(&collection).map_err(Error::Engine)?;
-            f(&guard).map_err(Error::Engine)
+            let result = f(&guard).map_err(Error::Engine)?;
+            // Report staleness so the caller can schedule a background rebuild; a
+            // missing collection (raced a drop) is simply "nothing to rebuild".
+            let stale = guard.needs_rebuild(&coll).unwrap_or(false);
+            Ok((result, stale))
         })
         .await
-        .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))?
+        .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))??;
+        if stale {
+            self.schedule_rebuild(collection);
+        }
+        Ok(result)
+    }
+
+    // Schedule a single off-lock rebuild for `collection` (ADR-0062), deduplicated
+    // so concurrent readers that all observe the same deferred rebuild start exactly
+    // one. A no-op if one is already in flight.
+    fn schedule_rebuild(&self, collection: String) {
+        {
+            let mut inflight = match self.rebuilding.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if !inflight.insert(collection.clone()) {
+                return; // already rebuilding this collection
+            }
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            state.run_rebuild(&collection).await;
+            if let Ok(mut inflight) = state.rebuilding.lock() {
+                inflight.remove(&collection);
+            }
+        });
+    }
+
+    // Drive a collection's off-lock rebuild to completion (ADR-0062): capture the
+    // inputs under the shared read lock, build with no lock held, install under a
+    // brief write lock, and repeat while a write landed during the build (the commit
+    // reports the collection still stale). Each phase is a `spawn_blocking` so the
+    // CPU-bound build never stalls the async runtime; errors end the attempt (the
+    // collection stays stale and the next read reschedules).
+    async fn run_rebuild(&self, collection: &str) {
+        loop {
+            let db = Arc::clone(&self.db);
+            let coll = collection.to_owned();
+            let inputs = tokio::task::spawn_blocking(move || {
+                let guard = db.read().ok()?;
+                guard.snapshot_rebuild_inputs(&coll).ok().flatten()
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(inputs) = inputs else { return };
+
+            let Ok(Ok(rebuilt)) = tokio::task::spawn_blocking(move || inputs.build()).await else {
+                return;
+            };
+
+            let db = Arc::clone(&self.db);
+            let still_stale = tokio::task::spawn_blocking(move || {
+                let mut guard = db.write().ok()?;
+                guard.commit_rebuild(rebuilt).ok()
+            })
+            .await
+            .ok()
+            .flatten();
+            match still_stale {
+                Some(true) => continue, // a write landed during the build — rebuild again
+                _ => return,
+            }
+        }
     }
 
     // Authorize `action` on `resource`, recording a denial in the audit log
@@ -1487,6 +1557,7 @@ pub async fn serve(
         embed: Arc::new(embed),
         rate_limiter: Arc::new(RateLimiter::new(config.rate_limit)),
         metrics: Arc::new(metrics::Metrics::default()),
+        rebuilding: Arc::new(Mutex::new(HashSet::new())),
     };
 
     // A follower continuously applies the leader's committed-op stream (ADR-0030).
@@ -1659,9 +1730,48 @@ fn rustls_server_config(
 /// Initialize structured logging from `RUST_LOG` (defaulting to `info`). Safe to
 /// call once at startup; a second call is ignored.
 pub fn init_tracing() {
+    init_observability(&Config::default());
+}
+
+/// Install the global tracing subscriber: an `RUST_LOG`-driven `fmt` layer plus,
+/// when the `otlp` feature is built **and** an OTLP endpoint is configured
+/// (ADR-0059), an OpenTelemetry traces export layer. Safe to call once at
+/// startup; a second call is a no-op. A failure to build the OTLP exporter logs a
+/// warning and falls back to `fmt`-only rather than taking the server down.
+#[cfg_attr(not(feature = "otlp"), allow(unused_variables))]
+pub fn init_observability(config: &Config) {
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::prelude::*;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer());
+
+    #[cfg(feature = "otlp")]
+    if config.otlp.is_enabled() {
+        match otlp::build_provider(&config.otlp) {
+            Ok(provider) => {
+                use opentelemetry::trace::TracerProvider as _;
+                let tracer = provider.tracer("quiver");
+                otlp::store_provider(provider);
+                let _ = registry
+                    .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                    .try_init();
+                return;
+            }
+            Err(e) => eprintln!("OTLP traces export disabled: {e}"),
+        }
+    }
+
+    let _ = registry.try_init();
+}
+
+/// Flush and shut down the OpenTelemetry exporter, if one was installed. A no-op
+/// without the `otlp` feature or when no endpoint was configured. Call once on
+/// server shutdown so batched spans are not lost.
+pub fn shutdown_observability() {
+    #[cfg(feature = "otlp")]
+    otlp::shutdown();
 }
 
 #[cfg(test)]

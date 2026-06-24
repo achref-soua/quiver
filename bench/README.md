@@ -17,7 +17,7 @@ Start a server, then run the synthetic smoke set (a small random dataset with
 exact ground truth — it validates the harness, not performance):
 
 ```bash
-QUIVER_INSECURE=true cargo run -p quiver-cli -- serve &      # dev only
+QUIVER_INSECURE=true cargo run -p quiverdb-cli -- serve &      # dev only
 uv run --project bench python -m quiver_bench.run --synthetic
 ```
 
@@ -64,6 +64,30 @@ uv run --project bench python -m quiver_bench.comparison \
 alongside single-thread QPS at each operating point. Comparative numbers on the
 identical box are publishable; absolute RSS and the 10M disk path stay
 reference-hardware-pending (see the methodology).
+
+## v0.22.0 Quiver-only sweeps (ADR-0061)
+
+Two Quiver-focused sweeps publish dimensions the competitor matrix doesn't cover.
+Both run against a server and write into the same per-dataset result dir:
+
+```bash
+# Memory wedge — same dataset under hnsw / disk_vamana+PQ, each in a FRESH
+# server process (--start-server). recall@{1,10,100} + build + QPS tradeoff.
+uv run --project bench python -m quiver_bench.quant_sweep \
+  --dataset sift1m --out docs/benchmarks/results/comparison-v0.22.0 \
+  --indexes hnsw,disk_vamana --start-server
+
+# Filtered-selectivity sweep — recall (vs filtered exact truth) + QPS as a
+# payload pre-filter keeps s% of the collection.
+uv run --project bench python -m quiver_bench.filter_sweep \
+  --dataset sift1m --out docs/benchmarks/results/comparison-v0.22.0 \
+  --quiver-url http://127.0.0.1:7333 --quiver-key "$QUIVER_API_KEY"
+```
+
+`recall@100` comes from one extra **untimed** pass so it never perturbs QPS. The
+wedge publishes the recall/build/throughput tradeoff; the absolute serving-RAM
+figure stays reference-hardware-pending because post-build RSS is the build's
+allocator high-water mark, not the cold-reload serving footprint (ADR-0061).
 
 ## Development
 
