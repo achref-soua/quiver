@@ -29,8 +29,13 @@ for the per-release rationale and Definitions of Done.
   searches with no lock at all — it never blocks on a concurrent writer (payload/
   filtered/hybrid reads keep the read lock for the store fetch, which is not safe
   lock-free under a writer, but also serve from the snapshot). Enable with
-  `mvcc_reads = true` (config) or `QUIVER_MVCC_READS=1`. Remaining: a before/after
-  read-during-write benchmark, after which the flag may become the default.
+  `mvcc_reads = true` (config) or `QUIVER_MVCC_READS=1`. A before/after sweep on the
+  same box (`docs/benchmarks/results/read-during-write.md`) confirms the win: under
+  two small-upsert writers, retained read-QPS goes from **0.00× (RwLock) to 0.79×
+  (MVCC)**, and from ~0.01× to ~0.67× under four. The flag stays **default-off**
+  (the proven `RwLock` path remains the default) until validated on dedicated
+  hardware — absolute QPS is `reference-hardware-pending`, only the ratio is the
+  honest signal on a shared dev box.
 - Read-during-write contention sweep now measures a grid of write pressure
   (writer-thread counts × upsert batch sizes), recording the retained-read-QPS
   ceiling that gates the MVCC build.

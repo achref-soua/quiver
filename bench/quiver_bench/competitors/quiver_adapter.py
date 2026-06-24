@@ -55,11 +55,15 @@ class QuiverAdapter(CompetitorAdapter):
         data_dir: str | None = None,
         index: str | None = None,
         pq_subspaces: int | None = None,
+        mvcc: bool = False,
     ) -> None:
         self._url = url
         self._api_key = api_key
         self._start_server = start_server
         self._data_dir = data_dir
+        # Start the server with lock-free MVCC reads (QUIVER_MVCC_READS, ADR-0064):
+        # the before/after knob for the read-during-write contention benchmark.
+        self._mvcc = mvcc
         # Index structure + quantization for the memory-wedge sweep. None keeps the
         # server default (in-memory HNSW, exact vectors); "ivf"/"disk_vamana" with
         # pq_subspaces trade recall for a smaller resident footprint.
@@ -106,6 +110,8 @@ class QuiverAdapter(CompetitorAdapter):
             "QUIVER_REST_ADDR": rest_addr,
             "QUIVER_GRPC_ADDR": grpc_addr,
         }
+        if self._mvcc:
+            env["QUIVER_MVCC_READS"] = "true"
         if self._api_key:
             env["QUIVER_API_KEYS"] = self._api_key
         self._proc = subprocess.Popen(
