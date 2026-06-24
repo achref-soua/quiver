@@ -48,6 +48,17 @@ describe("Quiver TypeScript client", () => {
     expect(info.pqSubspaces).toBe(2);
   });
 
+  it("strips trailing slashes from the base URL (no double slash in requests)", async () => {
+    let capturedUrl = "";
+    const fakeFetch = (async (input: RequestInfo | URL) => {
+      capturedUrl = typeof input === "string" ? input : input.toString();
+      return json([]);
+    }) as typeof globalThis.fetch;
+    const client = new Client("http://x:6333///", { fetch: fakeFetch });
+    await client.listCollections();
+    expect(capturedUrl).toBe("http://x:6333/v1/collections");
+  });
+
   it("createCollection sends filterable fields and parses them back", async () => {
     let captured: Record<string, unknown> | undefined;
     const fetch = mockFetch(async (_path, _method, init) => {
