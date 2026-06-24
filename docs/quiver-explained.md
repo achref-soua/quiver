@@ -387,6 +387,8 @@ Combine the **Vamana graph** (§4.2, built for SSD) with **Product Quantization*
 
 The result, in Quiver's own measured terms: a dataset serves from **roughly its PQ-code footprint** instead of the full vectors. For a 10M × 768-d collection, that's about **~1 GB resident instead of ~31 GB** — the arithmetic is exact and it's why "hundreds of millions of vectors on a laptop" is a real claim, not marketing. (On SIFTSMALL it reaches recall@10 up to 1.000 while holding only PQ codes in RAM.)
 
+> **The in-memory floor — and what v0.23.0 fixed.** "Roughly the PQ-code footprint" is a *floor*, not zero: what stays resident is the **PQ codes + the id map + the PQ codebook + a small in-memory FreshDiskANN delta** (recent writes not yet folded into the base graph). The full-precision vectors and base graph are `mmap`'d on disk and demand-paged — that is the whole point. There was a subtlety that undercut the claim *in practice* until **v0.23.0**: a restarted server **rebuilt the disk index from every full-precision vector on open** (only IVF had a fast load path), so its post-restart RSS briefly looked like the in-memory path and the benchmark's post-build number was unrepresentative. The **durable on-disk DiskVamana index** ([ADR-0063](./adr/0063-durable-disk-vamana-index.md)) closes that gap: the server `mmap`s its frugal base and replays only the post-checkpoint WAL tail on open (falling back to the authoritative rebuild on any mismatch, so the `kill -9` gate is untouched), and therefore serves from the resident-PQ floor *immediately after a restart*. The wedge benchmark now **closes and cold-reopens the server before sampling RSS** to measure exactly that floor rather than the build's high-water mark.
+
 ## 4.5 Filtering: search by meaning *and* by rules
 
 Real queries are hybrid: *"films like Blade Runner, **but only sci-fi released after 1980**."* That's a similarity search **plus** a structured filter on metadata.
@@ -633,7 +635,7 @@ The v0.22.0 release added four measurement dimensions (ADR-0061), all on the sam
 | QPS (8T) | 949 | 968 | 928 | 938 | 892 |
 | **speed-up** | 0.84× | 0.97× | 1.08× | 1.39× | **1.76×** |
 
-**Quantization tradeoff.** The disk-Vamana + PQ path holds recall@10 close to in-memory HNSW, but PQ trades away the *deep* tail — recall@100 falls from 0.94 to 0.71. The absolute serving-RAM wedge is **reference-hardware-pending** (post-build RSS on this box is the build's allocator high-water mark, not the cold-reload footprint where only PQ codes stay resident), so it is omitted, not estimated.
+**Quantization tradeoff.** The disk-Vamana + PQ path holds recall@10 close to in-memory HNSW, but PQ trades away the *deep* tail — recall@100 falls from 0.94 to 0.71. The absolute serving-RAM wedge is **reference-hardware-pending** on the shared dev box: post-build RSS here is the build's allocator high-water mark, while the representative figure is the **cold-reopen** footprint where only the PQ codes (plus the small delta and codebook) stay resident — the metric the durable disk index (ADR-0063, §4.4) finally makes real and the wedge runner now samples *after a cold restart*. So it is omitted, not estimated.
 
 | Config | recall@1 | recall@10 | recall@100 | build (s) | QPS (1T) |
 |---|---|---|---|---|---|

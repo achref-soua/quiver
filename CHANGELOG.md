@@ -8,7 +8,7 @@ Quiver is pre-1.0: minor releases ship coherent, owner-gated feature sets and
 may include pre-1.0 API refinements. See [`docs/roadmap.md`](docs/roadmap.md)
 for the per-release rationale and Definitions of Done.
 
-## [0.23.0] — Unreleased
+## [0.23.0] — 2026-06-24
 
 ### Added
 
@@ -25,12 +25,42 @@ for the per-release rationale and Definitions of Done.
   PQ-codes-resident path after a restart — the memory-frugality wedge — where
   earlier releases rebuilt from every full-precision vector on open (the cause of
   the benchmark's unrepresentative post-build RSS).
+- Cold-reopen-honest memory-frugality evidence: the disk-path wedge benchmark
+  now **closes and cold-reopens the server before sampling RSS** (#279), so the
+  reported serving memory reflects the durable load path rather than a warm
+  post-build process; a **one-command Windows disk-path frugality runner**
+  (`scripts/bench-disk-frugality.ps1`, #275) builds, cold-reopens, and samples
+  on a clean box; and a **read-during-write contention sweep**
+  (`docs/benchmarks/results/read-during-write.md`, #281) measures the read-QPS
+  retained under one concurrent writer — the measure-first gate for MVCC.
+  Absolute serving-RAM and QPS stay reference-hardware-pending, never fabricated.
+- Lock-free MVCC reads implementation design (ADR-0064): resolves the tension
+  ADR-0053 left open (indexes are mutated in place, so they cannot simply be
+  shared by `Arc`) with a per-collection arc-swap snapshot plus a small
+  copy-on-write overlay, published on commit — staged in three increments behind
+  a default-off `QUIVER_MVCC_READS` flag and gated on the measured contention
+  above. Design only in this release; the read path is unchanged.
 
 ### Changed
 
 - `QUIVER_DISABLE_DURABLE_DISK_INDEX` ops kill switch forces the (always-correct)
   rebuild-on-open path if the durable load is ever suspected. Durable load is on
   by default.
+
+### Security
+
+- Addressed code-scanning findings (#282): the TypeScript SDK's unsubscribe-link
+  regex is rewritten to remove a ReDoS vector, and the DCPE "hard-coded
+  cryptographic value" alerts are documented as false-positive/by-design at
+  `crates/quiver-crypto/src/dcpe.rs` — they are zeroed buffers filled by `OsRng`,
+  a tag output buffer, a test constant, and one deliberate key-derived
+  deterministic IV, not embedded secrets.
+
+### Fixed
+
+- Bumped vulnerable dependencies flagged by Dependabot (#283): `pydantic-settings`,
+  `langsmith`, and the `trivy-action` CI pin (dev/bench/CI dependencies only; the
+  engine and SDKs are unaffected).
 
 ## [0.22.0] — 2026-06-24
 
