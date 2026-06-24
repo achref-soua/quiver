@@ -61,6 +61,11 @@ impl GraphDelta {
     fn pending(&self) -> usize {
         self.delta.len() + self.deleted.len()
     }
+
+    // The tombstoned ids, for a durable snapshot (ADR-0063). Order is unspecified.
+    fn deleted_ids(&self) -> Vec<u64> {
+        self.deleted.iter().copied().collect()
+    }
 }
 
 // Ordering key with "smaller is closer" semantics, derived from a reported metric
@@ -225,6 +230,13 @@ impl FreshDiskVamana {
     #[must_use]
     pub fn base_len(&self) -> usize {
         self.base.len()
+    }
+
+    /// The tombstoned ids, for a durable index snapshot (ADR-0063). Order is
+    /// unspecified; callers persist and re-apply them via [`Self::mark_deleted`].
+    #[must_use]
+    pub fn deleted_ids(&self) -> Vec<u64> {
+        self.ext.deleted_ids()
     }
 
     /// Pending work (delta size + tombstones) as a fraction of the base size — the
