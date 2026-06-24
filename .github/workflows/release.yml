@@ -160,18 +160,23 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           # Idempotent: a crate version already on crates.io is skipped (so a
-          # re-run after a partial publish succeeds instead of failing).
+          # re-run after a partial publish succeeds instead of failing). The
+          # cargo call is the `if` condition so `bash -e` does not abort on the
+          # expected "already uploaded" failure before the skip check runs.
           for crate in quiverdb-core quiverdb-simd quiverdb-proto quiverdb-providers quiverdb-query \
                        quiverdb-crypto quiverdb-index quiverdb-embed quiverdb-import quiverdb-tui \
                        quiverdb-mcp quiverdb-server quiverdb-cli; do
             echo "::group::publish ${crate}"
-            out=$(cargo publish -p "${crate}" 2>&1); rc=$?
-            echo "${out}"
-            if [ "${rc}" -ne 0 ]; then
-              if echo "${out}" | grep -qiE "already (uploaded|exists)"; then
+            if out=$(cargo publish -p "${crate}" 2>&1); then
+              printf '%s\n' "${out}"
+              echo "→ published ${crate}"
+            else
+              printf '%s\n' "${out}"
+              if printf '%s' "${out}" | grep -qiE "already (uploaded|exists)"; then
                 echo "→ ${crate} already on crates.io, skipping"
               else
-                echo "::error::cargo publish failed for ${crate}"; exit 1
+                echo "::error::cargo publish failed for ${crate}"
+                exit 1
               fi
             fi
             echo "::endgroup::"
