@@ -10,6 +10,8 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-06-25
+
 ### Added
 
 - Lock-free MVCC reads (ADR-0064), **experimental and default-off** behind
@@ -413,7 +415,8 @@ for the per-release rationale and Definitions of Done.
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/achref-soua/quiver/compare/v0.23.0...v0.24.0
 [0.22.0]: https://github.com/achref-soua/quiver/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/achref-soua/quiver/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/achref-soua/quiver/compare/v0.20.0...v0.20.1
