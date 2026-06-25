@@ -82,6 +82,7 @@ async fn audit_log_records_mutations_and_denials_without_leaking_secrets() {
         otlp: Default::default(),
         mvcc_reads: false,
         cluster_shards: Vec::new(),
+        cluster_replicas: Vec::new(),
         cluster_shard_key: None,
     };
     let server = tokio::spawn(async move {

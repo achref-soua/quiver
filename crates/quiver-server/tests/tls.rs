@@ -154,6 +154,7 @@ async fn tls_secures_both_rest_and_grpc() {
         otlp: Default::default(),
         mvcc_reads: false,
         cluster_shards: Vec::new(),
+        cluster_replicas: Vec::new(),
         cluster_shard_key: None,
     };
     tokio::spawn(async move {
@@ -247,6 +248,7 @@ async fn mtls_requires_a_client_certificate() {
         otlp: Default::default(),
         mvcc_reads: false,
         cluster_shards: Vec::new(),
+        cluster_replicas: Vec::new(),
         cluster_shard_key: None,
     };
     tokio::spawn(async move {

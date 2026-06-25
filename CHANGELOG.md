@@ -10,6 +10,30 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Added
+
+- **Cluster read replicas** (ADR-0065 increment 2), opt-in via
+  `QUIVER_CLUSTER_REPLICAS` (a list of `<shard_index>=<replica_url>` entries). Each
+  shard can now declare one or more **read replicas** — ordinary leader-follower
+  followers (ADR-0030) of the shard's primary, reused unchanged. Writes, gets and
+  deletes still go to the single primary per shard; **searches round-robin across
+  `{primary} ∪ replicas`** to spread read load, falling back to another copy if one
+  is unreachable. Replicas are eventually consistent (replication lag) and refuse
+  direct writes, so a mis-route cannot corrupt one. `quiver_cluster::Shard` gains
+  `replica_urls` + `read_url`/`read_order`; `ShardMap::add_replica` attaches them.
+  An end-to-end test boots primaries + followers + a router + a single-node baseline
+  and proves replica-served top-k equals the baseline, a replica refuses writes, and
+  the router tolerates a down replica. Single-node and primary-only shards are
+  unaffected. The **"Quiver, Explained"** field guide gains §9.9 + a read-replica
+  figure (now 54 pages).
+
+### Fixed
+
+- `QUIVER_CLUSTER_SHARDS` / `QUIVER_CLUSTER_REPLICAS` env values are figment array
+  literals and must be **bracketed** (`[http://s1:6333,http://s2:6333]`); the
+  `.env.example` and config docs previously showed an unbracketed comma list, which
+  figment rejects as "expected a sequence" at startup.
+
 ## [0.25.0] — 2026-06-25
 
 ### Added

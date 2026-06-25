@@ -68,6 +68,7 @@ async fn multivector_round_trip() {
         otlp: Default::default(),
         mvcc_reads: false,
         cluster_shards: Vec::new(),
+        cluster_replicas: Vec::new(),
         cluster_shard_key: None,
     };
     let server = tokio::spawn(async move {
@@ -273,6 +274,7 @@ async fn colbert_index_round_trip() {
         otlp: Default::default(),
         mvcc_reads: false,
         cluster_shards: Vec::new(),
+        cluster_replicas: Vec::new(),
         cluster_shard_key: None,
     };
     let server = tokio::spawn(async move {

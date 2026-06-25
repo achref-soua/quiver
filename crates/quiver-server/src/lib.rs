@@ -366,12 +366,22 @@ pub struct Config {
     #[serde(default)]
     pub mvcc_reads: bool,
     /// Opt-in **cluster router** mode (ADR-0065): a non-empty list of shard base
-    /// URLs (e.g. `["http://s1:6333","http://s2:6333"]`, or `QUIVER_CLUSTER_SHARDS`
-    /// comma-separated) makes this server a stateless router that shards writes and
-    /// scatter-gathers searches across the shards. Empty (the default) = an ordinary
-    /// single-node server.
+    /// URLs (e.g. `["http://s1:6333","http://s2:6333"]`, or the bracketed
+    /// `QUIVER_CLUSTER_SHARDS` env array `[http://s1:6333,http://s2:6333]`) makes
+    /// this server a stateless router that shards writes and scatter-gathers
+    /// searches across the shards. Empty (the default) = an ordinary single-node
+    /// server.
     #[serde(default)]
     pub cluster_shards: Vec<String>,
+    /// Optional per-shard **read replicas** (ADR-0065 increment 2). Each entry is
+    /// `"<shard_index>=<replica_url>"` (repeat the index for several replicas of one
+    /// shard), e.g. `["0=http://s1b:6333", "1=http://s2b:6333"]` or the bracketed
+    /// `QUIVER_CLUSTER_REPLICAS` env list. A replica is an ordinary follower
+    /// (ADR-0030) of its shard's primary; the router fans searches across
+    /// `{primary} ∪ replicas` to spread read load. A shard with no entry is
+    /// primary-only. Empty (the default) = no replicas.
+    #[serde(default)]
+    pub cluster_replicas: Vec<String>,
     /// Optional API key the router presents to its shards (a cluster runs over a
     /// trusted network). `None` = shards are unauthenticated.
     #[serde(default)]
@@ -401,6 +411,7 @@ impl Default for Config {
             otlp: OtlpConfig::default(),
             mvcc_reads: false,
             cluster_shards: Vec::new(),
+            cluster_replicas: Vec::new(),
             cluster_shard_key: None,
         }
     }
@@ -1725,6 +1736,7 @@ pub async fn serve(
     } else {
         let c = cluster::Cluster::new(
             config.cluster_shards.clone(),
+            config.cluster_replicas.clone(),
             config.cluster_shard_key.clone(),
         )?;
         tracing::info!(shards = c.shard_count(), "quiver cluster router enabled");
