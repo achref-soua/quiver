@@ -43,8 +43,9 @@ pub(crate) struct Cluster {
 
 impl Cluster {
     /// Build the router from operator-declared shard primary URLs, optional
-    /// per-shard read replicas (each `"<shard_index>=<replica_url>"`, e.g.
-    /// `QUIVER_CLUSTER_REPLICAS`), and an optional key presented to the shards (a
+    /// per-shard read replicas (each `"<shard_id>=<replica_url>"`, e.g.
+    /// `QUIVER_CLUSTER_REPLICAS`; the shard id is its 0-based position in
+    /// `QUIVER_CLUSTER_SHARDS`), and an optional key presented to the shards (a
     /// cluster runs over a trusted network, like replication — ADR-0030).
     pub(crate) fn new(
         shard_urls: Vec<String>,
@@ -58,10 +59,8 @@ impl Cluster {
                     "QUIVER_CLUSTER_REPLICAS entry {spec:?} must be \"<shard_index>=<url>\""
                 ))
             })?;
-            let index: usize = index.trim().parse().map_err(|_| {
-                Error::Config(format!(
-                    "replica entry {spec:?} has a non-numeric shard index"
-                ))
+            let index: u64 = index.trim().parse().map_err(|_| {
+                Error::Config(format!("replica entry {spec:?} has a non-numeric shard id"))
             })?;
             map.add_replica(index, url)
                 .map_err(|e| Error::Config(e.to_string()))?;
@@ -265,14 +264,14 @@ impl Cluster {
         let map = self.map.load();
         let groups = map.partition(&points, |p| p.id.as_str());
         let mut total = 0u64;
-        for (shard_idx, group) in groups {
+        for (shard, group) in groups {
             let dtos: Vec<Value> = group
                 .iter()
                 .map(|p| json!({ "id": p.id, "vector": p.vector, "payload": p.payload }))
                 .collect();
             let url = format!(
                 "{}/v1/collections/{collection}/{endpoint}",
-                map.shards()[shard_idx].primary_url
+                shard.primary_url
             );
             let resp = self
                 .send(reqwest::Method::POST, url, Some(json!({ "points": dtos })))
@@ -290,12 +289,9 @@ impl Cluster {
         let map = self.map.load();
         let groups = map.partition(&ids, |id| id.as_str());
         let mut total = 0u64;
-        for (shard_idx, group) in groups {
+        for (shard, group) in groups {
             let owned: Vec<&String> = group;
-            let url = format!(
-                "{}/v1/collections/{collection}/points",
-                map.shards()[shard_idx].primary_url
-            );
+            let url = format!("{}/v1/collections/{collection}/points", shard.primary_url);
             let resp = self
                 .send(reqwest::Method::DELETE, url, Some(json!({ "ids": owned })))
                 .await?;
@@ -369,7 +365,12 @@ impl Cluster {
         let mut per_shard: Vec<Vec<MatchOut>> = Vec::with_capacity(map.len());
         for shard in map.shards() {
             let resp = self
-                .shard_query(shard, base.wrapping_add(shard.index), collection, &body)
+                .shard_query(
+                    shard,
+                    base.wrapping_add(shard.id as usize),
+                    collection,
+                    &body,
+                )
                 .await?;
             per_shard.push(matches_from_json(&resp, with_vector));
         }
