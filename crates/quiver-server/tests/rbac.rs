@@ -84,6 +84,8 @@ async fn scoped_keys_deny_over_scope_and_cross_namespace() {
         rate_limit: Default::default(),
         otlp: Default::default(),
         mvcc_reads: false,
+        cluster_shards: Vec::new(),
+        cluster_shard_key: None,
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

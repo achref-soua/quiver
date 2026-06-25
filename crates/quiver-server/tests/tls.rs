@@ -153,6 +153,8 @@ async fn tls_secures_both_rest_and_grpc() {
         rate_limit: Default::default(),
         otlp: Default::default(),
         mvcc_reads: false,
+        cluster_shards: Vec::new(),
+        cluster_shard_key: None,
     };
     tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;
@@ -244,6 +246,8 @@ async fn mtls_requires_a_client_certificate() {
         rate_limit: Default::default(),
         otlp: Default::default(),
         mvcc_reads: false,
+        cluster_shards: Vec::new(),
+        cluster_shard_key: None,
     };
     tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

@@ -163,7 +163,7 @@ jobs:
           # re-run after a partial publish succeeds instead of failing). The
           # cargo call is the `if` condition so `bash -e` does not abort on the
           # expected "already uploaded" failure before the skip check runs.
-          for crate in quiverdb-core quiverdb-simd quiverdb-proto quiverdb-providers quiverdb-query \
+          for crate in quiverdb-core quiverdb-simd quiverdb-cluster quiverdb-proto quiverdb-providers quiverdb-query \
                        quiverdb-crypto quiverdb-index quiverdb-embed quiverdb-import quiverdb-tui \
                        quiverdb-mcp quiverdb-server quiverdb-cli; do
             echo "::group::publish ${crate}"
