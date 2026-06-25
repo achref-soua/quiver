@@ -43,6 +43,7 @@ async fn cockpit_reads_live_server_snapshot() {
         otlp: Default::default(),
         mvcc_reads: false,
         cluster_shards: Vec::new(),
+        cluster_replicas: Vec::new(),
         cluster_shard_key: None,
     };
     tokio::spawn(async move {

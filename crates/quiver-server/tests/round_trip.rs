@@ -71,6 +71,7 @@ async fn rest_and_grpc_round_trip() {
         otlp: Default::default(),
         mvcc_reads: false,
         cluster_shards: Vec::new(),
+        cluster_replicas: Vec::new(),
         cluster_shard_key: None,
     };
     let server = tokio::spawn(async move {
@@ -329,6 +330,7 @@ async fn rest_concurrent_reads_survive_a_deferred_rebuild() {
         otlp: Default::default(),
         mvcc_reads: false,
         cluster_shards: Vec::new(),
+        cluster_replicas: Vec::new(),
         cluster_shard_key: None,
     };
     let server = tokio::spawn(async move {

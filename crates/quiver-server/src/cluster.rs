@@ -12,6 +12,7 @@
 //! `ponytail`: sequential scatter, parallelise when shard count / latency matters.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arc_swap::ArcSwap;
 use quiver_cluster::{ShardMap, merge_top_k};
@@ -34,19 +35,43 @@ pub(crate) struct Cluster {
     // collection -> higher_is_better (cosine/dot = true, L2 = false), learned on
     // create or by describing a shard, so a search knows how to merge.
     ordering: RwLock<HashMap<String, bool>>,
+    // Monotonic counter that round-robins each shard's reads across {primary} ∪
+    // replicas (ADR-0065 increment 2). Relaxed: an exact sequence is not required,
+    // only an even spread.
+    read_rr: AtomicUsize,
 }
 
 impl Cluster {
-    /// Build the router from operator-declared shard base URLs and an optional key
-    /// presented to the shards (a cluster runs over a trusted network, like
-    /// replication — ADR-0030).
-    pub(crate) fn new(shard_urls: Vec<String>, shard_key: Option<String>) -> Result<Self, Error> {
-        let map = ShardMap::from_urls(shard_urls).map_err(|e| Error::Config(e.to_string()))?;
+    /// Build the router from operator-declared shard primary URLs, optional
+    /// per-shard read replicas (each `"<shard_index>=<replica_url>"`, e.g.
+    /// `QUIVER_CLUSTER_REPLICAS`), and an optional key presented to the shards (a
+    /// cluster runs over a trusted network, like replication — ADR-0030).
+    pub(crate) fn new(
+        shard_urls: Vec<String>,
+        replica_specs: Vec<String>,
+        shard_key: Option<String>,
+    ) -> Result<Self, Error> {
+        let mut map = ShardMap::from_urls(shard_urls).map_err(|e| Error::Config(e.to_string()))?;
+        for spec in &replica_specs {
+            let (index, url) = spec.split_once('=').ok_or_else(|| {
+                Error::Config(format!(
+                    "QUIVER_CLUSTER_REPLICAS entry {spec:?} must be \"<shard_index>=<url>\""
+                ))
+            })?;
+            let index: usize = index.trim().parse().map_err(|_| {
+                Error::Config(format!(
+                    "replica entry {spec:?} has a non-numeric shard index"
+                ))
+            })?;
+            map.add_replica(index, url)
+                .map_err(|e| Error::Config(e.to_string()))?;
+        }
         Ok(Self {
             map: ArcSwap::from_pointee(map),
             http: reqwest::Client::new(),
             shard_key,
             ordering: RwLock::new(HashMap::new()),
+            read_rr: AtomicUsize::new(0),
         })
     }
 
@@ -96,6 +121,38 @@ impl Cluster {
             .map_err(|e| Error::Internal(format!("shard {url} bad response: {e}")))
     }
 
+    // Query one shard, trying its read targets ({primary} ∪ replicas) in the
+    // round-robin order for `nth`. The first reachable target answers; if a target
+    // is down (a stopped/stale replica, or — reads only — a stopped primary) the
+    // next is tried. The shard's slice is unavailable, and the error surfaced, only
+    // if every target is down.
+    async fn shard_query(
+        &self,
+        shard: &quiver_cluster::Shard,
+        nth: usize,
+        collection: &str,
+        body: &Value,
+    ) -> Result<Value, Error> {
+        let targets = shard.read_order(nth);
+        let mut last_err = None;
+        for (i, target) in targets.iter().enumerate() {
+            let url = format!("{target}/v1/collections/{collection}/query");
+            match self
+                .send(reqwest::Method::POST, url, Some(body.clone()))
+                .await
+            {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    if i + 1 < targets.len() {
+                        tracing::warn!(target, error = %e, "shard read target failed; trying next");
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Error::Internal("shard has no read targets".into())))
+    }
+
     // Send the same request to every shard (collection broadcast), returning the
     // first body. Any shard failure fails the whole op so the cluster never ends up
     // with a collection on only some shards.
@@ -109,7 +166,11 @@ impl Cluster {
         let mut last = Value::Null;
         for shard in map.shards() {
             last = self
-                .send(method.clone(), format!("{}{path}", shard.url), body.clone())
+                .send(
+                    method.clone(),
+                    format!("{}{path}", shard.primary_url),
+                    body.clone(),
+                )
                 .await?;
         }
         Ok(last)
@@ -211,7 +272,7 @@ impl Cluster {
                 .collect();
             let url = format!(
                 "{}/v1/collections/{collection}/{endpoint}",
-                map.shards()[shard_idx].url
+                map.shards()[shard_idx].primary_url
             );
             let resp = self
                 .send(reqwest::Method::POST, url, Some(json!({ "points": dtos })))
@@ -233,7 +294,7 @@ impl Cluster {
             let owned: Vec<&String> = group;
             let url = format!(
                 "{}/v1/collections/{collection}/points",
-                map.shards()[shard_idx].url
+                map.shards()[shard_idx].primary_url
             );
             let resp = self
                 .send(reqwest::Method::DELETE, url, Some(json!({ "ids": owned })))
@@ -255,7 +316,12 @@ impl Cluster {
         let mut out = Vec::new();
         for id in &ids {
             let shard = map.shard_for(id);
-            let url = format!("{}/v1/collections/{collection}/points/{id}", shard.url);
+            // Gets go to the primary (read-your-writes; replicas are eventually
+            // consistent — they serve searches, not point lookups).
+            let url = format!(
+                "{}/v1/collections/{collection}/points/{id}",
+                shard.primary_url
+            );
             let resp = match self.send(reqwest::Method::GET, url, None).await {
                 Ok(v) => v,
                 // A 404 (point not found) surfaces as an error from `send`; treat a
@@ -293,13 +359,17 @@ impl Cluster {
             body["filter"] =
                 serde_json::to_value(f).map_err(|e| Error::BadRequest(e.to_string()))?;
         }
-        // Scatter: ask each shard for its local top-k.
+        // Scatter: ask each shard for its local top-k, round-robining reads across
+        // {primary} ∪ replicas (ADR-0065 increment 2) to spread read load. The base
+        // advances once per search and is offset by the shard index so every shard
+        // sweeps its own targets (rather than aliasing to one). A search is
+        // eventually consistent — a replica may lag its primary (ADR-0030).
         let map = self.map.load();
+        let base = self.read_rr.fetch_add(1, Ordering::Relaxed);
         let mut per_shard: Vec<Vec<MatchOut>> = Vec::with_capacity(map.len());
         for shard in map.shards() {
-            let url = format!("{}/v1/collections/{collection}/query", shard.url);
             let resp = self
-                .send(reqwest::Method::POST, url, Some(body.clone()))
+                .shard_query(shard, base.wrapping_add(shard.index), collection, &body)
                 .await?;
             per_shard.push(matches_from_json(&resp, with_vector));
         }
@@ -318,7 +388,7 @@ impl Cluster {
             .shards()
             .first()
             .ok_or_else(|| Error::Internal("no shards".into()))?;
-        let url = format!("{}/v1/collections/{collection}", shard.url);
+        let url = format!("{}/v1/collections/{collection}", shard.primary_url);
         let info = self.send(reqwest::Method::GET, url, None).await?;
         let metric = info.get("metric").and_then(Value::as_str).unwrap_or("l2");
         let higher = matches!(metric, "cosine" | "dot");
@@ -416,4 +486,42 @@ fn point_from_json(resp: &Value, with_vector: bool) -> Option<PointOut> {
             None
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shards() -> Vec<String> {
+        vec!["http://s0:6333".into(), "http://s1:6333".into()]
+    }
+
+    #[test]
+    fn new_accepts_well_formed_replicas() {
+        let c = Cluster::new(
+            shards(),
+            vec!["0=http://s0b:6333".into(), "1=http://s1b:6333".into()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(c.shard_count(), 2);
+        let map = c.map.load();
+        assert_eq!(map.shards()[0].replica_urls, ["http://s0b:6333"]);
+        assert_eq!(map.shards()[1].replica_urls, ["http://s1b:6333"]);
+        // No replicas configured is fine too (primary-only shards).
+        assert!(Cluster::new(shards(), vec![], None).is_ok());
+    }
+
+    #[test]
+    fn new_rejects_malformed_replica_specs() {
+        // `Cluster` is not `Debug`, so assert on the error arm without unwrapping Ok.
+        let config_err = |spec: &str| match Cluster::new(shards(), vec![spec.into()], None) {
+            Err(Error::Config(_)) => {}
+            Err(e) => panic!("expected a Config error, got {e:?}"),
+            Ok(_) => panic!("expected a Config error for {spec:?}, built a router"),
+        };
+        config_err("http://nope"); // missing the `index=` prefix
+        config_err("x=http://nope"); // non-numeric shard index
+        config_err("9=http://nope"); // index past the shard set (add_replica rejects)
+    }
 }

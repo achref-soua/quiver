@@ -115,6 +115,7 @@ async fn server_stores_opaque_vectors_and_the_client_ranks() {
         otlp: Default::default(),
         mvcc_reads: false,
         cluster_shards: Vec::new(),
+        cluster_replicas: Vec::new(),
         cluster_shard_key: None,
     };
     let server = tokio::spawn(async move {

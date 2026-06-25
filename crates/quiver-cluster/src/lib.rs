@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Opt-in cluster-mode primitives (ADR-0065, increment 1).
+//! Opt-in cluster-mode primitives (ADR-0065, increments 1–2).
 //!
 //! A Quiver cluster shards points across N independent single-writer engines and
 //! fronts them with a stateless router. This crate is the **pure, dependency-light
 //! core** the router composes — it does no I/O:
 //!
-//! - [`ShardMap`] — a static, operator-declared list of shards (each an ordinary
-//!   Quiver server addressed by URL).
+//! - [`Shard`] — a single-writer **primary** plus optional **read replicas**
+//!   (ordinary followers, ADR-0030); writes go to the primary, searches may be
+//!   served by any of [`Shard::read_order`]'s `{primary} ∪ replicas`.
+//! - [`ShardMap`] — an operator-declared list of shards (each addressed by URL),
+//!   with replicas attached via [`ShardMap::add_replica`].
 //! - [`ShardMap::shard_for`] — which shard owns a point id, by **rendezvous (HRW)
 //!   hashing**: changing the shard set only remaps ~1/N of ids, not a full
 //!   reshuffle, and the mapping is stable across releases (a fixed FNV-1a hash, not
@@ -28,16 +31,67 @@ pub enum ClusterError {
     /// A shard URL was empty.
     #[error("shard {0} has an empty URL")]
     EmptyUrl(usize),
+    /// A replica was declared for a shard index that does not exist.
+    #[error("replica declared for shard {0}, but the cluster has {1} shard(s)")]
+    ReplicaShardOutOfRange(usize, usize),
+    /// A replica URL was empty.
+    #[error("shard {0} has an empty replica URL")]
+    EmptyReplicaUrl(usize),
 }
 
-/// One shard: an ordinary single-writer Quiver server, addressed by URL.
+/// One shard: a single-writer **primary** (ADR-0006) plus optional **read
+/// replicas** — ordinary followers (ADR-0030) of that primary. Writes, gets and
+/// deletes go to the primary; searches may be served by any of `{primary} ∪
+/// replicas` to spread read load (eventually consistent — a replica lags its
+/// primary by its replication delay).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shard {
     /// Stable index in the shard map; part of the hash key, so it must not change
     /// for an existing shard (appending a shard is fine).
     pub index: usize,
-    /// Base URL of the shard's server (e.g. `http://10.0.0.5:6333`).
-    pub url: String,
+    /// Base URL of the shard's single-writer primary (e.g. `http://10.0.0.5:6333`).
+    pub primary_url: String,
+    /// Base URLs of the shard's read-replica followers (ADR-0030), if any. Each is
+    /// an ordinary Quiver server run with `QUIVER_LEADER_URL` pointed at this
+    /// shard's primary; a follower refuses writes, so a mis-route cannot corrupt.
+    pub replica_urls: Vec<String>,
+}
+
+impl Shard {
+    /// The URL to serve a read from, chosen round-robin across `{primary} ∪
+    /// replicas` by `nth` (any monotonically increasing counter). A shard with no
+    /// replicas always returns the primary, so single-primary shards are
+    /// unaffected. The selection is a pure function of `nth`, so it is uniform over
+    /// a sweep of counters and deterministic for a fixed one — the property the
+    /// unit tests pin.
+    #[must_use]
+    pub fn read_url(&self, nth: usize) -> &str {
+        self.target(nth % (1 + self.replica_urls.len()))
+    }
+
+    /// All of the shard's read targets in preference order for counter `nth`: the
+    /// round-robin pick ([`read_url`](Self::read_url)) first, then the remaining
+    /// `{primary} ∪ replicas` rotated after it. The router tries them in order so a
+    /// down target (a stale or stopped replica, or — for reads only — a stopped
+    /// primary) falls through to the next live one; the shard's slice is
+    /// unavailable only if **every** target is down. This is read availability, not
+    /// write failover: writes still go to the primary alone (no HA until the Raft
+    /// increment).
+    #[must_use]
+    pub fn read_order(&self, nth: usize) -> Vec<&str> {
+        let n = 1 + self.replica_urls.len();
+        let start = nth % n;
+        (0..n).map(|off| self.target((start + off) % n)).collect()
+    }
+
+    // Target `i` of `{primary} ∪ replicas`: 0 is the primary, 1..=replicas the
+    // followers. Callers only ever pass `i < 1 + replica_urls.len()`.
+    fn target(&self, i: usize) -> &str {
+        match i {
+            0 => &self.primary_url,
+            i => &self.replica_urls[i - 1],
+        }
+    }
 }
 
 /// A static, operator-declared shard map (ADR-0065 increment 1). Online resharding
@@ -65,16 +119,42 @@ impl ShardMap {
             .enumerate()
             .map(|(index, url)| Shard {
                 index,
-                url: url.into().trim().to_owned(),
+                primary_url: url.into().trim().to_owned(),
+                replica_urls: Vec::new(),
             })
             .collect();
         if shards.is_empty() {
             return Err(ClusterError::NoShards);
         }
-        if let Some(s) = shards.iter().find(|s| s.url.is_empty()) {
+        if let Some(s) = shards.iter().find(|s| s.primary_url.is_empty()) {
             return Err(ClusterError::EmptyUrl(s.index));
         }
         Ok(Self { shards })
+    }
+
+    /// Attach a read-replica URL to the shard at `shard_index`. The replica is an
+    /// ordinary follower of that shard's primary (ADR-0030); the map only needs to
+    /// know its URL so searches can fan reads to it.
+    ///
+    /// # Errors
+    /// [`ClusterError::ReplicaShardOutOfRange`] if `shard_index` is not a shard,
+    /// [`ClusterError::EmptyReplicaUrl`] if `url` is blank.
+    pub fn add_replica<S: Into<String>>(
+        &mut self,
+        shard_index: usize,
+        url: S,
+    ) -> Result<(), ClusterError> {
+        let url = url.into().trim().to_owned();
+        if url.is_empty() {
+            return Err(ClusterError::EmptyReplicaUrl(shard_index));
+        }
+        let count = self.shards.len();
+        let shard = self
+            .shards
+            .get_mut(shard_index)
+            .ok_or(ClusterError::ReplicaShardOutOfRange(shard_index, count))?;
+        shard.replica_urls.push(url);
+        Ok(())
     }
 
     /// Number of shards.
@@ -207,6 +287,90 @@ mod tests {
             ClusterError::EmptyUrl(1)
         );
         assert_eq!(map3().len(), 3);
+        // A freshly built map has no replicas — every shard is primary-only.
+        assert!(map3().shards().iter().all(|s| s.replica_urls.is_empty()));
+    }
+
+    #[test]
+    fn add_replica_attaches_and_validates() {
+        let mut m = map3();
+        m.add_replica(1, "http://b2:6333").unwrap();
+        m.add_replica(1, " http://b3:6333 ").unwrap(); // trimmed
+        assert_eq!(m.shards()[0].replica_urls, Vec::<String>::new());
+        assert_eq!(
+            m.shards()[1].replica_urls,
+            vec!["http://b2:6333".to_owned(), "http://b3:6333".to_owned()]
+        );
+        // Out-of-range shard index and empty URL are rejected.
+        assert_eq!(
+            m.add_replica(3, "http://x").unwrap_err(),
+            ClusterError::ReplicaShardOutOfRange(3, 3)
+        );
+        assert_eq!(
+            m.add_replica(0, "   ").unwrap_err(),
+            ClusterError::EmptyReplicaUrl(0)
+        );
+    }
+
+    #[test]
+    fn read_url_falls_back_to_primary_with_no_replicas() {
+        // A primary-only shard serves every read from the primary, for any counter.
+        let m = map3();
+        let s = &m.shards()[0];
+        let p = s.primary_url.clone();
+        for nth in 0..10 {
+            assert_eq!(s.read_url(nth), p);
+        }
+    }
+
+    #[test]
+    fn read_url_round_robins_primary_then_replicas() {
+        let mut m = map3();
+        m.add_replica(0, "http://a2").unwrap();
+        m.add_replica(0, "http://a3").unwrap();
+        let s = &m.shards()[0];
+        // Cycle is primary, replica0, replica1, primary, … — uniform over a sweep.
+        let seq: Vec<&str> = (0..6).map(|n| s.read_url(n)).collect();
+        assert_eq!(
+            seq,
+            [
+                "http://a:6333",
+                "http://a2",
+                "http://a3",
+                "http://a:6333",
+                "http://a2",
+                "http://a3"
+            ]
+        );
+        // Every target is hit equally over a full number of cycles (uniform).
+        let mut counts = std::collections::HashMap::new();
+        for n in 0..3_000 {
+            *counts.entry(s.read_url(n)).or_insert(0) += 1;
+        }
+        assert_eq!(counts.len(), 3);
+        assert!(counts.values().all(|&c| c == 1_000));
+    }
+
+    #[test]
+    fn read_order_is_the_pick_then_the_rest() {
+        let mut m = map3();
+        m.add_replica(0, "http://a2").unwrap();
+        m.add_replica(0, "http://a3").unwrap();
+        let s = &m.shards()[0];
+        // The first element is always the round-robin pick; the rest rotate after it
+        // so a failed pick falls through to the other live targets.
+        assert_eq!(s.read_order(0), ["http://a:6333", "http://a2", "http://a3"]);
+        assert_eq!(s.read_order(1), ["http://a2", "http://a3", "http://a:6333"]);
+        assert_eq!(s.read_order(2), ["http://a3", "http://a:6333", "http://a2"]);
+        // Element 0 always equals read_url for the same counter.
+        for n in 0..6 {
+            assert_eq!(s.read_order(n)[0], s.read_url(n));
+        }
+        // A primary-only shard has exactly one target: the primary.
+        assert_eq!(
+            m.shards()[1].read_order(7),
+            [m.shards()[1].primary_url.as_str()]
+        );
     }
 
     #[test]
