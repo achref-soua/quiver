@@ -10,6 +10,21 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Added
+
+- **Cluster coordinator + dynamic router refresh** (ADR-0066, increment 3b). A new
+  opt-in **coordinator** mode (`QUIVER_COORDINATOR=true`) runs a thin, data-plane-free
+  service that owns the authoritative, monotonically **versioned** shard map and serves
+  a small membership API — `GET /cluster/map`, `POST /cluster/shards`,
+  `DELETE /cluster/shards/{id}`, `GET /cluster/health` — persisting its map + a
+  never-reused id counter to `QUIVER_COORDINATOR_STATE` so a restart recovers exactly.
+  A **router** given `QUIVER_COORDINATOR_URL` refreshes its shard map from the
+  coordinator on an interval and swaps any newer version into its `ArcSwap`, so adding
+  or removing a shard propagates **with no restart**; the coordinator is never a
+  per-query dependency. A router also exposes its currently adopted map read-only at
+  `GET /cluster/map`. No data migration yet (that is 3c) — a freshly added shard owns
+  only the keys that now hash to it. Single-node and a static cluster are unaffected.
+
 ### Changed
 
 - **Stable shard ids** (ADR-0066, increment-3 groundwork). `quiver_cluster::Shard`

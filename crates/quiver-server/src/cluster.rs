@@ -13,9 +13,16 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use quiver_cluster::{ShardMap, merge_top_k};
+
+/// How often a router polls the coordinator for a newer shard map (ADR-0066).
+/// Fixed: membership changes are rare and reads self-correct, so a few seconds of
+/// staleness is fine.
+// ponytail: fixed interval; make it configurable if an operator ever needs to tune it.
+pub(crate) const MAP_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 use quiver_embed::{
     DistanceMetric, Filter, FilterableField, IndexKind, IndexSpec, VectorEncryption,
 };
@@ -77,6 +84,31 @@ impl Cluster {
     /// Number of shards (for `/healthz` / diagnostics).
     pub(crate) fn shard_count(&self) -> usize {
         self.map.load().len()
+    }
+
+    /// A snapshot of the router's currently adopted shard map (version + shards), for
+    /// the read-only `GET /cluster/map` ops endpoint — so an operator (or a test) can
+    /// see which map version a router has refreshed to.
+    pub(crate) fn current_map(&self) -> ShardMap {
+        ShardMap::clone(&self.map.load())
+    }
+
+    /// Refresh the shard map from the coordinator (ADR-0066): fetch
+    /// `GET {coordinator}/cluster/map` and adopt it **only if its version is newer**
+    /// than the one held, swapping it into the `ArcSwap` with no restart. Returns
+    /// `true` if a newer map was adopted. A stale or equal version is ignored so an
+    /// out-of-order or duplicate response can never move the map backwards.
+    pub(crate) async fn refresh_from(&self, coordinator_url: &str) -> Result<bool, Error> {
+        let url = format!("{}/cluster/map", coordinator_url.trim_end_matches('/'));
+        let body = self.send(reqwest::Method::GET, url, None).await?;
+        let new_map: ShardMap = serde_json::from_value(body)
+            .map_err(|e| Error::Internal(format!("coordinator map: {e}")))?;
+        if new_map.version() > self.map.load().version() {
+            self.map.store(std::sync::Arc::new(new_map));
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     // --- HTTP plumbing -----------------------------------------------------

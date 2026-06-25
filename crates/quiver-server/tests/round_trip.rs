@@ -73,6 +73,9 @@ async fn rest_and_grpc_round_trip() {
         cluster_shards: Vec::new(),
         cluster_replicas: Vec::new(),
         cluster_shard_key: None,
+        coordinator: false,
+        coordinator_url: None,
+        coordinator_state: None,
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;
@@ -332,6 +335,9 @@ async fn rest_concurrent_reads_survive_a_deferred_rebuild() {
         cluster_shards: Vec::new(),
         cluster_replicas: Vec::new(),
         cluster_shard_key: None,
+        coordinator: false,
+        coordinator_url: None,
+        coordinator_state: None,
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;
