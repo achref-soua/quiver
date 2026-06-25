@@ -1,6 +1,9 @@
 # ADR-0051: Distributed / sharded mode (design only)
 
-- **Status:** Proposed (design only — not implemented; gated on explicit owner go-ahead)
+- **Status:** Accepted (the *shape*); implementation proceeds incrementally per
+  [ADR-0065](0065-cluster-mode-implementation.md) (opt-in `cluster` mode, sharding
+  + scatter-gather first, audited-Raft consensus last). This ADR records the
+  intended design; ADR-0065 records how it is built.
 - **Date:** 2026-06-23
 - **Deciders:** Achref Soua
 

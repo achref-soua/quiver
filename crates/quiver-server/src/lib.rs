@@ -31,6 +31,7 @@
 
 mod audit;
 mod auth;
+mod cluster;
 mod error;
 mod grpc;
 mod metrics;
@@ -364,6 +365,17 @@ pub struct Config {
     /// `QUIVER_MVCC_READS`. See `docs/adr/0064-mvcc-reads-implementation.md`.
     #[serde(default)]
     pub mvcc_reads: bool,
+    /// Opt-in **cluster router** mode (ADR-0065): a non-empty list of shard base
+    /// URLs (e.g. `["http://s1:6333","http://s2:6333"]`, or `QUIVER_CLUSTER_SHARDS`
+    /// comma-separated) makes this server a stateless router that shards writes and
+    /// scatter-gathers searches across the shards. Empty (the default) = an ordinary
+    /// single-node server.
+    #[serde(default)]
+    pub cluster_shards: Vec<String>,
+    /// Optional API key the router presents to its shards (a cluster runs over a
+    /// trusted network). `None` = shards are unauthenticated.
+    #[serde(default)]
+    pub cluster_shard_key: Option<String>,
 }
 
 impl Default for Config {
@@ -388,6 +400,8 @@ impl Default for Config {
             rate_limit: RateLimitConfig::default(),
             otlp: OtlpConfig::default(),
             mvcc_reads: false,
+            cluster_shards: Vec::new(),
+            cluster_shard_key: None,
         }
     }
 }
@@ -564,6 +578,10 @@ pub(crate) struct AppState {
     // because pure-vector fast-path reads bypass the reader-driven scheduler. Off by
     // default, so the non-MVCC path is byte-identical.
     mvcc: bool,
+    // Opt-in cluster router (ADR-0065): when `Some`, every collection/point op
+    // fans out to the shards instead of touching the local engine. `None` = an
+    // ordinary single-node server (the engine-backed path, untouched).
+    cluster: Option<Arc<cluster::Cluster>>,
 }
 
 /// A collection's metadata.
@@ -909,6 +927,19 @@ impl AppState {
         self.ensure_writable("create_collection")?;
         self.authorize(principal, Action::Admin, "create_collection", &name)?;
         self.limits.check_dim(dim as usize)?;
+        if let Some(c) = &self.cluster {
+            return c
+                .create_collection(
+                    name,
+                    dim,
+                    metric,
+                    index,
+                    filterable,
+                    multivector,
+                    vector_encryption,
+                )
+                .await;
+        }
         let descriptor = Descriptor::new(dim, Dtype::F32, metric)
             .with_index(index)
             .with_filterable(filterable.clone())
@@ -1011,6 +1042,9 @@ impl AppState {
     ) -> Result<bool, Error> {
         self.ensure_writable("delete_collection")?;
         self.authorize(principal, Action::Admin, "delete_collection", &name)?;
+        if let Some(c) = &self.cluster {
+            return c.drop_collection(&name).await;
+        }
         let resource = name.clone();
         let result = self
             .write_blocking(move |db| db.drop_collection(&name))
@@ -1045,6 +1079,9 @@ impl AppState {
             self.limits.check_vector_len(p.vector.len())?;
             self.limits.check_payload(&p.payload)?;
         }
+        if let Some(c) = &self.cluster {
+            return c.upsert(&collection, points).await;
+        }
         let resource = collection.clone();
         let result = self
             .write_blocking(move |db| {
@@ -1077,6 +1114,9 @@ impl AppState {
         for p in &points {
             self.limits.check_vector_len(p.vector.len())?;
             self.limits.check_payload(&p.payload)?;
+        }
+        if let Some(c) = &self.cluster {
+            return c.upsert_bulk(&collection, points).await;
         }
         let resource = collection.clone();
         let result = self
@@ -1130,6 +1170,9 @@ impl AppState {
     ) -> Result<u64, Error> {
         self.ensure_writable("delete_points")?;
         self.authorize(principal, Action::Write, "delete_points", &collection)?;
+        if let Some(c) = &self.cluster {
+            return c.delete_points(&collection, ids).await;
+        }
         let resource = collection.clone();
         let result = self
             .write_blocking(move |db| {
@@ -1162,6 +1205,9 @@ impl AppState {
         with_vector: bool,
     ) -> Result<Vec<PointOut>, Error> {
         self.authorize(principal, Action::Read, "get_points", &collection)?;
+        if let Some(c) = &self.cluster {
+            return c.get_points(&collection, ids, with_vector).await;
+        }
         self.read_blocking(move |db| {
             let mut out = Vec::new();
             for id in &ids {
@@ -1194,6 +1240,21 @@ impl AppState {
         self.authorize(principal, Action::Read, "search", &collection)?;
         self.limits.check_search(k, ef_search)?;
         self.limits.check_vector_len(vector.len())?;
+
+        // Cluster router (ADR-0065): scatter-gather across the shards, merge top-k.
+        if let Some(c) = &self.cluster {
+            return c
+                .search(
+                    &collection,
+                    vector,
+                    k,
+                    filter,
+                    ef_search,
+                    with_payload,
+                    with_vector,
+                )
+                .await;
+        }
 
         // Lock-free fast path (ADR-0064 increment 3): a **pure-vector** read of an
         // MVCC-served collection loads the cached snapshot cell and searches it with
@@ -1658,6 +1719,18 @@ pub async fn serve(
     }
     let mvcc = db.mvcc_reads();
 
+    // Opt-in cluster router (ADR-0065): build the shard fan-out when configured.
+    let cluster = if config.cluster_shards.is_empty() {
+        None
+    } else {
+        let c = cluster::Cluster::new(
+            config.cluster_shards.clone(),
+            config.cluster_shard_key.clone(),
+        )?;
+        tracing::info!(shards = c.shard_count(), "quiver cluster router enabled");
+        Some(Arc::new(c))
+    };
+
     let state = AppState {
         db: Arc::new(RwLock::new(db)),
         keys: Arc::new(config.api_keys.clone()),
@@ -1671,6 +1744,7 @@ pub async fn serve(
         rebuilding: Arc::new(Mutex::new(HashSet::new())),
         snapshot_cells: Arc::new(RwLock::new(HashMap::new())),
         mvcc,
+        cluster,
     };
 
     // A follower continuously applies the leader's committed-op stream (ADR-0030).

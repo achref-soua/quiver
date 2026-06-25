@@ -73,6 +73,8 @@ fn base_config(
         rate_limit: Default::default(),
         otlp: Default::default(),
         mvcc_reads: false,
+        cluster_shards: Vec::new(),
+        cluster_shard_key: None,
     }
 }
 
@@ -106,6 +108,8 @@ async fn replicate_streams_a_snapshot_then_the_live_tail() {
         rate_limit: Default::default(),
         otlp: Default::default(),
         mvcc_reads: false,
+        cluster_shards: Vec::new(),
+        cluster_shard_key: None,
     };
     tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;
