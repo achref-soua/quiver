@@ -117,6 +117,9 @@ async fn server_stores_opaque_vectors_and_the_client_ranks() {
         cluster_shards: Vec::new(),
         cluster_replicas: Vec::new(),
         cluster_shard_key: None,
+        coordinator: false,
+        coordinator_url: None,
+        coordinator_state: None,
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

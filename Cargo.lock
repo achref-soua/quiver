@@ -2334,6 +2334,8 @@ dependencies = [
 name = "quiverdb-cluster"
 version = "0.25.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

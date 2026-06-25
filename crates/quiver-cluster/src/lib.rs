@@ -40,6 +40,9 @@ pub enum ClusterError {
     /// Two shards share the same id (ids must be unique — they are the HRW key).
     #[error("duplicate shard id {0}")]
     DuplicateShardId(u64),
+    /// A membership operation referenced a shard id that is not in the map.
+    #[error("no shard with id {0}")]
+    UnknownShard(u64),
 }
 
 /// One shard: a single-writer **primary** (ADR-0006) plus optional **read
@@ -47,7 +50,7 @@ pub enum ClusterError {
 /// deletes go to the primary; searches may be served by any of `{primary} ∪
 /// replicas` to spread read load (eventually consistent — a replica lags its
 /// primary by its replication delay).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Shard {
     /// Immutable shard id — **the HRW hash key** (ADR-0066). It is decoupled from the
     /// shard's position in the map and must **never change or be reused**: removing a
@@ -60,6 +63,7 @@ pub struct Shard {
     /// Base URLs of the shard's read-replica followers (ADR-0030), if any. Each is
     /// an ordinary Quiver server run with `QUIVER_LEADER_URL` pointed at this
     /// shard's primary; a follower refuses writes, so a mis-route cannot corrupt.
+    #[serde(default)]
     pub replica_urls: Vec<String>,
 }
 
@@ -100,10 +104,16 @@ impl Shard {
     }
 }
 
-/// A static, operator-declared shard map (ADR-0065 increment 1). Online resharding
-/// is a later increment; here the set is fixed at startup.
-#[derive(Clone, Debug)]
+/// An operator-declared shard map. It carries a monotonically increasing
+/// **`version`** (ADR-0066): a coordinator owns the authoritative map and bumps the
+/// version on every membership change, and a router refreshes the map into its
+/// `ArcSwap`, ignoring any response whose version is not newer — so a membership
+/// change propagates without restarting the router. A statically configured map
+/// (`from_urls`) starts at version 0 and never changes.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ShardMap {
+    #[serde(default)]
+    version: u64,
     shards: Vec<Shard>,
 }
 
@@ -150,7 +160,62 @@ impl ShardMap {
         if let Some(dup) = shards.iter().find(|s| !seen.insert(s.id)) {
             return Err(ClusterError::DuplicateShardId(dup.id));
         }
-        Ok(Self { shards })
+        Ok(Self { version: 0, shards })
+    }
+
+    /// The map's version. A router only adopts a refreshed map whose version is
+    /// strictly greater than the one it already holds (ADR-0066).
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Add a shard with the coordinator-assigned (monotonic, never-reused) `id` and
+    /// bump the version. The coordinator owns id allocation; the map only enforces
+    /// that the id is unique and the primary URL non-empty.
+    ///
+    /// # Errors
+    /// [`ClusterError::DuplicateShardId`] if `id` is already present,
+    /// [`ClusterError::EmptyUrl`] if `primary_url` is blank.
+    pub fn add_shard<S: Into<String>>(
+        &mut self,
+        id: u64,
+        primary_url: S,
+        replica_urls: Vec<String>,
+    ) -> Result<(), ClusterError> {
+        let primary_url = primary_url.into().trim().to_owned();
+        if primary_url.is_empty() {
+            return Err(ClusterError::EmptyUrl(id));
+        }
+        if self.shards.iter().any(|s| s.id == id) {
+            return Err(ClusterError::DuplicateShardId(id));
+        }
+        self.shards.push(Shard {
+            id,
+            primary_url,
+            replica_urls,
+        });
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Remove the shard with `id` and bump the version. Refuses to remove the **last**
+    /// shard (a cluster needs at least one). A removed id is never reused — its
+    /// `~1/N` slice is the only data that remaps (ADR-0066).
+    ///
+    /// # Errors
+    /// [`ClusterError::NoShards`] if it would empty the map,
+    /// [`ClusterError::UnknownShard`] if `id` is not present.
+    pub fn remove_shard(&mut self, id: u64) -> Result<(), ClusterError> {
+        if !self.shards.iter().any(|s| s.id == id) {
+            return Err(ClusterError::UnknownShard(id));
+        }
+        if self.shards.len() == 1 {
+            return Err(ClusterError::NoShards);
+        }
+        self.shards.retain(|s| s.id != id);
+        self.version += 1;
+        Ok(())
     }
 
     /// Attach a read-replica URL to the shard with id `shard_id`. The replica is an
@@ -558,6 +623,59 @@ mod tests {
         let per_shard = vec![vec![("x", 0.9f32)], vec![("y", 0.95), ("z", 0.3)]];
         let got = merge_top_k(per_shard, 2, |t| t.1, true);
         assert_eq!(got.iter().map(|t| t.0).collect::<Vec<_>>(), ["y", "x"]);
+    }
+
+    #[test]
+    fn add_and_remove_shard_bump_the_version() {
+        let mut m = map3();
+        assert_eq!(m.version(), 0);
+        m.add_shard(7, "http://d:6333", vec!["http://d2:6333".into()])
+            .unwrap();
+        assert_eq!(m.version(), 1);
+        assert_eq!(m.len(), 4);
+        assert_eq!(m.shards().last().unwrap().id, 7);
+        assert_eq!(m.shards().last().unwrap().replica_urls, ["http://d2:6333"]);
+        // A duplicate id or empty URL is rejected and does not bump the version.
+        assert_eq!(
+            m.add_shard(7, "http://x", vec![]).unwrap_err(),
+            ClusterError::DuplicateShardId(7)
+        );
+        assert_eq!(
+            m.add_shard(8, "  ", vec![]).unwrap_err(),
+            ClusterError::EmptyUrl(8)
+        );
+        assert_eq!(m.version(), 1);
+        // Remove bumps the version and leaves a gap; the id is not reused by the map.
+        m.remove_shard(1).unwrap();
+        assert_eq!(m.version(), 2);
+        assert_eq!(
+            m.shards().iter().map(|s| s.id).collect::<Vec<_>>(),
+            [0, 2, 7]
+        );
+        assert_eq!(
+            m.remove_shard(1).unwrap_err(),
+            ClusterError::UnknownShard(1)
+        );
+    }
+
+    #[test]
+    fn remove_shard_refuses_to_empty_the_map() {
+        let mut m = ShardMap::from_urls(["http://only"]).unwrap();
+        assert_eq!(m.remove_shard(0).unwrap_err(), ClusterError::NoShards);
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn shard_map_round_trips_through_json() {
+        let mut m = map3();
+        m.add_shard(9, "http://d", vec!["http://d2".into()])
+            .unwrap();
+        let json = serde_json::to_string(&m).unwrap();
+        let back: ShardMap = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.version(), m.version());
+        assert_eq!(back.shards(), m.shards());
+        // A key routes identically through the deserialized map.
+        assert_eq!(back.shard_for("user:42").id, m.shard_for("user:42").id);
     }
 
     #[test]
