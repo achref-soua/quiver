@@ -81,6 +81,8 @@ async fn audit_log_records_mutations_and_denials_without_leaking_secrets() {
         rate_limit: Default::default(),
         otlp: Default::default(),
         mvcc_reads: false,
+        cluster_shards: Vec::new(),
+        cluster_shard_key: None,
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

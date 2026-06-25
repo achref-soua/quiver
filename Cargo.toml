@@ -40,6 +40,7 @@ todo = "warn"
 # Internal crates (path deps with a version so `cargo deny` sees no wildcard),
 # referenced as `quiver-x = { workspace = true }`.
 quiver-core = { path = "crates/quiver-core", version = "0.24", package = "quiverdb-core" }
+quiver-cluster = { path = "crates/quiver-cluster", version = "0.24", package = "quiverdb-cluster" }
 quiver-crypto = { path = "crates/quiver-crypto", version = "0.24", package = "quiverdb-crypto" }
 quiver-embed = { path = "crates/quiver-embed", version = "0.24", package = "quiverdb-embed" }
 quiver-import = { path = "crates/quiver-import", version = "0.24", package = "quiverdb-import" }
