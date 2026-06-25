@@ -14,6 +14,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -27,6 +28,14 @@ use tokio::sync::RwLock;
 
 use crate::Config;
 use crate::error::Error;
+
+// A grace window ≥ the router's map-refresh interval, so every router has adopted the
+// new map version (and its dual-write / routing) before the coordinator relies on it
+// — once before the copy (dual-write active), once after the flip (slice routed to
+// the new shard) before dropping the donors' copies.
+const MIGRATION_GRACE: Duration = Duration::from_secs(3);
+// Page size for scrolling a donor's points during the copy.
+const COPY_PAGE: usize = 1_000;
 
 // What the coordinator persists so a restart recovers exactly: the versioned map
 // plus the monotonic id counter (so an id is never reused even across restarts).
@@ -42,8 +51,11 @@ struct CoordinatorState {
     next_id: AtomicU64,
     // Where the state is persisted on each change; `None` = in-memory only.
     path: Option<PathBuf>,
-    // An HTTP client for shard health probes.
+    // An HTTP client for shard health probes and migration copy/drop.
     http: reqwest::Client,
+    // Optional API key the coordinator presents to shards (a cluster runs over a
+    // trusted network, like the router — ADR-0030).
+    shard_key: Option<String>,
 }
 
 impl CoordinatorState {
@@ -62,6 +74,7 @@ impl CoordinatorState {
                 next_id: AtomicU64::new(persisted.next_id),
                 path,
                 http: reqwest::Client::new(),
+                shard_key: config.cluster_shard_key.clone(),
             });
         }
         let map = build_seed_map(config)?;
@@ -71,6 +84,7 @@ impl CoordinatorState {
             next_id: AtomicU64::new(next_id),
             path,
             http: reqwest::Client::new(),
+            shard_key: config.cluster_shard_key.clone(),
         };
         Ok(state)
     }
@@ -86,6 +100,241 @@ impl CoordinatorState {
         let bytes = serde_json::to_vec_pretty(&persisted)
             .map_err(|e| Error::Internal(format!("serialize coordinator state: {e}")))?;
         std::fs::write(p, bytes).map_err(Error::Io)
+    }
+
+    // --- Automated online migration (ADR-0066 increment 3c-ii) -------------
+
+    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.shard_key {
+            Some(k) => rb.bearer_auth(k),
+            None => rb,
+        }
+    }
+
+    // Send a JSON request to a shard, returning its parsed body (or `Null`).
+    async fn send_json(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Value,
+    ) -> Result<Value, Error> {
+        let resp = self
+            .auth(self.http.request(method, url).json(&body))
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("shard {url} unreachable: {e}")))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::Internal(format!(
+                "shard {url} returned {status}: {text}"
+            )));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    // The shard's collection schemas (the `GET /v1/collections` array of DTOs).
+    async fn list_collection_metas(&self, url: &str) -> Result<Vec<Value>, Error> {
+        let body = self
+            .send_json(
+                reqwest::Method::GET,
+                &format!("{url}/v1/collections"),
+                Value::Null,
+            )
+            .await?;
+        Ok(body.as_array().cloned().unwrap_or_default())
+    }
+
+    // Create `dto`'s collection on the new shard if it is missing (it predates the
+    // shard's join, so the cluster broadcast never reached it).
+    async fn ensure_collection(&self, new_url: &str, dto: &Value) -> Result<(), Error> {
+        let name = dto["name"].as_str().unwrap_or_default();
+        let exists = self
+            .auth(self.http.get(format!("{new_url}/v1/collections/{name}")))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if exists {
+            return Ok(());
+        }
+        let mut body = json!({
+            "name": dto["name"],
+            "dim": dto["dim"],
+            "metric": dto["metric"],
+            "index": dto["index"],
+        });
+        for k in ["pq_subspaces", "filterable", "vector_encryption"] {
+            if let Some(v) = dto.get(k) {
+                body[k] = v.clone();
+            }
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &format!("{new_url}/v1/collections"),
+            body,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    // One page of a donor's points (id + payload, and the vector when `with_vector`).
+    async fn fetch_page(
+        &self,
+        url: &str,
+        collection: &str,
+        offset: usize,
+        with_vector: bool,
+    ) -> Result<Vec<Value>, Error> {
+        let body = self
+            .send_json(
+                reqwest::Method::POST,
+                &format!("{url}/v1/collections/{collection}/fetch"),
+                json!({"offset": offset, "limit": COPY_PAGE, "with_payload": true, "with_vector": with_vector}),
+            )
+            .await?;
+        Ok(body["points"].as_array().cloned().unwrap_or_default())
+    }
+
+    // Copy the slice owned by `new_id` from one donor to the new shard, paginated.
+    // **Get-if-absent**: a point already on the new shard was put there by a concurrent
+    // dual-write (the latest value), so the copy never overwrites it with the donor's
+    // possibly-older read — no lost update.
+    async fn copy_slice(
+        &self,
+        donor: &str,
+        new_url: &str,
+        collection: &str,
+        map: &ShardMap,
+        new_id: u64,
+    ) -> Result<(), Error> {
+        let mut offset = 0usize;
+        loop {
+            let page = self.fetch_page(donor, collection, offset, true).await?;
+            let n = page.len();
+            for pt in &page {
+                let Some(id) = pt["id"].as_str() else {
+                    continue;
+                };
+                if map.shard_for(id).id != new_id {
+                    continue;
+                }
+                let get = format!("{new_url}/v1/collections/{collection}/points/{id}");
+                let present = self
+                    .auth(self.http.get(&get))
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false);
+                if present {
+                    continue;
+                }
+                self.send_json(
+                    reqwest::Method::POST,
+                    &format!("{new_url}/v1/collections/{collection}/points"),
+                    json!({"points": [{"id": id, "vector": pt["vector"], "payload": pt["payload"]}]}),
+                )
+                .await?;
+            }
+            offset += n;
+            if n < COPY_PAGE {
+                return Ok(());
+            }
+        }
+    }
+
+    // After the flip, delete the donor's now-stale copies of `new_id`'s slice.
+    async fn drop_slice(
+        &self,
+        donor: &str,
+        collection: &str,
+        map: &ShardMap,
+        new_id: u64,
+    ) -> Result<(), Error> {
+        let mut offset = 0usize;
+        let mut ids: Vec<String> = Vec::new();
+        loop {
+            let page = self.fetch_page(donor, collection, offset, false).await?;
+            let n = page.len();
+            for pt in &page {
+                if let Some(id) = pt["id"].as_str()
+                    && map.shard_for(id).id == new_id
+                {
+                    ids.push(id.to_owned());
+                }
+            }
+            offset += n;
+            if n < COPY_PAGE {
+                break;
+            }
+        }
+        for chunk in ids.chunks(COPY_PAGE) {
+            self.send_json(
+                reqwest::Method::DELETE,
+                &format!("{donor}/v1/collections/{collection}/points"),
+                json!({ "ids": chunk }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    // The full migration: wait for dual-write to be live, copy each donor's slice to
+    // the new shard, flip ownership, wait for routers to adopt the flip, then drop the
+    // donors' copies. Single-vector collections only (the scroll path); a multivector
+    // collection aborts the migration honestly rather than silently dropping its slice.
+    async fn run_migration(&self, new_id: u64) -> Result<(), Error> {
+        tokio::time::sleep(MIGRATION_GRACE).await;
+        // Snapshot the map: membership is stable during a migration (no concurrent
+        // grow), so this is a valid HRW oracle for the whole copy + drop.
+        let map = self.map.read().await.clone();
+        let new_url = map
+            .shards()
+            .iter()
+            .find(|s| s.id == new_id)
+            .map(|s| s.primary_url.clone())
+            .ok_or_else(|| Error::Internal("joining shard left the map".into()))?;
+        let donors: Vec<String> = map
+            .active_shards()
+            .iter()
+            .map(|s| s.primary_url.clone())
+            .collect();
+        let donor0 = donors
+            .first()
+            .ok_or_else(|| Error::Internal("no donor for migration".into()))?;
+        let collections = self.list_collection_metas(donor0).await?;
+        if collections
+            .iter()
+            .any(|c| c["multivector"].as_bool().unwrap_or(false))
+        {
+            return Err(Error::BadRequest(
+                "auto-migration does not yet support multivector collections".into(),
+            ));
+        }
+        for c in &collections {
+            let name = c["name"].as_str().unwrap_or_default().to_owned();
+            self.ensure_collection(&new_url, c).await?;
+            for donor in &donors {
+                self.copy_slice(donor, &new_url, &name, &map, new_id)
+                    .await?;
+            }
+        }
+        // Flip ownership atomically.
+        {
+            let mut m = self.map.write().await;
+            m.promote(new_id)
+                .map_err(|e| Error::BadRequest(e.to_string()))?;
+            self.persist(&m)?;
+        }
+        tokio::time::sleep(MIGRATION_GRACE).await;
+        for c in &collections {
+            let name = c["name"].as_str().unwrap_or_default().to_owned();
+            for donor in &donors {
+                self.drop_slice(donor, &name, &map, new_id).await?;
+            }
+        }
+        tracing::info!(shard = new_id, "cluster migration complete");
+        Ok(())
     }
 }
 
@@ -120,6 +369,7 @@ pub async fn serve_coordinator(config: Config, listener: TcpListener) -> Result<
         .route("/readyz", get(healthz))
         .route("/cluster/map", get(get_map))
         .route("/cluster/shards", post(add_shard))
+        .route("/cluster/shards/grow", post(grow))
         .route("/cluster/shards/joining", post(add_joining_shard))
         .route("/cluster/shards/{id}/promote", post(promote_shard))
         .route("/cluster/shards/{id}", axum::routing::delete(remove_shard))
@@ -156,6 +406,35 @@ async fn add_shard(
         .map_err(|e| Error::BadRequest(e.to_string()))?;
     st.persist(&map)?;
     Ok(Json(map.clone()))
+}
+
+// Grow the cluster by one shard (ADR-0066 increment 3c-ii): add it as joining, then
+// run the whole online migration — copy its slice from the donors, flip ownership,
+// drop the donors' copies — in the background, so the request returns immediately
+// with the joining map. The slice stays queryable and no acknowledged write is lost
+// throughout (the data plane of increment 3c-i). On any failure the join is reverted.
+async fn grow(
+    State(st): State<Arc<CoordinatorState>>,
+    Json(req): Json<AddShardReq>,
+) -> Result<Json<ShardMap>, Error> {
+    let id = st.next_id.fetch_add(1, Ordering::SeqCst);
+    let snapshot = {
+        let mut map = st.map.write().await;
+        map.add_joining_shard(id, &req.primary_url, req.replica_urls.clone())
+            .map_err(|e| Error::BadRequest(e.to_string()))?;
+        st.persist(&map)?;
+        map.clone()
+    };
+    let bg = st.clone();
+    tokio::spawn(async move {
+        if let Err(e) = bg.run_migration(id).await {
+            tracing::error!(shard = id, error = %e, "cluster migration failed; reverting the join");
+            let mut map = bg.map.write().await;
+            let _ = map.remove_shard(id);
+            let _ = bg.persist(&map);
+        }
+    });
+    Ok(Json(snapshot))
 }
 
 // Add a shard in the **joining** state (ADR-0066 increment 3c): it is in the map so

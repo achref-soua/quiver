@@ -25,8 +25,18 @@ for the per-release rationale and Definitions of Done.
   set with `add_joining_shard`/`promote`/`donor_for`/`active_shards`/
   `partition_to_donors`. An end-to-end test drives a join→copy→flip migration and
   proves the slice is queryable throughout and every acknowledged write survives the
-  flip. The coordinator's **automated** copy-and-flip loop (so an operator just adds a
-  shard) is the next increment (3c-ii); single-node and a static cluster are unaffected.
+  flip.
+- **Automated cluster growth** (ADR-0066, increment 3c-ii). `POST /cluster/shards/grow`
+  adds a shard and runs the **whole online migration in the background** — wait for
+  routers to adopt the joining map (dual-write live), **copy** the new shard's slice
+  from the donors (paginated scroll, **get-if-absent** so a concurrent dual-write is
+  never clobbered, provisioning the collection schema on the new shard), **promote**
+  (flip), then **drop** the donors' now-stale copies — so an operator grows the cluster
+  with a single call and the slice stays queryable with no lost writes throughout. On
+  any failure the join is reverted. (Single-vector collections; a multivector
+  collection aborts the migration honestly rather than dropping its slice silently.)
+  The point `fetch` endpoint gains an `offset` for paginated scroll. Single-node and a
+  static cluster are unaffected.
 - **Cluster coordinator + dynamic router refresh** (ADR-0066, increment 3b). A new
   opt-in **coordinator** mode (`QUIVER_COORDINATOR=true`) runs a thin, data-plane-free
   service that owns the authoritative, monotonically **versioned** shard map and serves

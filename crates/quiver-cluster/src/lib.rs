@@ -294,6 +294,7 @@ impl ShardMap {
             return Err(ClusterError::NoShards);
         }
         self.shards.retain(|s| s.id != id);
+        self.joining.retain(|&j| j != id); // an aborted join is fully cleaned up
         self.version += 1;
         Ok(())
     }
