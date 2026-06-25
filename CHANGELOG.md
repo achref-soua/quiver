@@ -10,6 +10,88 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-06-25
+
+*Elastic* — the cluster grows and replicates: per-shard read replicas (increment 2)
+and dynamic, elastic membership with online rebalancing behind a coordinator
+(increment 3 — ADR-0066), all opt-in, with single-node unchanged at zero overhead.
+
+### Added
+
+- **Cluster online slice migration — data plane** (ADR-0066, increment 3c). When a
+  shard joins, the coordinator can add it in a **joining** state (`POST
+  /cluster/shards/joining`) and later **promote** it (`POST
+  /cluster/shards/{id}/promote`). While a shard is joining, the router **dual-writes**
+  the migrating slice to both the joining owner and the **donor** that still serves it,
+  serves searches from the active shards (excluding the joining one, whose donor holds
+  the authoritative slice), and routes gets to the donor — so the slice stays queryable
+  and no write is lost. At promotion the slice's ownership flips atomically (a version
+  bump); a **dedup-by-id gather** absorbs the brief window where the donor and the
+  promoted shard both hold a slice point. `quiver_cluster::ShardMap` gains a `joining`
+  set with `add_joining_shard`/`promote`/`donor_for`/`active_shards`/
+  `partition_to_donors`. An end-to-end test drives a join→copy→flip migration and
+  proves the slice is queryable throughout and every acknowledged write survives the
+  flip.
+- **Automated cluster growth** (ADR-0066, increment 3c-ii). `POST /cluster/shards/grow`
+  adds a shard and runs the **whole online migration in the background** — wait for
+  routers to adopt the joining map (dual-write live), **copy** the new shard's slice
+  from the donors (paginated scroll, **get-if-absent** so a concurrent dual-write is
+  never clobbered, provisioning the collection schema on the new shard), **promote**
+  (flip), then **drop** the donors' now-stale copies — so an operator grows the cluster
+  with a single call and the slice stays queryable with no lost writes throughout. On
+  any failure the join is reverted. (Single-vector collections; a multivector
+  collection aborts the migration honestly rather than dropping its slice silently.)
+  The point `fetch` endpoint gains an `offset` for paginated scroll. Single-node and a
+  static cluster are unaffected.
+- **Cluster coordinator + dynamic router refresh** (ADR-0066, increment 3b). A new
+  opt-in **coordinator** mode (`QUIVER_COORDINATOR=true`) runs a thin, data-plane-free
+  service that owns the authoritative, monotonically **versioned** shard map and serves
+  a small membership API — `GET /cluster/map`, `POST /cluster/shards`,
+  `DELETE /cluster/shards/{id}`, `GET /cluster/health` — persisting its map + a
+  never-reused id counter to `QUIVER_COORDINATOR_STATE` so a restart recovers exactly.
+  A **router** given `QUIVER_COORDINATOR_URL` refreshes its shard map from the
+  coordinator on an interval and swaps any newer version into its `ArcSwap`, so adding
+  or removing a shard propagates **with no restart**; the coordinator is never a
+  per-query dependency. A router also exposes its currently adopted map read-only at
+  `GET /cluster/map`. No data migration yet (that is 3c) — a freshly added shard owns
+  only the keys that now hash to it. Single-node and a static cluster are unaffected.
+
+### Changed
+
+- **Stable shard ids** (ADR-0066, increment-3 groundwork). `quiver_cluster::Shard`
+  now carries an immutable `id: u64` — **the HRW key** — instead of a positional
+  `index: usize`, decoupled from the shard's position so a shard can be removed
+  without re-keying (and moving the data of) its survivors. `ShardMap` keys
+  `partition`/`add_replica` by id and gains `from_shards` for non-contiguous ids (the
+  gap a removed shard leaves); `partition` now yields `(&Shard, group)`. `from_urls`
+  is unchanged (ids `0..N`), so a static cluster's routing and on-the-wire behaviour
+  are byte-identical and `QUIVER_CLUSTER_REPLICAS`'s `<shard_id>=<url>` form still
+  targets `0..N`. Pure `quiver-cluster` refactor; single-node unaffected.
+
+### Added
+
+- **Cluster read replicas** (ADR-0065 increment 2), opt-in via
+  `QUIVER_CLUSTER_REPLICAS` (a list of `<shard_index>=<replica_url>` entries). Each
+  shard can now declare one or more **read replicas** — ordinary leader-follower
+  followers (ADR-0030) of the shard's primary, reused unchanged. Writes, gets and
+  deletes still go to the single primary per shard; **searches round-robin across
+  `{primary} ∪ replicas`** to spread read load, falling back to another copy if one
+  is unreachable. Replicas are eventually consistent (replication lag) and refuse
+  direct writes, so a mis-route cannot corrupt one. `quiver_cluster::Shard` gains
+  `replica_urls` + `read_url`/`read_order`; `ShardMap::add_replica` attaches them.
+  An end-to-end test boots primaries + followers + a router + a single-node baseline
+  and proves replica-served top-k equals the baseline, a replica refuses writes, and
+  the router tolerates a down replica. Single-node and primary-only shards are
+  unaffected. The **"Quiver, Explained"** field guide gains §9.9 + a read-replica
+  figure (now 54 pages).
+
+### Fixed
+
+- `QUIVER_CLUSTER_SHARDS` / `QUIVER_CLUSTER_REPLICAS` env values are figment array
+  literals and must be **bracketed** (`[http://s1:6333,http://s2:6333]`); the
+  `.env.example` and config docs previously showed an unbracketed comma list, which
+  figment rejects as "expected a sequence" at startup.
+
 ## [0.25.0] — 2026-06-25
 
 ### Added
@@ -434,7 +516,8 @@ for the per-release rationale and Definitions of Done.
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/achref-soua/quiver/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/achref-soua/quiver/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/achref-soua/quiver/compare/v0.23.0...v0.24.0
 [0.22.0]: https://github.com/achref-soua/quiver/compare/v0.21.0...v0.22.0
