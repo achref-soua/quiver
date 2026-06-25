@@ -42,17 +42,37 @@ Two questions this ADR must settle before any code:
 
 ## Decision
 
-**Build cluster mode in increments behind an opt-in `cluster` mode, sharding
-first and consensus last, and use an audited Raft library for the consensus
-layer rather than a hand-rolled log.**
+**Build cluster mode in increments behind an opt-in `cluster` mode, designed for
+*dynamic, elastic* scaling from the start, and use an audited Raft library for the
+consensus layer rather than a hand-rolled log.**
 
-### Sharding & routing (the data-path shape, unchanged from ADR-0051)
+Dynamic scaling is a first-class goal, not a bolt-on: shards must be able to
+**join and leave at runtime** (manually or by an autoscaler) with **minimal data
+movement** and **no downtime**. Three best-practice choices make that possible and
+are baked in from increment 1:
 
-- **Shard map.** A versioned `ShardMap { version, shards: [{ id, key_range,
-  primary, replicas }] }`. Increment 1 ships a **static, operator-declared** map
-  (fixed N); online resharding is a later increment. Keys hash from the
-  **external point id** (never the payload), so load is even and a point's home
-  shard is a pure function of its id.
+- **Rendezvous (HRW) hashing**, not modulo-N or fixed ranges. With HRW, adding or
+  removing a shard remaps only ~`1/N` of point ids — the rest stay put — so an
+  elastic membership change rebalances a small, bounded slice rather than
+  reshuffling the whole keyspace. (Modulo-N would remap nearly everything on a
+  resize; a hash ring with virtual nodes is the alternative, but HRW gives the same
+  minimal-reshuffle property with no ring bookkeeping.)
+- **A versioned, refreshable shard map**, never a hard-coded static list. The map
+  carries a monotonic `version`; routers cache it and **refresh** it (so a
+  membership change propagates without restarting the router), and a shard that
+  receives a misrouted request answers "not my range" so a stale map self-corrects
+  on the data path.
+- **Routing as a pure function of the *current* map**, so the same id deterministically
+  resolves to its owner under whatever the live membership is.
+
+### Sharding & routing (the data-path shape)
+
+- **Shard map.** A versioned `ShardMap { version, shards: [{ id, url, … }] }`, keyed
+  by **rendezvous (HRW) hashing of the external point id** (never the payload). It
+  is **dynamic by construction** — the set can change at runtime and the map is
+  refreshed, not recompiled. Increment 1 *seeds* the map from operator-declared
+  shard URLs, but the type and the router are built for membership churn; online
+  rebalancing (increment below) moves only the HRW-remapped slice.
 - **Router.** A stateless tier that hashes the id for single-shard ops
   (upsert/get/delete) and **scatter-gathers** queries: send the ANN/hybrid query
   to every shard, request `k` (or `k·overfetch` under id-hash skew) from each,
@@ -87,22 +107,36 @@ heavy dependency.)
 
 ## Increments (each its own flag-gated PR, single-node default untouched)
 
-1. **Sharding + scatter-gather, no consensus.** The `ShardMap` type, the hashing,
-   a router that single-shard-routes writes/gets and scatter-gathers queries over
-   a **static** map of single-primary shards (no replicas yet). Correctness oracle:
-   a multi-shard cluster returns the **same top-k as a single node** holding the
-   same data (scatter-gather vs single-node ground truth). No HA yet — a shard
-   down means its slice is unavailable, surfaced honestly.
+1. **Sharding + scatter-gather over a refreshable map.** The `ShardMap` (HRW
+   hashing, versioned, refreshable — *not* a static-only list), and a router that
+   single-shard-routes writes/gets and scatter-gathers queries over the current
+   membership of single-primary shards (no replicas yet). Correctness oracle: a
+   multi-shard cluster returns the **same top-k as a single node** holding the same
+   data (scatter-gather vs single-node ground truth). The map is seeded from
+   operator-declared shard URLs; the *type and router* already support membership
+   churn so increment 3 adds it without a redesign. No HA yet — a shard down means
+   its slice is unavailable, surfaced honestly.
 2. **Per-shard read replicas.** Reuse ADR-0030 log shipping per shard so a shard's
-   replicas serve reads and stay warm — read scale-out within the cluster, still
-   no failover.
-3. **Per-shard consensus (Raft) + automatic failover.** Adopt the chosen Raft
-   crate; leader election, membership changes, and promotion-without-data-loss.
-   Tests: partition/rejoin, leader-kill failover (no lost acked writes),
-   split-brain safety, all against single-node ground truth; loom/property tests
-   where they fit the small deterministic state machines.
-4. **Coordinator + online resharding.** The thin control plane owns the map,
-   health, and rebalance orchestration, off the data path.
+   replicas serve reads and stay warm — read scale-out within the cluster.
+3. **Dynamic, elastic membership + online rebalancing (the headline of dynamic
+   scaling).** A thin **coordinator** owns the versioned shard map and shard health;
+   routers **refresh** the map (no restart), and a shard added or removed at runtime
+   triggers **online migration** of only the HRW-remapped `~1/N` slice — reads and
+   writes continue throughout (the donor serves until the recipient is caught up,
+   then the map version flips; a stale router self-corrects via the shard-side "not
+   my range" redirect). This is what makes scaling *dynamic*: grow or shrink the
+   cluster under live load without downtime and without reshuffling the whole
+   dataset.
+4. **Per-shard consensus (Raft) + automatic failover (write HA).** Adopt the chosen
+   audited Raft crate; leader election, promotion-without-data-loss. Tests:
+   partition/rejoin, leader-kill failover (no lost acked writes), split-brain
+   safety, all against single-node ground truth; loom/property tests where they fit
+   the small deterministic state machines.
+5. **Autoscaling hooks (optional, best-practice automation).** Drive increment-3
+   membership changes from load/capacity signals (per-shard RSS, QPS, disk) behind
+   an explicit policy — so the cluster can scale itself, not only by operator action.
+   Kept last and opt-in: automatic resizing is only safe once online rebalancing
+   (3) and write HA (4) are proven.
 
 Single-node remains the default and pays nothing: cluster code is behind the mode
 gate, and an engine that is not a shard behaves exactly as today.
