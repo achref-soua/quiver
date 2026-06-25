@@ -10,6 +10,12 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-06-25
+
+*Elastic* — the cluster grows and replicates: per-shard read replicas (increment 2)
+and dynamic, elastic membership with online rebalancing behind a coordinator
+(increment 3 — ADR-0066), all opt-in, with single-node unchanged at zero overhead.
+
 ### Added
 
 - **Cluster online slice migration — data plane** (ADR-0066, increment 3c). When a
@@ -510,7 +516,8 @@ for the per-release rationale and Definitions of Done.
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/achref-soua/quiver/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/achref-soua/quiver/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/achref-soua/quiver/compare/v0.23.0...v0.24.0
 [0.22.0]: https://github.com/achref-soua/quiver/compare/v0.21.0...v0.22.0
