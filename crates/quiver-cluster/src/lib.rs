@@ -115,6 +115,13 @@ pub struct ShardMap {
     #[serde(default)]
     version: u64,
     shards: Vec<Shard>,
+    /// Ids of shards currently **joining** (ADR-0066 increment 3c): present in the
+    /// map (so HRW already routes their slice to them) but not yet the authoritative
+    /// owner of that slice — the *donor* still serves it until the migration flips.
+    /// A router uses this to dual-write the slice (to the joining shard **and** its
+    /// donor) and to exclude joining shards from search until they are promoted.
+    #[serde(default)]
+    joining: Vec<u64>,
 }
 
 impl ShardMap {
@@ -160,7 +167,11 @@ impl ShardMap {
         if let Some(dup) = shards.iter().find(|s| !seen.insert(s.id)) {
             return Err(ClusterError::DuplicateShardId(dup.id));
         }
-        Ok(Self { version: 0, shards })
+        Ok(Self {
+            version: 0,
+            shards,
+            joining: Vec::new(),
+        })
     }
 
     /// The map's version. A router only adopts a refreshed map whose version is
@@ -197,6 +208,75 @@ impl ShardMap {
         });
         self.version += 1;
         Ok(())
+    }
+
+    /// Add a shard in the **joining** state (ADR-0066 increment 3c): it is in the map
+    /// (HRW routes its slice to it) but is not yet the authoritative owner — its donor
+    /// keeps serving the slice until [`promote`](Self::promote). Bumps the version.
+    ///
+    /// # Errors
+    /// As [`add_shard`](Self::add_shard).
+    pub fn add_joining_shard<S: Into<String>>(
+        &mut self,
+        id: u64,
+        primary_url: S,
+        replica_urls: Vec<String>,
+    ) -> Result<(), ClusterError> {
+        self.add_shard(id, primary_url, replica_urls)?;
+        self.joining.push(id);
+        // `add_shard` already bumped the version once; the joining flag is part of the
+        // same membership change, so no second bump.
+        Ok(())
+    }
+
+    /// Promote a joining shard to the authoritative owner of its slice (the migration
+    /// **flip**, ADR-0066): clear its joining flag and bump the version. After this,
+    /// routers route the slice's writes/gets/searches to it and the donor may drop
+    /// the slice.
+    ///
+    /// # Errors
+    /// [`ClusterError::UnknownShard`] if `id` is not currently joining.
+    pub fn promote(&mut self, id: u64) -> Result<(), ClusterError> {
+        if !self.joining.contains(&id) {
+            return Err(ClusterError::UnknownShard(id));
+        }
+        self.joining.retain(|&j| j != id);
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Whether the shard with `id` is currently joining (not yet the slice owner).
+    #[must_use]
+    pub fn is_joining(&self, id: u64) -> bool {
+        self.joining.contains(&id)
+    }
+
+    /// The **donor** for `point_id` during a migration: when `point_id`'s HRW owner is
+    /// a *joining* shard, this is the shard that still owns the slice — the HRW winner
+    /// among the **active** (non-joining) shards. `None` when the owner is already
+    /// active (no migration in flight for this id). Writes are dual-written to the
+    /// owner **and** this donor; gets and searches for the slice go here until the
+    /// flip.
+    #[must_use]
+    pub fn donor_for(&self, point_id: &str) -> Option<&Shard> {
+        if !self.is_joining(self.shard_for(point_id).id) {
+            return None;
+        }
+        self.shards
+            .iter()
+            .filter(|s| !self.is_joining(s.id))
+            .max_by_key(|s| hrw_score(s.id, point_id))
+    }
+
+    /// The shards that may serve **searches** — the active (non-joining) ones. A
+    /// joining shard is excluded because its donor still holds the authoritative
+    /// slice; including both would double-count (the donor covers the slice).
+    #[must_use]
+    pub fn active_shards(&self) -> Vec<&Shard> {
+        self.shards
+            .iter()
+            .filter(|s| !self.is_joining(s.id))
+            .collect()
     }
 
     /// Remove the shard with `id` and bump the version. Refuses to remove the **last**
@@ -298,6 +378,33 @@ impl ShardMap {
         self.shards
             .iter()
             .filter_map(|s| by_id.remove(&s.id).map(|g| (s, g)))
+            .collect()
+    }
+
+    /// Partition the **migrating** items — those whose HRW owner is a joining shard —
+    /// by their [`donor_for`](Self::donor_for) (ADR-0066 increment 3c), so the router
+    /// can **dual-write** the slice to the donor as well as the owner. Items not in a
+    /// migrating slice are omitted, so with no migration in flight this is empty and
+    /// the router does no extra work.
+    #[must_use]
+    pub fn partition_to_donors<'a, T, F>(
+        &'a self,
+        items: &'a [T],
+        id_of: F,
+    ) -> Vec<(&'a Shard, Vec<&'a T>)>
+    where
+        F: Fn(&T) -> &str,
+    {
+        let mut by_donor: std::collections::HashMap<u64, Vec<&T>> =
+            std::collections::HashMap::new();
+        for item in items {
+            if let Some(donor) = self.donor_for(id_of(item)) {
+                by_donor.entry(donor.id).or_default().push(item);
+            }
+        }
+        self.shards
+            .iter()
+            .filter_map(|s| by_donor.remove(&s.id).map(|g| (s, g)))
             .collect()
     }
 }
@@ -663,6 +770,76 @@ mod tests {
         let mut m = ShardMap::from_urls(["http://only"]).unwrap();
         assert_eq!(m.remove_shard(0).unwrap_err(), ClusterError::NoShards);
         assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn joining_shard_routes_through_its_donor_until_promoted() {
+        // Start with two active shards, then add a third as *joining*.
+        let mut m = ShardMap::from_urls(["http://a", "http://b"]).unwrap();
+        m.add_joining_shard(2, "http://c", vec![]).unwrap();
+        assert!(m.is_joining(2));
+        assert_eq!(m.version(), 1);
+        // Search shards exclude the joining one (its donor covers the slice).
+        assert_eq!(
+            m.active_shards().iter().map(|s| s.id).collect::<Vec<_>>(),
+            [0, 1]
+        );
+
+        // Find a key whose HRW owner is the joining shard 2; its donor must be an
+        // active shard (0 or 1) and equal to the owner under the 2-shard map.
+        let two = ShardMap::from_urls(["http://a", "http://b"]).unwrap();
+        let mut checked_slice = 0;
+        for i in 0..2_000 {
+            let id = format!("k{i}");
+            if m.shard_for(&id).id == 2 {
+                let donor = m.donor_for(&id).expect("a joining owner has a donor");
+                assert!(donor.id == 0 || donor.id == 1);
+                assert_eq!(donor.id, two.shard_for(&id).id, "donor == pre-join owner");
+                checked_slice += 1;
+            } else {
+                // A non-migrating key has no donor.
+                assert!(m.donor_for(&id).is_none());
+            }
+        }
+        assert!(
+            checked_slice > 0,
+            "some keys should hash to the joining shard"
+        );
+
+        // Promote: the flip clears the joining flag, bumps the version, and the
+        // shard becomes a normal active owner with no donor.
+        m.promote(2).unwrap();
+        assert!(!m.is_joining(2));
+        assert_eq!(m.version(), 2);
+        assert_eq!(m.active_shards().len(), 3);
+        assert!((0..2_000).all(|i| m.donor_for(&format!("k{i}")).is_none()));
+        // Promoting a non-joining shard is an error.
+        assert_eq!(m.promote(2).unwrap_err(), ClusterError::UnknownShard(2));
+    }
+
+    #[test]
+    fn partition_to_donors_covers_only_the_migrating_slice() {
+        let mut m = ShardMap::from_urls(["http://a", "http://b"]).unwrap();
+        // No migration in flight ⇒ no dual-write work.
+        let ids: Vec<String> = (0..100).map(|i| format!("k{i}")).collect();
+        assert!(m.partition_to_donors(&ids, |s| s.as_str()).is_empty());
+
+        m.add_joining_shard(2, "http://c", vec![]).unwrap();
+        let donor_groups = m.partition_to_donors(&ids, |s| s.as_str());
+        // Every dual-written item is one whose owner is the joining shard, and it is
+        // grouped under an active donor.
+        let mut dual = 0;
+        for (donor, group) in &donor_groups {
+            assert!(donor.id == 0 || donor.id == 1);
+            for id in group {
+                assert_eq!(m.shard_for(id).id, 2);
+                dual += 1;
+            }
+        }
+        // The dual-written set equals exactly the keys owned by the joining shard.
+        let owned_by_joiner = ids.iter().filter(|id| m.shard_for(id).id == 2).count();
+        assert_eq!(dual, owned_by_joiner);
+        assert!(dual > 0);
     }
 
     #[test]

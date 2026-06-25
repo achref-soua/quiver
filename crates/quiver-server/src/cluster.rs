@@ -294,23 +294,42 @@ impl Cluster {
         endpoint: &str,
     ) -> Result<u64, Error> {
         let map = self.map.load();
-        let groups = map.partition(&points, |p| p.id.as_str());
+        // Each point goes to its HRW owner; the returned count is the logical upsert.
         let mut total = 0u64;
-        for (shard, group) in groups {
-            let dtos: Vec<Value> = group
-                .iter()
-                .map(|p| json!({ "id": p.id, "vector": p.vector, "payload": p.payload }))
-                .collect();
-            let url = format!(
-                "{}/v1/collections/{collection}/{endpoint}",
-                shard.primary_url
-            );
-            let resp = self
-                .send(reqwest::Method::POST, url, Some(json!({ "points": dtos })))
+        for (shard, group) in map.partition(&points, |p| p.id.as_str()) {
+            total += self
+                .post_points(collection, endpoint, &shard.primary_url, &group)
                 .await?;
-            total += resp.get("upserted").and_then(Value::as_u64).unwrap_or(0);
+        }
+        // Migration dual-write (ADR-0066 increment 3c): a point whose owner is a
+        // *joining* shard is also written to the donor that still serves the slice, so
+        // a write during migration is on both and the flip loses nothing. The donor
+        // copy is not counted (it is the same logical point). Empty when no migration
+        // is in flight, so a steady-state cluster does no extra work.
+        for (donor, group) in map.partition_to_donors(&points, |p| p.id.as_str()) {
+            self.post_points(collection, endpoint, &donor.primary_url, &group)
+                .await?;
         }
         Ok(total)
+    }
+
+    // POST a group of points to one shard, returning its `upserted` count.
+    async fn post_points(
+        &self,
+        collection: &str,
+        endpoint: &str,
+        primary_url: &str,
+        group: &[&PointIn],
+    ) -> Result<u64, Error> {
+        let dtos: Vec<Value> = group
+            .iter()
+            .map(|p| json!({ "id": p.id, "vector": p.vector, "payload": p.payload }))
+            .collect();
+        let url = format!("{primary_url}/v1/collections/{collection}/{endpoint}");
+        let resp = self
+            .send(reqwest::Method::POST, url, Some(json!({ "points": dtos })))
+            .await?;
+        Ok(resp.get("upserted").and_then(Value::as_u64).unwrap_or(0))
     }
 
     pub(crate) async fn delete_points(
@@ -319,17 +338,33 @@ impl Cluster {
         ids: Vec<String>,
     ) -> Result<u64, Error> {
         let map = self.map.load();
-        let groups = map.partition(&ids, |id| id.as_str());
         let mut total = 0u64;
-        for (shard, group) in groups {
-            let owned: Vec<&String> = group;
-            let url = format!("{}/v1/collections/{collection}/points", shard.primary_url);
-            let resp = self
-                .send(reqwest::Method::DELETE, url, Some(json!({ "ids": owned })))
+        for (shard, group) in map.partition(&ids, |id| id.as_str()) {
+            total += self
+                .delete_group(collection, &shard.primary_url, &group)
                 .await?;
-            total += resp.get("deleted").and_then(Value::as_u64).unwrap_or(0);
+        }
+        // Migration dual-delete (ADR-0066 increment 3c): also remove from the donor so
+        // a delete during a join is not resurrected by the slice copy. Not counted.
+        for (donor, group) in map.partition_to_donors(&ids, |id| id.as_str()) {
+            self.delete_group(collection, &donor.primary_url, &group)
+                .await?;
         }
         Ok(total)
+    }
+
+    // DELETE a group of ids from one shard, returning its `deleted` count.
+    async fn delete_group(
+        &self,
+        collection: &str,
+        primary_url: &str,
+        group: &[&String],
+    ) -> Result<u64, Error> {
+        let url = format!("{primary_url}/v1/collections/{collection}/points");
+        let resp = self
+            .send(reqwest::Method::DELETE, url, Some(json!({ "ids": group })))
+            .await?;
+        Ok(resp.get("deleted").and_then(Value::as_u64).unwrap_or(0))
     }
 
     // --- Reads -------------------------------------------------------------
@@ -343,9 +378,10 @@ impl Cluster {
         let map = self.map.load();
         let mut out = Vec::new();
         for id in &ids {
-            let shard = map.shard_for(id);
-            // Gets go to the primary (read-your-writes; replicas are eventually
-            // consistent — they serve searches, not point lookups).
+            // Gets go to the authoritative primary: the donor while the owner is a
+            // joining shard mid-migration (ADR-0066), else the HRW owner. Replicas are
+            // eventually consistent — they serve searches, not point lookups.
+            let shard = map.donor_for(id).unwrap_or_else(|| map.shard_for(id));
             let url = format!(
                 "{}/v1/collections/{collection}/points/{id}",
                 shard.primary_url
@@ -394,8 +430,12 @@ impl Cluster {
         // eventually consistent — a replica may lag its primary (ADR-0030).
         let map = self.map.load();
         let base = self.read_rr.fetch_add(1, Ordering::Relaxed);
-        let mut per_shard: Vec<Vec<MatchOut>> = Vec::with_capacity(map.len());
-        for shard in map.shards() {
+        // Scatter only to *active* shards: a joining shard is excluded because its
+        // donor still holds the authoritative slice (ADR-0066 increment 3c) — querying
+        // both would double-count. With no migration in flight this is every shard.
+        let active = map.active_shards();
+        let mut per_shard: Vec<Vec<MatchOut>> = Vec::with_capacity(active.len());
+        for shard in &active {
             let resp = self
                 .shard_query(
                     shard,
@@ -406,8 +446,16 @@ impl Cluster {
                 .await?;
             per_shard.push(matches_from_json(&resp, with_vector));
         }
-        // Gather: merge to the exact global top-k by score.
-        Ok(merge_top_k(per_shard, k, |m| m.score, higher))
+        // Gather: dedup by id, then merge to the exact global top-k by score. The
+        // dedup absorbs the brief post-flip window where a just-promoted shard and its
+        // donor both still hold a slice point, so it is never double-counted.
+        let mut seen = std::collections::HashSet::new();
+        let deduped: Vec<MatchOut> = per_shard
+            .into_iter()
+            .flatten()
+            .filter(|m| seen.insert(m.id.clone()))
+            .collect();
+        Ok(merge_top_k(vec![deduped], k, |m| m.score, higher))
     }
 
     // The score ordering for `collection` (cached on create; learned by describing
