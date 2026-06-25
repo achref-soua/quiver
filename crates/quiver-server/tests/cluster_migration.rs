@@ -266,3 +266,103 @@ async fn online_join_migration_loses_no_writes_and_stays_queryable() {
     assert_router_matches_baseline(&http, &router, &baseline).await;
     assert_all_present(&http, &router, 150).await;
 }
+
+// Poll until the cluster holds exactly `expected` points total (the donors' slice
+// copies have been dropped after the flip — no duplicates remain).
+async fn wait_total(http: &reqwest::Client, shards: &[&str], expected: u64) {
+    for _ in 0..400 {
+        let mut total = 0;
+        for s in shards {
+            total += count(http, s).await;
+        }
+        if total == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("cluster never settled to {expected} points (drop incomplete?)");
+}
+
+#[tokio::test]
+async fn auto_grow_migrates_the_slice_with_no_loss() {
+    let dirs: Vec<_> = (0..6).map(|_| tempfile::tempdir().unwrap()).collect();
+    let state = tempfile::tempdir().unwrap();
+    let http = reqwest::Client::new();
+
+    let s0 = boot(Config {
+        data_dir: dirs[0].path().into(),
+        ..Default::default()
+    })
+    .await;
+    let s1 = boot(Config {
+        data_dir: dirs[1].path().into(),
+        ..Default::default()
+    })
+    .await;
+    let s2 = boot(Config {
+        data_dir: dirs[2].path().into(),
+        ..Default::default()
+    })
+    .await;
+    let baseline = boot(Config {
+        data_dir: dirs[3].path().into(),
+        ..Default::default()
+    })
+    .await;
+    for b in [&s0, &s1, &s2, &baseline] {
+        wait_ready(&http, b).await;
+    }
+    let coordinator = boot(Config {
+        data_dir: dirs[4].path().into(),
+        coordinator: true,
+        coordinator_state: Some(state.path().join("coord.json")),
+        cluster_shards: vec![s0.clone(), s1.clone()],
+        ..Default::default()
+    })
+    .await;
+    wait_ready(&http, &coordinator).await;
+    let router = boot(Config {
+        data_dir: dirs[5].path().into(),
+        cluster_shards: vec![s0.clone(), s1.clone()],
+        coordinator_url: Some(coordinator.clone()),
+        ..Default::default()
+    })
+    .await;
+    wait_ready(&http, &router).await;
+
+    // The collection is created on the donors + baseline — NOT on s2; the coordinator
+    // must provision it on the new shard during the migration.
+    for b in [&s0, &s1, &baseline] {
+        create(&http, b).await;
+    }
+    upsert_range(&http, &router, 0, 120).await;
+    upsert_range(&http, &baseline, 0, 120).await;
+
+    // One call grows the cluster; the coordinator copies, flips, and drops in the
+    // background. The response is the joining map (v1).
+    let resp: Value = http
+        .post(format!("{coordinator}/cluster/shards/grow"))
+        .json(&json!({ "primary_url": s2 }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["version"].as_u64().unwrap(), 1);
+
+    // A write *during* the background migration must survive (dual-write + copy).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    upsert_range(&http, &router, 120, 180).await;
+    upsert_range(&http, &baseline, 120, 180).await;
+
+    // The migration flips (v2) and then drops the donors' copies, settling the cluster
+    // to exactly 180 points with the new shard owning its slice.
+    wait_router_version(&http, &router, 2).await;
+    wait_total(&http, &[&s0, &s1, &s2], 180).await;
+    assert!(count(&http, &s2).await > 0, "the new shard owns no slice");
+
+    // Queryable + correct throughout, and every acknowledged write survived.
+    assert_router_matches_baseline(&http, &router, &baseline).await;
+    assert_all_present(&http, &router, 180).await;
+}

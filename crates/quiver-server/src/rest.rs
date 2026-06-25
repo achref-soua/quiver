@@ -787,6 +787,9 @@ async fn search_text(
 struct FetchBody {
     #[serde(default)]
     filter: Option<Filter>,
+    /// Skip this many matching points (for paginated scroll over a large collection).
+    #[serde(default)]
+    offset: usize,
     #[serde(default = "default_fetch_limit")]
     limit: usize,
     #[serde(default = "default_true")]
@@ -834,6 +837,7 @@ async fn fetch(
             &principal,
             name,
             body.filter,
+            body.offset,
             body.limit,
             body.with_payload,
             body.with_vector,

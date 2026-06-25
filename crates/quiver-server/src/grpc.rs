@@ -663,6 +663,7 @@ impl Quiver for QuiverService {
                 &principal,
                 req.collection,
                 filter,
+                0,
                 limit,
                 req.with_payload,
                 req.with_vector,

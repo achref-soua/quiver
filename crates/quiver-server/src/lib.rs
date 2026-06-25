@@ -1560,11 +1560,13 @@ impl AppState {
         self.upsert(principal, collection, dense).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn fetch(
         &self,
         principal: &Principal,
         collection: String,
         filter: Option<Filter>,
+        offset: usize,
         limit: usize,
         with_payload: bool,
         with_vector: bool,
@@ -1575,6 +1577,7 @@ impl AppState {
             let matches = db.fetch(
                 &collection,
                 filter.as_ref(),
+                offset,
                 limit,
                 with_payload,
                 with_vector,
