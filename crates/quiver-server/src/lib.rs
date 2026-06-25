@@ -32,6 +32,7 @@
 mod audit;
 mod auth;
 mod cluster;
+mod coordinator;
 mod error;
 mod grpc;
 mod metrics;
@@ -366,16 +367,44 @@ pub struct Config {
     #[serde(default)]
     pub mvcc_reads: bool,
     /// Opt-in **cluster router** mode (ADR-0065): a non-empty list of shard base
-    /// URLs (e.g. `["http://s1:6333","http://s2:6333"]`, or `QUIVER_CLUSTER_SHARDS`
-    /// comma-separated) makes this server a stateless router that shards writes and
-    /// scatter-gathers searches across the shards. Empty (the default) = an ordinary
-    /// single-node server.
+    /// URLs (e.g. `["http://s1:6333","http://s2:6333"]`, or the bracketed
+    /// `QUIVER_CLUSTER_SHARDS` env array `[http://s1:6333,http://s2:6333]`) makes
+    /// this server a stateless router that shards writes and scatter-gathers
+    /// searches across the shards. Empty (the default) = an ordinary single-node
+    /// server.
     #[serde(default)]
     pub cluster_shards: Vec<String>,
+    /// Optional per-shard **read replicas** (ADR-0065 increment 2). Each entry is
+    /// `"<shard_index>=<replica_url>"` (repeat the index for several replicas of one
+    /// shard), e.g. `["0=http://s1b:6333", "1=http://s2b:6333"]` or the bracketed
+    /// `QUIVER_CLUSTER_REPLICAS` env list. A replica is an ordinary follower
+    /// (ADR-0030) of its shard's primary; the router fans searches across
+    /// `{primary} ∪ replicas` to spread read load. A shard with no entry is
+    /// primary-only. Empty (the default) = no replicas.
+    #[serde(default)]
+    pub cluster_replicas: Vec<String>,
     /// Optional API key the router presents to its shards (a cluster runs over a
     /// trusted network). `None` = shards are unauthenticated.
     #[serde(default)]
     pub cluster_shard_key: Option<String>,
+    /// Run this process as the **cluster coordinator** (ADR-0066) instead of a
+    /// normal server: it owns the authoritative versioned shard map and serves the
+    /// `/cluster/*` membership API, off the data path. It seeds its map from
+    /// `cluster_shards`/`cluster_replicas` (or recovers it from `coordinator_state`).
+    /// Default `false`.
+    #[serde(default)]
+    pub coordinator: bool,
+    /// Base URL of the cluster coordinator (ADR-0066). When set on a **router**, the
+    /// router refreshes its shard map from `GET {url}/cluster/map` on an interval, so
+    /// a membership change propagates without a restart. `None` = a static map from
+    /// `cluster_shards` (increments 1–2 behaviour).
+    #[serde(default)]
+    pub coordinator_url: Option<String>,
+    /// Where the **coordinator** persists its versioned map + id counter, so a
+    /// restart recovers the exact membership (and never reuses a shard id). `None` =
+    /// in-memory only (lost on restart). Only meaningful with `coordinator = true`.
+    #[serde(default)]
+    pub coordinator_state: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -401,7 +430,11 @@ impl Default for Config {
             otlp: OtlpConfig::default(),
             mvcc_reads: false,
             cluster_shards: Vec::new(),
+            cluster_replicas: Vec::new(),
             cluster_shard_key: None,
+            coordinator: false,
+            coordinator_url: None,
+            coordinator_state: None,
         }
     }
 }
@@ -1527,11 +1560,13 @@ impl AppState {
         self.upsert(principal, collection, dense).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn fetch(
         &self,
         principal: &Principal,
         collection: String,
         filter: Option<Filter>,
+        offset: usize,
         limit: usize,
         with_payload: bool,
         with_vector: bool,
@@ -1542,6 +1577,7 @@ impl AppState {
             let matches = db.fetch(
                 &collection,
                 filter.as_ref(),
+                offset,
                 limit,
                 with_payload,
                 with_vector,
@@ -1694,6 +1730,13 @@ pub async fn serve(
     rest_listener: TcpListener,
     grpc_listener: TcpListener,
 ) -> Result<(), Error> {
+    // Coordinator mode (ADR-0066) is a wholly separate, data-plane-free service: it
+    // owns the versioned shard map and serves the membership API on the REST
+    // listener. It opens no database and runs no gRPC.
+    if config.coordinator {
+        drop(grpc_listener);
+        return coordinator::serve_coordinator(config, rest_listener).await;
+    }
     let mut db = open_database(&config)?;
     let audit = Arc::new(AuditLog::open(config.audit_log.as_deref())?);
     // Publish every committed op to replication followers (ADR-0030). The observer
@@ -1725,10 +1768,26 @@ pub async fn serve(
     } else {
         let c = cluster::Cluster::new(
             config.cluster_shards.clone(),
+            config.cluster_replicas.clone(),
             config.cluster_shard_key.clone(),
         )?;
         tracing::info!(shards = c.shard_count(), "quiver cluster router enabled");
-        Some(Arc::new(c))
+        let c = Arc::new(c);
+        // With a coordinator (ADR-0066), refresh the shard map from it so a
+        // membership change propagates without a restart. The seed above is the
+        // bootstrap map; the coordinator's map (≥ version 0) takes over on refresh.
+        if let Some(coord) = config.coordinator_url.clone() {
+            let router = c.clone();
+            tokio::spawn(async move {
+                loop {
+                    if let Err(e) = router.refresh_from(&coord).await {
+                        tracing::debug!(error = %e, "shard-map refresh failed; will retry");
+                    }
+                    tokio::time::sleep(cluster::MAP_REFRESH_INTERVAL).await;
+                }
+            });
+        }
+        Some(c)
     };
 
     let state = AppState {

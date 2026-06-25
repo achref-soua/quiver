@@ -348,7 +348,7 @@ fn call_tool_embed(
                 _ => None,
             };
             let points = db
-                .fetch(collection, filter.as_ref(), limit, true, false)
+                .fetch(collection, filter.as_ref(), 0, limit, true, false)
                 .map_err(|e| e.to_string())?;
             let rendered: Vec<Value> = points
                 .iter()

@@ -43,7 +43,11 @@ async fn cockpit_reads_live_server_snapshot() {
         otlp: Default::default(),
         mvcc_reads: false,
         cluster_shards: Vec::new(),
+        cluster_replicas: Vec::new(),
         cluster_shard_key: None,
+        coordinator: false,
+        coordinator_url: None,
+        coordinator_state: None,
     };
     tokio::spawn(async move {
         let _ = serve(config, rest, grpc).await;

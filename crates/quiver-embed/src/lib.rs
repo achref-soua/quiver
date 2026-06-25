@@ -986,6 +986,7 @@ impl Database {
         &self,
         collection: &str,
         filter: Option<&Filter>,
+        offset: usize,
         limit: usize,
         with_payload: bool,
         with_vector: bool,
@@ -993,6 +994,11 @@ impl Database {
         let handle = self.handle(collection)?;
         require_single_vector(handle)?;
         let mut out = Vec::new();
+        // `offset` skips matching points already returned by a prior page, so a caller
+        // can scroll the whole collection in `limit`-sized pages (the scan order is
+        // stable for a quiescent collection). Applied after the filter so offset
+        // counts matches, not raw rows.
+        let mut skipped = 0usize;
         for (id, record) in self.store.scan(handle.id)? {
             if out.len() >= limit {
                 break;
@@ -1001,6 +1007,10 @@ impl Database {
             if let Some(filter) = filter
                 && !filter.matches(&payload)
             {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
                 continue;
             }
             out.push(Match {
@@ -4018,7 +4028,7 @@ mod tests {
 
         // Fetch returns the entitled set; each payload carries the blob the client
         // would decrypt and rank locally, and vectors are omitted when not asked for.
-        let all = db.fetch("vault", None, 100, true, false).unwrap();
+        let all = db.fetch("vault", None, 0, 100, true, false).unwrap();
         assert_eq!(all.len(), 5);
         assert!(
             all.iter()
@@ -4033,6 +4043,7 @@ mod tests {
                     field: "tier".to_owned(),
                     value: serde_json::json!("vip"),
                 }),
+                0,
                 100,
                 false,
                 false,
@@ -4040,7 +4051,15 @@ mod tests {
             .unwrap();
         assert_eq!(vip.len(), 2);
         // A limit bounds the returned set.
-        assert_eq!(db.fetch("vault", None, 2, false, false).unwrap().len(), 2);
+        assert_eq!(
+            db.fetch("vault", None, 0, 2, false, false).unwrap().len(),
+            2
+        );
+        // An offset scrolls past earlier matches (paginated migration copy).
+        assert_eq!(
+            db.fetch("vault", None, 3, 100, false, false).unwrap().len(),
+            2
+        );
 
         // get returns the stored placeholder + blob payload by id; delete works
         // through the store with no index to update.

@@ -57,6 +57,9 @@ pub(crate) fn router(state: AppState) -> Router {
             post(search_multi_vector),
         )
         .route("/v1/snapshot", post(snapshot))
+        // The map a cluster router has currently refreshed to (ADR-0066); 404 on a
+        // non-router server. Read-only ops/diagnostics.
+        .route("/cluster/map", get(cluster_map))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         // Outermost so it times the whole request, including a 401/429; runs after
         // routing, so the matched-path template is available (ADR-0054).
@@ -168,6 +171,15 @@ async fn readyz() -> &'static str {
 
 async fn metrics(Extension(metrics): Extension<std::sync::Arc<crate::metrics::Metrics>>) -> String {
     metrics.render()
+}
+
+// The shard map this router has currently adopted (ADR-0066). 404 when the server is
+// not a cluster router, so the endpoint doubles as a "am I a router?" probe.
+async fn cluster_map(State(state): State<AppState>) -> Response {
+    match &state.cluster {
+        Some(c) => Json(c.current_map()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Time every routed request and record it by `(method, matched-route-template,
@@ -775,6 +787,9 @@ async fn search_text(
 struct FetchBody {
     #[serde(default)]
     filter: Option<Filter>,
+    /// Skip this many matching points (for paginated scroll over a large collection).
+    #[serde(default)]
+    offset: usize,
     #[serde(default = "default_fetch_limit")]
     limit: usize,
     #[serde(default = "default_true")]
@@ -822,6 +837,7 @@ async fn fetch(
             &principal,
             name,
             body.filter,
+            body.offset,
             body.limit,
             body.with_payload,
             body.with_vector,
