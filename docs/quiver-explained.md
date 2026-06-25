@@ -743,11 +743,21 @@ Quiver also slots into your stack. **Migration importers** pull data straight fr
 
 Everything above ships in **one static binary**. For source and registry distribution the crates publish under the **`quiverdb-*`** namespace (ADR-0056) — each package is `quiverdb-<crate>` while its library name stays `quiver_<crate>` and the binary stays `quiver`, so imports and `cargo install --path` are unchanged. A multi-stage Docker image, a docker-compose, and a Helm chart round out the deploy story; secure defaults mean the server refuses to start on a non-loopback bind without a master key and TLS.
 
-## 9.8 The roads not (yet) taken
+## 9.8 Scaling out: sharding & scatter-gather
 
-Two large capabilities are *designed* — as architecture records — but deliberately unbuilt until the single-node story is unbeatable: **distributed/sharded mode** (hash sharding + scatter-gather + per-shard Raft for write HA) and **GPU acceleration** (behind the index trait, CPU-default). A third — **concurrent reads** — is now *built end to end*: reads run in parallel behind a reader–writer lock (§5.3), rebuilds run off the exclusive lock (§5.4), and the fully **lock-free MVCC** read path (§5.5, ADR-0064) — an `arc-swap` snapshot plus a small overlay, so pure-vector reads never wait on the writer at all — ships **opt-in** (`QUIVER_MVCC_READS`), with the proven `RwLock` path the default until it is validated on dedicated hardware. Each began as a design ADR; none compromises the single static binary.
+One node already serves tens of millions of vectors, but eventually a dataset outgrows a single machine — or writes outpace one writer. Quiver's answer (ADR-0065, opt-in) is to **shard**: split the collection across N independent Quiver servers and put a thin **router** in front. Set `QUIVER_CLUSTER_SHARDS` to the shard URLs and the same server binary *becomes* that router — clients talk to it exactly as they would a single node.
 
-To make the sharding shape concrete (designed, not built — ADR-0051): suppose the movie catalogue outgrows one node. Hash each point's id into one of three **shards**, each an ordinary Quiver node owning ~⅓ of the vectors. A write routes to the owning shard; a query is a **scatter-gather** — the coordinator sends the query vector to all three in parallel, each returns its local top-*k*, and the coordinator merges them by exact distance into a global top-*k* (the same approximate-then-re-rank shape, one level up). Write availability would come from a small per-shard Raft group. It stays on paper because per-shard consensus is a multi-quarter commitment, and Quiver's rule is to be unbeatable at one node first — the §5.4 off-lock rebuild is exactly the kind of intra-node win that buys time before reaching for distribution.
+Think of a library that has grown too big for one room. You split the books across several rooms, and a front desk — the router — knows which room holds what. To *file* a book (a write), the desk sends it to its one owning room. To *find the ten most relevant books* (a search), the desk asks **every** room for its ten best and merges those shortlists into the overall ten. That is a **scatter-gather**, and the merge is exact: the global top-ten can only be drawn from the rooms' individual top-tens, so collecting ten from each and keeping the best ten is guaranteed correct.
+
+Which room owns a book is decided by **rendezvous hashing** of the book's id. The valuable property: add or remove a room and only about `1/N` of the books change hands — not a wholesale reshuffle. That is the foundation for **dynamic, elastic scaling**: grow or shrink the cluster under live load by moving only the small slice that moves. (Online rebalancing, a coordinator that tracks membership and health, per-shard write-failover via an audited Raft library, and autoscaling are the staged increments that build on this first one.)
+
+Crucially, each shard is just an ordinary single-writer Quiver server — same engine, same `kill -9` crash gate, same encryption. The cluster is **composition over the existing engine, not a new one**, and it is strictly opt-in: configure no shards and the server is exactly the single node the rest of this guide describes, at zero overhead.
+
+> **FIGURE_SCATTER_GATHER**
+
+## 9.9 The roads not (yet) taken
+
+What is *not* yet built is deliberately so, until the single-node story is unbeatable and the need is concrete. **Per-shard write high-availability** — promoting a replica with no lost acknowledged write — needs a consensus layer; the chosen direction is **one Raft group per shard** using an *audited* Raft library rather than a hand-rolled log (the same discipline that put `arc-swap` under MVCC), and it is a staged increment, not a sprint. **GPU acceleration** sits behind the index trait so a CPU build is unchanged (ADR-0052). Each begins as a design ADR; none compromises the single static binary, and single-node remains the default everywhere.
 
 ---
 
@@ -777,6 +787,9 @@ To make the sharding shape concrete (designed, not built — ADR-0051): suppose 
 - **Off-lock rebuild** — rebuilding a stale index without the exclusive lock; the prior index is served while the new one builds, then swapped in (ADR-0062).
 - **Lock-free MVCC reads** — serving reads from an `arc-swap` snapshot (base index + a small overlay of recent writes) with no lock, so reads never block on the writer (§5.5, ADR-0064; opt-in via `QUIVER_MVCC_READS`).
 - **Overlay** — the small, immutable set of writes (recent vectors + tombstones) layered on a published base index so an MVCC read stays fresh without rebuilding the index.
+- **Sharding** — splitting a collection across N independent Quiver servers (shards) so a dataset can exceed one machine; a router decides which shard owns each point (§9.8, ADR-0065).
+- **Scatter-gather** — answering a search in a cluster by asking every shard for its local top-k, then merging into the exact global top-k.
+- **Rendezvous (HRW) hashing** — picking a point's owning shard by the highest hash of (shard, id), so adding or removing a shard moves only ~1/N of the data — the basis for elastic scaling.
 - **Snapshot isolation / MVCC** — a read sees one consistent version; it may miss a just-committed write but never a half-applied one.
 - **Saturated throughput (NT)** — QPS under many concurrent client threads vs one (1T) — the test for whether parallel reads help.
 - **Selectivity** — the fraction of a collection a filter keeps; decides pre-filter (selective) vs post-filter (broad).
