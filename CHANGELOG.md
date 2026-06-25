@@ -12,6 +12,21 @@ for the per-release rationale and Definitions of Done.
 
 ### Added
 
+- **Cluster online slice migration — data plane** (ADR-0066, increment 3c). When a
+  shard joins, the coordinator can add it in a **joining** state (`POST
+  /cluster/shards/joining`) and later **promote** it (`POST
+  /cluster/shards/{id}/promote`). While a shard is joining, the router **dual-writes**
+  the migrating slice to both the joining owner and the **donor** that still serves it,
+  serves searches from the active shards (excluding the joining one, whose donor holds
+  the authoritative slice), and routes gets to the donor — so the slice stays queryable
+  and no write is lost. At promotion the slice's ownership flips atomically (a version
+  bump); a **dedup-by-id gather** absorbs the brief window where the donor and the
+  promoted shard both hold a slice point. `quiver_cluster::ShardMap` gains a `joining`
+  set with `add_joining_shard`/`promote`/`donor_for`/`active_shards`/
+  `partition_to_donors`. An end-to-end test drives a join→copy→flip migration and
+  proves the slice is queryable throughout and every acknowledged write survives the
+  flip. The coordinator's **automated** copy-and-flip loop (so an operator just adds a
+  shard) is the next increment (3c-ii); single-node and a static cluster are unaffected.
 - **Cluster coordinator + dynamic router refresh** (ADR-0066, increment 3b). A new
   opt-in **coordinator** mode (`QUIVER_COORDINATOR=true`) runs a thin, data-plane-free
   service that owns the authoritative, monotonically **versioned** shard map and serves

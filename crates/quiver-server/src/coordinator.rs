@@ -120,6 +120,8 @@ pub async fn serve_coordinator(config: Config, listener: TcpListener) -> Result<
         .route("/readyz", get(healthz))
         .route("/cluster/map", get(get_map))
         .route("/cluster/shards", post(add_shard))
+        .route("/cluster/shards/joining", post(add_joining_shard))
+        .route("/cluster/shards/{id}/promote", post(promote_shard))
         .route("/cluster/shards/{id}", axum::routing::delete(remove_shard))
         .route("/cluster/health", get(health))
         .with_state(state);
@@ -151,6 +153,34 @@ async fn add_shard(
     let id = st.next_id.fetch_add(1, Ordering::SeqCst);
     let mut map = st.map.write().await;
     map.add_shard(id, req.primary_url, req.replica_urls)
+        .map_err(|e| Error::BadRequest(e.to_string()))?;
+    st.persist(&map)?;
+    Ok(Json(map.clone()))
+}
+
+// Add a shard in the **joining** state (ADR-0066 increment 3c): it is in the map so
+// HRW routes its slice to it, but the donor still serves the slice until the flip.
+// Drives the start of an online migration; the data copy + `promote` flip follow.
+async fn add_joining_shard(
+    State(st): State<Arc<CoordinatorState>>,
+    Json(req): Json<AddShardReq>,
+) -> Result<Json<ShardMap>, Error> {
+    let id = st.next_id.fetch_add(1, Ordering::SeqCst);
+    let mut map = st.map.write().await;
+    map.add_joining_shard(id, req.primary_url, req.replica_urls)
+        .map_err(|e| Error::BadRequest(e.to_string()))?;
+    st.persist(&map)?;
+    Ok(Json(map.clone()))
+}
+
+// Promote a joining shard to the authoritative slice owner (the migration **flip**,
+// ADR-0066): the router now routes the slice to it, and the donor may drop the copy.
+async fn promote_shard(
+    State(st): State<Arc<CoordinatorState>>,
+    Path(id): Path<u64>,
+) -> Result<Json<ShardMap>, Error> {
+    let mut map = st.map.write().await;
+    map.promote(id)
         .map_err(|e| Error::BadRequest(e.to_string()))?;
     st.persist(&map)?;
     Ok(Json(map.clone()))
