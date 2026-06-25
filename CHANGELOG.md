@@ -10,6 +10,18 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Changed
+
+- **Stable shard ids** (ADR-0066, increment-3 groundwork). `quiver_cluster::Shard`
+  now carries an immutable `id: u64` — **the HRW key** — instead of a positional
+  `index: usize`, decoupled from the shard's position so a shard can be removed
+  without re-keying (and moving the data of) its survivors. `ShardMap` keys
+  `partition`/`add_replica` by id and gains `from_shards` for non-contiguous ids (the
+  gap a removed shard leaves); `partition` now yields `(&Shard, group)`. `from_urls`
+  is unchanged (ids `0..N`), so a static cluster's routing and on-the-wire behaviour
+  are byte-identical and `QUIVER_CLUSTER_REPLICAS`'s `<shard_id>=<url>` form still
+  targets `0..N`. Pure `quiver-cluster` refactor; single-node unaffected.
+
 ### Added
 
 - **Cluster read replicas** (ADR-0065 increment 2), opt-in via
