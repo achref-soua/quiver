@@ -145,12 +145,18 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Rendezvous weight of a shard for a point id: `fnv1a(index_le_bytes ‖ id_bytes)`.
+/// Rendezvous weight of a shard for a point id. The id is hashed once (FNV-1a),
+/// combined with a golden-ratio-scaled shard seed, then run through a `splitmix64`
+/// finalizer so the weight is well-distributed in *both* arguments — concatenating
+/// a small shard index into the hash key avalanches poorly for short ids (an early
+/// low-byte difference barely moves the comparison, skewing the assignment).
 fn hrw_score(shard_index: usize, point_id: &str) -> u64 {
-    let mut buf = Vec::with_capacity(8 + point_id.len());
-    buf.extend_from_slice(&(shard_index as u64).to_le_bytes());
-    buf.extend_from_slice(point_id.as_bytes());
-    fnv1a(&buf)
+    let mut x = fnv1a(point_id.as_bytes())
+        .wrapping_add((shard_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    // splitmix64 finalizer.
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
 }
 
 /// Merge each shard's local top-`k` ranked results into the exact global top-`k`
@@ -231,6 +237,19 @@ mod tests {
         // Even split is 3000 each; allow ±20% for hash variance.
         for c in counts {
             assert!((2_400..=3_600).contains(&c), "uneven: {counts:?}");
+        }
+    }
+
+    #[test]
+    fn distribution_is_even_for_two_shards_and_short_ids() {
+        // The case a naive HRW skewed: 2 shards and short, sequential ids (`p0`…).
+        let m = ShardMap::from_urls(["http://a", "http://b"]).unwrap();
+        let mut counts = [0usize; 2];
+        for i in 0..2_000 {
+            counts[m.shard_for(&format!("p{i}")).index] += 1;
+        }
+        for c in counts {
+            assert!((800..=1_200).contains(&c), "two-shard skew: {counts:?}");
         }
     }
 

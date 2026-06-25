@@ -2465,12 +2465,14 @@ dependencies = [
 name = "quiverdb-server"
 version = "0.24.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "axum-server",
  "figment",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "quiverdb-cluster",
  "quiverdb-core",
  "quiverdb-crypto",
  "quiverdb-embed",

@@ -107,6 +107,8 @@ async fn server_searches_encrypted_vectors_without_seeing_plaintext() {
         rate_limit: Default::default(),
         otlp: Default::default(),
         mvcc_reads: false,
+        cluster_shards: Vec::new(),
+        cluster_shard_key: None,
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

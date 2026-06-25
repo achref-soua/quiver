@@ -10,6 +10,23 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Added
+
+- **Cluster mode — sharding + scatter-gather** (ADR-0065 increment 1), opt-in via
+  `QUIVER_CLUSTER_SHARDS`. A non-empty list of shard URLs makes the server a
+  stateless **router**: it shards writes by point id using **rendezvous (HRW)
+  hashing** — so adding or removing a shard remaps only ~1/N of ids, the basis for
+  the **dynamic, elastic scaling** the cluster is designed for — and **scatter-gathers**
+  searches across all shards, merging the exact global top-k. Each shard is an
+  ordinary single-writer Quiver engine with its own `kill -9` crash gate; the
+  cluster is composition, not a rewrite. A new `quiver-cluster` crate holds the pure
+  primitives (shard map, HRW hashing, merge). An end-to-end test proves a two-shard
+  router returns the same top-k distances as a single-node baseline holding the same
+  data, and that writes shard and routed get/delete work. Single-node stays the
+  zero-overhead default (the router is `None` unless configured). Later increments:
+  read replicas, online elastic membership + rebalancing + a coordinator, per-shard
+  Raft write-HA, autoscaling hooks.
+
 ## [0.24.0] — 2026-06-25
 
 ### Added
