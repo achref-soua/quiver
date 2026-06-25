@@ -765,7 +765,19 @@ Declaring them is just wiring: set `QUIVER_CLUSTER_REPLICAS` to a list of `<shar
 
 The one honest caveat is **eventual consistency**: a replica lags its primary by however long replication takes (usually milliseconds), so a search served from a replica may miss a write committed an instant ago — the same trade as §9.4's single-node read replicas, and the reason replicas serve *searches* while point-lookups (`get`) still go to the primary for read-your-writes. A follower also **refuses direct writes**, so even a misrouted write can never corrupt a replica. This is read scale-out and warm standbys — *not* write failover; promoting a replica when its primary dies needs consensus, the audited-Raft increment in the roads not yet taken below.
 
-## 9.10 The roads not (yet) taken
+## 9.10 Growing without downtime: dynamic, elastic scaling
+
+Sharding and replicas help, but the headline is this: you can **add a shard to a live cluster** — under read and write load — and the cluster rebalances itself with **no downtime and no lost writes**, moving only the small slice that has to move.
+
+Back to the library. The rooms get crowded, so you open a new one. A new desk supervisor — the **coordinator** — keeps the master floor-plan, stamped with a **version number**; the front desks (the routers) re-read it every couple of seconds, so they learn about the new room *without ever closing*. When the new room opens, **rendezvous hashing** means only about `1/N` of the books now belong there — every other book stays exactly where it was.
+
+Moving that slice is a careful handshake, because readers and writers never stop. **(1)** The new room joins the floor-plan but the **old room still owns and serves** the slice; meanwhile every *new* arrival for those books is filed in **both** rooms (a **dual-write**), so nothing written during the move can be missed. **(2)** The coordinator **copies** the slice's existing books from the old room to the new one — and because the copy never overwrites a book the new room already has from a dual-write, a book updated mid-move keeps its newest version. **(3)** Once the new room has caught up, the coordinator **flips** the floor-plan to the next version: the new room now owns the slice, and the old room **discards its copies**. Throughout, a search always reaches a room that has the books, and a front desk still reading the previous floor-plan is still correct — the old room serves until everyone has re-read the plan.
+
+> **FIGURE_DYNAMIC_SCALING**
+
+In Quiver terms: run one server as the **coordinator** (`QUIVER_COORDINATOR=true`); point routers at it (`QUIVER_COORDINATOR_URL`); then `POST /cluster/shards/grow` with the new shard's URL and the coordinator does the rest — join, copy, flip, drop — in the background, while the cluster keeps answering. The same machinery shrinks a cluster, and an autoscaler could one day call `grow` on its own. What is deliberately *not* here yet is automatic **write** failover when a primary dies: that needs consensus, the audited-Raft increment below.
+
+## 9.11 The roads not (yet) taken
 
 What is *not* yet built is deliberately so, until the single-node story is unbeatable and the need is concrete. **Per-shard write high-availability** — promoting a replica with no lost acknowledged write — needs a consensus layer; the chosen direction is **one Raft group per shard** using an *audited* Raft library rather than a hand-rolled log (the same discipline that put `arc-swap` under MVCC), and it is a staged increment, not a sprint. **GPU acceleration** sits behind the index trait so a CPU build is unchanged (ADR-0052). Each begins as a design ADR; none compromises the single static binary, and single-node remains the default everywhere.
 
@@ -805,6 +817,8 @@ What is *not* yet built is deliberately so, until the single-node story is unbea
 - **Selectivity** — the fraction of a collection a filter keeps; decides pre-filter (selective) vs post-filter (broad).
 - **Replication (leader–follower)** — asynchronous read replicas: a follower tails a leader's writes to scale reads, with no consensus.
 - **Read replica (cluster)** — a per-shard follower the router fans searches to so reads scale out within a cluster; writes still go to the shard's primary, and a replica is eventually consistent (§9.9, ADR-0065 + ADR-0030).
+- **Coordinator** — a thin service, off the query path, that owns the cluster's **versioned** shard map; routers refresh the map from it so membership changes propagate with no restart (§9.10, ADR-0066).
+- **Online migration / dynamic scaling** — adding or removing a shard on a live cluster, moving only the ~1/N HRW-remapped slice with no downtime and no lost writes (the donor serves + dual-writes until the new shard catches up, then ownership flips atomically) (§9.10, ADR-0066).
 - **Sharding / scatter-gather** — splitting data across nodes (designed, not built); a query fans out to all shards and merges results.
 - **OTLP / OpenTelemetry** — the wire protocol for exporting traces to a collector (Jaeger/Tempo/Grafana); opt-in in Quiver.
 - **Cockpit (TUI)** — the retro terminal interface (`quiver tui`): a live dashboard plus an interactive query runner.
