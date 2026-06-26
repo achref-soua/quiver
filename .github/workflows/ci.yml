@@ -33,6 +33,11 @@ jobs:
         run: cargo clippy -p quiverdb-server --features otlp --all-targets -- -D warnings
       - name: Clippy (optional raft feature — keeps the gated consensus adapter from rotting)
         run: cargo clippy -p quiverdb-server --features raft --all-targets -- -D warnings
+      - name: Clippy (optional cuda feature — build-only; keeps the gated GPU kernel from rotting)
+        # cudarc dynamically loads the CUDA driver at runtime, so the feature
+        # *compiles* without a CUDA toolchain. The GPU is validated on real hardware
+        # locally — it cannot run on the GPU-less CI runner, so this only builds it.
+        run: cargo clippy -p quiverdb-index --features cuda --all-targets -- -D warnings
       - name: Format + clippy (cockpit-shots — its own workspace, not in --workspace above)
         run: |
           cargo fmt --manifest-path tools/cockpit-shots/Cargo.toml --check

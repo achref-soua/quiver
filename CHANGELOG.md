@@ -12,6 +12,19 @@ for the per-release rationale and Definitions of Done.
 
 ### Added
 
+- **GPU-accelerated batch distance** (ADR-0052, behind the off-by-default `cuda`
+  cargo feature on `quiverdb-index`). The hot kernel a brute-force / exact scan
+  spends its time in — squared-L2 distance from one query to many vectors — now runs
+  on a CUDA GPU when the feature is on and a device is present (`gpu::batch_l2_sq`),
+  and **falls back to the CPU SIMD kernel** otherwise, producing identical results.
+  cudarc dynamically loads the CUDA driver and compiles the kernel with NVRTC at
+  runtime, so a **default build links zero CUDA** and the feature even *compiles*
+  without a CUDA toolchain (only *running* the GPU path needs a device) — the same
+  off-by-default discipline as the `raft` and `otlp` features, with the CPU path the
+  always-compiled default and the on-disk format / crash gate untouched. Validated
+  on real hardware: the GPU result is asserted equal to the CPU kernel (the test is
+  a no-op where no GPU is present, so CI builds the feature but only the CPU path is
+  exercised). Wiring it into the planner's exact-scan path is the next step.
 - **Coordinator autoscaling — automatic scale-out** (ADR-0065 increment 5, opt-in).
   When enabled, the coordinator samples each shard's point count and, when the
   busiest crosses a configured `high_water_points`, **grows the cluster into a
