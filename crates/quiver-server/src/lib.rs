@@ -1971,7 +1971,9 @@ pub async fn serve(
     let raft = if let Some(node_id) = config.raft_node_id {
         let members = parse_raft_members(&config.raft_members)?;
         let applier = raft::EngineApplier::new(Arc::clone(&db));
-        let shard = raft::start_member(node_id, members, applier)
+        // The Raft log persists under the data dir, beside the engine (ADR-0067 4c).
+        let log_dir = config.data_dir.join("raft");
+        let shard = raft::start_member(node_id, members, applier, &log_dir)
             .await
             .map_err(|e| Error::Config(format!("raft startup: {e}")))?;
         tracing::info!(node_id, "per-shard raft write HA enabled");

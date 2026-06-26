@@ -26,6 +26,7 @@
 //!
 //! [`ADR-0030`]: ../../../docs/adr/0030-leader-follower-replication.md
 
+mod durable_log;
 pub mod grpc;
 mod log_store;
 
@@ -395,6 +396,7 @@ pub async fn start_member(
     node_id: NodeId,
     members: BTreeMap<NodeId, String>,
     applier: EngineApplier,
+    log_dir: &std::path::Path,
 ) -> Result<RaftShard, Box<dyn std::error::Error + Send + Sync>> {
     let config = Arc::new(
         Config {
@@ -405,7 +407,10 @@ pub async fn start_member(
         }
         .validate()?,
     );
-    let log_store = LogStore::default();
+    // The durable, crash-safe log store (ADR-0067 increment 4c): a restarted voter
+    // recovers its log + vote and rejoins safely. The volatile `LogStore` stays for
+    // the in-process consensus tests, which never restart.
+    let log_store = durable_log::DurableLogStore::open(log_dir)?;
     let state_machine = Arc::new(StateMachineStore::new(applier));
     let raft = openraft::Raft::new(
         node_id,
