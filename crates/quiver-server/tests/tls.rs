@@ -159,6 +159,8 @@ async fn tls_secures_both_rest_and_grpc() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        raft_node_id: None,
+        raft_members: Vec::new(),
     };
     tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;
@@ -256,6 +258,8 @@ async fn mtls_requires_a_client_certificate() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        raft_node_id: None,
+        raft_members: Vec::new(),
     };
     tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

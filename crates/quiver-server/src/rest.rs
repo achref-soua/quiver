@@ -60,6 +60,13 @@ pub(crate) fn router(state: AppState) -> Router {
         // The map a cluster router has currently refreshed to (ADR-0066); 404 on a
         // non-router server. Read-only ops/diagnostics.
         .route("/cluster/map", get(cluster_map))
+        // Dynamic Raft voter membership (ADR-0067 increment 4c, admin): add or
+        // remove a voter from this node's per-shard Raft group at runtime.
+        .route("/cluster/raft/voters", post(raft_add_voter))
+        .route(
+            "/cluster/raft/voters/{id}",
+            axum::routing::delete(raft_remove_voter),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         // Outermost so it times the whole request, including a 401/429; runs after
         // routing, so the matched-path template is available (ADR-0054).
@@ -505,6 +512,32 @@ async fn snapshot(
 ) -> Result<Json<quiver_embed::SnapshotInfo>, Error> {
     let info = state.snapshot(&principal, body.destination).await?;
     Ok(Json(info))
+}
+
+#[derive(Deserialize)]
+struct AddVoterBody {
+    id: u64,
+    url: String,
+}
+
+/// Add a voter to this node's Raft shard at runtime (ADR-0067 increment 4c, admin).
+async fn raft_add_voter(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<AddVoterBody>,
+) -> Result<StatusCode, Error> {
+    state.raft_add_voter(&principal, body.id, body.url).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove a voter from this node's Raft shard at runtime (ADR-0067 increment 4c, admin).
+async fn raft_remove_voter(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<u64>,
+) -> Result<StatusCode, Error> {
+    state.raft_remove_voter(&principal, id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

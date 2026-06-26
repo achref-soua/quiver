@@ -79,6 +79,8 @@ fn base_config(
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        raft_node_id: None,
+        raft_members: Vec::new(),
     }
 }
 
@@ -118,6 +120,8 @@ async fn replicate_streams_a_snapshot_then_the_live_tail() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        raft_node_id: None,
+        raft_members: Vec::new(),
     };
     tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

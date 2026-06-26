@@ -53,6 +53,21 @@ service Quiver {
   rpc Replicate(ReplicateRequest) returns (stream ReplicationOp);
 }
 
+// Per-shard Raft consensus RPC between a shard's members (ADR-0067, increment 4).
+// The payloads are opaque, serialized openraft messages — the contract is owned
+// by the `raft`-feature consensus layer, not this schema, so the wire stays
+// stable as openraft evolves. Served only by a node that is a Raft voter.
+service RaftService {
+  rpc AppendEntries(RaftEnvelope) returns (RaftEnvelope);
+  rpc Vote(RaftEnvelope) returns (RaftEnvelope);
+  rpc InstallSnapshot(RaftEnvelope) returns (RaftEnvelope);
+}
+
+// An opaque, serialized openraft request or response (see `RaftService`).
+message RaftEnvelope {
+  bytes data = 1;
+}
+
 // Distance / similarity metric.
 enum Metric {
   METRIC_UNSPECIFIED = 0;
