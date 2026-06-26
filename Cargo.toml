@@ -133,6 +133,17 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
 ] }
 tracing-opentelemetry = "0.33"
 
+# Per-shard Raft for write high availability (ADR-0067), opt-in behind
+# quiver-server's `raft` feature — off by default, so a default build never pulls
+# it. `openraft` is the audited consensus core (the ADR-0065 adoption gate settled
+# the pick: openraft 0.9 is cargo-deny clean and async-native; raft-rs fails on a
+# protobuf advisory). `storage-v2` selects the split log-store/state-machine API
+# (ADR-0067); `serde` makes the Raft types (de)serializable. The reusable generic
+# in-memory `LogStore<C>` is vendored into quiver-server (the published
+# `openraft-memstore` implements the deprecated v1 storage that `storage-v2`
+# removes); a durable, ADR-0050-snapshot-backed store arrives in increment 4c.
+openraft = { version = "0.9.24", features = ["serde", "storage-v2"] }
+
 # Retro terminal cockpit (quiver-tui): ratatui renders; crossterm drives input
 # (its version is pinned to the one ratatui re-exports so they share a single
 # backend). The `event-stream` feature gives an async input stream. ratatui 0.30

@@ -37,6 +37,8 @@ mod error;
 mod grpc;
 mod metrics;
 mod otlp;
+#[cfg(feature = "raft")]
+pub mod raft;
 mod rate_limit;
 mod replication;
 mod rest;
