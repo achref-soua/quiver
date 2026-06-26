@@ -48,6 +48,8 @@ async fn cockpit_reads_live_server_snapshot() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        raft_node_id: None,
+        raft_members: Vec::new(),
     };
     tokio::spawn(async move {
         let _ = serve(config, rest, grpc).await;

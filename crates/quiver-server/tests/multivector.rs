@@ -73,6 +73,8 @@ async fn multivector_round_trip() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        raft_node_id: None,
+        raft_members: Vec::new(),
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;
@@ -282,6 +284,8 @@ async fn colbert_index_round_trip() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        raft_node_id: None,
+        raft_members: Vec::new(),
     };
     let server = tokio::spawn(async move {
         let _ = serve(config, rest_listener, grpc_listener).await;

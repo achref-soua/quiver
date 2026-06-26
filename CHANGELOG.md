@@ -10,6 +10,77 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-06-26
+
+*Resilient* — surviving a node failure: opt-in per-shard write high availability on
+an audited Raft core, end to end (durable, log-compacting, elastic), with the
+single node unchanged at zero overhead.
+
+### Added
+
+- **Per-shard Raft state-machine adapter — foundation** (ADR-0067, cluster increment
+  4a). Behind a new **off-by-default `raft` cargo feature** on `quiverdb-server`, the
+  audited [`openraft`](https://crates.io/crates/openraft) consensus core is wired to
+  the engine's apply seam: a committed Raft log entry is one engine write op
+  (`WalOp`), and the state-machine adapter forwards it through the same
+  `apply_replicated` path a replication follower already uses (ADR-0030). This
+  increment runs a **single-member** group to prove the adapter end to end — it
+  commits an op and the engine then serves it; multi-member voting, automatic
+  failover, leader-aware routing, and log compaction land in increments 4b–4d. A
+  default build never links `openraft`, and single-node / non-Raft clusters are
+  byte-for-byte unchanged. The in-memory Raft log store is vendored from openraft's
+  example memstore (the published `openraft-memstore` implements the deprecated v1
+  storage that the `storage-v2` API removes); a durable, snapshot-backed store
+  arrives in 4c. Increment 4b adds a real multi-voter group with **automatic leader
+  failover** (no acknowledged write lost, verified against single-node ground truth)
+  and a **gRPC transport** (`quiver.v1.RaftService`) carrying the consensus RPCs
+  between a shard's members over the server's existing tonic stack. The server now
+  **runs a per-shard Raft group on its existing gRPC port** when configured with a
+  `raft_node_id` and `raft_members` (`QUIVER_RAFT_NODE_ID` / `QUIVER_RAFT_MEMBERS`):
+  a write is prepared on the leader, proposed through consensus, and **committed by a
+  quorum before it is acknowledged**, so a leader failover loses no acknowledged
+  write; a write that reaches a non-leader is refused with a *"not the leader"*
+  redirect (HTTP 421, carrying the leader's URL). An integration test boots a real
+  three-node group, drives writes through the HTTP API, and kills the leader's
+  process to prove automatic failover end to end. The **cluster router is now
+  leader-aware**: it sends a Raft shard's writes to the shard's current leader,
+  discovering it among the shard's voter URLs (`{primary} ∪ replicas`), caching it,
+  and re-discovering it on a *"not the leader"* (HTTP 421) reply or a failover — so a
+  router self-corrects after a leader change without the coordinator on the write
+  path. A non-Raft shard is unchanged (its primary always accepts, so its replicas
+  are never written to). An integration test fronts a three-node Raft shard with a
+  router, kills the leader, and confirms post-failover writes still land and no
+  acknowledged write is lost. The **correctness gate** asserts the two headline
+  safety properties: a writer driving continuous upserts through the router while
+  the leader's process is killed loses **no acknowledged write** (every acked id is
+  served by a survivor afterwards), and a **minority cannot commit a write** (no
+  split-brain) — the latter proven at the consensus-adapter level, where a node can
+  be truly isolated, while it still serves data committed before the partition. The
+  Raft log is now **durable** (increment 4c): a crash-safe `RaftLogStorage` persists
+  the granted vote and the log to an append-only file under `<data_dir>/raft`,
+  `fsync`ed before the call returns and replayed on open (a torn tail from a crash
+  mid-write is discarded), so a restarted voter recovers its log and vote and
+  rejoins safely — the same `kill -9` discipline as the engine WAL, proven by a
+  reopen-from-disk test. The committed index stays advisory (recomputed on restart),
+  so the commit path pays no extra `fsync`. The state-machine **snapshot now carries
+  engine state** (ADR-0050), so the durable log can be **compacted** and a far-behind
+  or newly added voter catches up by **installing the snapshot** instead of replaying
+  a purged log: a snapshot captures the engine as the op stream that recreates it,
+  and installing it resets the target engine and replays — proven both directly and
+  end to end (a fresh voter, added after the leader snapshots and purges its log,
+  catches up purely from the snapshot). A shard's **voter set is dynamic**: an admin
+  endpoint (`POST` / `DELETE /cluster/raft/voters`) adds or removes a voter at
+  runtime — the new node is added as a learner, catches up, and is promoted via a
+  joint-consensus change — so a Raft shard can grow or shrink online without a
+  restart (proven by an end-to-end test that grows a single-member leader to two
+  voters and back). The increment's hardening suite (4d) adds a **partition/rejoin**
+  gate — a voter cut off from the group misses what the surviving majority commits,
+  then on healing rejoins and catches up with nothing lost — and a **property test**
+  that replays a long random interleaving of append/truncate/purge/vote and asserts
+  the reopened store equals a reference model, alongside the existing
+  no-lost-acknowledged-write and no-split-brain gates. Raft stays **opt-in per
+  shard**; a default build still never links `openraft`.
+
 ## [0.26.0] — 2026-06-25
 
 *Elastic* — the cluster grows and replicates: per-shard read replicas (increment 2)
@@ -516,7 +587,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/achref-soua/quiver/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/achref-soua/quiver/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/achref-soua/quiver/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/achref-soua/quiver/compare/v0.23.0...v0.24.0

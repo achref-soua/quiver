@@ -37,6 +37,8 @@ mod error;
 mod grpc;
 mod metrics;
 mod otlp;
+#[cfg(feature = "raft")]
+pub mod raft;
 mod rate_limit;
 mod replication;
 mod rest;
@@ -405,6 +407,25 @@ pub struct Config {
     /// in-memory only (lost on restart). Only meaningful with `coordinator = true`.
     #[serde(default)]
     pub coordinator_state: Option<PathBuf>,
+    /// This node's **Raft member id** within its shard's group (ADR-0067, write
+    /// HA). Setting it opts the node into per-shard Raft: it joins the group
+    /// described by [`raft_members`], commits writes only after a **quorum**
+    /// commit, and fails over automatically if the leader dies. `None` (the
+    /// default) = the single-primary shard of increments 1–3, unchanged. Requires
+    /// the server's `raft` build feature.
+    ///
+    /// [`raft_members`]: Config::raft_members
+    #[serde(default)]
+    pub raft_node_id: Option<u64>,
+    /// The Raft group's members as `"<id>=<grpc-url>"` entries (ADR-0067), e.g.
+    /// `["1=http://n1:6334","2=http://n2:6334","3=http://n3:6334"]` or the
+    /// bracketed `QUIVER_RAFT_MEMBERS` env array. Each URL is the member's gRPC
+    /// address (the `RaftService` rides the existing gRPC server). Used only when
+    /// [`raft_node_id`] is set; the lowest id bootstraps the group.
+    ///
+    /// [`raft_node_id`]: Config::raft_node_id
+    #[serde(default)]
+    pub raft_members: Vec<String>,
 }
 
 impl Default for Config {
@@ -435,6 +456,8 @@ impl Default for Config {
             coordinator: false,
             coordinator_url: None,
             coordinator_state: None,
+            raft_node_id: None,
+            raft_members: Vec::new(),
         }
     }
 }
@@ -615,6 +638,13 @@ pub(crate) struct AppState {
     // fans out to the shards instead of touching the local engine. `None` = an
     // ordinary single-node server (the engine-backed path, untouched).
     cluster: Option<Arc<cluster::Cluster>>,
+    // Opt-in per-shard Raft write HA (ADR-0067): when `Some`, this node is a Raft
+    // voter for its shard — writes are proposed through consensus and applied only
+    // after a quorum commits, so a leader failure fails over with no lost
+    // acknowledged write. `None` = the single-primary shard (increments 1–3).
+    // Compiled only behind the off-by-default `raft` feature.
+    #[cfg(feature = "raft")]
+    raft: Option<Arc<raft::RaftShard>>,
 }
 
 /// A collection's metadata.
@@ -934,6 +964,107 @@ impl AppState {
         self.write_blocking(move |db| db.apply_replicated(op)).await
     }
 
+    // Reject a write up front if this node is not its shard's Raft leader
+    // (ADR-0067), returning the leader's URL so a router redirects. Checking
+    // before preparing the op avoids a wasted local prepare on a follower (and a
+    // follower's stale local state silently producing a no-op). A leadership change
+    // between this check and the proposal is still caught: `client_write` then
+    // returns `ForwardToLeader`, mapped by `map_client_write_err`.
+    #[cfg(feature = "raft")]
+    fn ensure_raft_leader(&self, rs: &raft::RaftShard) -> Result<(), Error> {
+        let leader = rs.raft.metrics().borrow().current_leader;
+        if leader == Some(rs.node_id) {
+            Ok(())
+        } else {
+            Err(Error::NotLeader {
+                leader: leader.and_then(|id| rs.member_url(id)),
+            })
+        }
+    }
+
+    /// Add a voter to this node's Raft shard at runtime (ADR-0067 increment 4c,
+    /// admin only). Returns a bad-request error if this node is not a Raft shard or
+    /// the server was built without the `raft` feature.
+    pub(crate) async fn raft_add_voter(
+        &self,
+        principal: &Principal,
+        id: u64,
+        url: String,
+    ) -> Result<(), Error> {
+        self.authorize_global(principal, Action::Admin, "raft_add_voter")?;
+        #[cfg(feature = "raft")]
+        {
+            let rs = self
+                .raft
+                .clone()
+                .ok_or_else(|| Error::BadRequest("this node is not a raft shard".to_owned()))?;
+            return rs
+                .add_voter(id, url)
+                .await
+                .map_err(|e| Error::Internal(format!("add raft voter: {e}")));
+        }
+        #[cfg(not(feature = "raft"))]
+        {
+            let _ = (id, url);
+            Err(Error::BadRequest(
+                "server built without the raft feature".to_owned(),
+            ))
+        }
+    }
+
+    /// Remove a voter from this node's Raft shard at runtime (ADR-0067 increment 4c,
+    /// admin only).
+    pub(crate) async fn raft_remove_voter(
+        &self,
+        principal: &Principal,
+        id: u64,
+    ) -> Result<(), Error> {
+        self.authorize_global(principal, Action::Admin, "raft_remove_voter")?;
+        #[cfg(feature = "raft")]
+        {
+            let rs = self
+                .raft
+                .clone()
+                .ok_or_else(|| Error::BadRequest("this node is not a raft shard".to_owned()))?;
+            return rs
+                .remove_voter(id)
+                .await
+                .map_err(|e| Error::Internal(format!("remove raft voter: {e}")));
+        }
+        #[cfg(not(feature = "raft"))]
+        {
+            let _ = id;
+            Err(Error::BadRequest(
+                "server built without the raft feature".to_owned(),
+            ))
+        }
+    }
+
+    // Propose one prepared op through the shard's Raft group and wait for the
+    // quorum commit + local apply (ADR-0067). The op is acknowledged only after it
+    // is committed, so a leader failover never loses it.
+    #[cfg(feature = "raft")]
+    async fn raft_propose(&self, rs: &raft::RaftShard, op: WalOp) -> Result<(), Error> {
+        rs.raft
+            .client_write(op)
+            .await
+            .map(|_| ())
+            .map_err(map_client_write_err)
+    }
+
+    // Propose a batch of prepared ops in order, returning how many committed. Stops
+    // at the first failure (e.g. a mid-batch leadership change) and surfaces it, so
+    // a partial batch is reported honestly rather than as a silent success.
+    #[cfg(feature = "raft")]
+    async fn raft_propose_all(&self, rs: &raft::RaftShard, ops: Vec<WalOp>) -> Result<u64, Error> {
+        let mut committed = 0u64;
+        for op in ops {
+            self.raft_propose(rs, op).await?;
+            committed += 1;
+        }
+        Ok(committed)
+    }
+
     // Refuse a mutating operation on a read-only replication follower (ADR-0030);
     // its state is owned by the leader's stream, not by external clients.
     fn ensure_writable(&self, op: &str) -> Result<(), Error> {
@@ -972,6 +1103,45 @@ impl AppState {
                     vector_encryption,
                 )
                 .await;
+        }
+        // Per-shard Raft write path (ADR-0067): the leader prepares the op (which
+        // assigns the new collection id) and proposes it through consensus; every
+        // voter applies it after the quorum commit. The `create_lock` serializes
+        // concurrent creates so two cannot claim the same next id.
+        #[cfg(feature = "raft")]
+        if let Some(rs) = self.raft.clone() {
+            self.ensure_raft_leader(&rs)?;
+            let descriptor = Descriptor::new(dim, Dtype::F32, metric)
+                .with_index(index)
+                .with_filterable(filterable.clone())
+                .with_multivector(multivector)
+                .with_vector_encryption(vector_encryption);
+            let _guard = rs.create_lock.lock().await;
+            let prep_name = name.clone();
+            let result = match self
+                .read_blocking(move |db| db.prepare_create_collection(&prep_name, &descriptor))
+                .await
+            {
+                Ok(op) => self.raft_propose(&rs, op).await,
+                Err(e) => Err(e),
+            };
+            self.audit.record(
+                principal.actor(),
+                "create_collection",
+                &name,
+                Outcome::of(&result),
+            );
+            result?;
+            return Ok(CollectionInfo {
+                name,
+                dim,
+                metric,
+                count: 0,
+                index,
+                filterable,
+                multivector,
+                vector_encryption,
+            });
         }
         let descriptor = Descriptor::new(dim, Dtype::F32, metric)
             .with_index(index)
@@ -1115,6 +1285,34 @@ impl AppState {
         if let Some(c) = &self.cluster {
             return c.upsert(&collection, points).await;
         }
+        // Per-shard Raft write path (ADR-0067): prepare each point's op on the
+        // leader, then propose each through consensus. One op per point keeps the
+        // apply seam identical to a direct write; a batched Raft entry is a later
+        // optimization (ponytail: correctness first, opt-in path).
+        #[cfg(feature = "raft")]
+        if let Some(rs) = self.raft.clone() {
+            self.ensure_raft_leader(&rs)?;
+            let prep = collection.clone();
+            let result = match self
+                .read_blocking(move |db| {
+                    points
+                        .iter()
+                        .map(|p| db.prepare_upsert(&prep, &p.id, &p.vector, &p.payload))
+                        .collect::<quiver_embed::Result<Vec<_>>>()
+                })
+                .await
+            {
+                Ok(ops) => self.raft_propose_all(&rs, ops).await,
+                Err(e) => Err(e),
+            };
+            self.audit.record(
+                principal.actor(),
+                "upsert",
+                &collection,
+                Outcome::of(&result),
+            );
+            return result;
+        }
         let resource = collection.clone();
         let result = self
             .write_blocking(move |db| {
@@ -1205,6 +1403,35 @@ impl AppState {
         self.authorize(principal, Action::Write, "delete_points", &collection)?;
         if let Some(c) = &self.cluster {
             return c.delete_points(&collection, ids).await;
+        }
+        // Per-shard Raft write path (ADR-0067): prepare each delete on the leader
+        // (`None` for an absent point), then propose the present ones through
+        // consensus. The returned count is the number actually deleted.
+        #[cfg(feature = "raft")]
+        if let Some(rs) = self.raft.clone() {
+            self.ensure_raft_leader(&rs)?;
+            let prep = collection.clone();
+            let result = match self
+                .read_blocking(move |db| {
+                    ids.iter()
+                        .map(|id| db.prepare_delete(&prep, id))
+                        .collect::<quiver_embed::Result<Vec<Option<WalOp>>>>()
+                })
+                .await
+            {
+                Ok(ops) => {
+                    self.raft_propose_all(&rs, ops.into_iter().flatten().collect())
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            self.audit.record(
+                principal.actor(),
+                "delete_points",
+                &collection,
+                Outcome::of(&result),
+            );
+            return result;
         }
         let resource = collection.clone();
         let result = self
@@ -1790,8 +2017,31 @@ pub async fn serve(
         Some(c)
     };
 
+    // The shared engine handle. Wrapped before `AppState` so the Raft applier can
+    // hold the same handle (it drives `apply_replicated` on commit) without
+    // referencing `AppState` back — see `raft::EngineApplier`.
+    let db = Arc::new(RwLock::new(db));
+
+    // Opt-in per-shard Raft write HA (ADR-0067): when this node has a Raft id, join
+    // its shard's group over the gRPC transport. The applier holds `db` directly,
+    // so the state machine does not reference the Raft group it lives in.
+    #[cfg(feature = "raft")]
+    let raft = if let Some(node_id) = config.raft_node_id {
+        let members = parse_raft_members(&config.raft_members)?;
+        let applier = raft::EngineApplier::new(Arc::clone(&db));
+        // The Raft log persists under the data dir, beside the engine (ADR-0067 4c).
+        let log_dir = config.data_dir.join("raft");
+        let shard = raft::start_member(node_id, members, applier, &log_dir)
+            .await
+            .map_err(|e| Error::Config(format!("raft startup: {e}")))?;
+        tracing::info!(node_id, "per-shard raft write HA enabled");
+        Some(Arc::new(shard))
+    } else {
+        None
+    };
+
     let state = AppState {
-        db: Arc::new(RwLock::new(db)),
+        db,
         keys: Arc::new(config.api_keys.clone()),
         audit,
         replication_tx,
@@ -1804,6 +2054,8 @@ pub async fn serve(
         snapshot_cells: Arc::new(RwLock::new(HashMap::new())),
         mvcc,
         cluster,
+        #[cfg(feature = "raft")]
+        raft,
     };
 
     // A follower continuously applies the leader's committed-op stream (ADR-0030).
@@ -1812,6 +2064,13 @@ pub async fn serve(
     }
 
     let app = rest::router(state.clone());
+    // Mount the per-shard Raft transport on the same gRPC server (ADR-0067): build
+    // it before `state` is consumed by `grpc::service`.
+    #[cfg(feature = "raft")]
+    let raft_service = state
+        .raft
+        .as_ref()
+        .map(|rs| raft::grpc::RaftRpc::service(rs.raft.clone()));
     let grpc = grpc::service(state);
 
     let tls = load_tls(&config)?;
@@ -1847,8 +2106,11 @@ pub async fn serve(
             .map_err(|e| Error::Internal(format!("grpc tls config: {e}")))?;
     }
     let grpc_fut = async move {
-        grpc_builder
-            .add_service(grpc)
+        let routes = grpc_builder.add_service(grpc);
+        // Add the Raft service when this node runs a Raft group; a no-op otherwise.
+        #[cfg(feature = "raft")]
+        let routes = routes.add_optional_service(raft_service);
+        routes
             .serve_with_incoming(TcpListenerStream::new(grpc_listener))
             .await
             .map_err(|e| Error::Internal(format!("grpc server: {e}")))
@@ -1860,6 +2122,52 @@ pub async fn serve(
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+// Parse `["<id>=<url>", …]` Raft member entries into an id→URL map (ADR-0067).
+// Mirrors the `cluster_replicas` `<idx>=<url>` form; the bracketed
+// `QUIVER_RAFT_MEMBERS` env array reaches here as these strings. A node opting
+// into Raft must name a non-empty member set.
+#[cfg(feature = "raft")]
+fn parse_raft_members(
+    entries: &[String],
+) -> Result<std::collections::BTreeMap<u64, String>, Error> {
+    let mut members = std::collections::BTreeMap::new();
+    for entry in entries {
+        let (id, url) = entry
+            .split_once('=')
+            .ok_or_else(|| Error::Config(format!("raft member '{entry}' must be '<id>=<url>'")))?;
+        let id: u64 = id
+            .trim()
+            .parse()
+            .map_err(|_| Error::Config(format!("raft member id '{id}' is not a number")))?;
+        members.insert(id, url.trim().to_owned());
+    }
+    if members.is_empty() {
+        return Err(Error::Config(
+            "raft_node_id is set but raft_members is empty".to_owned(),
+        ));
+    }
+    Ok(members)
+}
+
+// Map an openraft `client_write` failure to a server [`Error`]. A `ForwardToLeader`
+// (this node is not the leader) becomes a [`Error::NotLeader`] carrying the
+// leader's URL so a router redirects; anything else is an internal fault.
+#[cfg(feature = "raft")]
+fn map_client_write_err(
+    err: openraft::error::RaftError<
+        u64,
+        openraft::error::ClientWriteError<u64, openraft::BasicNode>,
+    >,
+) -> Error {
+    use openraft::error::{ClientWriteError, RaftError};
+    match err {
+        RaftError::APIError(ClientWriteError::ForwardToLeader(f)) => Error::NotLeader {
+            leader: f.leader_node.map(|n| n.addr),
+        },
+        other => Error::Internal(format!("raft write failed: {other}")),
+    }
 }
 
 // Open the engine, enabling encryption-at-rest when a key is configured. The

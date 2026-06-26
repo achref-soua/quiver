@@ -202,6 +202,8 @@ async fn online_join_migration_loses_no_writes_and_stays_queryable() {
         data_dir: dirs[4].path().into(),
         coordinator: true,
         coordinator_state: Some(state.path().join("coord.json")),
+        raft_node_id: None,
+        raft_members: Vec::new(),
         cluster_shards: vec![s0.clone(), s1.clone()],
         ..Default::default()
     })
@@ -316,6 +318,8 @@ async fn auto_grow_migrates_the_slice_with_no_loss() {
         data_dir: dirs[4].path().into(),
         coordinator: true,
         coordinator_state: Some(state.path().join("coord.json")),
+        raft_node_id: None,
+        raft_members: Vec::new(),
         cluster_shards: vec![s0.clone(), s1.clone()],
         ..Default::default()
     })
