@@ -31,12 +31,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Clippy (optional otlp feature — keeps the gated exporter from rotting)
         run: cargo clippy -p quiverdb-server --features otlp --all-targets -- -D warnings
+      - name: Clippy (optional raft feature — keeps the gated consensus adapter from rotting)
+        run: cargo clippy -p quiverdb-server --features raft --all-targets -- -D warnings
       - name: Format + clippy (cockpit-shots — its own workspace, not in --workspace above)
         run: |
           cargo fmt --manifest-path tools/cockpit-shots/Cargo.toml --check
           cargo clippy --manifest-path tools/cockpit-shots/Cargo.toml --all-targets -- -D warnings
       - name: Test (workspace, excluding the crash-recovery stress test)
         run: cargo test --workspace -- --skip kill_mid_write_preserves_acknowledged_writes
+      - name: Test (optional raft feature — the consensus state-machine adapter)
+        run: "cargo test -p quiverdb-server --features raft raft::"
       - name: Crash-recovery stress test (retried — kill -9 timing is runner-sensitive)
         # The kill-mid-write gate SIGKILLs a writer at randomized points and asserts
         # recovery. A genuine recovery regression is deterministic and fails every

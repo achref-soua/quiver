@@ -10,6 +10,23 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-shard Raft state-machine adapter — foundation** (ADR-0067, cluster increment
+  4a). Behind a new **off-by-default `raft` cargo feature** on `quiverdb-server`, the
+  audited [`openraft`](https://crates.io/crates/openraft) consensus core is wired to
+  the engine's apply seam: a committed Raft log entry is one engine write op
+  (`WalOp`), and the state-machine adapter forwards it through the same
+  `apply_replicated` path a replication follower already uses (ADR-0030). This
+  increment runs a **single-member** group to prove the adapter end to end — it
+  commits an op and the engine then serves it; multi-member voting, automatic
+  failover, leader-aware routing, and log compaction land in increments 4b–4d. A
+  default build never links `openraft`, and single-node / non-Raft clusters are
+  byte-for-byte unchanged. The in-memory Raft log store is vendored from openraft's
+  example memstore (the published `openraft-memstore` implements the deprecated v1
+  storage that the `storage-v2` API removes); a durable, snapshot-backed store
+  arrives in 4c.
+
 ## [0.26.0] — 2026-06-25
 
 *Elastic* — the cluster grows and replicates: per-shard read replicas (increment 2)

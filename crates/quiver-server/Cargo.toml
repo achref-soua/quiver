@@ -43,6 +43,11 @@ opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
+# Per-shard Raft write HA (ADR-0067) — optional, enabled by the `raft` feature.
+# The in-memory log store is vendored (src/raft/log_store.rs), so only the
+# audited `openraft` core is an external dependency.
+openraft = { workspace = true, optional = true }
+
 [features]
 # Compile the OpenTelemetry traces exporter. Off by default; even when compiled
 # in, the exporter only activates when an OTLP endpoint is configured at runtime
@@ -53,6 +58,13 @@ otlp = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
 ]
+
+# Compile the per-shard Raft state-machine adapter (ADR-0067, increment 4). Off by
+# default — a default build never links `openraft`, and single-node / non-Raft
+# clusters are unaffected. Increment 4a wires the audited consensus core to the
+# engine's apply seam and proves it with a single-member group; multi-member
+# failover, log compaction, and leader-aware routing land in 4b–4d.
+raft = ["dep:openraft"]
 
 [dev-dependencies]
 rcgen = { workspace = true }
