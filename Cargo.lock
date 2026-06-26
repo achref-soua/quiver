@@ -2630,6 +2630,7 @@ dependencies = [
  "quiverdb-embed",
  "quiverdb-import",
  "quiverdb-mcp",
+ "quiverdb-providers",
  "quiverdb-server",
  "quiverdb-tui",
  "serde_json",
