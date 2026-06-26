@@ -28,9 +28,17 @@ for the per-release rationale and Definitions of Done.
   arrives in 4c. Increment 4b adds a real multi-voter group with **automatic leader
   failover** (no acknowledged write lost, verified against single-node ground truth)
   and a **gRPC transport** (`quiver.v1.RaftService`) carrying the consensus RPCs
-  between a shard's members over the server's existing tonic stack. Wiring this into
-  the server's run path and the cluster router (leader-aware routing) follows in the
-  remaining 4b increments.
+  between a shard's members over the server's existing tonic stack. The server now
+  **runs a per-shard Raft group on its existing gRPC port** when configured with a
+  `raft_node_id` and `raft_members` (`QUIVER_RAFT_NODE_ID` / `QUIVER_RAFT_MEMBERS`):
+  a write is prepared on the leader, proposed through consensus, and **committed by a
+  quorum before it is acknowledged**, so a leader failover loses no acknowledged
+  write; a write that reaches a non-leader is refused with a *"not the leader"*
+  redirect (HTTP 421, carrying the leader's URL). An integration test boots a real
+  three-node group, drives writes through the HTTP API, and kills the leader's
+  process to prove automatic failover end to end. Cluster-router leader-aware
+  routing that consumes the redirect follows in 4b-iii-c. Raft stays **opt-in per
+  shard**; a default build still never links `openraft`.
 
 ## [0.26.0] — 2026-06-25
 

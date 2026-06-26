@@ -39,8 +39,10 @@ jobs:
           cargo clippy --manifest-path tools/cockpit-shots/Cargo.toml --all-targets -- -D warnings
       - name: Test (workspace, excluding the crash-recovery stress test)
         run: cargo test --workspace -- --skip kill_mid_write_preserves_acknowledged_writes
-      - name: Test (optional raft feature — the consensus state-machine adapter)
-        run: "cargo test -p quiverdb-server --features raft raft::"
+      - name: Test (optional raft feature — consensus adapter + server wiring)
+        # The `raft` filter (substring) runs the in-process/gRPC adapter unit
+        # tests (`raft::…`) and the `raft_cluster` server-wiring failover test.
+        run: "cargo test -p quiverdb-server --features raft raft"
       - name: Crash-recovery stress test (retried — kill -9 timing is runner-sensitive)
         # The kill-mid-write gate SIGKILLs a writer at randomized points and asserts
         # recovery. A genuine recovery regression is deterministic and fails every
