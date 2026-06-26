@@ -10,6 +10,60 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.29.0] — 2026-06-27
+
+*Hardened* — a finalization and production-readiness pass: a documented security
+audit (static review + a dynamic OWASP ZAP scan + the fuzzers re-run), the fixes
+those probes surfaced, the complete API/CLI/configuration reference, and assorted
+correctness and coherence fixes. No engine behavior change; the single node is
+unchanged at zero overhead.
+
+### Security
+
+- **Authenticated cluster coordinator** — the coordinator's membership API
+  (`POST`/`DELETE /cluster/shards*`, `/cluster/map`, `/cluster/health`) now enforces
+  the same default-deny RBAC as the data plane: reads need any valid key and the
+  mutating shard ops need an `admin` key, so a network-reachable coordinator can no
+  longer be reshaped by an unauthenticated caller. A keyless coordinator refuses to
+  start unless `insecure` (cluster mode only; single-node unaffected).
+- **Baseline security response headers** — every response now carries
+  `X-Content-Type-Options: nosniff` and `Cross-Origin-Resource-Policy: same-origin`
+  (flagged by the OWASP ZAP API scan).
+- **Security audit** ([`docs/security/audit-0.29.0.md`](docs/security/audit-0.29.0.md))
+  — a static OWASP-style review plus a dynamic OWASP ZAP scan of a live server
+  (0 failures across 119 rules) and the three `cargo-fuzz` targets re-run clean
+  (tens of millions of inputs), with every finding fixed and regression-tested and
+  the residual risks stated honestly. The threat model is extended to cluster mode,
+  the coordinator, and per-shard Raft.
+
+### Fixed
+
+- **Crash-recovery gate** — a WAL segment too short to hold its 16-byte header
+  (a `kill -9` during WAL rotation, beside the prior durable segment) is now treated
+  as an empty torn tail rather than a hard error, so `Store::open` recovers cleanly.
+  This was the source of the intermittent `wal … shorter than its header` failure on
+  loaded CI runners; the crash gate (ADR-0005) is honored, not weakened.
+- **Field-guide figures 29 & 30** — fixed overlapping labels/arrows.
+
+### Documentation
+
+- **Complete API reference** — a committed [OpenAPI 3.1 spec](docs/api/openapi.yaml)
+  for every REST endpoint (pinned to the router by a coverage test), and a reconciled
+  `docs/api/rest-grpc.md` (removed endpoints that were documented but never
+  implemented).
+- **CLI reference** and an **exhaustive configuration reference** (every `QUIVER_*`
+  variable) in the docs site.
+- The **"Quiver, Explained" field guide** gains §6.5 on the security-robustness
+  evidence (audit + OWASP ZAP + fuzzing), and a systematic bad-input contract test
+  documents that every public entry point rejects malformed input with a 4xx, never
+  a 500.
+
+### Internal
+
+- The `quiver demo` command seeds a second, text-searchable collection so the cockpit
+  demo exercises every view; community-health files (SUPPORT, CODEOWNERS, Dependabot)
+  and a project wiki round out the repository.
+
 ## [0.28.0] — 2026-06-26
 
 *Autopilot* — the cluster scales itself and borrows a GPU's muscle where one exists:
@@ -621,7 +675,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/achref-soua/quiver/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/achref-soua/quiver/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/achref-soua/quiver/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/achref-soua/quiver/compare/v0.25.0...v0.26.0
