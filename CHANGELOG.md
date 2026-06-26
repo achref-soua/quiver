@@ -44,8 +44,13 @@ for the per-release rationale and Definitions of Done.
   path. A non-Raft shard is unchanged (its primary always accepts, so its replicas
   are never written to). An integration test fronts a three-node Raft shard with a
   router, kills the leader, and confirms post-failover writes still land and no
-  acknowledged write is lost. Raft stays **opt-in per shard**; a default build still
-  never links `openraft`.
+  acknowledged write is lost. The **correctness gate** asserts the two headline
+  safety properties: a writer driving continuous upserts through the router while
+  the leader's process is killed loses **no acknowledged write** (every acked id is
+  served by a survivor afterwards), and a **minority cannot commit a write** (no
+  split-brain) — the latter proven at the consensus-adapter level, where a node can
+  be truly isolated, while it still serves data committed before the partition. Raft
+  stays **opt-in per shard**; a default build still never links `openraft`.
 
 ## [0.26.0] — 2026-06-25
 
