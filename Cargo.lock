@@ -2766,6 +2766,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "postcard",
  "quiverdb-cluster",
  "quiverdb-core",
  "quiverdb-crypto",

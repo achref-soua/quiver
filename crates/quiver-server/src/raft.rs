@@ -26,6 +26,7 @@
 //!
 //! [`ADR-0030`]: ../../../docs/adr/0030-leader-follower-replication.md
 
+pub mod grpc;
 mod log_store;
 
 use std::collections::BTreeMap;
