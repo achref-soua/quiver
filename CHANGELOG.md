@@ -36,9 +36,16 @@ for the per-release rationale and Definitions of Done.
   write; a write that reaches a non-leader is refused with a *"not the leader"*
   redirect (HTTP 421, carrying the leader's URL). An integration test boots a real
   three-node group, drives writes through the HTTP API, and kills the leader's
-  process to prove automatic failover end to end. Cluster-router leader-aware
-  routing that consumes the redirect follows in 4b-iii-c. Raft stays **opt-in per
-  shard**; a default build still never links `openraft`.
+  process to prove automatic failover end to end. The **cluster router is now
+  leader-aware**: it sends a Raft shard's writes to the shard's current leader,
+  discovering it among the shard's voter URLs (`{primary} ∪ replicas`), caching it,
+  and re-discovering it on a *"not the leader"* (HTTP 421) reply or a failover — so a
+  router self-corrects after a leader change without the coordinator on the write
+  path. A non-Raft shard is unchanged (its primary always accepts, so its replicas
+  are never written to). An integration test fronts a three-node Raft shard with a
+  router, kills the leader, and confirms post-failover writes still land and no
+  acknowledged write is lost. Raft stays **opt-in per shard**; a default build still
+  never links `openraft`.
 
 ## [0.26.0] — 2026-06-25
 

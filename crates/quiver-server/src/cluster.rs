@@ -46,6 +46,30 @@ pub(crate) struct Cluster {
     // replicas (ADR-0065 increment 2). Relaxed: an exact sequence is not required,
     // only an even spread.
     read_rr: AtomicUsize,
+    // Discovered current Raft leader per shard id → its REST URL (ADR-0067, write
+    // HA). A write goes to the cached leader first; on a "not the leader" (HTTP
+    // 421) it is re-discovered among the shard's voter URLs ({primary} ∪ replicas)
+    // and re-cached, so the router self-corrects after a failover without the
+    // coordinator on the write path. Empty for a non-Raft cluster (a shard's
+    // primary always accepts, so it caches the primary and never redirects).
+    leaders: RwLock<HashMap<u64, String>>,
+}
+
+// How long a write keeps hunting for a shard's Raft leader before giving up — the
+// window an election takes to settle. ponytail: fixed ~3 s ceiling (60 × 50 ms);
+// make it configurable only if a deployment's elections run longer.
+const WRITE_LEADER_ATTEMPTS: usize = 60;
+const WRITE_LEADER_BACKOFF: Duration = Duration::from_millis(50);
+
+// The outcome of one write attempt to a single shard URL.
+enum WriteOutcome {
+    /// 421 — this node is a Raft follower; the leader is another voter.
+    NotLeader,
+    /// The node was unreachable (try another voter, if any).
+    Unreachable(Error),
+    /// A real rejection (validation, auth, a non-Raft replica's read-only 403) —
+    /// propagate it rather than masking it by trying another node.
+    Fatal(Error),
 }
 
 impl Cluster {
@@ -78,6 +102,7 @@ impl Cluster {
             shard_key,
             ordering: RwLock::new(HashMap::new()),
             read_rr: AtomicUsize::new(0),
+            leaders: RwLock::new(HashMap::new()),
         })
     }
 
@@ -185,8 +210,10 @@ impl Cluster {
     }
 
     // Send the same request to every shard (collection broadcast), returning the
-    // first body. Any shard failure fails the whole op so the cluster never ends up
-    // with a collection on only some shards.
+    // last body. Any shard failure fails the whole op so the cluster never ends up
+    // with a collection on only some shards. Collection create/drop are **writes**,
+    // so each shard's request is leader-aware (ADR-0067): it lands on the shard's
+    // Raft leader, or its sole primary for a non-Raft shard.
     async fn broadcast(
         &self,
         method: reqwest::Method,
@@ -197,14 +224,108 @@ impl Cluster {
         let mut last = Value::Null;
         for shard in map.shards() {
             last = self
-                .send(
-                    method.clone(),
-                    format!("{}{path}", shard.primary_url),
-                    body.clone(),
-                )
+                .write_to_shard(shard, method.clone(), path, body.clone())
                 .await?;
         }
         Ok(last)
+    }
+
+    // One write attempt to a single shard URL, classifying the result so the caller
+    // knows whether to try another voter (`NotLeader`/`Unreachable`) or stop
+    // (`Fatal`). A 421 is the "not the leader" redirect from ADR-0067's write path.
+    async fn try_write(
+        &self,
+        method: reqwest::Method,
+        url: String,
+        body: Option<Value>,
+    ) -> Result<Value, WriteOutcome> {
+        let mut rb = self.http.request(method, &url);
+        if let Some(b) = body {
+            rb = rb.json(&b);
+        }
+        let resp = self.auth(rb).send().await.map_err(|e| {
+            WriteOutcome::Unreachable(Error::Internal(format!("shard {url} unreachable: {e}")))
+        })?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::MISDIRECTED_REQUEST {
+            return Err(WriteOutcome::NotLeader);
+        }
+        if !status.is_success() {
+            return Err(WriteOutcome::Fatal(Error::Internal(format!(
+                "shard {url} returned {status}: {text}"
+            ))));
+        }
+        if text.is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|e| {
+            WriteOutcome::Fatal(Error::Internal(format!("shard {url} bad response: {e}")))
+        })
+    }
+
+    // Send a write to a shard's current Raft leader (ADR-0067), discovering it among
+    // the shard's voter URLs ({primary} ∪ replicas) and caching it. Candidates are
+    // tried in preference order — cached leader, primary, then replicas — and the
+    // **first 2xx wins** (cached as the leader). A non-Raft shard's primary always
+    // answers 2xx on the first try, so its replicas are never written to; only a
+    // primary that 421s ("not the leader") or is unreachable falls through to them,
+    // and a non-Raft replica refuses a write (403) so a mis-route cannot corrupt. If
+    // a node answered 421 but none is leader yet, an election is in flight: back off
+    // and retry within a bounded window.
+    async fn write_to_shard(
+        &self,
+        shard: &quiver_cluster::Shard,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, Error> {
+        let target = |url: &str| format!("{url}{path}");
+        for _ in 0..WRITE_LEADER_ATTEMPTS {
+            // Cached leader first, then {primary} ∪ replicas, deduped.
+            let cached = self.leaders.read().await.get(&shard.id).cloned();
+            let mut candidates: Vec<String> = cached.into_iter().collect();
+            for v in shard.read_order(0) {
+                if !candidates.iter().any(|u| u == v) {
+                    candidates.push(v.to_owned());
+                }
+            }
+
+            let mut saw_not_leader = false;
+            let mut unreachable: Option<Error> = None;
+            for url in &candidates {
+                match self
+                    .try_write(method.clone(), target(url), body.clone())
+                    .await
+                {
+                    Ok(v) => return self.cache_leader(shard.id, url, v).await,
+                    Err(WriteOutcome::NotLeader) => saw_not_leader = true,
+                    Err(WriteOutcome::Unreachable(e)) => unreachable = Some(e),
+                    Err(WriteOutcome::Fatal(e)) => return Err(e),
+                }
+            }
+
+            if saw_not_leader {
+                // A voter exists but no leader yet — an election is in flight.
+                tokio::time::sleep(WRITE_LEADER_BACKOFF).await;
+            } else {
+                // No node claimed not-the-leader: a non-Raft shard (or a fully-down
+                // one) with no write failover. Surface the unreachable error.
+                return Err(unreachable.unwrap_or_else(|| {
+                    Error::Internal(format!("shard {} has no write target", shard.id))
+                }));
+            }
+        }
+        Err(Error::Internal(format!(
+            "shard {} has no Raft leader (writes unavailable after retries)",
+            shard.id
+        )))
+    }
+
+    // Record `url` as shard `id`'s leader and return the write's body.
+    async fn cache_leader(&self, id: u64, url: &str, body: Value) -> Result<Value, Error> {
+        self.leaders.write().await.insert(id, url.to_owned());
+        Ok(body)
     }
 
     // --- Collection ops (broadcast) ----------------------------------------
@@ -298,7 +419,7 @@ impl Cluster {
         let mut total = 0u64;
         for (shard, group) in map.partition(&points, |p| p.id.as_str()) {
             total += self
-                .post_points(collection, endpoint, &shard.primary_url, &group)
+                .post_points(collection, endpoint, shard, &group)
                 .await?;
         }
         // Migration dual-write (ADR-0066 increment 3c): a point whose owner is a
@@ -307,27 +428,32 @@ impl Cluster {
         // copy is not counted (it is the same logical point). Empty when no migration
         // is in flight, so a steady-state cluster does no extra work.
         for (donor, group) in map.partition_to_donors(&points, |p| p.id.as_str()) {
-            self.post_points(collection, endpoint, &donor.primary_url, &group)
+            self.post_points(collection, endpoint, donor, &group)
                 .await?;
         }
         Ok(total)
     }
 
-    // POST a group of points to one shard, returning its `upserted` count.
+    // POST a group of points to one shard's leader, returning its `upserted` count.
     async fn post_points(
         &self,
         collection: &str,
         endpoint: &str,
-        primary_url: &str,
+        shard: &quiver_cluster::Shard,
         group: &[&PointIn],
     ) -> Result<u64, Error> {
         let dtos: Vec<Value> = group
             .iter()
             .map(|p| json!({ "id": p.id, "vector": p.vector, "payload": p.payload }))
             .collect();
-        let url = format!("{primary_url}/v1/collections/{collection}/{endpoint}");
+        let path = format!("/v1/collections/{collection}/{endpoint}");
         let resp = self
-            .send(reqwest::Method::POST, url, Some(json!({ "points": dtos })))
+            .write_to_shard(
+                shard,
+                reqwest::Method::POST,
+                &path,
+                Some(json!({ "points": dtos })),
+            )
             .await?;
         Ok(resp.get("upserted").and_then(Value::as_u64).unwrap_or(0))
     }
@@ -340,29 +466,31 @@ impl Cluster {
         let map = self.map.load();
         let mut total = 0u64;
         for (shard, group) in map.partition(&ids, |id| id.as_str()) {
-            total += self
-                .delete_group(collection, &shard.primary_url, &group)
-                .await?;
+            total += self.delete_group(collection, shard, &group).await?;
         }
         // Migration dual-delete (ADR-0066 increment 3c): also remove from the donor so
         // a delete during a join is not resurrected by the slice copy. Not counted.
         for (donor, group) in map.partition_to_donors(&ids, |id| id.as_str()) {
-            self.delete_group(collection, &donor.primary_url, &group)
-                .await?;
+            self.delete_group(collection, donor, &group).await?;
         }
         Ok(total)
     }
 
-    // DELETE a group of ids from one shard, returning its `deleted` count.
+    // DELETE a group of ids from one shard's leader, returning its `deleted` count.
     async fn delete_group(
         &self,
         collection: &str,
-        primary_url: &str,
+        shard: &quiver_cluster::Shard,
         group: &[&String],
     ) -> Result<u64, Error> {
-        let url = format!("{primary_url}/v1/collections/{collection}/points");
+        let path = format!("/v1/collections/{collection}/points");
         let resp = self
-            .send(reqwest::Method::DELETE, url, Some(json!({ "ids": group })))
+            .write_to_shard(
+                shard,
+                reqwest::Method::DELETE,
+                &path,
+                Some(json!({ "ids": group })),
+            )
             .await?;
         Ok(resp.get("deleted").and_then(Value::as_u64).unwrap_or(0))
     }
