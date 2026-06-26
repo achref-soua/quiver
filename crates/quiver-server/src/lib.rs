@@ -977,8 +977,66 @@ impl AppState {
             Ok(())
         } else {
             Err(Error::NotLeader {
-                leader: leader.and_then(|id| rs.members.get(&id).cloned()),
+                leader: leader.and_then(|id| rs.member_url(id)),
             })
+        }
+    }
+
+    /// Add a voter to this node's Raft shard at runtime (ADR-0067 increment 4c,
+    /// admin only). Returns a bad-request error if this node is not a Raft shard or
+    /// the server was built without the `raft` feature.
+    pub(crate) async fn raft_add_voter(
+        &self,
+        principal: &Principal,
+        id: u64,
+        url: String,
+    ) -> Result<(), Error> {
+        self.authorize_global(principal, Action::Admin, "raft_add_voter")?;
+        #[cfg(feature = "raft")]
+        {
+            let rs = self
+                .raft
+                .clone()
+                .ok_or_else(|| Error::BadRequest("this node is not a raft shard".to_owned()))?;
+            return rs
+                .add_voter(id, url)
+                .await
+                .map_err(|e| Error::Internal(format!("add raft voter: {e}")));
+        }
+        #[cfg(not(feature = "raft"))]
+        {
+            let _ = (id, url);
+            Err(Error::BadRequest(
+                "server built without the raft feature".to_owned(),
+            ))
+        }
+    }
+
+    /// Remove a voter from this node's Raft shard at runtime (ADR-0067 increment 4c,
+    /// admin only).
+    pub(crate) async fn raft_remove_voter(
+        &self,
+        principal: &Principal,
+        id: u64,
+    ) -> Result<(), Error> {
+        self.authorize_global(principal, Action::Admin, "raft_remove_voter")?;
+        #[cfg(feature = "raft")]
+        {
+            let rs = self
+                .raft
+                .clone()
+                .ok_or_else(|| Error::BadRequest("this node is not a raft shard".to_owned()))?;
+            return rs
+                .remove_voter(id)
+                .await
+                .map_err(|e| Error::Internal(format!("remove raft voter: {e}")));
+        }
+        #[cfg(not(feature = "raft"))]
+        {
+            let _ = id;
+            Err(Error::BadRequest(
+                "server built without the raft feature".to_owned(),
+            ))
         }
     }
 
