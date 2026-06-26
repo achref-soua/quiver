@@ -166,6 +166,7 @@ async fn router_refreshes_membership_from_the_coordinator() {
         data_dir: dirs[4].path().into(),
         coordinator: true,
         coordinator_state: Some(state.path().join("coord.json")),
+        autoscale: Default::default(),
         raft_node_id: None,
         raft_members: Vec::new(),
         cluster_shards: vec![s0.clone(), s1.clone()],
@@ -304,6 +305,7 @@ async fn coordinator_persists_membership_across_restart() {
         data_dir: dir.path().join("c1"),
         coordinator: true,
         coordinator_state: Some(state_path.clone()),
+        autoscale: Default::default(),
         raft_node_id: None,
         raft_members: Vec::new(),
         cluster_shards: vec![s0.clone()],
@@ -323,6 +325,7 @@ async fn coordinator_persists_membership_across_restart() {
         data_dir: dir.path().join("c2"),
         coordinator: true,
         coordinator_state: Some(state_path.clone()),
+        autoscale: Default::default(),
         raft_node_id: None,
         raft_members: Vec::new(),
         // A different bootstrap set is ignored because the state file exists.
