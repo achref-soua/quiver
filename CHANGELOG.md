@@ -10,6 +10,21 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Added
+
+- **Coordinator autoscaling — automatic scale-out** (ADR-0065 increment 5, opt-in).
+  When enabled, the coordinator samples each shard's point count and, when the
+  busiest crosses a configured `high_water_points`, **grows the cluster into a
+  standby on its own** — driving the same safe online migration as a manual
+  `POST /cluster/shards/grow`, so a busy cluster gains a shard with no operator
+  action and no lost data. It is an **explicit policy, not magic**: nothing scales
+  without a configured threshold and a standby to grow into, a cooldown bounds the
+  rate, an in-flight migration is never interrupted, and a `max_shards` cap bounds
+  growth. Configured with an `[autoscale]` table (or `QUIVER_AUTOSCALE_*`). Scale-in
+  is deliberately **not** automated — safe online drain is a later increment, so
+  shrink stays a manual, drained `DELETE /cluster/shards/{id}`. Single-node and a
+  cluster without the policy are unchanged.
+
 ## [0.27.0] — 2026-06-26
 
 *Resilient* — surviving a node failure: opt-in per-shard write high availability on

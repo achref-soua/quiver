@@ -90,6 +90,7 @@ async fn scoped_keys_deny_over_scope_and_cross_namespace() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        autoscale: Default::default(),
         raft_node_id: None,
         raft_members: Vec::new(),
     };
