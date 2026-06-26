@@ -18,6 +18,20 @@ memmap2 = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+# Optional GPU acceleration (ADR-0052), gated behind the off-by-default `cuda`
+# feature. cudarc dynamically loads the CUDA driver at runtime and compiles the
+# distance kernel with NVRTC, so a default build links nothing and the feature even
+# *builds* without a CUDA toolchain present (only *running* needs a GPU). The CPU
+# SIMD kernel stays the default and the fallback.
+cudarc = { version = "0.12", features = [
+    "cuda-12010",
+    "nvrtc",
+    "driver",
+], optional = true }
+
+[features]
+# GPU-accelerated batch distance (ADR-0052). Off by default.
+cuda = ["dep:cudarc"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -11,6 +11,7 @@
 mod colbert;
 pub mod disk;
 mod fresh;
+pub mod gpu;
 mod hnsw;
 mod ivf;
 mod kmeans;
