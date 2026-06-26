@@ -56,8 +56,14 @@ for the per-release rationale and Definitions of Done.
   mid-write is discarded), so a restarted voter recovers its log and vote and
   rejoins safely — the same `kill -9` discipline as the engine WAL, proven by a
   reopen-from-disk test. The committed index stays advisory (recomputed on restart),
-  so the commit path pays no extra `fsync`. Raft stays **opt-in per shard**; a
-  default build still never links `openraft`.
+  so the commit path pays no extra `fsync`. The state-machine **snapshot now carries
+  engine state** (ADR-0050), so the durable log can be **compacted** and a far-behind
+  or newly added voter catches up by **installing the snapshot** instead of replaying
+  a purged log: a snapshot captures the engine as the op stream that recreates it,
+  and installing it resets the target engine and replays — proven both directly and
+  end to end (a fresh voter, added after the leader snapshots and purges its log,
+  catches up purely from the snapshot). Raft stays **opt-in per shard**; a default
+  build still never links `openraft`.
 
 ## [0.26.0] — 2026-06-25
 

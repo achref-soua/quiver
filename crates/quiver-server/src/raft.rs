@@ -91,6 +91,25 @@ pub trait ApplyOp: Send + Sync + 'static {
     /// fault on an already-committed entry — it is surfaced loudly (the state
     /// machine maps it to a Raft `StorageError`), never silently dropped.
     fn apply(&self, op: WalOp) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
+
+    /// Capture the engine's full state as an opaque blob (ADR-0050), for a Raft
+    /// snapshot. A snapshot lets the log be compacted (ADR-0067 increment 4c) and a
+    /// far-behind or newly added voter catch up by installing it instead of
+    /// replaying the whole log. The default captures nothing — only an
+    /// engine-backed applier needs to override it.
+    fn snapshot(&self) -> impl std::future::Future<Output = std::io::Result<Vec<u8>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Replace the engine's state with a blob produced by [`snapshot`](Self::snapshot)
+    /// (the receiving side of a Raft snapshot install). The default does nothing.
+    fn restore(
+        &self,
+        data: Vec<u8>,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+        let _ = data;
+        async { Ok(()) }
+    }
 }
 
 /// The Raft bookkeeping this node persists alongside the engine: the id of the
@@ -109,8 +128,18 @@ pub struct StateMachineData {
 pub struct StoredSnapshot {
     /// Snapshot metadata (covered log id, membership, snapshot id).
     pub meta: SnapshotMeta<NodeId, BasicNode>,
-    /// Serialized [`StateMachineData`] at the snapshot point.
+    /// Serialized `SnapshotPayload` at the snapshot point.
     pub data: Vec<u8>,
+}
+
+/// The serialized contents of a Raft snapshot (ADR-0067 increment 4c): the Raft
+/// bookkeeping plus the engine's state captured via [`ApplyOp::snapshot`]. A voter
+/// installing this restores its engine from `engine` and adopts `sm`, so it can
+/// catch up from a snapshot instead of replaying a (possibly purged) log.
+#[derive(Serialize, Deserialize)]
+struct SnapshotPayload {
+    sm: StateMachineData,
+    engine: Vec<u8>,
 }
 
 /// The Raft state machine: it owns the engine applier and the Raft bookkeeping,
@@ -141,12 +170,20 @@ impl<A: ApplyOp> StateMachineStore<A> {
 
 impl<A: ApplyOp> RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore<A>> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let (data, last_applied_log, last_membership) = {
+        let (sm, last_applied_log, last_membership) = {
             let sm = self.state_machine.read().await;
-            let data =
-                serde_json::to_vec(&*sm).map_err(|e| StorageIOError::read_state_machine(&e))?;
-            (data, sm.last_applied_log, sm.last_membership.clone())
+            (sm.clone(), sm.last_applied_log, sm.last_membership.clone())
         };
+        // Capture the engine alongside the bookkeeping so a far-behind or newly
+        // added voter can catch up by installing this rather than replaying a log
+        // that may have been compacted away (ADR-0067 increment 4c).
+        let engine = self
+            .applier
+            .snapshot()
+            .await
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+        let data = serde_json::to_vec(&SnapshotPayload { sm, engine })
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
 
         let snapshot_idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot_id = match last_applied_log {
@@ -225,20 +262,23 @@ impl<A: ApplyOp> RaftStateMachine<TypeConfig> for Arc<StateMachineStore<A>> {
         meta: &SnapshotMeta<NodeId, BasicNode>,
         snapshot: Box<<TypeConfig as RaftTypeConfig>::SnapshotData>,
     ) -> Result<(), StorageError<NodeId>> {
-        // ponytail: 4a carries only Raft metadata in the snapshot, so this keeps
-        // the Raft layer consistent but does NOT transfer engine data. A
-        // single-member group never installs a snapshot, so it is never exercised
-        // here; increment 4c integrates ADR-0050 so a lagging/new voter receives
-        // engine state. Until then a real install would under-restore — which is
-        // why multi-member voting is gated to 4b+.
-        let stored = StoredSnapshot {
+        // Restore the engine from the snapshot, then adopt the Raft bookkeeping
+        // (ADR-0067 increment 4c): a far-behind or newly added voter receives the
+        // engine state it could not replay from a compacted log. `ApplyOp::restore`
+        // resets the engine before replaying, so this is correct even if the voter
+        // already holds divergent state.
+        let data = snapshot.into_inner();
+        let payload: SnapshotPayload = serde_json::from_slice(&data)
+            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        self.applier
+            .restore(payload.engine)
+            .await
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        *self.state_machine.write().await = payload.sm;
+        *self.current_snapshot.write().await = Some(StoredSnapshot {
             meta: meta.clone(),
-            data: snapshot.into_inner(),
-        };
-        let restored: StateMachineData = serde_json::from_slice(&stored.data)
-            .map_err(|e| StorageIOError::read_snapshot(Some(stored.meta.signature()), &e))?;
-        *self.state_machine.write().await = restored;
-        *self.current_snapshot.write().await = Some(stored);
+            data,
+        });
         Ok(())
     }
 
@@ -361,6 +401,51 @@ impl ApplyOp for EngineApplier {
         .await
         .map_err(|e| std::io::Error::other(format!("blocking apply task failed: {e}")))?
     }
+
+    // Capture the engine as the WalOps that recreate it (ADR-0050's replication
+    // snapshot — the same op stream a fresh follower bootstraps from), postcard-
+    // encoded. A read lock suffices; the blocking work is offloaded.
+    async fn snapshot(&self) -> std::io::Result<Vec<u8>> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let guard = db
+                .read()
+                .map_err(|_| std::io::Error::other("database lock poisoned"))?;
+            let ops = guard
+                .replication_snapshot()
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            postcard::to_allocvec(&ops).map_err(|e| std::io::Error::other(e.to_string()))
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("blocking snapshot task failed: {e}")))?
+    }
+
+    // Replace the engine with a snapshot: reset (drop every collection) then replay
+    // the captured WalOps. Reset-then-replay (rather than merge) makes install
+    // idempotent and correct even on a voter that already holds divergent state.
+    async fn restore(&self, data: Vec<u8>) -> std::io::Result<()> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let ops: Vec<WalOp> =
+                postcard::from_bytes(&data).map_err(|e| std::io::Error::other(e.to_string()))?;
+            let mut guard = db
+                .write()
+                .map_err(|_| std::io::Error::other("database lock poisoned"))?;
+            for name in guard.collection_names() {
+                guard
+                    .drop_collection(&name)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
+            for op in ops {
+                guard
+                    .apply_replicated(op)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("blocking restore task failed: {e}")))?
+    }
 }
 
 /// A node's per-shard Raft group plus the handles the server's write path needs
@@ -479,6 +564,31 @@ mod tests {
                 .await
                 .apply_replicated(op)
                 .map_err(|e| std::io::Error::other(e.to_string()))
+        }
+
+        async fn snapshot(&self) -> std::io::Result<Vec<u8>> {
+            let ops = self
+                .0
+                .lock()
+                .await
+                .replication_snapshot()
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            postcard::to_allocvec(&ops).map_err(|e| std::io::Error::other(e.to_string()))
+        }
+
+        async fn restore(&self, data: Vec<u8>) -> std::io::Result<()> {
+            let ops: Vec<WalOp> =
+                postcard::from_bytes(&data).map_err(|e| std::io::Error::other(e.to_string()))?;
+            let mut db = self.0.lock().await;
+            for name in db.collection_names() {
+                db.drop_collection(&name)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
+            for op in ops {
+                db.apply_replicated(op)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
+            Ok(())
         }
     }
 
@@ -616,7 +726,11 @@ mod tests {
 
         // Receive and install a distinct snapshot (begin_receiving_snapshot +
         // install_snapshot); the machine adopts it as its current snapshot.
-        let bytes = serde_json::to_vec(&StateMachineData::default()).unwrap();
+        let bytes = serde_json::to_vec(&SnapshotPayload {
+            sm: StateMachineData::default(),
+            engine: Vec::new(),
+        })
+        .unwrap();
         let mut receiver = sm.clone();
         let mut cursor = receiver.begin_receiving_snapshot().await.unwrap();
         *cursor = Cursor::new(bytes);
@@ -629,6 +743,61 @@ mod tests {
 
         let current = sm.clone().get_current_snapshot().await.unwrap().unwrap();
         assert_eq!(current.meta.snapshot_id, "installed", "install replaced it");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_transfers_engine_state_to_a_fresh_voter() {
+        // A source engine holding data, captured into a state-machine snapshot
+        // (ADR-0067 increment 4c: the snapshot carries engine state, not just Raft
+        // metadata, so a far-behind / newly added voter can catch up from it).
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = Arc::new(Mutex::new(Database::open(src_dir.path()).unwrap()));
+        {
+            let mut db = src.lock().await;
+            db.create_collection("docs", Descriptor::new(4, Dtype::F32, DistanceMetric::L2))
+                .unwrap();
+            db.upsert("docs", "a", &[1.0, 0.0, 0.0, 0.0], &serde_json::json!({}))
+                .unwrap();
+            db.upsert("docs", "b", &[0.0, 1.0, 0.0, 0.0], &serde_json::json!({}))
+                .unwrap();
+        }
+        let sm_src = Arc::new(StateMachineStore::new(EngineApplier(src.clone())));
+        let snap = sm_src
+            .clone()
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let bytes = snap.snapshot.into_inner();
+
+        // A fresh, empty target installs the snapshot — its engine is restored.
+        let tgt_dir = tempfile::tempdir().unwrap();
+        let tgt = Arc::new(Mutex::new(Database::open(tgt_dir.path()).unwrap()));
+        let mut receiver = Arc::new(StateMachineStore::new(EngineApplier(tgt.clone())));
+        receiver
+            .install_snapshot(&snap.meta, Box::new(std::io::Cursor::new(bytes)))
+            .await
+            .unwrap();
+
+        // The target now serves both points the source held.
+        let params = SearchParams {
+            k: 2,
+            ef_search: 16,
+            with_payload: false,
+            with_vector: false,
+            filter: None,
+        };
+        let hits = tgt
+            .lock()
+            .await
+            .search("docs", &[1.0, 0.0, 0.0, 0.0], &params)
+            .unwrap();
+        let ids: std::collections::HashSet<_> = hits.iter().map(|m| m.id.clone()).collect();
+        assert!(
+            ids.contains("a") && ids.contains("b"),
+            "the snapshot transferred the engine state to a fresh voter"
+        );
     }
 
     // ----------------------------------------------------------------------
@@ -736,13 +905,18 @@ mod tests {
 
         async fn install_snapshot(
             &mut self,
-            _rpc: InstallSnapshotRequest<TypeConfig>,
+            rpc: InstallSnapshotRequest<TypeConfig>,
             _option: RPCOption,
         ) -> Result<InstallSnapshotResponse<NodeId>, RpcError<InstallSnapshotError>> {
-            // Never reached: these tests keep the full log (no compaction/purge),
-            // so a lagging follower catches up via append_entries, never a
-            // snapshot install. Snapshot transfer arrives with log compaction (4c).
-            unreachable!("4b-i tests never transfer a snapshot")
+            // Forward to the target's snapshot-receive handler (4c): a voter that
+            // is behind a compacted log catches up by installing a snapshot.
+            let target = self.board.handle(self.target).ok_or_else(|| {
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::other("node down")))
+            })?;
+            target
+                .install_snapshot(rpc)
+                .await
+                .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
         }
     }
 
@@ -1033,5 +1207,87 @@ mod tests {
         // committed before the partition.
         await_serves(&survivor.engine, &a, "a").await;
         survivor.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_voter_catches_up_via_snapshot_after_compaction() {
+        // The headline of log compaction (ADR-0067 increment 4c): a leader commits
+        // data, snapshots, and PURGES its log — then a fresh voter added as a learner
+        // can only catch up by INSTALLING the snapshot (the early log is gone), which
+        // proves the snapshot carries engine state end to end and the transport
+        // delivers it.
+        let board = Switchboard::default();
+        let cfg = Arc::new(
+            Config {
+                heartbeat_interval: 100,
+                election_timeout_min: 300,
+                election_timeout_max: 600,
+                // Keep no post-snapshot log, so the purge leaves a fresh voter no
+                // entries to replay — it must install the snapshot to catch up.
+                max_in_snapshot_log_to_keep: 0,
+                purge_batch_size: 1,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap(),
+        );
+
+        let dir1 = tempfile::tempdir().unwrap();
+        let e1 = Arc::new(Mutex::new(Database::open(dir1.path()).unwrap()));
+        let r1 = openraft::Raft::new(
+            1,
+            cfg.clone(),
+            board.clone(),
+            LogStore::default(),
+            Arc::new(StateMachineStore::new(EngineApplier(e1.clone()))),
+        )
+        .await
+        .unwrap();
+        board.register(1, r1.clone());
+        let mut members = BTreeMap::new();
+        members.insert(1, BasicNode::default());
+        r1.initialize(members).await.unwrap();
+        r1.wait(Some(Duration::from_secs(10)))
+            .state(ServerState::Leader, "leader")
+            .await
+            .unwrap();
+
+        let a = [1.0f32, 0.0, 0.0, 0.0];
+        let b = [0.0f32, 1.0, 0.0, 0.0];
+        for op in collection_ops(&[("a", a), ("b", b)]) {
+            r1.client_write(op).await.unwrap();
+        }
+
+        // Snapshot, then purge the log up to the snapshot point.
+        r1.trigger().snapshot().await.unwrap();
+        let snap_index = loop {
+            if let Some(s) = r1.metrics().borrow().snapshot {
+                break s.index;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        r1.trigger().purge_log(snap_index).await.unwrap();
+
+        // Add a fresh voter; with the log compacted it catches up via the snapshot.
+        let dir2 = tempfile::tempdir().unwrap();
+        let e2 = Arc::new(Mutex::new(Database::open(dir2.path()).unwrap()));
+        let r2 = openraft::Raft::new(
+            2,
+            cfg.clone(),
+            board.clone(),
+            LogStore::default(),
+            Arc::new(StateMachineStore::new(EngineApplier(e2.clone()))),
+        )
+        .await
+        .unwrap();
+        board.register(2, r2.clone());
+        r1.add_learner(2, BasicNode::default(), true).await.unwrap();
+
+        // The new voter now serves the snapshotted data it never saw in the log.
+        await_serves(&e2, &a, "a").await;
+        await_serves(&e2, &b, "b").await;
+
+        r1.shutdown().await.unwrap();
+        r2.shutdown().await.unwrap();
     }
 }
