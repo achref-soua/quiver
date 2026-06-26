@@ -16,10 +16,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
+use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{get, post};
-use axum::{Router, response::IntoResponse};
+use axum::{Extension, Json, Router, response::IntoResponse};
 use quiver_cluster::ShardMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,6 +30,7 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
 use crate::Config;
+use crate::auth::{self, Action, ApiKey, Principal};
 use crate::error::Error;
 
 // A grace window ≥ the router's map-refresh interval, so every router has adopted the
@@ -97,6 +101,12 @@ struct CoordinatorState {
     // Optional API key the coordinator presents to shards (a cluster runs over a
     // trusted network, like the router — ADR-0030).
     shard_key: Option<String>,
+    // Configured API keys (RBAC, ADR-0011). The membership API requires a valid
+    // key — `admin` for the mutating shard ops, any role for reads — so a
+    // network-reachable coordinator cannot be reshaped by an unauthenticated
+    // caller. Empty only in `insecure` mode (enforced at startup by
+    // `Config::validate`), where `authenticate` admits any caller as admin.
+    keys: Arc<Vec<ApiKey>>,
     // Opt-in automatic scale-out policy (ADR-0065 increment 5).
     autoscale: AutoscaleConfig,
     // Remaining standby shard URLs to grow into, consumed one per scale-out.
@@ -122,6 +132,7 @@ impl CoordinatorState {
                 path,
                 http: reqwest::Client::new(),
                 shard_key: config.cluster_shard_key.clone(),
+                keys: Arc::new(config.api_keys.clone()),
                 autoscale: config.autoscale.clone(),
                 standby: tokio::sync::Mutex::new(config.autoscale.standby_urls.clone()),
                 last_scale: tokio::sync::Mutex::new(None),
@@ -135,6 +146,7 @@ impl CoordinatorState {
             path,
             http: reqwest::Client::new(),
             shard_key: config.cluster_shard_key.clone(),
+            keys: Arc::new(config.api_keys.clone()),
             autoscale: config.autoscale.clone(),
             standby: tokio::sync::Mutex::new(config.autoscale.standby_urls.clone()),
             last_scale: tokio::sync::Mutex::new(None),
@@ -533,9 +545,12 @@ pub async fn serve_coordinator(config: Config, listener: TcpListener) -> Result<
             }
         });
     }
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(healthz))
+    // Every route except liveness is authenticated (ADR-0011): the read-only
+    // `/cluster/map` and `/cluster/health` need any valid key; the mutating shard
+    // ops additionally require the `admin` role, checked in each handler. With no
+    // keys configured (insecure mode, enforced at startup by `Config::validate`)
+    // `authenticate` admits any caller, so a dev/loopback cluster is unchanged.
+    let authed = Router::new()
         .route("/cluster/map", get(get_map))
         .route("/cluster/shards", post(add_shard))
         .route("/cluster/shards/grow", post(grow))
@@ -543,8 +558,51 @@ pub async fn serve_coordinator(config: Config, listener: TcpListener) -> Result<
         .route("/cluster/shards/{id}/promote", post(promote_shard))
         .route("/cluster/shards/{id}", axum::routing::delete(remove_shard))
         .route("/cluster/health", get(health))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            coordinator_auth,
+        ))
         .with_state(state);
+    let app = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(healthz))
+        .merge(authed);
     axum::serve(listener, app).await.map_err(Error::Io)
+}
+
+/// Authenticate every non-liveness coordinator request against the configured API
+/// keys (ADR-0011): a 401 if the bearer token is missing or invalid. The caller's
+/// [`Principal`] rides the request so a mutating handler can require the `admin`
+/// role. In `insecure` mode (no keys, enforced at startup) any caller is admitted.
+async fn coordinator_auth(
+    State(st): State<Arc<CoordinatorState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let presented = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
+        .map(str::to_owned);
+    match auth::authenticate(&st.keys, presented.as_deref()) {
+        Some(principal) => {
+            request.extensions_mut().insert(principal);
+            next.run(request).await
+        }
+        None => {
+            let body = json!({
+                "type": "about:blank",
+                "title": "Unauthorized",
+                "status": 401,
+                "detail": "missing or invalid API key",
+            });
+            (StatusCode::UNAUTHORIZED, Json(body)).into_response()
+        }
+    }
 }
 
 async fn healthz() -> &'static str {
@@ -567,8 +625,10 @@ struct AddShardReq {
 // map. The id counter advances even on a rejected add, so an id is never reused.
 async fn add_shard(
     State(st): State<Arc<CoordinatorState>>,
+    Extension(principal): Extension<Principal>,
     Json(req): Json<AddShardReq>,
 ) -> Result<Json<ShardMap>, Error> {
+    principal.require(Action::Admin, None)?;
     let id = st.next_id.fetch_add(1, Ordering::SeqCst);
     let mut map = st.map.write().await;
     map.add_shard(id, req.primary_url, req.replica_urls)
@@ -584,8 +644,10 @@ async fn add_shard(
 // throughout (the data plane of increment 3c-i). On any failure the join is reverted.
 async fn grow(
     State(st): State<Arc<CoordinatorState>>,
+    Extension(principal): Extension<Principal>,
     Json(req): Json<AddShardReq>,
 ) -> Result<Json<ShardMap>, Error> {
+    principal.require(Action::Admin, None)?;
     let snapshot = st.grow_shard(req.primary_url, req.replica_urls).await?;
     Ok(Json(snapshot))
 }
@@ -595,8 +657,10 @@ async fn grow(
 // Drives the start of an online migration; the data copy + `promote` flip follow.
 async fn add_joining_shard(
     State(st): State<Arc<CoordinatorState>>,
+    Extension(principal): Extension<Principal>,
     Json(req): Json<AddShardReq>,
 ) -> Result<Json<ShardMap>, Error> {
+    principal.require(Action::Admin, None)?;
     let id = st.next_id.fetch_add(1, Ordering::SeqCst);
     let mut map = st.map.write().await;
     map.add_joining_shard(id, req.primary_url, req.replica_urls)
@@ -609,8 +673,10 @@ async fn add_joining_shard(
 // ADR-0066): the router now routes the slice to it, and the donor may drop the copy.
 async fn promote_shard(
     State(st): State<Arc<CoordinatorState>>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<u64>,
 ) -> Result<Json<ShardMap>, Error> {
+    principal.require(Action::Admin, None)?;
     let mut map = st.map.write().await;
     map.promote(id)
         .map_err(|e| Error::BadRequest(e.to_string()))?;
@@ -623,8 +689,10 @@ async fn promote_shard(
 // drained or empty shard.)
 async fn remove_shard(
     State(st): State<Arc<CoordinatorState>>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<u64>,
 ) -> Result<Json<ShardMap>, Error> {
+    principal.require(Action::Admin, None)?;
     let mut map = st.map.write().await;
     map.remove_shard(id)
         .map_err(|e| Error::BadRequest(e.to_string()))?;
