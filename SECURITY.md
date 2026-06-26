@@ -21,6 +21,7 @@ Quiver's security design — assets, adversaries, trust boundaries, and what the
 
 - [`docs/security/threat-model.md`](./docs/security/threat-model.md)
 - [`docs/security/crypto.md`](./docs/security/crypto.md)
+- [`docs/security/audit-0.29.0.md`](./docs/security/audit-0.29.0.md) — the latest security audit: a static OWASP-style review, a dynamic [OWASP ZAP](https://www.zaproxy.org/) scan of a live server, and the fuzzers re-run, with every finding fixed and regression-tested.
 
 Key facts worth stating up front:
 
