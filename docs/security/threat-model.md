@@ -47,9 +47,10 @@ flowchart LR
 
 This precise boundary is the honest core of the security story.
 
-The most recent code-level review of these controls — including the migration
-connectors' SSRF posture and a cleartext-credential fix — is the
-[v0.17.0 audit note](./audit-0.17.0.md).
+The most recent code-level review of these controls — extended to cluster mode,
+the coordinator, per-shard Raft, and a dynamic OWASP ZAP pass — is the
+[v0.29.0 audit note](./audit-0.29.0.md); the prior pass (migration-connector SSRF
+posture and a cleartext-credential fix) is the [v0.17.0 audit note](./audit-0.17.0.md).
 
 ## STRIDE summary
 
