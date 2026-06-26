@@ -58,7 +58,7 @@ connectors' SSRF posture and a cleartext-credential fix — is the
 - **Repudiation** → audit log records actor, action, resource, time.
 - **Information disclosure** → the encryption layers above; tenant isolation; sanitized errors (no internal paths/secrets); secrets never logged.
 - **Denial of service** → query **cost limits** enforced at the op layer (caps on `k`, `ef_search`, `fetch` limit, vector dimension, payload size, upsert batch size, and HTTP request body size — ADR-0040), rejected with 400 / `InvalidArgument` so one oversized request cannot exhaust the single-writer engine. *Deferred (stated, not claimed):* per-key/tenant rate limits, concurrent-query caps, and a work-cancelling query timeout (not achievable under the current `spawn_blocking` model without cooperative cancellation).
-- **Elevation of privilege** → default-deny RBAC scopes; tenant isolation at the data layer; no anonymous writes; no default credentials.
+- **Elevation of privilege** → default-deny RBAC scopes; tenant isolation at the data layer; no anonymous writes; no default credentials. In **cluster mode** the coordinator's membership API is authenticated on the same footing: reshaping the cluster (`POST`/`DELETE /cluster/shards*`) requires an **admin** key and reading the map requires any valid key, so a network-reachable coordinator cannot be reshaped by an unauthenticated caller (only `/healthz`/`/readyz` are open; a keyless coordinator refuses to start unless `insecure`).
 
 ## Crypto-shredding
 
