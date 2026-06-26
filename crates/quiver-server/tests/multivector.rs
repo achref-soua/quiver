@@ -73,6 +73,7 @@ async fn multivector_round_trip() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        autoscale: Default::default(),
         raft_node_id: None,
         raft_members: Vec::new(),
     };
@@ -284,6 +285,7 @@ async fn colbert_index_round_trip() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        autoscale: Default::default(),
         raft_node_id: None,
         raft_members: Vec::new(),
     };

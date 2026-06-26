@@ -87,6 +87,7 @@ async fn audit_log_records_mutations_and_denials_without_leaking_secrets() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        autoscale: Default::default(),
         raft_node_id: None,
         raft_members: Vec::new(),
     };

@@ -1,7 +1,10 @@
 # ADR-0052: GPU-accelerated build & search (design only)
 
-- **Status:** Proposed (design only — not implemented; gated on explicit owner go-ahead)
-- **Date:** 2026-06-23
+- **Status:** Partially implemented (v0.28.0) — the GPU **batch-distance kernel** ships
+  behind the off-by-default `cuda` feature on `quiverdb-index` (`gpu::batch_l2_sq`,
+  CUDA via cudarc/NVRTC, CPU SIMD fallback), validated on real hardware; wiring it
+  into the planner's exact-scan path and the IVF/k-means build kernels remains.
+- **Date:** 2026-06-23 (implemented 2026-06-26)
 - **Deciders:** Achref Soua
 
 ## Context

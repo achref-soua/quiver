@@ -159,6 +159,7 @@ async fn tls_secures_both_rest_and_grpc() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        autoscale: Default::default(),
         raft_node_id: None,
         raft_members: Vec::new(),
     };
@@ -258,6 +259,7 @@ async fn mtls_requires_a_client_certificate() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        autoscale: Default::default(),
         raft_node_id: None,
         raft_members: Vec::new(),
     };

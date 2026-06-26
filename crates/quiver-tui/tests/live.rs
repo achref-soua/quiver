@@ -48,6 +48,7 @@ async fn cockpit_reads_live_server_snapshot() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        autoscale: Default::default(),
         raft_node_id: None,
         raft_members: Vec::new(),
     };

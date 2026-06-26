@@ -72,6 +72,7 @@ pub use error::Error;
 pub use otlp::OtlpConfig;
 // The embedding/rerank seam lives in its own lean crate (ADR-0058) so the MCP
 // server can share it; re-exported here so the server's public API is unchanged.
+pub use coordinator::AutoscaleConfig;
 pub use quiver_providers::{
     EmbedRegistry, EmbeddingConfig, EmbeddingProvider, ProviderError, ProviderKind, RerankConfig,
     RerankProvider,
@@ -407,6 +408,12 @@ pub struct Config {
     /// in-memory only (lost on restart). Only meaningful with `coordinator = true`.
     #[serde(default)]
     pub coordinator_state: Option<PathBuf>,
+    /// Opt-in automatic **scale-out** policy for a coordinator (ADR-0065 increment
+    /// 5). Set an `[autoscale]` table in `quiver.toml` (or `QUIVER_AUTOSCALE_*`):
+    /// `enabled`, a per-shard `high_water_points` threshold, a `standby_urls` pool to
+    /// grow into, and `interval_secs` / `cooldown_secs` / `max_shards`. Default off.
+    #[serde(default)]
+    pub autoscale: AutoscaleConfig,
     /// This node's **Raft member id** within its shard's group (ADR-0067, write
     /// HA). Setting it opts the node into per-shard Raft: it joins the group
     /// described by [`raft_members`], commits writes only after a **quorum**
@@ -456,6 +463,7 @@ impl Default for Config {
             coordinator: false,
             coordinator_url: None,
             coordinator_state: None,
+            autoscale: AutoscaleConfig::default(),
             raft_node_id: None,
             raft_members: Vec::new(),
         }

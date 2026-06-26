@@ -10,6 +10,40 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-06-26
+
+*Autopilot* — the cluster scales itself and borrows a GPU's muscle where one exists:
+opt-in automatic scale-out and an optional CUDA distance kernel, both off by
+default with the single node unchanged at zero overhead.
+
+### Added
+
+- **GPU-accelerated batch distance** (ADR-0052, behind the off-by-default `cuda`
+  cargo feature on `quiverdb-index`). The hot kernel a brute-force / exact scan
+  spends its time in — squared-L2 distance from one query to many vectors — now runs
+  on a CUDA GPU when the feature is on and a device is present (`gpu::batch_l2_sq`),
+  and **falls back to the CPU SIMD kernel** otherwise, producing identical results.
+  cudarc dynamically loads the CUDA driver and compiles the kernel with NVRTC at
+  runtime, so a **default build links zero CUDA** and the feature even *compiles*
+  without a CUDA toolchain (only *running* the GPU path needs a device) — the same
+  off-by-default discipline as the `raft` and `otlp` features, with the CPU path the
+  always-compiled default and the on-disk format / crash gate untouched. Validated
+  on real hardware: the GPU result is asserted equal to the CPU kernel (the test is
+  a no-op where no GPU is present, so CI builds the feature but only the CPU path is
+  exercised). Wiring it into the planner's exact-scan path is the next step.
+- **Coordinator autoscaling — automatic scale-out** (ADR-0065 increment 5, opt-in).
+  When enabled, the coordinator samples each shard's point count and, when the
+  busiest crosses a configured `high_water_points`, **grows the cluster into a
+  standby on its own** — driving the same safe online migration as a manual
+  `POST /cluster/shards/grow`, so a busy cluster gains a shard with no operator
+  action and no lost data. It is an **explicit policy, not magic**: nothing scales
+  without a configured threshold and a standby to grow into, a cooldown bounds the
+  rate, an in-flight migration is never interrupted, and a `max_shards` cap bounds
+  growth. Configured with an `[autoscale]` table (or `QUIVER_AUTOSCALE_*`). Scale-in
+  is deliberately **not** automated — safe online drain is a later increment, so
+  shrink stays a manual, drained `DELETE /cluster/shards/{id}`. Single-node and a
+  cluster without the policy are unchanged.
+
 ## [0.27.0] — 2026-06-26
 
 *Resilient* — surviving a node failure: opt-in per-shard write high availability on
@@ -587,7 +621,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/achref-soua/quiver/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/achref-soua/quiver/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/achref-soua/quiver/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/achref-soua/quiver/compare/v0.24.0...v0.25.0

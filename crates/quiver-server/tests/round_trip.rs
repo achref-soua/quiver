@@ -76,6 +76,7 @@ async fn rest_and_grpc_round_trip() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        autoscale: Default::default(),
         raft_node_id: None,
         raft_members: Vec::new(),
     };
@@ -340,6 +341,7 @@ async fn rest_concurrent_reads_survive_a_deferred_rebuild() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        autoscale: Default::default(),
         raft_node_id: None,
         raft_members: Vec::new(),
     };
