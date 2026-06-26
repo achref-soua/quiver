@@ -635,6 +635,80 @@ impl Store {
         Ok(true)
     }
 
+    /// Build the validated [`WalOp`] that [`Store::create_collection`] would log,
+    /// **without** applying it. The per-shard Raft write path (ADR-0067) proposes
+    /// this op through consensus so a quorum commits it before any member applies
+    /// it (via [`Store::apply_replicated`]). The new collection's id is assigned
+    /// here, on the leader, and carried in the op exactly as a direct create would
+    /// — so every member applies the same id; the caller serializes concurrent
+    /// creates so two cannot claim the same `next_collection_id`.
+    pub fn prepare_create_collection(&self, name: &str, descriptor: &Descriptor) -> Result<WalOp> {
+        if self.name_index.contains_key(name) {
+            return Err(CoreError::AlreadyExists(format!("collection {name}")));
+        }
+        if descriptor.dim == 0 {
+            return Err(CoreError::InvalidArgument(
+                "dim must be non-zero".to_owned(),
+            ));
+        }
+        Ok(WalOp::CreateCollection {
+            collection_id: CollectionId(self.next_collection_id),
+            name: name.to_owned(),
+            descriptor: postcard::to_allocvec(descriptor)?,
+        })
+    }
+
+    /// Build the validated [`WalOp::Upsert`] that [`Store::upsert`] would log,
+    /// without applying it (the Raft write path; see
+    /// [`Store::prepare_create_collection`]). The vector is encoded identically to
+    /// the direct path, so a member applying the proposed op reaches the same state
+    /// a direct upsert would.
+    pub fn prepare_upsert(
+        &self,
+        collection: CollectionId,
+        external_id: &str,
+        vector: &[f32],
+        payload: &[u8],
+    ) -> Result<WalOp> {
+        let dim = self
+            .collections
+            .get(&collection)
+            .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?
+            .descriptor
+            .dim as usize;
+        if vector.len() != dim {
+            return Err(CoreError::InvalidArgument(format!(
+                "vector has {} dims, collection expects {dim}",
+                vector.len()
+            )));
+        }
+        Ok(WalOp::Upsert {
+            collection_id: collection,
+            external_id: external_id.to_owned(),
+            vector: f32_to_le_bytes(vector),
+            payload: payload.to_vec(),
+        })
+    }
+
+    /// Build the [`WalOp::Delete`] that [`Store::delete`] would log, or `None` if
+    /// the point does not exist, without applying it (the Raft write path).
+    pub fn prepare_delete(
+        &self,
+        collection: CollectionId,
+        external_id: &str,
+    ) -> Result<Option<WalOp>> {
+        let existed = self
+            .collections
+            .get(&collection)
+            .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?
+            .primary
+            .contains_key(external_id);
+        Ok(existed.then(|| WalOp::Delete {
+            collection_id: collection,
+            external_id: external_id.to_owned(),
+        }))
+    }
+
     /// Fetch a point by external id.
     pub fn get(&self, collection: CollectionId, external_id: &str) -> Result<Option<Record>> {
         let state = self
