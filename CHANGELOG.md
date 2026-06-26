@@ -10,6 +10,12 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-06-26
+
+*Resilient* — surviving a node failure: opt-in per-shard write high availability on
+an audited Raft core, end to end (durable, log-compacting, elastic), with the
+single node unchanged at zero overhead.
+
 ### Added
 
 - **Per-shard Raft state-machine adapter — foundation** (ADR-0067, cluster increment
@@ -581,7 +587,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/achref-soua/quiver/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/achref-soua/quiver/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/achref-soua/quiver/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/achref-soua/quiver/compare/v0.23.0...v0.24.0
