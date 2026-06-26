@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `quiver demo` — zero-config demo mode.
 //!
-//! One command after install: seeds 1 000 synthetic 128-d vectors, starts
-//! the REST server on :7333, and opens the TUI cockpit — no env vars, no
-//! config files, no external downloads needed.
+//! One command after install: seeds two collections — `articles` (64 titles with
+//! author/topic/year payloads, text-searchable via the built-in `fake` embedder)
+//! and `demo` (1 000 synthetic 128-d vectors for the constellation view) — starts
+//! the REST server on :7333, and opens the TUI cockpit. No env vars, config
+//! files, or external downloads, and the cockpit's every op (browse, constellation,
+//! text search) works offline against this data.
 //!
 //! Override the data directory: `QUIVER_DEMO_DIR=/path/to/dir quiver demo`
 use std::io::{self, Write as _};
@@ -18,6 +21,12 @@ const DEMO_KEY: &str = "quiver-demo";
 const DEMO_DIM: u32 = 128;
 const DEMO_POINTS: usize = 1_000;
 const DEMO_COLLECTION: &str = "demo";
+// A second, text-searchable collection so the cockpit has more than one
+// collection to browse and the query runner has rich payloads to inspect. Text
+// search is backed by the built-in `fake` embedder (a deterministic content
+// hash, wired up in `run()`), so the search op works offline with no model.
+const ARTICLES_COLLECTION: &str = "articles";
+const ARTICLES_DIM: u32 = 64;
 const SERVER_PORT: u16 = 7333;
 
 // ── colour helpers ────────────────────────────────────────────────────────────
@@ -140,6 +149,99 @@ fn open_db(data_dir: &Path) -> Result<quiver_embed::Database> {
     })
 }
 
+// A small, deterministic article corpus: 64 unique titles with author/topic/year
+// payloads. Built from word lists so it needs no bundled data file and is stable
+// across runs (same ids, same vectors).
+fn article_corpus() -> Vec<(String, &'static str, &'static str, u32)> {
+    const ADJ: [&str; 8] = [
+        "scalable",
+        "memory-frugal",
+        "secure",
+        "fast",
+        "elegant",
+        "robust",
+        "minimal",
+        "concurrent",
+    ];
+    const NOUN: [&str; 8] = [
+        "index", "engine", "protocol", "cipher", "cluster", "kernel", "pipeline", "store",
+    ];
+    const TOPIC: [&str; 8] = [
+        "vector databases",
+        "rust systems",
+        "machine learning",
+        "distributed systems",
+        "cryptography",
+        "search engines",
+        "graph algorithms",
+        "data structures",
+    ];
+    const AUTHOR: [&str; 6] = [
+        "A. Soua",
+        "R. Vega",
+        "M. Lin",
+        "K. Okafor",
+        "S. Petrov",
+        "J. Haddad",
+    ];
+    let mut out = Vec::with_capacity(ADJ.len() * NOUN.len());
+    for (a, adj) in ADJ.iter().enumerate() {
+        for (n, noun) in NOUN.iter().enumerate() {
+            let i = out.len();
+            let topic = TOPIC[(a + n) % TOPIC.len()];
+            out.push((
+                format!("The {adj} {noun} for {topic}"),
+                AUTHOR[i % AUTHOR.len()],
+                topic,
+                2018 + (i % 8) as u32,
+            ));
+        }
+    }
+    out
+}
+
+// Seed the `articles` collection: embed each title with the same deterministic
+// `fake` embedder the server uses for `/query/text` (wired in `run()`), so a
+// typed query lands in the same vector space as the stored titles and the
+// cockpit's query runner returns real, stable results offline.
+fn seed_articles(db: &mut quiver_embed::Database) -> Result<()> {
+    use quiver_embed::{Descriptor, DistanceMetric, Dtype};
+    use quiver_providers::{EmbeddingProvider, FakeEmbedder};
+
+    if db
+        .collection_names()
+        .iter()
+        .any(|n| n == ARTICLES_COLLECTION)
+    {
+        return Ok(());
+    }
+    let descriptor = Descriptor::new(ARTICLES_DIM, Dtype::F32, DistanceMetric::Cosine);
+    db.create_collection(ARTICLES_COLLECTION, descriptor)
+        .context("failed to create demo articles collection")?;
+
+    let corpus = article_corpus();
+    let titles: Vec<String> = corpus.iter().map(|(t, ..)| t.clone()).collect();
+    let vectors = FakeEmbedder::new(ARTICLES_DIM as usize)
+        .embed(&titles)
+        .map_err(|e| anyhow::anyhow!("fake embed failed: {e}"))?;
+    let payloads: Vec<serde_json::Value> = corpus
+        .iter()
+        .map(|(title, author, topic, year)| {
+            serde_json::json!({ "title": title, "author": author, "topic": topic, "year": year })
+        })
+        .collect();
+    let ids: Vec<String> = (0..corpus.len()).map(|i| format!("art-{i}")).collect();
+    let records: Vec<(&str, &[f32], &serde_json::Value)> = ids
+        .iter()
+        .zip(vectors.iter())
+        .zip(payloads.iter())
+        .map(|((id, v), p)| (id.as_str(), v.as_slice(), p))
+        .collect();
+    db.upsert_batch(ARTICLES_COLLECTION, &records)
+        .context("failed to seed demo articles")?;
+    Ok(())
+}
+
 fn seed_demo(data_dir: &Path) -> Result<bool> {
     use quiver_embed::{Descriptor, DistanceMetric, Dtype};
 
@@ -148,6 +250,10 @@ fn seed_demo(data_dir: &Path) -> Result<bool> {
     if db.collection_names().iter().any(|n| n == DEMO_COLLECTION) {
         return Ok(false); // already seeded
     }
+
+    // The text-searchable collection first, so the browser opens on a collection
+    // whose query runner works out of the box.
+    seed_articles(&mut db)?;
 
     let descriptor = Descriptor::new(DEMO_DIM, Dtype::F32, DistanceMetric::Cosine);
     db.create_collection(DEMO_COLLECTION, descriptor)
@@ -185,14 +291,16 @@ pub async fn run() -> Result<()> {
 
     step(
         "⟳",
-        &format!("Seeding {DEMO_POINTS} vectors into '{DEMO_COLLECTION}'..."),
+        &format!(
+            "Seeding '{ARTICLES_COLLECTION}' (text search) and {DEMO_POINTS} vectors into '{DEMO_COLLECTION}'..."
+        ),
     );
     let dd = data_dir.clone();
     let seeded = tokio::task::spawn_blocking(move || seed_demo(&dd)).await??;
     done();
     if seeded {
         ok(&format!(
-            "{DEMO_POINTS} vectors ready in '{DEMO_COLLECTION}'."
+            "'{ARTICLES_COLLECTION}' ready for text search · {DEMO_POINTS} vectors ready in '{DEMO_COLLECTION}' for the constellation."
         ));
     } else {
         ok("Existing demo data found — skipping seed.");
@@ -207,6 +315,19 @@ pub async fn run() -> Result<()> {
             grpc_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), SERVER_PORT + 1),
             api_keys: vec![quiver_server::ApiKey::admin(DEMO_KEY)],
             insecure: true,
+            // Wire the built-in deterministic `fake` embedder to the articles
+            // collection so the cockpit's text search (`POST /query/text`) works
+            // with no external model — the same embedder used to seed it.
+            embedding: std::collections::HashMap::from([(
+                ARTICLES_COLLECTION.to_string(),
+                quiver_server::EmbeddingConfig {
+                    provider: quiver_server::ProviderKind::Fake,
+                    model: String::new(),
+                    endpoint: String::new(),
+                    dim: ARTICLES_DIM,
+                    api_key_env: String::new(),
+                },
+            )]),
             ..Default::default()
         };
         if let Err(e) = quiver_server::run(config).await {
@@ -242,4 +363,60 @@ pub async fn run() -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    // The demo database covers every cockpit op: two collections to browse, a
+    // 1 000-point collection for the constellation, and a text-searchable
+    // collection whose vectors are embedded with the same `fake` embedder the
+    // server uses for `/query/text` — so an exact-title query returns its article.
+    #[test]
+    fn seed_demo_creates_both_collections_and_articles_are_searchable() {
+        use quiver_embed::SearchParams;
+        use quiver_providers::{EmbeddingProvider, FakeEmbedder};
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(seed_demo(tmp.path()).unwrap(), "first seed reports seeded");
+
+        let mut db = quiver_embed::Database::open(tmp.path()).unwrap();
+        let names = db.collection_names();
+        assert!(
+            names.iter().any(|n| n == ARTICLES_COLLECTION),
+            "articles collection seeded"
+        );
+        assert!(
+            names.iter().any(|n| n == DEMO_COLLECTION),
+            "demo collection seeded"
+        );
+
+        let corpus = article_corpus();
+        assert_eq!(db.len(ARTICLES_COLLECTION).unwrap(), corpus.len());
+        assert_eq!(db.len(DEMO_COLLECTION).unwrap(), DEMO_POINTS);
+
+        // The cockpit's text search embeds the query with this same `fake` embedder,
+        // so querying an exact stored title returns that article first.
+        let (title0, ..) = corpus[0].clone();
+        let qv = FakeEmbedder::new(ARTICLES_DIM as usize)
+            .embed(&[title0])
+            .unwrap()
+            .remove(0);
+        let hits = db
+            .search(
+                ARTICLES_COLLECTION,
+                &qv,
+                &SearchParams {
+                    k: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits[0].id, "art-0", "exact-title query returns its article");
+
+        // Re-seeding an existing store is a no-op.
+        assert!(!seed_demo(tmp.path()).unwrap(), "second seed is a no-op");
+    }
 }

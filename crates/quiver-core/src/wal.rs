@@ -270,10 +270,13 @@ fn read_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<ReadOutcome> {
 /// Read every intact record from a WAL segment, stopping cleanly at a torn
 /// trailing record. Each record is opened with `codec` (the identity transform
 /// under the plaintext codec; authenticated decryption under the AEAD codec).
-/// Errors on a structurally invalid header, an underlying I/O failure, or a
-/// frame that is intact on disk yet fails authentication (a wrong key or
-/// tampering) — a torn tail is a normal, expected outcome reported via
-/// [`WalReplay::torn_at`].
+/// A segment too short to even hold its 16-byte file header is itself a torn tail
+/// (a `kill -9` during WAL rotation, before the new segment's header became
+/// durable) and is reported as an empty replay torn at offset 0 — never an error.
+/// Errors on a header with a wrong magic or an unsupported version, an underlying
+/// I/O failure, or a frame that is intact on disk yet fails authentication (a
+/// wrong key or tampering) — a torn tail is a normal, expected outcome reported
+/// via [`WalReplay::torn_at`].
 pub fn read_all(path: &Path, codec: &dyn PageCodec) -> Result<WalReplay> {
     let file = File::open(path).map_err(|e| CoreError::io(path, e))?;
     let file_len = file.metadata().map_err(|e| CoreError::io(path, e))?.len();
@@ -283,10 +286,19 @@ pub fn read_all(path: &Path, codec: &dyn PageCodec) -> Result<WalReplay> {
     match read_full(&mut reader, &mut hdr)? {
         ReadOutcome::Full => {}
         _ => {
-            return Err(CoreError::MalformedPage(format!(
-                "wal {} is shorter than its header",
-                path.display()
-            )));
+            // A segment whose 16-byte header never became durable holds no
+            // records: `create` fsyncs the header before returning the writer, so
+            // a record can only be appended (and acknowledged) after a durable
+            // header. A `kill -9` during WAL rotation can leave such a sub-header
+            // segment beside the prior, fully-durable one; recovery must treat it
+            // as an empty torn tail — exactly like a torn frame — and never as a
+            // hard error, or the crash gate (ADR-0005) flakes. `base_lsn` is
+            // unknown here and unused by the recovery path.
+            return Ok(WalReplay {
+                entries: Vec::new(),
+                torn_at: Some(0),
+                base_lsn: Lsn(0),
+            });
         }
     }
     let magic = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
@@ -542,6 +554,23 @@ mod tests {
             read_all(&path, &PlainCodec),
             Err(CoreError::BadMagic { .. })
         ));
+    }
+
+    #[test]
+    fn sub_header_segment_is_an_empty_torn_tail() {
+        // A `kill -9` during WAL rotation can leave a freshly-created segment with
+        // fewer than its 16-byte header durable, beside the prior segment that
+        // holds the acknowledged writes. Recovery must treat it as an empty torn
+        // tail — never a hard error (the crash gate, ADR-0005) — or `Store::open`
+        // fails and a clean recovery is lost (the source of the crash-gate flake).
+        for len in [0usize, 1, WAL_FILE_HEADER_SIZE - 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wal-1.log");
+            std::fs::write(&path, vec![0u8; len]).unwrap();
+            let replay = read_all(&path, &PlainCodec).unwrap();
+            assert!(replay.entries.is_empty(), "len {len}: expected no entries");
+            assert_eq!(replay.torn_at, Some(0), "len {len}: expected torn at 0");
+        }
     }
 
     proptest! {

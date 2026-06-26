@@ -20,6 +20,7 @@ quiver-crypto = { workspace = true }
 quiver-embed = { workspace = true }
 quiver-import = { workspace = true }
 quiver-mcp = { workspace = true }
+quiver-providers = { workspace = true }
 quiver-server = { workspace = true }
 quiver-tui = { workspace = true }
 

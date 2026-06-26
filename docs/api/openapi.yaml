@@ -1,0 +1,586 @@
+# Quiver REST API — OpenAPI 3.1 specification.
+#
+# This document is the machine-readable contract for Quiver's REST surface. It is
+# kept in lock-step with the axum router in `crates/quiver-server/src/rest.rs`; a
+# coverage test (`crates/quiver-server/tests/openapi.rs`) fails if a route is added
+# or removed without updating this file. The semantics and the gRPC mapping are in
+# `rest-grpc.md`; the wire details in `wire-protocol.md`.
+openapi: 3.1.0
+info:
+  title: Quiver REST API
+  version: 0.29.0
+  summary: The security-first vector database — REST surface.
+  description: |
+    Every `/v1/*` and `/cluster/*` endpoint requires a Bearer API key
+    (`Authorization: Bearer <key>`); `/healthz`, `/readyz`, and `/metrics` are
+    open. Authorization is default-deny RBAC (read ⊆ write ⊆ admin) scoped per
+    collection (ADR-0011). Errors are RFC-9457 `application/problem+json`.
+    Mutating public endpoints honour an `Idempotency-Key` header. Per-request cost
+    limits (ADR-0040) reject oversized requests with 400.
+  license:
+    name: AGPL-3.0-only
+    url: https://www.gnu.org/licenses/agpl-3.0.html
+servers:
+  - url: http://localhost:6333
+    description: Local development server (loopback default).
+security:
+  - bearerAuth: []
+tags:
+  - name: Collections
+    description: Create, inspect, and delete collections (delete crypto-shreds).
+  - name: Points
+    description: Upsert, fetch, and delete single-vector points.
+  - name: Search
+    description: Vector, hybrid (dense ⊕ sparse BM25/RRF), and text search.
+  - name: Documents
+    description: Multi-vector / late-interaction (ColBERT MaxSim) documents.
+  - name: Operations
+    description: Snapshots and liveness/metrics.
+  - name: Cluster
+    description: Cluster map and per-shard Raft membership (admin).
+
+paths:
+  /v1/collections:
+    post:
+      tags: [Collections]
+      summary: Create a collection
+      operationId: createCollection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCollectionRequest' }
+      responses:
+        '200': { description: The created collection., content: { application/json: { schema: { $ref: '#/components/schemas/Collection' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      tags: [Collections]
+      summary: List collections (scoped to the key)
+      operationId: listCollections
+      responses:
+        '200':
+          description: Collections visible to the caller.
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Collection' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/collections/{name}:
+    parameters: [ { $ref: '#/components/parameters/CollectionName' } ]
+    get:
+      tags: [Collections]
+      summary: Get one collection
+      operationId: getCollection
+      responses:
+        '200': { description: The collection., content: { application/json: { schema: { $ref: '#/components/schemas/Collection' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Collections]
+      summary: Delete a collection (crypto-shred)
+      operationId: deleteCollection
+      responses:
+        '200':
+          description: Whether the collection existed.
+          content: { application/json: { schema: { type: object, properties: { existed: { type: boolean } }, required: [existed] } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/collections/{name}/points:
+    parameters: [ { $ref: '#/components/parameters/CollectionName' } ]
+    post:
+      tags: [Points]
+      summary: Upsert points (batch)
+      operationId: upsertPoints
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/UpsertRequest' } } }
+      responses:
+        '200': { $ref: '#/components/responses/Upserted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Points]
+      summary: Delete points by id
+      operationId: deletePoints
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, properties: { ids: { type: array, items: { type: string } } }, required: [ids] } } }
+      responses:
+        '200':
+          description: Number deleted.
+          content: { application/json: { schema: { type: object, properties: { deleted: { type: integer } }, required: [deleted] } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/collections/{name}/points:bulk:
+    parameters: [ { $ref: '#/components/parameters/CollectionName' } ]
+    post:
+      tags: [Points]
+      summary: Bulk upsert (one fsync + one index rebuild)
+      operationId: upsertPointsBulk
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/UpsertRequest' } } }
+      responses:
+        '200': { $ref: '#/components/responses/Upserted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/collections/{name}/points:text:
+    parameters: [ { $ref: '#/components/parameters/CollectionName' } ]
+    post:
+      tags: [Points]
+      summary: Upsert from text (server-side embedding, ADR-0047)
+      description: Requires a configured `[embedding.<collection>]` provider.
+      operationId: upsertPointsText
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [points]
+              properties:
+                points:
+                  type: array
+                  items:
+                    type: object
+                    required: [id, text]
+                    properties:
+                      id: { type: string }
+                      text: { type: string }
+                      payload: { type: object, additionalProperties: true }
+      responses:
+        '200': { $ref: '#/components/responses/Upserted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /v1/collections/{name}/points/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/CollectionName' }
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Points]
+      summary: Get one point by id
+      operationId: getPoint
+      responses:
+        '200': { description: The point., content: { application/json: { schema: { $ref: '#/components/schemas/Match' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/collections/{name}/query:
+    parameters: [ { $ref: '#/components/parameters/CollectionName' } ]
+    post:
+      tags: [Search]
+      summary: Vector k-NN search (optional metadata filter)
+      operationId: search
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SearchRequest' } } }
+      responses:
+        '200': { $ref: '#/components/responses/SearchResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/collections/{name}/query/hybrid:
+    parameters: [ { $ref: '#/components/parameters/CollectionName' } ]
+    post:
+      tags: [Search]
+      summary: Hybrid search — dense ⊕ sparse (BM25) fused with RRF
+      operationId: hybridSearch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [vector]
+              properties:
+                vector: { type: array, items: { type: number, format: float } }
+                sparse:
+                  type: object
+                  description: Sparse query terms (BM25), as parallel indices/values.
+                  properties:
+                    indices: { type: array, items: { type: integer } }
+                    values: { type: array, items: { type: number, format: float } }
+                k: { type: integer, default: 10 }
+                ef_search: { type: integer, default: 64 }
+                rrf_k0: { type: number, format: float }
+                filter: { $ref: '#/components/schemas/Filter' }
+                with_payload: { type: boolean, default: true }
+                with_vector: { type: boolean, default: false }
+      responses:
+        '200': { $ref: '#/components/responses/SearchResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/collections/{name}/query/text:
+    parameters: [ { $ref: '#/components/parameters/CollectionName' } ]
+    post:
+      tags: [Search]
+      summary: Text search — embed the query (⊕ BM25), optional rerank
+      description: Requires a configured `[embedding.<collection>]` provider.
+      operationId: searchText
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string }
+                k: { type: integer, default: 10 }
+                ef_search: { type: integer, default: 64 }
+                filter: { $ref: '#/components/schemas/Filter' }
+                rerank: { type: boolean, default: false }
+                with_payload: { type: boolean, default: true }
+                with_vector: { type: boolean, default: false }
+      responses:
+        '200': { $ref: '#/components/responses/SearchResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /v1/collections/{name}/fetch:
+    parameters: [ { $ref: '#/components/parameters/CollectionName' } ]
+    post:
+      tags: [Search]
+      summary: List points without ranking (optional filter + limit)
+      description: The retrieval path for client-side-encrypted collections the server cannot rank (ADR-0032).
+      operationId: fetch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filter: { $ref: '#/components/schemas/Filter' }
+                limit: { type: integer, default: 10 }
+                with_payload: { type: boolean, default: true }
+                with_vector: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Matching points (unranked).
+          content: { application/json: { schema: { type: object, properties: { points: { type: array, items: { $ref: '#/components/schemas/Match' } } }, required: [points] } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/collections/{name}/documents:
+    parameters: [ { $ref: '#/components/parameters/CollectionName' } ]
+    post:
+      tags: [Documents]
+      summary: Upsert multi-vector documents
+      operationId: upsertDocuments
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [documents]
+              properties:
+                documents:
+                  type: array
+                  items:
+                    type: object
+                    required: [id, vectors]
+                    properties:
+                      id: { type: string }
+                      vectors: { type: array, items: { type: array, items: { type: number, format: float } } }
+                      payload: { type: object, additionalProperties: true }
+      responses:
+        '200': { $ref: '#/components/responses/Upserted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Documents]
+      summary: Delete documents by id
+      operationId: deleteDocuments
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, properties: { ids: { type: array, items: { type: string } } }, required: [ids] } } }
+      responses:
+        '200':
+          description: Number deleted.
+          content: { application/json: { schema: { type: object, properties: { deleted: { type: integer } }, required: [deleted] } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/collections/{name}/documents/query:
+    parameters: [ { $ref: '#/components/parameters/CollectionName' } ]
+    post:
+      tags: [Documents]
+      summary: Multi-vector search (MaxSim late interaction)
+      operationId: searchMultiVector
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [vectors]
+              properties:
+                vectors: { type: array, items: { type: array, items: { type: number, format: float } } }
+                k: { type: integer, default: 10 }
+                filter: { $ref: '#/components/schemas/Filter' }
+                with_payload: { type: boolean, default: true }
+      responses:
+        '200':
+          description: Ranked documents (MaxSim).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [matches]
+                properties:
+                  matches:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        score: { type: number, format: float }
+                        payload: { type: object, additionalProperties: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/snapshot:
+    post:
+      tags: [Operations]
+      summary: Take a consistent online snapshot (admin)
+      description: Writes a consistent backup of the whole database to a server-local directory (ADR-0050). Requires the admin role.
+      operationId: snapshot
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [destination], properties: { destination: { type: string, description: Server-local destination directory; must not already exist. } } } } }
+      responses:
+        '200': { description: Snapshot info. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /cluster/map:
+    get:
+      tags: [Cluster]
+      summary: The shard map this router has adopted
+      description: 404 on a non-router server. Read-only diagnostics.
+      operationId: clusterMap
+      responses:
+        '200': { description: The adopted shard map. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /cluster/raft/voters:
+    post:
+      tags: [Cluster]
+      summary: Add a per-shard Raft voter at runtime (admin)
+      description: Requires the `raft` build feature and the admin role (ADR-0067).
+      operationId: raftAddVoter
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [id, url], properties: { id: { type: integer }, url: { type: string } } } } }
+      responses:
+        '204': { description: Voter added. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /cluster/raft/voters/{id}:
+    parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+    delete:
+      tags: [Cluster]
+      summary: Remove a per-shard Raft voter at runtime (admin)
+      operationId: raftRemoveVoter
+      responses:
+        '204': { description: Voter removed. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /healthz:
+    get:
+      tags: [Operations]
+      summary: Liveness
+      operationId: healthz
+      security: []
+      responses: { '200': { description: ok. } }
+  /readyz:
+    get:
+      tags: [Operations]
+      summary: Readiness
+      operationId: readyz
+      security: []
+      responses: { '200': { description: ready. }, '503': { description: not ready. } }
+  /metrics:
+    get:
+      tags: [Operations]
+      summary: Prometheus metrics (open; bind privately)
+      operationId: metrics
+      security: []
+      responses: { '200': { description: Prometheus exposition., content: { text/plain: {} } } }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "An API key presented as `Authorization: Bearer <key>`."
+  parameters:
+    CollectionName:
+      name: name
+      in: path
+      required: true
+      description: Collection name (a single path segment; avoid `/`).
+      schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: De-duplicates a retried mutating request.
+      schema: { type: string }
+  responses:
+    BadRequest:
+      description: Malformed or out-of-policy request (cost limit, wrong dim, bad body).
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    Unauthorized:
+      description: Missing or invalid API key.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    Forbidden:
+      description: The key's role or collection scope forbids the operation.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    NotFound:
+      description: Unknown collection or point.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    Conflict:
+      description: The collection already exists.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    UpstreamError:
+      description: A configured embedding/rerank provider failed.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    Upserted:
+      description: Number of points upserted.
+      content: { application/json: { schema: { type: object, properties: { upserted: { type: integer } }, required: [upserted] } } }
+    SearchResult:
+      description: Ranked matches (nearest first).
+      content: { application/json: { schema: { $ref: '#/components/schemas/SearchResponse' } } }
+  schemas:
+    Metric:
+      type: string
+      enum: [l2, cosine, dot]
+      default: l2
+    IndexKind:
+      type: string
+      enum: [hnsw, vamana, disk_vamana, ivf, colbert]
+      default: hnsw
+    FieldType:
+      type: string
+      enum: [keyword, numeric]
+    VectorEncryption:
+      type: string
+      enum: [none, dcpe, client_side]
+      default: none
+      description: |
+        `none` = plaintext vectors, server ranks. `dcpe` = experimental, L2-only,
+        leaks the distance-comparison relation by design (ADR-0031). `client_side`
+        = opaque AEAD ciphertext, the server never ranks (ADR-0032).
+    FilterableField:
+      type: object
+      required: [path, field_type]
+      properties:
+        path: { type: string, description: Dot-path into the payload. }
+        field_type: { $ref: '#/components/schemas/FieldType' }
+    Filter:
+      type: object
+      additionalProperties: true
+      description: |
+        A recursive metadata filter (AND/OR/NOT + eq/ne/in/lt/lte/gt/gte/exists over
+        dot-paths), e.g. `{"eq": {"field": "color", "value": "red"}}`. See
+        `wire-protocol.md` for the full grammar.
+    CreateCollectionRequest:
+      type: object
+      required: [name, dim]
+      properties:
+        name: { type: string }
+        dim: { type: integer, minimum: 1 }
+        metric: { $ref: '#/components/schemas/Metric' }
+        index: { $ref: '#/components/schemas/IndexKind' }
+        pq_subspaces: { type: integer, nullable: true, description: Product-quantization subspaces (for quantized/disk indexes). }
+        filterable: { type: array, items: { $ref: '#/components/schemas/FilterableField' } }
+        multivector: { type: boolean, default: false }
+        vector_encryption: { $ref: '#/components/schemas/VectorEncryption' }
+    Collection:
+      type: object
+      required: [name, dim, metric, count, index]
+      properties:
+        name: { type: string }
+        dim: { type: integer }
+        metric: { $ref: '#/components/schemas/Metric' }
+        count: { type: integer }
+        index: { $ref: '#/components/schemas/IndexKind' }
+        pq_subspaces: { type: integer }
+        filterable: { type: array, items: { $ref: '#/components/schemas/FilterableField' } }
+        multivector: { type: boolean }
+        vector_encryption: { $ref: '#/components/schemas/VectorEncryption' }
+    Point:
+      type: object
+      required: [id, vector]
+      properties:
+        id: { type: string }
+        vector: { type: array, items: { type: number, format: float } }
+        payload: { type: object, additionalProperties: true }
+    UpsertRequest:
+      type: object
+      required: [points]
+      properties:
+        points: { type: array, items: { $ref: '#/components/schemas/Point' } }
+    SearchRequest:
+      type: object
+      required: [vector]
+      properties:
+        vector: { type: array, items: { type: number, format: float } }
+        k: { type: integer, default: 10 }
+        filter: { $ref: '#/components/schemas/Filter' }
+        ef_search: { type: integer, default: 64 }
+        with_payload: { type: boolean, default: true }
+        with_vector: { type: boolean, default: false }
+    Match:
+      type: object
+      required: [id, score]
+      properties:
+        id: { type: string }
+        score: { type: number, format: float }
+        payload: { type: object, additionalProperties: true }
+        vector: { type: array, items: { type: number, format: float } }
+    SearchResponse:
+      type: object
+      required: [matches]
+      properties:
+        matches: { type: array, items: { $ref: '#/components/schemas/Match' } }
+    Problem:
+      type: object
+      description: RFC-9457 problem detail.
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }

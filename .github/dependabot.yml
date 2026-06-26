@@ -1,0 +1,33 @@
+# Dependabot keeps dependencies current with weekly PRs. Cargo and GitHub Actions
+# are the load-bearing ecosystems; the SDKs (pip/npm) are covered too so their
+# lockfiles do not drift. Grouped to keep PR volume sane.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: "/sdks/python"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: npm
+    directory: "/sdks/typescript"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
