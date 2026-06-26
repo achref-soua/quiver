@@ -10,6 +10,12 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-06-26
+
+*Autopilot* — the cluster scales itself and borrows a GPU's muscle where one exists:
+opt-in automatic scale-out and an optional CUDA distance kernel, both off by
+default with the single node unchanged at zero overhead.
+
 ### Added
 
 - **GPU-accelerated batch distance** (ADR-0052, behind the off-by-default `cuda`
@@ -615,7 +621,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/achref-soua/quiver/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/achref-soua/quiver/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/achref-soua/quiver/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/achref-soua/quiver/compare/v0.24.0...v0.25.0
