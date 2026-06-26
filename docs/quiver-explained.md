@@ -763,7 +763,7 @@ Declaring them is just wiring: set `QUIVER_CLUSTER_REPLICAS` to a list of `<shar
 
 > **FIGURE_CLUSTER_REPLICAS**
 
-The one honest caveat is **eventual consistency**: a replica lags its primary by however long replication takes (usually milliseconds), so a search served from a replica may miss a write committed an instant ago — the same trade as §9.4's single-node read replicas, and the reason replicas serve *searches* while point-lookups (`get`) still go to the primary for read-your-writes. A follower also **refuses direct writes**, so even a misrouted write can never corrupt a replica. This is read scale-out and warm standbys — *not* write failover; promoting a replica when its primary dies needs consensus, the audited-Raft increment in the roads not yet taken below.
+The one honest caveat is **eventual consistency**: a replica lags its primary by however long replication takes (usually milliseconds), so a search served from a replica may miss a write committed an instant ago — the same trade as §9.4's single-node read replicas, and the reason replicas serve *searches* while point-lookups (`get`) still go to the primary for read-your-writes. A follower also **refuses direct writes**, so even a misrouted write can never corrupt a replica. This is read scale-out and warm standbys — *not* write failover; promoting a replica when its primary dies needs consensus, the per-shard write HA of §9.11.
 
 ## 9.10 Growing without downtime: dynamic, elastic scaling
 
@@ -775,11 +775,21 @@ Moving that slice is a careful handshake, because readers and writers never stop
 
 > **FIGURE_DYNAMIC_SCALING**
 
-In Quiver terms: run one server as the **coordinator** (`QUIVER_COORDINATOR=true`); point routers at it (`QUIVER_COORDINATOR_URL`); then `POST /cluster/shards/grow` with the new shard's URL and the coordinator does the rest — join, copy, flip, drop — in the background, while the cluster keeps answering. The same machinery shrinks a cluster, and an autoscaler could one day call `grow` on its own. What is deliberately *not* here yet is automatic **write** failover when a primary dies: that needs consensus, the audited-Raft increment below.
+In Quiver terms: run one server as the **coordinator** (`QUIVER_COORDINATOR=true`); point routers at it (`QUIVER_COORDINATOR_URL`); then `POST /cluster/shards/grow` with the new shard's URL and the coordinator does the rest — join, copy, flip, drop — in the background, while the cluster keeps answering. The same machinery shrinks a cluster, and an autoscaler could one day call `grow` on its own. The one thing still missing — automatic **write** failover when a primary dies — is the next section.
 
-## 9.11 The roads not (yet) taken
+## 9.11 Surviving a node failure: per-shard write HA
 
-What is *not* yet built is deliberately so, until the single-node story is unbeatable and the need is concrete. **Per-shard write high-availability** — promoting a replica with no lost acknowledged write — needs a consensus layer; the chosen direction is **one Raft group per shard** using an *audited* Raft library rather than a hand-rolled log (the same discipline that put `arc-swap` under MVCC), and it is a staged increment, not a sprint. **GPU acceleration** sits behind the index trait so a CPU build is unchanged (ADR-0052). Each begins as a design ADR; none compromises the single static binary, and single-node remains the default everywhere.
+Sharding, replicas, and online growth all assume each room's librarian stays at the desk. But a librarian can call in sick — a shard's primary can crash — and until now that shard's slice went read-only until an operator stepped in. **Per-shard write high availability** (ADR-0067, opt-in) closes that last gap: each room keeps its books on a **quorum of shelves**, and if the head librarian for a room steps away, the others **elect** a new one on the spot — and not a single checked-out book is lost.
+
+Concretely, each shard runs **one Raft group** — an *audited* consensus library, not a hand-rolled log (the same discipline that put `arc-swap` under MVCC). The shard's replicas (§9.9) become the group's **voters**; its primary is the **leader**. A write is **proposed** to the leader and **acknowledged only after a quorum** of voters has committed it — so the instant a client hears "done", a majority already holds that write, and every future leader must too. If the leader's process dies, the surviving voters **elect** a new leader automatically: no operator, and no lost acknowledged write.
+
+> **FIGURE_WRITE_HA**
+
+The router learns the new leader the self-correcting way it learns everything else (§9.10): it routes a shard's writes to the leader, and a write that reaches a former leader gets a **"not the leader"** reply naming who is — so the router redirects and carries on, with no coordinator on the write path. The safety side of the quorum rule matters just as much: a **minority** that cannot reach a quorum **refuses** writes rather than inventing its own history, so a network split can never elect two leaders writing divergent data — **no split-brain**. The honest cost is a round-trip — every write now waits for a quorum, not just the local disk — which is why write HA is **opt-in per shard**: a shard that doesn't need failover keeps the cheaper single-writer path, and single-node Quiver is wholly unaffected. The on-disk format and the per-shard `kill -9` crash gate are unchanged; Raft is a replicated log *above* the engine, not a new one.
+
+## 9.12 The roads not (yet) taken
+
+What is *not* yet built is deliberately so, until the single-node story is unbeatable and the need is concrete. Per-shard write HA (§9.11) is real but staged: its Raft log lives in memory today, with a **durable, log-compacting store** — so a crashed voter can restart and rejoin safely — as the next increment. **GPU acceleration** sits behind the index trait so a CPU build is unchanged (ADR-0052). Each begins as a design ADR; none compromises the single static binary, and single-node remains the default everywhere.
 
 ---
 
@@ -819,6 +829,7 @@ What is *not* yet built is deliberately so, until the single-node story is unbea
 - **Read replica (cluster)** — a per-shard follower the router fans searches to so reads scale out within a cluster; writes still go to the shard's primary, and a replica is eventually consistent (§9.9, ADR-0065 + ADR-0030).
 - **Coordinator** — a thin service, off the query path, that owns the cluster's **versioned** shard map; routers refresh the map from it so membership changes propagate with no restart (§9.10, ADR-0066).
 - **Online migration / dynamic scaling** — adding or removing a shard on a live cluster, moving only the ~1/N HRW-remapped slice with no downtime and no lost writes (the donor serves + dual-writes until the new shard catches up, then ownership flips atomically) (§9.10, ADR-0066).
+- **Per-shard write HA (Raft)** — automatic write failover: each shard runs one Raft group with its replicas as **voters**; a write is acknowledged only after a **quorum** commits it (so a failover loses no acknowledged write), a non-leader replies *"not the leader"* so the router redirects, and a minority refuses writes (no split-brain) (§9.11, ADR-0067; opt-in per shard).
 - **Sharding / scatter-gather** — splitting data across nodes (designed, not built); a query fans out to all shards and merges results.
 - **OTLP / OpenTelemetry** — the wire protocol for exporting traces to a collector (Jaeger/Tempo/Grafana); opt-in in Quiver.
 - **Cockpit (TUI)** — the retro terminal interface (`quiver tui`): a live dashboard plus an interactive query runner.
