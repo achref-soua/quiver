@@ -789,9 +789,29 @@ The router learns the new leader the self-correcting way it learns everything el
 
 The group is **durable and elastic**, not a fixed three. The Raft log is itself **crash-safe** — a voter that dies recovers its own log and vote on restart and rejoins, the same `kill -9` discipline the engine already keeps — so a failure is never one-way. It **compacts** that log against periodic snapshots, so the log can't grow without bound and a far-behind or freshly added voter catches up by **installing a snapshot** instead of replaying history. And its **voters can change online**: an operator (or, later, an autoscaler) adds or removes a voter on a running shard with no restart — the new node joins as a non-voting learner, catches up, and is then promoted. So a shard's redundancy can grow with its importance, live.
 
-## 9.12 The roads not (yet) taken
+## 9.12 Growing on its own: autoscaling
 
-What is *not* yet built is deliberately so, until the single-node story is unbeatable and the need is concrete. Per-shard write HA (§9.11) is now built end to end — durable, log-compacting, and elastic. **GPU acceleration** sits behind the index trait so a CPU build is unchanged (ADR-0052). And **autoscaling** — driving the cluster's grow/shrink and a shard's voter set automatically from load signals, behind an explicit policy rather than magic — is the natural next layer on top of the elastic membership this part describes. Each begins as a design ADR; none compromises the single static binary, and single-node remains the default everywhere.
+§9.10 lets you *add a room by hand* under load; the obvious next step is to let the desk supervisor open one **by itself**. Turn the policy on and the **coordinator** watches how full each room is getting and, when the busiest crosses a line you set, opens a new room from a **pool you keep on standby** — running the exact same safe migration §9.10 already does. No pager, no operator, no lost book.
+
+It is deliberately a **policy, not magic**. Nothing happens without two things you provide: a **threshold** (the per-shard point count that means "too full") and a **standby pool** (the spare shard URLs to grow into). And it is bounded: a **cooldown** keeps it from thrashing while a migration settles, an in-flight migration is **never interrupted**, and a **max-shards cap** stops runaway growth. The load signal is honest and legible — the number of vectors a shard holds — not an opaque score.
+
+> **FIGURE_AUTOSCALE**
+
+In Quiver terms: set an `[autoscale]` table on the coordinator (`enabled`, `high_water_points`, a `standby_urls` list, `interval_secs` / `cooldown_secs` / `max_shards`) and it grows the cluster from the standby pool on its own. **Scaling in is deliberately still manual** — safely *draining* a shard's slice back onto its neighbours online is a reverse migration that is its own careful increment, and Quiver would rather make you run a drained `DELETE` than risk a silent dropped write to save a machine automatically. Off by default; a cluster without the policy is exactly the one §9.10 describes.
+
+## 9.13 Optional muscle: GPU-accelerated distance
+
+Everything Quiver does fast on a CPU, it does with one trick repeated billions of times: measure the distance between two vectors (§1.2). On a brute-force or exact scan that one kernel — *this query against those ten thousand vectors* — is essentially the whole bill. A CPU does it a few lanes at a time (§4.2's SIMD); a **GPU** does thousands of rows at once. So for that batch, a GPU is the right tool — when you have one.
+
+The catch is that most self-hosted boxes **don't** have one, and a hard CUDA dependency would wreck the "single static binary that runs anywhere" promise. So the GPU lives entirely behind a seam (the distance kernel, §4.2) and an **off-by-default `cuda` build feature**, exactly like the `raft` and `otlp` features: a normal build links **zero** CUDA, the CPU SIMD kernel stays the default *and* the fallback, and the GPU produces **identical** numbers — it is a pure accelerator, never a correctness dependency, and it never touches the on-disk format or the crash gate. The CUDA driver is even loaded *dynamically* and the kernel compiled at runtime, so the feature **compiles without a CUDA toolchain** — only *running* the GPU path needs a device, and if there is no device the code quietly uses the CPU.
+
+> **FIGURE_GPU**
+
+This is the **batch-distance kernel** (the part of GPU acceleration that earns its keep), validated against the CPU kernel on real hardware. Folding it into the planner's exact-scan path and the k-means / quantizer training batches is the next step; the point today is the seam — Quiver can borrow a GPU's muscle where one exists, and lose nothing where one doesn't.
+
+## 9.14 The roads not (yet) taken
+
+What is *not* yet built is deliberately so, until the single-node story is unbeatable and the need is concrete. The big features now stand: write HA (§9.11), autoscaling (§9.12), and the GPU distance kernel (§9.13). What remains is mostly **wiring and evidence** — threading the GPU kernel through more of the search and build paths, automating safe scale-*in* (a reverse-migration drain), and the launch polish a `v1.0.0` is gated on: the published **reference-hardware** benchmark table (recorded on dedicated machines, never fabricated), a hosted docs site, and a recorded cockpit cast. None compromises the single static binary, and single-node remains the default everywhere.
 
 ---
 
@@ -832,6 +852,8 @@ What is *not* yet built is deliberately so, until the single-node story is unbea
 - **Coordinator** — a thin service, off the query path, that owns the cluster's **versioned** shard map; routers refresh the map from it so membership changes propagate with no restart (§9.10, ADR-0066).
 - **Online migration / dynamic scaling** — adding or removing a shard on a live cluster, moving only the ~1/N HRW-remapped slice with no downtime and no lost writes (the donor serves + dual-writes until the new shard catches up, then ownership flips atomically) (§9.10, ADR-0066).
 - **Per-shard write HA (Raft)** — automatic write failover: each shard runs one Raft group with its replicas as **voters**; a write is acknowledged only after a **quorum** commits it (so a failover loses no acknowledged write), a non-leader replies *"not the leader"* so the router redirects, and a minority refuses writes (no split-brain) (§9.11, ADR-0067; opt-in per shard).
+- **Autoscaling** — the coordinator grows the cluster on its own: when the busiest shard's point count crosses a configured high-water mark, it joins a standby shard via the same safe online migration as a manual grow, bounded by a cooldown and a max-shards cap. Scale-out only; scale-in stays a manual drained remove (§9.12, ADR-0065; opt-in).
+- **GPU acceleration** — an optional CUDA accelerator for the batch distance kernel behind an off-by-default `cuda` build feature; the CPU SIMD kernel is the default and the fallback, results are identical, and a normal build links no CUDA (§9.13, ADR-0052).
 - **Sharding / scatter-gather** — splitting data across nodes (designed, not built); a query fans out to all shards and merges results.
 - **OTLP / OpenTelemetry** — the wire protocol for exporting traces to a collector (Jaeger/Tempo/Grafana); opt-in in Quiver.
 - **Cockpit (TUI)** — the retro terminal interface (`quiver tui`): a live dashboard plus an interactive query runner.
