@@ -65,6 +65,7 @@ message SearchResponse { repeated Match matches = 1; string next_cursor = 2; }
 | `POST /v1/keys` · `GET /v1/keys` · `DELETE /v1/keys/{id}` | API-key admin |
 | `GET /v1/collections/{id}/stats` | Stats |
 | `POST /v1/snapshot` | Snapshot — consistent online backup to a server-local dir (ADR-0050, admin) |
+| `POST /cluster/raft/voters` · `DELETE /cluster/raft/voters/{id}` | Add/remove a per-shard Raft voter at runtime (ADR-0067 increment 4c, admin; requires the `raft` build feature) |
 | `GET /healthz` · `GET /readyz` · `GET /metrics` | ops |
 
 `CreateCollection` selects the per-collection index (ADR-0007): the JSON body and

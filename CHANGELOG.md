@@ -62,8 +62,13 @@ for the per-release rationale and Definitions of Done.
   a purged log: a snapshot captures the engine as the op stream that recreates it,
   and installing it resets the target engine and replays — proven both directly and
   end to end (a fresh voter, added after the leader snapshots and purges its log,
-  catches up purely from the snapshot). Raft stays **opt-in per shard**; a default
-  build still never links `openraft`.
+  catches up purely from the snapshot). A shard's **voter set is dynamic**: an admin
+  endpoint (`POST` / `DELETE /cluster/raft/voters`) adds or removes a voter at
+  runtime — the new node is added as a learner, catches up, and is promoted via a
+  joint-consensus change — so a Raft shard can grow or shrink online without a
+  restart (proven by an end-to-end test that grows a single-member leader to two
+  voters and back). Raft stays **opt-in per shard**; a default build still never
+  links `openraft`.
 
 ## [0.26.0] — 2026-06-25
 

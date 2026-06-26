@@ -457,13 +457,71 @@ pub struct RaftShard {
     /// This node's member id within the group.
     pub node_id: NodeId,
     /// The group's members: id → gRPC base URL, for resolving a leader hint to a
-    /// URL in the "not the leader" redirect.
-    pub members: BTreeMap<NodeId, String>,
+    /// URL in the "not the leader" redirect. Behind a lock because the voter set is
+    /// **dynamic** (ADR-0067 increment 4c): [`add_voter`](Self::add_voter) /
+    /// [`remove_voter`](Self::remove_voter) change it at runtime.
+    pub members: std::sync::RwLock<BTreeMap<NodeId, String>>,
     /// Serializes create-collection proposals so two concurrent creates cannot
     /// claim the same next collection id — the leader assigns it at prepare time
     /// (ADR-0067, owner-locked decision). Upserts/deletes target an existing
     /// collection and take no lock.
     pub create_lock: tokio::sync::Mutex<()>,
+}
+
+impl RaftShard {
+    /// Resolve a member id to its gRPC base URL (for the "not the leader" redirect).
+    pub fn member_url(&self, id: NodeId) -> Option<String> {
+        self.members.read().ok()?.get(&id).cloned()
+    }
+
+    /// Add a voter to this shard's Raft group at runtime (ADR-0067 increment 4c):
+    /// first add it as a **learner** so it catches up (replaying the log, or
+    /// installing a snapshot if the log was compacted — increment 4c), blocking
+    /// until it is current, then **promote** it to a voting member via a joint
+    /// consensus change. Must be called on the leader.
+    ///
+    /// # Errors
+    /// Propagates openraft learner/membership-change errors (e.g. not the leader).
+    pub async fn add_voter(
+        &self,
+        id: NodeId,
+        url: String,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.raft
+            .add_learner(id, BasicNode::new(url.clone()), true)
+            .await?;
+        self.raft
+            .change_membership(
+                openraft::ChangeMembers::AddVoterIds([id].into_iter().collect()),
+                true,
+            )
+            .await?;
+        if let Ok(mut m) = self.members.write() {
+            m.insert(id, url);
+        }
+        Ok(())
+    }
+
+    /// Remove a voter from this shard's Raft group at runtime (ADR-0067 increment
+    /// 4c) via a joint consensus change. Must be called on the leader.
+    ///
+    /// # Errors
+    /// Propagates openraft membership-change errors (e.g. not the leader).
+    pub async fn remove_voter(
+        &self,
+        id: NodeId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.raft
+            .change_membership(
+                openraft::ChangeMembers::RemoveVoters([id].into_iter().collect()),
+                false,
+            )
+            .await?;
+        if let Ok(mut m) = self.members.write() {
+            m.remove(&id);
+        }
+        Ok(())
+    }
 }
 
 /// Boot this node's per-shard Raft group as a member of `members` (id → gRPC base
@@ -524,7 +582,7 @@ pub async fn start_member(
     Ok(RaftShard {
         raft,
         node_id,
-        members,
+        members: std::sync::RwLock::new(members),
         create_lock: tokio::sync::Mutex::new(()),
     })
 }
