@@ -74,7 +74,19 @@ exactly like a torn frame — never an error. Test:
 exact CI message, passes after). The crash gate (ADR-0005) is honored, not
 weakened.
 
-## Dynamic scan (OWASP ZAP baseline)
+### F3 — Missing hardening response headers (fixed)
+
+**Severity:** low. **Status:** fixed this release.
+
+The OWASP ZAP API scan flagged that responses lacked `X-Content-Type-Options:
+nosniff` and a `Cross-Origin-Resource-Policy` header. Both are now set on **every**
+response (open endpoints and the authed API alike) by an outermost middleware
+(`rest.rs::security_headers`): `nosniff` stops content-type sniffing and
+`same-origin` keeps responses from being embedded cross-origin by a `no-cors`
+load. Test: `security_headers.rs::every_response_carries_security_headers`
+(asserts both headers on a 200 and a 401).
+
+## Dynamic scan (OWASP ZAP — baseline + API scan)
 
 A live server was started with the production-style secure configuration —
 encryption-at-rest on, an admin API key required, REST on `127.0.0.1:7333` — a
@@ -95,15 +107,23 @@ rules passed.**
   open liveness/metrics endpoints. ZAP therefore could not crawl into the API,
   which is the intended posture; it also means the baseline passive scan did not
   exercise the **authenticated** request bodies.
-- The deeper, authenticated **API scan** (`zap-api-scan.py`, which actively
-  fuzzes each operation from an OpenAPI definition with a key configured) is
-  sequenced with the machine-readable OpenAPI spec being generated for the API
-  reference; it is **not yet run** and is listed as a residual item below rather
-  than claimed.
+### API scan (active rules over the OpenAPI surface)
 
-No missing-security-header failure, information disclosure, injection reflection,
-or insecure-transport finding was reported. (The JSON API reflects no HTML, so
-the CSP / anti-CSRF / XSS passive rules pass by absence of an attack surface.)
+With the OpenAPI spec now committed (`docs/api/openapi.yaml`), `zap-api-scan.py`
+was run against the same live server, importing the spec and running ZAP's full
+**active** rule set over every operation.
+
+**Result: 0 FAIL, 117 rules passed, 2 low-risk warnings.** Every injection rule —
+SQL, OS command (incl. time-based), XSS, server-side template injection, XXE,
+XPath/XSLT injection, the padding oracle, and cloud-metadata exposure — **passed**.
+The two warnings were missing hardening **response headers** on the open
+endpoints (`X-Content-Type-Options`, `Cross-Origin-Resource-Policy`) — **fixed**
+this release (F3 below). Honestly noted: the simple header-replacer used to inject
+the bearer token did not take, so the active scan exercised the endpoints largely
+**unauthenticated** (mostly 401s); the authenticated request-body surface is
+instead covered by the static review (C5) and the `error_paths` bad-input contract
+test. No injection, disclosure, or insecure-transport finding was reported (the
+JSON API reflects no HTML, so the CSP/CSRF/XSS rules pass by absence of surface).
 
 ## Checked, not vulnerable
 
@@ -234,9 +254,12 @@ every PR.
   Use `client_side` where that matters. (ADR-0031 / ADR-0035.)
 - **The audit log is append-only but not yet hash-chained**, so it is
   tamper-evident only to the extent the filesystem is. (`audit.md`.)
-- **The authenticated ZAP API scan is not yet run** — it is sequenced with the
-  OpenAPI spec being generated for the API reference, and is listed here rather
-  than claimed as complete.
+- **The ZAP API scan ran the active rules largely unauthenticated** — the simple
+  bearer-token replacer did not inject, so the active scan did not deeply fuzz the
+  authenticated request bodies (those are covered by the static review and the
+  `error_paths` contract test). A future pass can wire a ZAP context auth to
+  active-scan the authed bodies directly. No injection finding was reported either
+  way.
 - **CodeQL `rust/hard-coded-cryptographic-value` alerts on `dcpe.rs`** are the
   scheme's fixed, published test/domain constants (by design, justified at
   `dcpe.rs`); they require an owner dismissal in the GitHub Security UI (the agent
@@ -246,8 +269,9 @@ every PR.
 
 ## Sign-off
 
-The findings this pass (F1 coordinator auth, F2 crash-gate torn header) are fixed
-with regression tests; the ZAP baseline DAST is clean (0 FAIL, 1 informational);
-the three fuzzers ran clean; and the static review found the access-control,
-injection, SSRF, crypto, and DoS classes defended or not reachable, with the open
-items listed honestly above. No fabricated results.
+The findings this pass (F1 coordinator auth, F2 crash-gate torn header, F3 missing
+hardening headers) are fixed with regression tests; the ZAP DAST is clean (0 FAIL
+across the baseline and the active API scan — 117 rules passed, only the two
+header warnings now fixed); the three fuzzers ran clean; and the static review
+found the access-control, injection, SSRF, crypto, and DoS classes defended or not
+reachable, with the open items listed honestly above. No fabricated results.
