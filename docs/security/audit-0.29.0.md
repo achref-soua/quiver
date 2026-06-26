@@ -84,7 +84,9 @@ response (open endpoints and the authed API alike) by an outermost middleware
 (`rest.rs::security_headers`): `nosniff` stops content-type sniffing and
 `same-origin` keeps responses from being embedded cross-origin by a `no-cors`
 load. Test: `security_headers.rs::every_response_carries_security_headers`
-(asserts both headers on a 200 and a 401).
+(asserts both headers on a 200 and a 401). **Re-verified with ZAP** against the
+fixed server: the API scan went from 2 warnings to **0 FAIL, 0 WARN, 119 rules
+passed** — both header rules (incl. the CORP site-isolation rule `90004`) now pass.
 
 ## Dynamic scan (OWASP ZAP — baseline + API scan)
 
