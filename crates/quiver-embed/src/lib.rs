@@ -835,6 +835,57 @@ impl Database {
         Ok(())
     }
 
+    /// Build the [`WalOp`] for creating a collection — the same validated op
+    /// [`Database::create_collection`] would log — **without** applying it. The
+    /// per-shard Raft write path (ADR-0067) proposes this op through consensus and
+    /// applies it via [`Database::apply_replicated`] only after a quorum commits,
+    /// so a leader failover never loses an acknowledged write. The new id is
+    /// assigned here, on the leader (the caller serializes concurrent creates).
+    ///
+    /// # Errors
+    /// Propagates index validation and store preparation errors.
+    pub fn prepare_create_collection(&self, name: &str, descriptor: &Descriptor) -> Result<WalOp> {
+        validate_index(descriptor)?;
+        Ok(self.store.prepare_create_collection(name, descriptor)?)
+    }
+
+    /// Build the validated [`WalOp::Upsert`] [`Database::upsert`] would log, without
+    /// applying it (the Raft write path; see [`Database::prepare_create_collection`]).
+    ///
+    /// # Errors
+    /// [`Error::CollectionNotFound`] if the collection is not loaded, or a store
+    /// preparation error (e.g. a dimensionality mismatch).
+    pub fn prepare_upsert(
+        &self,
+        collection: &str,
+        id: &str,
+        vector: &[f32],
+        payload: &Value,
+    ) -> Result<WalOp> {
+        let handle = self
+            .collections
+            .get(collection)
+            .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+        require_single_vector(handle)?;
+        let payload_bytes = serde_json::to_vec(payload)?;
+        Ok(self
+            .store
+            .prepare_upsert(handle.id, id, vector, &payload_bytes)?)
+    }
+
+    /// Build the [`WalOp::Delete`] [`Database::delete`] would log, or `None` if the
+    /// point does not exist, without applying it (the Raft write path).
+    ///
+    /// # Errors
+    /// [`Error::CollectionNotFound`] if the collection is not loaded.
+    pub fn prepare_delete(&self, collection: &str, id: &str) -> Result<Option<WalOp>> {
+        let handle = self
+            .collections
+            .get(collection)
+            .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+        Ok(self.store.prepare_delete(handle.id, id)?)
+    }
+
     /// Upsert a batch of points with a single WAL `fdatasync` (ADR-0038).
     ///
     /// `points` is `(id, vector, payload)` tuples.  The batch is committed
@@ -3052,6 +3103,75 @@ mod tests {
 
     fn open(dir: &Path) -> Database {
         Database::open(dir).unwrap()
+    }
+
+    #[test]
+    fn prepare_then_apply_matches_a_direct_write() {
+        // A direct-write engine and a prepare→apply engine fed the same operations
+        // must reach identical logical state — the invariant the Raft write path
+        // (ADR-0067) relies on: the leader proposes a *prepared* op, and every
+        // member applies it via `apply_replicated` exactly as a direct write would.
+        let dir_a = tempfile::tempdir().unwrap();
+        let mut direct = open(dir_a.path());
+        let dir_b = tempfile::tempdir().unwrap();
+        let mut raft = open(dir_b.path());
+
+        let vector = [1.0, 2.0, 3.0, 4.0];
+        let payload = json!({ "k": "v" });
+
+        // Direct path: write, then remove one point.
+        direct.create_collection("docs", desc()).unwrap();
+        direct.upsert("docs", "p1", &vector, &payload).unwrap();
+        direct
+            .upsert("docs", "p2", &[0.0, 1.0, 0.0, 0.0], &json!({}))
+            .unwrap();
+        assert!(direct.delete("docs", "p2").unwrap());
+
+        // Raft path: prepare each op, then apply it (as a quorum-committed entry).
+        let create = raft.prepare_create_collection("docs", &desc()).unwrap();
+        raft.apply_replicated(create).unwrap();
+        let up1 = raft
+            .prepare_upsert("docs", "p1", &vector, &payload)
+            .unwrap();
+        raft.apply_replicated(up1).unwrap();
+        let up2 = raft
+            .prepare_upsert("docs", "p2", &[0.0, 1.0, 0.0, 0.0], &json!({}))
+            .unwrap();
+        raft.apply_replicated(up2).unwrap();
+        let del = raft
+            .prepare_delete("docs", "p2")
+            .unwrap()
+            .expect("p2 present");
+        raft.apply_replicated(del).unwrap();
+
+        // Identical logical state ⇒ identical ops to recreate it.
+        assert_eq!(
+            direct.replication_snapshot().unwrap(),
+            raft.replication_snapshot().unwrap(),
+        );
+    }
+
+    #[test]
+    fn prepare_validates_like_the_direct_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(dir.path());
+        db.create_collection("docs", desc()).unwrap();
+        // A dimensionality mismatch is rejected at prepare time.
+        assert!(
+            db.prepare_upsert("docs", "p", &[1.0, 2.0], &json!({}))
+                .is_err()
+        );
+        // A duplicate collection name is rejected at prepare time.
+        assert!(db.prepare_create_collection("docs", &desc()).is_err());
+        // An unknown collection is not found.
+        assert!(
+            db.prepare_upsert("nope", "p", &[1.0, 2.0, 3.0, 4.0], &json!({}))
+                .is_err()
+        );
+        // Deleting a missing point prepares to nothing (no op); an unknown
+        // collection is not found.
+        assert!(db.prepare_delete("docs", "ghost").unwrap().is_none());
+        assert!(db.prepare_delete("nope", "x").is_err());
     }
 
     #[test]
