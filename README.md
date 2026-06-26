@@ -21,7 +21,7 @@
 
 Native-Rust vector databases already exist; Quiver is not trying to out-scale Milvus or out-feature Qdrant. Its defensible edge is the **combination** of three things, executed well:
 
-- **Security-first, by default** — encryption-at-rest is on out of the box, sealing every durable byte (segments, manifest, **and** the write-ahead log) with XChaCha20-Poly1305; payloads can be client-side-encrypted so the server never sees them; API-key scopes, RBAC, tenant isolation, audit, and crypto-shredding. Only audited cryptography (RustCrypto AEAD/KDF + `rustls`) — never a home-grown primitive. The parsers that touch untrusted input (the search-filter wire format and the on-disk page/WAL decoders) are [fuzzed](./docs/security/fuzzing.md).
+- **Security-first, by default** — encryption-at-rest is on out of the box, sealing every durable byte (segments, manifest, **and** the write-ahead log) with XChaCha20-Poly1305; payloads can be client-side-encrypted so the server never sees them; API-key scopes, RBAC, tenant isolation, audit, and crypto-shredding. Only audited cryptography (RustCrypto AEAD/KDF + `rustls`) — never a home-grown primitive. The parsers that touch untrusted input (the search-filter wire format and the on-disk page/WAL decoders) are [fuzzed](./docs/security/fuzzing.md), and the whole codebase is reviewed in a documented [security audit](./docs/security/audit-0.29.0.md) — a static OWASP-style review **plus a dynamic [OWASP ZAP](https://www.zaproxy.org/) scan** of a live server and the fuzzers re-run — with every finding fixed and regression-tested and the residual risks stated honestly.
 - **Memory frugality** — a disk-resident graph index (DiskANN/Vamana) plus quantization (product / scalar / binary) serve large datasets from a laptop's RAM budget. The headline metric is **memory at a fixed recall**.
 - **Developer experience** — a single static binary; embeddable *and* server modes; a `ratatui` cockpit with a 2-D constellation view of the vector space; idiomatic Python/TypeScript SDKs; an MCP server so agents can drive it.
 
@@ -312,6 +312,6 @@ Every option is an environment variable with a secure default; see [`.env.exampl
 - **Documentation site** — [`apps/docs`](./apps/docs) (mdBook; `just docs`)
 - **Roadmap & Definitions of Done** — [`docs/roadmap.md`](./docs/roadmap.md)
 - **Changelog** — [`CHANGELOG.md`](./CHANGELOG.md)
-- **Security policy** — [`SECURITY.md`](./SECURITY.md) · **Threat model** — [`docs/security/threat-model.md`](./docs/security/threat-model.md)
+- **Security policy** — [`SECURITY.md`](./SECURITY.md) · **Threat model** — [`docs/security/threat-model.md`](./docs/security/threat-model.md) · **Security audit (OWASP ZAP + static + fuzz)** — [`docs/security/audit-0.29.0.md`](./docs/security/audit-0.29.0.md)
 - **Contributing** — [`CONTRIBUTING.md`](./CONTRIBUTING.md)
 - **License** — [AGPL-3.0-only](./LICENSE)
