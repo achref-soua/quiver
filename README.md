@@ -98,8 +98,10 @@ quiver demo
 
 <img src="docs/assets/cockpit/demo-start.png" alt="quiver demo output — seeds vectors, starts server, opens cockpit" width="540">
 
-Seeds 1 000 synthetic vectors, starts the REST server on `:7333`, and opens the retro
-cockpit — no config files, no env vars, no external downloads.
+Seeds two collections — a text-searchable `articles` set and 1 000 synthetic vectors
+for the constellation — starts the REST server on `:7333`, and opens the retro
+cockpit, where every op (browse, constellation, text search) works offline against the
+seeded data. No config files, no env vars, no external downloads.
 
 **Full server quick start:**
 
