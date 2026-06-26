@@ -1348,4 +1348,63 @@ mod tests {
         r1.shutdown().await.unwrap();
         r2.shutdown().await.unwrap();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_partitioned_voter_rejoins_and_catches_up() {
+        // Partition / rejoin (ADR-0067 increment 4d): a voter cut off from the group
+        // misses the writes the surviving majority commits, then on healing rejoins
+        // and catches up to the full state — no acknowledged write is lost, and the
+        // group reconverges.
+        let (board, voters) = boot_cluster(&[1, 2, 3]).await;
+        voters[0]
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .state(ServerState::Leader, "bootstrap leader")
+            .await
+            .unwrap();
+
+        let a = [1.0f32, 0.0, 0.0, 0.0];
+        let b = [0.0f32, 1.0, 0.0, 0.0];
+        let ops = collection_ops(&[("a", a)]);
+        let coll_id = ops
+            .iter()
+            .find_map(|op| match op {
+                WalOp::CreateCollection { collection_id, .. } => Some(*collection_id),
+                _ => None,
+            })
+            .expect("create-collection op");
+        for op in &ops {
+            commit(&board, &voters, op).await;
+        }
+        for v in &voters {
+            await_serves(&v.engine, &a, "a").await;
+        }
+
+        // Partition voter 3 away — peers can no longer reach it, so it misses what
+        // the majority commits next.
+        let isolated = 3;
+        board.kill(isolated);
+
+        // The majority {1,2} still has a quorum and keeps committing.
+        let b_op = WalOp::Upsert {
+            collection_id: coll_id,
+            external_id: "b".to_owned(),
+            vector: b.iter().flat_map(|f| f.to_le_bytes()).collect(),
+            payload: b"{}".to_vec(),
+        };
+        commit(&board, &voters, &b_op).await;
+        for v in voters.iter().filter(|v| v.id != isolated) {
+            await_serves(&v.engine, &b, "b").await;
+        }
+
+        // Heal the partition: voter 3 reconnects and catches up to the write it
+        // missed, reconverging with the group.
+        board.register(isolated, voters[2].raft.clone());
+        await_serves(&voters[2].engine, &a, "a").await;
+        await_serves(&voters[2].engine, &b, "b").await;
+
+        for v in &voters {
+            v.raft.shutdown().await.unwrap();
+        }
+    }
 }

@@ -67,8 +67,13 @@ for the per-release rationale and Definitions of Done.
   runtime — the new node is added as a learner, catches up, and is promoted via a
   joint-consensus change — so a Raft shard can grow or shrink online without a
   restart (proven by an end-to-end test that grows a single-member leader to two
-  voters and back). Raft stays **opt-in per shard**; a default build still never
-  links `openraft`.
+  voters and back). The increment's hardening suite (4d) adds a **partition/rejoin**
+  gate — a voter cut off from the group misses what the surviving majority commits,
+  then on healing rejoins and catches up with nothing lost — and a **property test**
+  that replays a long random interleaving of append/truncate/purge/vote and asserts
+  the reopened store equals a reference model, alongside the existing
+  no-lost-acknowledged-write and no-split-brain gates. Raft stays **opt-in per
+  shard**; a default build still never links `openraft`.
 
 ## [0.26.0] — 2026-06-25
 

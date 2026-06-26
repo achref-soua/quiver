@@ -157,6 +157,22 @@ impl DurableLogStore {
         .map_err(store_err)?
         .map_err(store_err)
     }
+
+    // Persist + mirror a batch of entries (the durable half of `append`, without
+    // openraft's flush callback). Split out so the crash-recovery replay can be
+    // property-tested directly — openraft's `LogFlushed` callback is `pub(crate)`
+    // and cannot be constructed from a test.
+    async fn append_entries(
+        &self,
+        entries: Vec<Entry<TypeConfig>>,
+    ) -> Result<(), StorageError<NodeId>> {
+        self.durable(Record::Append(entries.clone())).await?;
+        let mut mem = self.mem.lock().await;
+        for e in entries {
+            mem.log.insert(e.get_log_id().index, e);
+        }
+        Ok(())
+    }
 }
 
 impl RaftLogReader<TypeConfig> for DurableLogStore {
@@ -215,16 +231,9 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
     where
         I: IntoIterator<Item = Entry<TypeConfig>>,
     {
-        let entries: Vec<Entry<TypeConfig>> = entries.into_iter().collect();
         // Persist + fsync the batch, then mirror in memory, then signal the flush —
         // so a crash before the fsync leaves no entry openraft believes is durable.
-        self.durable(Record::Append(entries.clone())).await?;
-        {
-            let mut mem = self.mem.lock().await;
-            for e in entries {
-                mem.log.insert(e.get_log_id().index, e);
-            }
-        }
+        self.append_entries(entries.into_iter().collect()).await?;
         callback.log_io_completed(Ok(()));
         Ok(())
     }
@@ -360,6 +369,105 @@ mod tests {
         assert!(
             entries.len() >= 5,
             "the durable log replays its entries after a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_matches_a_reference_model_for_random_op_sequences() {
+        use std::collections::BTreeSet;
+
+        use openraft::{CommittedLeaderId, EntryPayload, LogId};
+
+        fn log_entry(index: u64) -> Entry<TypeConfig> {
+            Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+                payload: EntryPayload::Normal(del(index)),
+            }
+        }
+
+        // A pseudo-random sequence of store mutations must replay (after a reopen)
+        // to exactly the state produced by applying them — hardening the hand-rolled
+        // crash-recovery replay against any interleaving of append / truncate /
+        // purge / save-vote (ADR-0067 increment 4d). The reference model mirrors the
+        // store's documented effect of each op; a deterministic xorshift drives a
+        // varied-but-reproducible sequence.
+        let dir = tempfile::tempdir().unwrap();
+        let mut model: BTreeSet<u64> = BTreeSet::new();
+        let mut model_purged: Option<u64> = None;
+        let mut model_vote: Option<Vote<u64>> = None;
+        let mut next = 1u64;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rng = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        {
+            let mut s = DurableLogStore::open(dir.path()).unwrap();
+            for _ in 0..120 {
+                match rng() % 5 {
+                    0 | 1 => {
+                        let n = (rng() % 3) + 1;
+                        let mut batch = Vec::new();
+                        for _ in 0..n {
+                            batch.push(log_entry(next));
+                            model.insert(next);
+                            next += 1;
+                        }
+                        s.append_entries(batch).await.unwrap();
+                    }
+                    2 if next > 1 => {
+                        let at = (rng() % next).max(1);
+                        s.truncate(LogId::new(CommittedLeaderId::new(1, 1), at))
+                            .await
+                            .unwrap();
+                        model.retain(|&i| i < at);
+                        next = at;
+                    }
+                    3 => {
+                        if let Some(&max) = model.iter().next_back() {
+                            let upto = rng() % (max + 1);
+                            s.purge(LogId::new(CommittedLeaderId::new(1, 1), upto))
+                                .await
+                                .unwrap();
+                            model.retain(|&i| i > upto);
+                            model_purged = Some(upto);
+                        }
+                    }
+                    _ => {
+                        let v = Vote::new(rng() % 10, rng() % 3);
+                        s.save_vote(&v).await.unwrap();
+                        model_vote = Some(v);
+                    }
+                }
+            }
+        }
+
+        // Reopen from disk: the replayed state must equal the reference model.
+        let mut s = DurableLogStore::open(dir.path()).unwrap();
+        assert_eq!(
+            s.read_vote().await.unwrap(),
+            model_vote,
+            "vote replays exactly"
+        );
+        let state = s.get_log_state().await.unwrap();
+        assert_eq!(
+            state.last_purged_log_id.map(|l| l.index),
+            model_purged,
+            "last-purged replays exactly"
+        );
+        let indices: BTreeSet<u64> = s
+            .try_get_log_entries(0..=u64::MAX)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.get_log_id().index)
+            .collect();
+        assert_eq!(
+            indices, model,
+            "the log replays to exactly the same entries"
         );
     }
 }
