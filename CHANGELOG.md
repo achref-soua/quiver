@@ -25,7 +25,12 @@ for the per-release rationale and Definitions of Done.
   byte-for-byte unchanged. The in-memory Raft log store is vendored from openraft's
   example memstore (the published `openraft-memstore` implements the deprecated v1
   storage that the `storage-v2` API removes); a durable, snapshot-backed store
-  arrives in 4c.
+  arrives in 4c. Increment 4b adds a real multi-voter group with **automatic leader
+  failover** (no acknowledged write lost, verified against single-node ground truth)
+  and a **gRPC transport** (`quiver.v1.RaftService`) carrying the consensus RPCs
+  between a shard's members over the server's existing tonic stack. Wiring this into
+  the server's run path and the cluster router (leader-aware routing) follows in the
+  remaining 4b increments.
 
 ## [0.26.0] — 2026-06-25
 
