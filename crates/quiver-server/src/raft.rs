@@ -963,4 +963,70 @@ mod tests {
             v.raft.shutdown().await.unwrap();
         }
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_minority_cannot_commit_a_write() {
+        // No split-brain (ADR-0067, 4b-iv): once a minority of voters is reachable,
+        // the survivor cannot reach a quorum, so it cannot commit a write — while
+        // still serving the data committed while the quorum was whole. The
+        // Switchboard truly isolates a killed voter (a de-registered node is
+        // `Unreachable`), so a minority here is a real partition — unlike a
+        // whole-process kill, which cannot stop openraft's background core.
+        let (board, voters) = boot_cluster(&[1, 2, 3]).await;
+        voters[0]
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .state(ServerState::Leader, "bootstrap leader")
+            .await
+            .unwrap();
+
+        // Commit a batch while all three voters form a quorum.
+        let a = [1.0f32, 0.0, 0.0, 0.0];
+        let ops = collection_ops(&[("a", a)]);
+        let coll_id = ops
+            .iter()
+            .find_map(|op| match op {
+                WalOp::CreateCollection { collection_id, .. } => Some(*collection_id),
+                _ => None,
+            })
+            .expect("create-collection op");
+        for op in &ops {
+            commit(&board, &voters, op).await;
+        }
+        for v in &voters {
+            await_serves(&v.engine, &a, "a").await;
+        }
+
+        // Isolate a minority of one: kill voters 2 and 3. The survivor (voter 1)
+        // cannot reach a quorum, which needs two.
+        for v in &voters[1..] {
+            board.kill(v.id);
+            v.raft.shutdown().await.unwrap();
+        }
+        let survivor = &voters[0];
+
+        // A new write cannot commit on the minority: `client_write` either errors
+        // (no leader / forward-to-leader) or never resolves (a leader stepping down
+        // after losing quorum), bounded by a timeout — but never succeeds.
+        let op = WalOp::Upsert {
+            collection_id: coll_id,
+            external_id: "b".to_owned(),
+            vector: [0.0f32, 1.0, 0.0, 0.0]
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect(),
+            payload: b"{}".to_vec(),
+        };
+        let committed =
+            tokio::time::timeout(Duration::from_secs(3), survivor.raft.client_write(op)).await;
+        assert!(
+            matches!(committed, Err(_) | Ok(Err(_))),
+            "a minority of one committed a write — split-brain"
+        );
+
+        // Safety, not just denial of liveness: the survivor still serves the data
+        // committed before the partition.
+        await_serves(&survivor.engine, &a, "a").await;
+        survivor.raft.shutdown().await.unwrap();
+    }
 }
