@@ -120,6 +120,7 @@ async fn server_stores_opaque_vectors_and_the_client_ranks() {
         coordinator: false,
         coordinator_url: None,
         coordinator_state: None,
+        autoscale: Default::default(),
         raft_node_id: None,
         raft_members: Vec::new(),
     };
