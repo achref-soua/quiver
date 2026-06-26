@@ -330,6 +330,115 @@ pub async fn start_single_member<A: ApplyOp>(
     Ok(raft)
 }
 
+/// The production [`ApplyOp`]: drive a committed entry into the server's engine
+/// through the same `apply_replicated` seam (ADR-0030) a replication follower
+/// uses, offloading the synchronous engine work with `spawn_blocking`. It holds
+/// the engine handle **directly** (not the whole server `AppState`), so the Raft
+/// group the state machine lives in is never referenced back — no `Arc` cycle.
+pub struct EngineApplier {
+    db: Arc<std::sync::RwLock<quiver_embed::Database>>,
+}
+
+impl EngineApplier {
+    /// Build an applier over the server's shared engine handle.
+    pub fn new(db: Arc<std::sync::RwLock<quiver_embed::Database>>) -> Self {
+        Self { db }
+    }
+}
+
+impl ApplyOp for EngineApplier {
+    async fn apply(&self, op: WalOp) -> std::io::Result<()> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = db
+                .write()
+                .map_err(|_| std::io::Error::other("database lock poisoned"))?;
+            guard
+                .apply_replicated(op)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("blocking apply task failed: {e}")))?
+    }
+}
+
+/// A node's per-shard Raft group plus the handles the server's write path needs
+/// (ADR-0067, increment 4b). Held behind an `Arc` in `AppState` because the
+/// `create_lock` is not `Clone`.
+pub struct RaftShard {
+    /// This node's Raft handle.
+    pub raft: Raft,
+    /// This node's member id within the group.
+    pub node_id: NodeId,
+    /// The group's members: id → gRPC base URL, for resolving a leader hint to a
+    /// URL in the "not the leader" redirect.
+    pub members: BTreeMap<NodeId, String>,
+    /// Serializes create-collection proposals so two concurrent creates cannot
+    /// claim the same next collection id — the leader assigns it at prepare time
+    /// (ADR-0067, owner-locked decision). Upserts/deletes target an existing
+    /// collection and take no lock.
+    pub create_lock: tokio::sync::Mutex<()>,
+}
+
+/// Boot this node's per-shard Raft group as a member of `members` (id → gRPC base
+/// URL), applying committed entries through `applier` over the gRPC transport.
+///
+/// The lowest-id member bootstraps the group by initializing the membership
+/// (idempotent — an already-initialized node is left as-is); the other members
+/// join when the initializer replicates the membership entry to them. Returns
+/// once the local group is running; leader election and replication proceed in
+/// the background, so a member whose peers are not up yet does not block startup.
+///
+/// # Errors
+/// Propagates openraft configuration/construction errors.
+pub async fn start_member(
+    node_id: NodeId,
+    members: BTreeMap<NodeId, String>,
+    applier: EngineApplier,
+) -> Result<RaftShard, Box<dyn std::error::Error + Send + Sync>> {
+    let config = Arc::new(
+        Config {
+            heartbeat_interval: 250,
+            election_timeout_min: 500,
+            election_timeout_max: 1000,
+            ..Default::default()
+        }
+        .validate()?,
+    );
+    let log_store = LogStore::default();
+    let state_machine = Arc::new(StateMachineStore::new(applier));
+    let raft = openraft::Raft::new(
+        node_id,
+        config,
+        grpc::GrpcRaftNetwork,
+        log_store,
+        state_machine,
+    )
+    .await?;
+
+    // The lowest-id member bootstraps the group. The 4b log is volatile, so a
+    // fresh boot is always uninitialized; the `is_initialized` guard keeps this
+    // correct for the durable store of 4c without changing 4b behaviour.
+    if members.keys().next() == Some(&node_id) && !raft.is_initialized().await? {
+        let nodes: BTreeMap<NodeId, BasicNode> = members
+            .iter()
+            .map(|(id, url)| (*id, BasicNode::new(url.clone())))
+            .collect();
+        if let Err(e) = raft.initialize(nodes).await {
+            // An already-initialized race is benign; anything else is logged but
+            // not fatal — the node still serves and can be re-bootstrapped.
+            tracing::debug!(error = %e, "raft initialize (already bootstrapped?)");
+        }
+    }
+
+    Ok(RaftShard {
+        raft,
+        node_id,
+        members,
+        create_lock: tokio::sync::Mutex::new(()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;

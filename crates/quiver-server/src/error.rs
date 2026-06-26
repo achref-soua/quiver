@@ -43,6 +43,17 @@ pub enum Error {
     /// and provider transport/parse detail), so it is shown to the client.
     #[error("{0}")]
     Upstream(String),
+    /// This node received a write but is not its shard's Raft leader (ADR-0067).
+    /// Carries the current leader's base URL when the group knows it, so a cluster
+    /// router (or client) redirects the write to the leader — the same
+    /// self-correcting data-path pattern as the cluster's "not my range" redirect.
+    /// Returned as HTTP 421 Misdirected Request / gRPC `Unavailable` (retry
+    /// elsewhere). The detail carries only a URL, so it is client-safe.
+    #[error("not the raft leader; leader: {leader:?}")]
+    NotLeader {
+        /// The current leader's gRPC base URL, if known.
+        leader: Option<String>,
+    },
 }
 
 impl Error {
@@ -59,6 +70,7 @@ impl Error {
             Error::Forbidden(_) => (StatusCode::FORBIDDEN, tonic::Code::PermissionDenied),
             Error::BadRequest(_) => (StatusCode::BAD_REQUEST, tonic::Code::InvalidArgument),
             Error::Upstream(_) => (StatusCode::BAD_GATEWAY, tonic::Code::Unavailable),
+            Error::NotLeader { .. } => (StatusCode::MISDIRECTED_REQUEST, tonic::Code::Unavailable),
             Error::Engine(EngineError::Core(CoreError::InvalidArgument(_)))
             | Error::Engine(EngineError::Index(_))
             | Error::Engine(EngineError::Unsupported(_))
