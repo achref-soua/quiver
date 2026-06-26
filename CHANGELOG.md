@@ -49,8 +49,15 @@ for the per-release rationale and Definitions of Done.
   the leader's process is killed loses **no acknowledged write** (every acked id is
   served by a survivor afterwards), and a **minority cannot commit a write** (no
   split-brain) — the latter proven at the consensus-adapter level, where a node can
-  be truly isolated, while it still serves data committed before the partition. Raft
-  stays **opt-in per shard**; a default build still never links `openraft`.
+  be truly isolated, while it still serves data committed before the partition. The
+  Raft log is now **durable** (increment 4c): a crash-safe `RaftLogStorage` persists
+  the granted vote and the log to an append-only file under `<data_dir>/raft`,
+  `fsync`ed before the call returns and replayed on open (a torn tail from a crash
+  mid-write is discarded), so a restarted voter recovers its log and vote and
+  rejoins safely — the same `kill -9` discipline as the engine WAL, proven by a
+  reopen-from-disk test. The committed index stays advisory (recomputed on restart),
+  so the commit path pays no extra `fsync`. Raft stays **opt-in per shard**; a
+  default build still never links `openraft`.
 
 ## [0.26.0] — 2026-06-25
 
