@@ -2673,7 +2673,7 @@ dependencies = [
  "chacha20 0.9.1",
  "chacha20poly1305",
  "hkdf",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "quiverdb-core",
  "quiverdb-embed",
  "serde_json",

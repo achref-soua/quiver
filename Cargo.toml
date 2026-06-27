@@ -90,7 +90,7 @@ chacha20poly1305 = { version = "0.10", features = ["getrandom"] }
 # (chacha20 0.9 / cipher 0.4), so no new major lands. HMAC-SHA256 (digest 0.10 /
 # sha2 0.10) provides the DCPE ciphertext integrity tag.
 chacha20 = "0.9"
-hmac = "0.12"
+hmac = "0.13"
 # Compact, dependency-free encoding for the client-side payload envelope
 # (ADR-0012): nonce and ciphertext are base64 strings so the JSON envelope is
 # identical across the Rust reference implementation and the language SDKs.
