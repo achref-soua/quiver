@@ -579,6 +579,17 @@ The DCPE mode implements a *published* academic scheme (the "Scale-And-Perturb" 
 
 > 💡 **This is the security-first ethos in miniature.** A lesser project would ship DCPE and call it "encrypted search," full stop. Quiver ships it behind an experimental flag, names the exact academic paper, and spells out precisely what it leaks and which attacker breaks it. That candor is the point.
 
+## 6.5 Not just claimed — *audited, fuzzed, and scanned*
+
+"Security-first" is easy to put on a README. Quiver backs it with evidence, and writes down what it finds — including what it *doesn't*.
+
+- **A written security audit.** The codebase is reviewed OWASP-style against the threat model — broken access control, injection, SSRF, cryptographic failures, misconfiguration, denial-of-service. Every finding is **fixed and pinned by a regression test** (a test that fails before the fix and passes after); every control that turns out *not* to be vulnerable is recorded with the reason. The latest is the v0.29.0 audit note.
+- **A real penetration-testing tool.** A live, encrypted, authenticated server is scanned with **OWASP ZAP** — the industry-standard web-application security scanner — running its full *active* rule set: SQL injection, OS-command injection, cross-site scripting, server-side template injection, XML external entities, path traversal, the padding oracle, cloud-metadata exposure, and more. The v0.29.0 scan came back **clean — zero failures across 119 rules**; the only two findings (a pair of missing hardening response headers) were fixed and the scan re-run to **zero warnings**.
+- **Fuzzing the dangerous parts.** The code that touches attacker-controlled bytes — the search-filter wire format and the on-disk page/WAL decoders — is continuously **fuzzed**. The latest pass ran **tens of millions of randomized inputs** with zero crashes: malformed input is rejected with a typed error, never a panic.
+- **A locked-down supply chain.** Every dependency is pinned and scanned (`cargo deny`, `cargo audit`) with no blanket suppressions, and static analysis (CodeQL) runs on every change.
+
+> 💡 **The honest core.** None of this claims Quiver is "unhackable" — no serious project would. It claims something more useful: the security is *measured*, the results are *written down*, every real finding is *fixed with a test that proves it*, and the residual risks are *stated plainly* rather than buried.
+
 ---
 
 # Part 7 — The Numbers (Honestly Reported)

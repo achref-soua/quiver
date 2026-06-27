@@ -16,15 +16,25 @@ service Quiver {
 
   rpc Upsert(UpsertRequest) returns (UpsertResponse);
   rpc UpsertStream(stream UpsertRequest) returns (UpsertResponse); // client-streaming bulk load (ADR-0045)
+  rpc UpsertText(UpsertTextRequest) returns (UpsertResponse);      // server-side embedding (ADR-0047)
   rpc DeletePoints(DeletePointsRequest) returns (DeletePointsResponse);
   rpc GetPoints(GetPointsRequest) returns (GetPointsResponse);
+  rpc Fetch(FetchRequest) returns (FetchResponse);                // unranked list (ADR-0032)
 
   rpc Search(SearchRequest) returns (SearchResponse);
-  rpc BatchSearch(BatchSearchRequest) returns (stream SearchResponse);
+  rpc HybridSearch(HybridSearchRequest) returns (SearchResponse); // dense ⊕ sparse BM25, RRF
+  rpc SearchText(SearchTextRequest) returns (SearchResponse);     // embed query, optional rerank
 
-  rpc CreateApiKey(CreateApiKeyRequest) returns (ApiKey);        // admin scope
-  rpc Stats(StatsRequest) returns (StatsResponse);
+  rpc UpsertMultiVector(UpsertMultiVectorRequest) returns (UpsertMultiVectorResponse);
+  rpc SearchMultiVector(SearchMultiVectorRequest) returns (SearchMultiVectorResponse); // MaxSim
+  rpc DeleteDocuments(DeleteDocumentsRequest) returns (DeleteDocumentsResponse);
+
+  rpc Replicate(ReplicateRequest) returns (stream ReplicationOp); // leader→follower (ADR-0030, admin)
 }
+
+// A separate RaftService carries per-shard Raft AppendEntries/Vote/InstallSnapshot
+// when the `raft` build feature is enabled (ADR-0067). API keys are provisioned
+// through configuration (ADR-0011), not a runtime RPC.
 
 message SearchRequest {
   string collection = 1;
@@ -58,15 +68,17 @@ message SearchResponse { repeated Match matches = 1; string next_cursor = 2; }
 | `POST /v1/collections/{id}/query` | Search |
 | `POST /v1/collections/{id}/query/hybrid` | HybridSearch (dense ⊕ sparse/BM25, RRF) |
 | `POST /v1/collections/{id}/query/text` | SearchText (embed query, ⊕ BM25, optional rerank) |
-| `POST /v1/collections/{id}/query/batch` | BatchSearch |
+| `POST /v1/collections/{id}/fetch` | Fetch (list points without ranking; the client-side-encryption retrieval path, ADR-0032) |
+| `GET /v1/collections/{id}/points/{point_id}` | GetPoints (one point by id) |
 | `POST /v1/collections/{id}/documents` | UpsertMultiVector (late-interaction docs) |
 | `DELETE /v1/collections/{id}/documents` | DeleteDocuments |
 | `POST /v1/collections/{id}/documents/query` | SearchMultiVector (MaxSim) |
-| `POST /v1/keys` · `GET /v1/keys` · `DELETE /v1/keys/{id}` | API-key admin |
-| `GET /v1/collections/{id}/stats` | Stats |
 | `POST /v1/snapshot` | Snapshot — consistent online backup to a server-local dir (ADR-0050, admin) |
+| `GET /cluster/map` | The shard map a router has adopted (404 on a non-router server; read-only) |
 | `POST /cluster/raft/voters` · `DELETE /cluster/raft/voters/{id}` | Add/remove a per-shard Raft voter at runtime (ADR-0067 increment 4c, admin; requires the `raft` build feature) |
 | `GET /healthz` · `GET /readyz` · `GET /metrics` | ops |
+
+The complete, machine-readable contract for this surface is the committed [OpenAPI 3.1 spec](./openapi.yaml) (`docs/api/openapi.yaml`), pinned to the router by a coverage test. The cluster **coordinator** runs a separate admin API (`/cluster/shards`, `/cluster/shards/grow`, `/cluster/shards/{id}/promote`, `DELETE /cluster/shards/{id}`, `/cluster/health`) — authenticated like the data plane (ADR-0011): reads need any valid key, the mutating shard ops need the admin role.
 
 `CreateCollection` selects the per-collection index (ADR-0007): the JSON body and
 the proto request carry `index` (`hnsw` | `vamana` | `disk_vamana` | `ivf`,
@@ -95,7 +107,7 @@ REST bodies are JSON; vectors are JSON arrays (or base64 for `int8`/`binary`). E
 
 ## OpenAPI & SDKs
 
-`quiver-server` serves the generated **OpenAPI 3.1** document (and a rendered reference); the Python (`uv`) and TypeScript (pnpm) SDKs are generated/maintained against the proto + OpenAPI and verified by **contract tests** against the spec (ADR-0018). The MCP server (`quiver-mcp`) exposes `CreateCollection`/`Upsert`/`Search`/key-admin as agent tools over this same surface.
+The **OpenAPI 3.1** contract is committed at [`docs/api/openapi.yaml`](./openapi.yaml) and kept in lock-step with the router by a coverage test (`crates/quiver-server/tests/openapi.rs` fails if a route is added or removed without updating the spec). The Python (`uv`) and TypeScript (pnpm) SDKs are maintained against the proto + this spec. The MCP server (`quiver-mcp`) exposes the collection/upsert/search/fetch/document tools over this same surface (ADR-0018/0058).
 
 ## Observability hooks
 

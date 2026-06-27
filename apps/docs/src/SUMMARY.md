@@ -7,6 +7,7 @@
 - [Concepts](concepts.md)
 - [Quickstart](quickstart.md)
 - [Self-hosting & configuration](self-hosting.md)
+- [Configuration reference](configuration.md)
 - [Kubernetes & Helm](kubernetes.md)
 
 # Guides
@@ -30,6 +31,7 @@
 
 # API & SDKs
 
+- [CLI reference](api/cli.md)
 - [REST & gRPC](api/rest-grpc.md)
 - [MCP server](api/mcp.md)
 - [Python, TypeScript & Go SDKs](api/sdks.md)

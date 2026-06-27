@@ -3,8 +3,8 @@
 //! (`docs/api/rest-grpc.md`).
 
 use axum::extract::{DefaultBodyLimit, Path, Request, State};
-use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -83,6 +83,27 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics))
         .layer(Extension(state.metrics.clone()))
         .merge(api)
+        // Outermost: set hardening response headers on every response (open
+        // endpoints and the authed API alike). Flagged by the v0.29.0 OWASP ZAP
+        // scan; cheap, standard defence-in-depth for an API that returns no HTML.
+        .layer(middleware::from_fn(security_headers))
+}
+
+// Add baseline security response headers (ADR-0014): `nosniff` stops MIME
+// content-type sniffing, and a same-origin resource policy keeps responses from
+// being embedded cross-origin by a `no-cors` load. Applied to every response.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    response
 }
 
 async fn auth(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
