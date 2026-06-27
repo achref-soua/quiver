@@ -101,7 +101,7 @@ hkdf = "0.12"
 # Memory-mapped reads for the disk-resident index (ADR-0019): only the touched
 # (ciphertext) pages stay resident; the OS pages them in and out.
 memmap2 = "0.9"
-sha2 = "0.10"
+sha2 = "0.11"
 zeroize = "1"
 criterion = { version = "0.5", default-features = false, features = [
     "cargo_bench_support",
