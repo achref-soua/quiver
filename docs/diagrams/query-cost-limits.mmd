@@ -1,0 +1,15 @@
+---
+title: Query cost limits & DoS protection (ADR-0040)
+---
+flowchart TB
+  REQ["Incoming query"]
+  EST["Cost estimate<br/>(k · ef · filters · vectors)"]
+  TB{"Per-key token bucket<br/>(Redis / in-proc)"}
+  CAP{"Hard cost ceiling?"}
+  RUN["Execute"]
+  REJ["Reject 429 / 400<br/>(too expensive / rate limited)"]
+  REQ --> EST --> TB
+  TB -->|tokens left| CAP
+  TB -->|empty| REJ
+  CAP -->|within| RUN
+  CAP -->|exceeds| REJ

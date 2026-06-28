@@ -1,0 +1,17 @@
+---
+title: Secondary (metadata) indexes & filter evaluation (ADR-0022)
+---
+flowchart LR
+  Q["Query filter<br/>(metadata predicate)"]
+  PLAN["Predicate plan"]
+  subgraph idx["Per-field indexes"]
+    BMAP["Bitmap / roaring<br/>(low-cardinality)"]
+    RANGE["Sorted range index<br/>(numeric / time)"]
+  end
+  MASK["Candidate row mask"]
+  ANN["ANN search<br/>(masked)"]
+  Q --> PLAN --> BMAP
+  PLAN --> RANGE
+  BMAP --> MASK
+  RANGE --> MASK
+  MASK --> ANN

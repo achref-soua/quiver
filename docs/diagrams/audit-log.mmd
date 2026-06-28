@@ -1,0 +1,10 @@
+---
+title: Append-only audit log (ADR-0011)
+---
+flowchart LR
+  OP["Authenticated operation<br/>(mutating / admin)"]
+  POL["Policy enforcement"]
+  ENTRY["Audit entry<br/>(actor, action, resource, ts)"]
+  LOG[("Append-only log<br/>(hash-chained)")]
+  VERIFY["Playback / verification<br/>(tamper-evident)"]
+  OP --> POL --> ENTRY --> LOG --> VERIFY
