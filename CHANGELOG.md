@@ -10,6 +10,29 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.29.1] — 2026-06-28
+
+A documentation and tooling patch — no engine change; every published crate is
+byte-for-byte unchanged.
+
+### Documentation
+
+- **Per-subsystem architecture diagrams** — 18 Mermaid sources under
+  `docs/diagrams/` render to committed SVGs in `docs/assets/diagrams/` via
+  `just diagrams` (mermaid-cli on demand; no new dependency). They cover
+  payload storage, secondary indexes, the audit log, query cost limits,
+  multi-vector MaxSim, BM25, server-side embedding, migration importers,
+  dynamic membership, deferred rebuild, snapshot isolation, gRPC streaming,
+  TLS/mTLS, the envelope key hierarchy, RBAC, observability, MVCC reads, and
+  quantization. A new gallery `docs/diagrams.md` is linked from the
+  architecture overview, complementing the 31-figure field guide.
+
+### CI
+
+- **Visual recap on release** — a `visual-recap` workflow builds a montage of
+  the cockpit screenshots after each release, attaches it plus a gallery
+  markdown as release assets, and appends the gallery to the release notes.
+
 ## [0.29.0] — 2026-06-27
 
 *Hardened* — a finalization and production-readiness pass: a documented security
@@ -675,7 +698,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.29.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.29.1...HEAD
+[0.29.1]: https://github.com/achref-soua/quiver/compare/v0.29.0...v0.29.1
 [0.29.0]: https://github.com/achref-soua/quiver/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/achref-soua/quiver/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/achref-soua/quiver/compare/v0.26.0...v0.27.0
