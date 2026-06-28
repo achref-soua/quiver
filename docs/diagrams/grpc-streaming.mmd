@@ -1,0 +1,18 @@
+---
+title: gRPC streaming APIs (quiver-proto / server)
+---
+sequenceDiagram
+  participant C as Client SDK
+  participant S as quiver-server (tonic)
+  participant E as Engine
+  C->>S: client-stream Upsert(batch...)
+  loop batches
+    C->>S: UpsertChunk
+    S->>E: buffered apply
+  end
+  S-->>C: UpsertSummary
+  C->>S: Scroll(filter)
+  loop pages
+    E-->>S: page
+    S-->>C: server-stream ScrollChunk
+  end

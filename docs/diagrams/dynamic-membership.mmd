@@ -1,0 +1,15 @@
+---
+title: Dynamic cluster membership (ADR-0066)
+---
+flowchart TB
+  COORD["Coordinator"]
+  MAP["Versioned shard map<br/>(epoch N)"]
+  ADD["Add / remove shard"]
+  NEWMAP["Shard map epoch N+1"]
+  ROUTER["Router"]
+  REBAL["Online rebalance<br/>(migration handshake)"]
+  COORD --> MAP
+  ADD --> COORD --> NEWMAP
+  NEWMAP -->|propagate| ROUTER
+  NEWMAP --> REBAL
+  ROUTER -. refresh on epoch change .-> NEWMAP

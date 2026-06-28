@@ -1,0 +1,18 @@
+---
+title: Vector quantization — PQ / scalar / binary (ADR-0008)
+---
+flowchart LR
+  VEC["Vector (f32)"]
+  subgraph pq["Product quantization"]
+    SUB["Split into m subspaces"]
+    CB["Per-subspace codebooks<br/>(k-means centroids)"]
+    CODE["Compact codes (u8)"]
+  end
+  SCALAR["Scalar quant (int8)"]
+  BIN["Binary (1-bit)"]
+  STORE[("Compressed store<br/>(RAM-frugal)")]
+  ADC["Asymmetric distance<br/>(query vs codes)"]
+  VEC --> SUB --> CB --> CODE --> STORE
+  VEC --> SCALAR --> STORE
+  VEC --> BIN --> STORE
+  STORE --> ADC

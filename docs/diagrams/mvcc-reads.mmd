@@ -1,0 +1,13 @@
+---
+title: Lock-free MVCC reads (ADR-0064)
+---
+flowchart TB
+  W["Writer"]
+  NEW["Build new overlay<br/>(pages + tombstones)"]
+  SWAP["arc-swap<br/>(atomic publish)"]
+  SNAP["Immutable snapshot"]
+  R1["Reader A (old snapshot)"]
+  R2["Reader B (new snapshot)"]
+  W --> NEW --> SWAP --> SNAP
+  SNAP --> R2
+  SWAP -. old snapshot freed<br/>when last reader drops .-> R1

@@ -1,0 +1,16 @@
+---
+title: Server-side embedding hooks (ADR-0047)
+---
+flowchart LR
+  IN["Upsert(text) / Search(text)"]
+  PROV["Provider abstraction<br/>(quiver-providers)"]
+  subgraph backends["Backends"]
+    OAI["OpenAI"]
+    COH["Cohere"]
+    OLL["Ollama / local"]
+    HTTP["Generic HTTP"]
+  end
+  VEC["Embedding vector"]
+  ENG["Engine: upsert / ANN search"]
+  IN --> PROV --> backends
+  backends --> VEC --> ENG

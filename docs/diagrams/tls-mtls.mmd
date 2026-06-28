@@ -1,0 +1,16 @@
+---
+title: TLS / mTLS termination (quiver-crypto / server)
+---
+sequenceDiagram
+  participant CL as Client
+  participant SV as quiver-server (rustls)
+  CL->>SV: ClientHello
+  SV-->>CL: ServerHello + cert chain
+  CL->>CL: validate chain (ring provider)
+  opt mTLS
+    SV->>CL: CertificateRequest
+    CL-->>SV: client cert
+    SV->>SV: validate client cert
+  end
+  CL->>SV: Finished (session keys)
+  Note over CL,SV: encrypted gRPC / REST
