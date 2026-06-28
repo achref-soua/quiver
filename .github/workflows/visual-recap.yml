@@ -1,12 +1,17 @@
 name: visual-recap
 
-# On every published release, build a visual recap (montage + gallery) from the
+# After a release publishes, build a visual recap (montage + gallery) from the
 # cockpit screenshots committed at the tag, attach it as release assets, and append
 # the gallery to the release notes. Re-runnable: the notes block is replaced, not duplicated.
+#
+# Triggered via workflow_run (not `release: published`) because release.yml creates the
+# release with the Actions GITHUB_TOKEN, and token-created releases do not chain to other
+# workflows. The tag is resolved from the just-published latest release.
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: [release]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -18,18 +23,28 @@ permissions:
 
 jobs:
   recap:
+    # Only on a successful release run, or a manual dispatch.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      # Route untrusted event input through env, then validate to a strict tag
-      # charset before it is ever used in a shell command or a checkout ref.
+      # Resolve the tag (manual input, else the latest published release) and validate it
+      # to a strict charset before it is ever used in a shell command or a checkout ref.
       - name: Resolve and validate tag
         id: tag
         env:
-          RAW_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            RAW_TAG="$INPUT_TAG"
+          else
+            RAW_TAG="$(gh release view --repo "$REPO" --json tagName -q .tagName)"
+          fi
           if ! printf '%s' "$RAW_TAG" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$'; then
-            echo "refusing unsafe tag: $RAW_TAG" >&2
+            echo "refusing unsafe or empty tag: $RAW_TAG" >&2
             exit 1
           fi
           echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
