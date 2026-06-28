@@ -1,0 +1,13 @@
+---
+title: Deferred index rebuild — state machine (ADR-0062)
+---
+stateDiagram-v2
+  [*] --> Live
+  Live --> Deferred: churn threshold crossed
+  Deferred --> Rebuilding: off-lock build starts<br/>(reads inputs snapshot)
+  Rebuilding --> Swap: new index ready
+  Swap --> Live: atomic pointer swap
+  note right of Rebuilding
+    Reads keep serving the old index
+    (no write lock held)
+  end note

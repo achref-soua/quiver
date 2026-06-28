@@ -85,5 +85,6 @@ Both ship in one static binary; `quiver-server` is a thin network/policy shell o
 ## Where to read next
 
 - C4 system context — [`c4-context.md`](c4-context.md); container view — [`c4-container.md`](c4-container.md).
+- Per-subsystem diagrams (storage, indexing, retrieval, distributed, security, ops) — [`../diagrams.md`](../diagrams.md).
 - Decisions — [`../adr/`](../adr/). Roadmap & DoDs — [`../roadmap.md`](../roadmap.md). Risks — [`../risk-register.md`](../risk-register.md).
 - The bridge to implementation — [`../repo-scaffold-plan.md`](../repo-scaffold-plan.md).

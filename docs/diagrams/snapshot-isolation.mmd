@@ -1,0 +1,13 @@
+---
+title: Online snapshot — consistent backup (ADR-0050)
+---
+flowchart LR
+  REQ["Snapshot request"]
+  BASE[("Sealed segments<br/>(immutable)")]
+  COW["Copy-on-write overlay<br/>(pin live pages)"]
+  WAL["WAL tail<br/>(up to LSN)"]
+  OUT[("Consistent snapshot<br/>= base + overlay + WAL")]
+  REQ --> COW
+  BASE --> OUT
+  COW --> OUT
+  WAL --> OUT

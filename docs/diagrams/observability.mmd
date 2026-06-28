@@ -1,0 +1,12 @@
+---
+title: Observability — metrics, tracing, OTLP (ADR-0014/0054/0059)
+---
+flowchart LR
+  ENG["Engine + server spans"]
+  MET["Prometheus metrics<br/>(/metrics)"]
+  TRACE["Tracing spans<br/>(tracing crate)"]
+  OTLP["OTLP exporter<br/>(optional feature)"]
+  PROM[("Prometheus")]
+  COLL[("OTel collector")]
+  ENG --> MET --> PROM
+  ENG --> TRACE --> OTLP --> COLL

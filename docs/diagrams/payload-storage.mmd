@@ -1,0 +1,16 @@
+---
+title: Payload storage — row-addressed columns & paged heaps (ADR-0020/0021)
+---
+flowchart TB
+  UP["Upsert (id, vector, payload)"]
+  ROW["Row id → stride address"]
+  subgraph seg["Segment"]
+    COLS["Columnar fields<br/>(fixed-stride)"]
+    HEAP["Paged var-length heap<br/>(strings / blobs)"]
+    TOMB["Roaring tombstones<br/>(deleted rows)"]
+  end
+  COMPACT["Compaction<br/>(drop tombstoned, rewrite pages)"]
+  UP --> ROW --> COLS
+  ROW --> HEAP
+  ROW --> TOMB
+  seg --> COMPACT --> seg

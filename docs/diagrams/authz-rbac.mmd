@@ -1,0 +1,13 @@
+---
+title: Authentication & RBAC (ADR-0011)
+---
+flowchart LR
+  REQ["Request<br/>(API key / token)"]
+  AUTHN["Authenticate"]
+  ROLE["Resolve role"]
+  SCOPE{"Scope allows<br/>action on resource?"}
+  ALLOW["Execute + audit"]
+  DENY["403 + audit"]
+  REQ --> AUTHN --> ROLE --> SCOPE
+  SCOPE -->|yes| ALLOW
+  SCOPE -->|no| DENY
