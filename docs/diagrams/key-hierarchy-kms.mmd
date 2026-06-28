@@ -1,0 +1,11 @@
+---
+title: Envelope key hierarchy & KMS (ADR-0010/0013)
+---
+flowchart TB
+  MASTER["Master key<br/>(env / KMS-wrapped)"]
+  KMS["External KMS<br/>(unwrap on boot)"]
+  DEK["Per-collection DEK"]
+  PAGE["Per-page / per-vector subkey<br/>(derived)"]
+  DATA[("AEAD-encrypted<br/>pages & payloads")]
+  KMS --> MASTER --> DEK --> PAGE --> DATA
+  MASTER -. rotate / crypto-shred .-> DEK

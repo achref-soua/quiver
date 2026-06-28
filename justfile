@@ -50,6 +50,11 @@ docs:
 tui-shots:
     cargo run --release --manifest-path tools/cockpit-shots/Cargo.toml
 
+# Render docs/diagrams/*.mmd to docs/assets/diagrams/*.svg (mermaid-cli on demand
+# via npx). Locally, point PUPPETEER_EXECUTABLE_PATH at any Chromium.
+diagrams:
+    bash docs/diagrams/render.sh
+
 # Dependency advisory scan — no suppressions; the tree is advisory-clean.
 audit:
     cargo audit

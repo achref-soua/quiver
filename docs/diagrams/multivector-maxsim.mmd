@@ -1,0 +1,12 @@
+---
+title: Multi-vector / ColBERT late interaction (ADR-0028/0034)
+---
+flowchart LR
+  DOC["Document<br/>→ token vectors"]
+  STORE[("Per-token vectors<br/>(grouped by doc)")]
+  QTOK["Query token vectors"]
+  MAXSIM["MaxSim:<br/>sum over q of max over d"]
+  RANK["Document score → rank"]
+  DOC --> STORE
+  QTOK --> MAXSIM
+  STORE --> MAXSIM --> RANK

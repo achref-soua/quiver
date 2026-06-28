@@ -1,0 +1,13 @@
+---
+title: BM25 sparse / hybrid retrieval (ADR-0043/0046)
+---
+flowchart LR
+  TXT["Text field"]
+  TOK["Tokenizer +<br/>Snowball stemmer"]
+  INV[("Inverted index<br/>(term → postings)")]
+  QRY["Query terms"]
+  SCORE["BM25 scoring<br/>(tf · idf · length norm)"]
+  FUSE["Fuse with dense ANN<br/>(hybrid top-k)"]
+  TXT --> TOK --> INV
+  QRY --> TOK
+  INV --> SCORE --> FUSE

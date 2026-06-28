@@ -1,0 +1,15 @@
+---
+title: Migration importers (ADR-0024/0027/0029)
+---
+flowchart LR
+  subgraph src["Source"]
+    QD["Qdrant"]
+    CH["Chroma"]
+    PG["pgvector / Postgres"]
+  end
+  MAP["Schema mapping<br>(vectors + payload + ids)"]
+  FETCH["Incremental fetch loop<br/>(cursor / batch)"]
+  UPS["Quiver upsert<br/>(idempotent)"]
+  COLL[("Quiver collection")]
+  src --> MAP --> FETCH --> UPS --> COLL
+  FETCH -. resume on cursor .-> FETCH
