@@ -30,7 +30,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::blockfile::{BlockFile, write_blocks};
+use crate::blockfile::{BlockFile, BlockWriter, write_blocks};
 use crate::descriptor::FilterableField;
 use crate::error::{CoreError, Result};
 use crate::page::{PageCodec, PageType};
@@ -232,6 +232,93 @@ pub(crate) fn write_segment(
     Ok(())
 }
 
+/// Write a new sealed segment by **streaming** its rows, holding only one page of
+/// each column in memory instead of the whole live set (ADR-0068). `next_row`
+/// yields `(external_id, vector_bytes, payload_bytes)` in the final row order (row
+/// `i` → `.vec` slot `i`) until it returns `None`; `row_count` is only a capacity
+/// hint.
+///
+/// The `.vec` and `.pay` columns are streamed page-by-page through a
+/// [`BlockWriter`]; the row directory (O(rows) of ids + offsets) and, for a
+/// collection with filterable fields, the secondary index (which `SecIndex::build`
+/// needs over all payloads) are still assembled in memory — those are the small /
+/// opt-in costs, while the vector and payload *bytes* (the dominant term) never
+/// all reside at once. Produces the same on-disk files as [`write_segment`]; not
+/// directory-`fsync`'d here.
+pub(crate) fn write_segment_streaming(
+    seg_dir: &Path,
+    segment_id: u64,
+    codec: &dyn PageCodec,
+    row_count: usize,
+    filterable: &[FilterableField],
+    mut next_row: impl FnMut() -> Result<Option<(String, Vec<u8>, Vec<u8>)>>,
+) -> Result<()> {
+    let mut vec_w = BlockWriter::create(
+        &vec_path(seg_dir, segment_id),
+        codec,
+        PageType::Segment,
+        segment_id,
+    )?;
+    let mut pay_w = BlockWriter::create(
+        &pay_path(seg_dir, segment_id),
+        codec,
+        PageType::Segment,
+        segment_id,
+    )?;
+
+    let mut dir_rows = Vec::with_capacity(row_count);
+    // Only a collection with filterable fields builds a `.sec`, and only that path
+    // holds the payloads (SecIndex::build needs them all); otherwise this stays empty.
+    let want_sec = !filterable.is_empty();
+    let mut sec_payloads: Vec<Vec<u8>> = if want_sec {
+        Vec::with_capacity(row_count)
+    } else {
+        Vec::new()
+    };
+
+    let mut pay_off = 0u64;
+    while let Some((external_id, vector, payload)) = next_row()? {
+        vec_w.write(&vector)?;
+        pay_w.write(&payload)?;
+        dir_rows.push(RowEntry {
+            external_id,
+            pay_off,
+            pay_len: payload.len() as u32,
+        });
+        pay_off += payload.len() as u64;
+        if want_sec {
+            sec_payloads.push(payload);
+        }
+    }
+    vec_w.finish()?;
+    pay_w.finish()?;
+
+    let dir = SegmentDir {
+        format_version: SEGMENT_FORMAT_VERSION,
+        segment_id,
+        rows: dir_rows,
+    };
+    crate::paged::write_paged(
+        &dir_path(seg_dir, segment_id),
+        codec,
+        PageType::Segment,
+        segment_id,
+        &postcard::to_allocvec(&dir)?,
+    )?;
+    if want_sec {
+        let payloads: Vec<&[u8]> = sec_payloads.iter().map(Vec::as_slice).collect();
+        let sec = SecIndex::build(filterable, &payloads)?;
+        crate::paged::write_paged(
+            &sec_path(seg_dir, segment_id),
+            codec,
+            PageType::Segment,
+            segment_id,
+            &sec.encode()?,
+        )?;
+    }
+    Ok(())
+}
+
 /// Atomically write a segment's tombstone bitmap to `seg-NNN.del`.
 ///
 /// Unlike the immutable `.vec`/`.pay`/`.dir`, the `.del` is rewritten as rows
@@ -403,6 +490,73 @@ mod tests {
         assert_eq!(seg.read_payload(&PlainCodec, 1).unwrap(), b"[1,2,3]");
         // No `.sec` is written when there are no filterable fields.
         assert!(!sec_path(seg_dir, 1).exists());
+    }
+
+    #[test]
+    fn streaming_segment_matches_write_segment() {
+        // The streamed writer must produce a segment that reads back identically to
+        // the one `write_segment` builds from the same rows (ADR-0068).
+        let whole = tempfile::tempdir().unwrap();
+        write_segment(whole.path(), 1, &PlainCodec, &rows(), &[]).unwrap();
+
+        let streamed = tempfile::tempdir().unwrap();
+        let src = rows();
+        let mut i = 0usize;
+        write_segment_streaming(streamed.path(), 1, &PlainCodec, src.len(), &[], || {
+            if i == src.len() {
+                return Ok(None);
+            }
+            let r = &src[i];
+            i += 1;
+            Ok(Some((
+                r.external_id.to_owned(),
+                r.vector.to_vec(),
+                r.payload.to_vec(),
+            )))
+        })
+        .unwrap();
+
+        for name in ["vec", "pay", "dir"] {
+            let a = std::fs::read(whole.path().join(format!("seg-0000000001.{name}"))).unwrap();
+            let b = std::fs::read(streamed.path().join(format!("seg-0000000001.{name}"))).unwrap();
+            assert_eq!(a, b, "streamed .{name} differs from write_segment");
+        }
+    }
+
+    #[test]
+    fn streaming_segment_consumes_rows_lazily_without_collecting_them() {
+        // The writer pulls one row at a time from a generator that never
+        // materializes the whole set — evidence that compacting a large collection
+        // does not require all its vectors/payloads resident at once (ADR-0068).
+        let dir = tempfile::tempdir().unwrap();
+        let n = 20_000u32;
+        let mut produced = 0u32;
+        write_segment_streaming(dir.path(), 1, &PlainCodec, n as usize, &[], || {
+            if produced == n {
+                return Ok(None);
+            }
+            let i = produced;
+            produced += 1;
+            // Each row is generated on demand; no Vec of all rows ever exists.
+            Ok(Some((
+                format!("k{i}"),
+                i.to_le_bytes().to_vec(),
+                b"{}".to_vec(),
+            )))
+        })
+        .unwrap();
+
+        let seg = open_segment(dir.path(), 1, &PlainCodec).unwrap();
+        assert_eq!(seg.row_count(), n);
+        assert_eq!(
+            seg.read_vector(&PlainCodec, 0, 4).unwrap(),
+            0u32.to_le_bytes()
+        );
+        assert_eq!(
+            seg.read_vector(&PlainCodec, n - 1, 4).unwrap(),
+            (n - 1).to_le_bytes()
+        );
+        assert_eq!(seg.row_ids()[12_345], "k12345");
     }
 
     #[test]

@@ -83,6 +83,14 @@ pub fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
 
 /// Inner product of two equal-length `i8` vectors, accumulated in `i32`.
 ///
+/// # Overflow
+/// The accumulator is `i32`. Each term is at most `128·128 = 16_384`, so the sum
+/// is exact for dimensions up to `i32::MAX / 16_384 ≈ 131_071` — orders of
+/// magnitude beyond any realistic embedding width (and the ADR-0040 dimension
+/// cap). The scalar reference accumulates in `i32` identically, so the SIMD and
+/// scalar paths agree at every dimension: there is no silent divergence within or
+/// beyond the bound.
+///
 /// # Panics
 /// Panics if `a.len() != b.len()`.
 #[inline]
@@ -100,6 +108,12 @@ pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
 }
 
 /// Squared Euclidean distance of two equal-length `i8` vectors, in `i32`.
+///
+/// # Overflow
+/// The accumulator is `i32`. Each term `(a−b)²` is at most `255² = 65_025`, so the
+/// sum is exact for dimensions up to `i32::MAX / 65_025 ≈ 33_022` — well beyond
+/// realistic embedding widths. The scalar reference accumulates in `i32`
+/// identically, so the SIMD and scalar paths never diverge.
 ///
 /// # Panics
 /// Panics if `a.len() != b.len()`.
