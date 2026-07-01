@@ -1,0 +1,38 @@
+{
+  "_comment": "Canonical cross-language known-answer test (KAT) vectors for Quiver's client-side ciphers, generated once from the Rust reference in crates/quiver-crypto. The Rust, Python, and TypeScript test suites all load and assert THIS file, so any cross-language drift in a cipher fails the build (F-13). Do not edit by hand — regenerate from the Rust reference if a cipher changes, and bump the affected version. See ADR-0031 (DCPE) and ADR-0032 (opaque vectors).",
+  "dcpe": {
+    "_note": "DCPE v2 (ADR-0035), distance-comparison-preserving. Tolerance-based: the perturbation makes decrypt recover the plaintext only within ~1e-3, while the HMAC tag and the HKDF-derived scale match exactly. Decrypt direction (encrypt uses a fresh random IV; these iv/ciphertext/tag are the reference output for this key at this fixed IV).",
+    "key_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+    "beta": 0.05,
+    "scale": 1.95453267099551331,
+    "iv_hex": "112233445566778899aabbcc",
+    "tag_hex": "0e37dacb37dd8b1bc6f2f2eced612fc66e9dd2ca1efe859817328680454ba176",
+    "permutation_d8": [2, 6, 1, 5, 7, 0, 4, 3],
+    "ciphertext": [
+      0.5790184,
+      -1.3649843,
+      -0.3800147,
+      1.1816978,
+      1.5671049,
+      0.18977723,
+      0.98995024,
+      -0.7886901
+    ],
+    "plaintext": [0.1, -0.2, 0.3, -0.4, 0.5, 0.6, -0.7, 0.8],
+    "plaintext_tolerance": 0.001
+  },
+  "opaque_vector": {
+    "_note": "Semantically secure client-side opaque vectors (ADR-0032): XChaCha20-Poly1305 over the raw little-endian f32 bytes. Exact interop (not tolerance-based): decrypt recovers the plaintext byte-identically. The envelope is the JSON the server stores and returns verbatim.",
+    "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "envelope": {
+      "__quiver_vec__": {
+        "alg": "xchacha20poly1305",
+        "ct": "8zgd/+aSyPbmk1vkIdfaGYBKr45Bv0DsPOGdDFojuCqldB3jGiguWQ==",
+        "dim": 6,
+        "n": "1Tt6qe+yyU87VhS4bfOpdtloq2DlFllv",
+        "v": 1
+      }
+    },
+    "plaintext": [0.0, 1.0, -1.0, 0.5, -0.25, 3.5]
+  }
+}

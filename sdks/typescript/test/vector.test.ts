@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -15,6 +19,18 @@ function cipher(): VectorCipher {
 }
 
 describe("VectorCipher", () => {
+  it("decrypts the canonical cross-language KAT envelope (F-13)", () => {
+    // The single shared KAT, asserted identically by the Rust and Python suites:
+    // decrypting the Rust reference envelope proves byte-exact interop (ADR-0032).
+    const kat = JSON.parse(
+      readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), "../../../kat/client-ciphers.json"),
+        "utf8",
+      ),
+    ).opaque_vector as { key_hex: string; envelope: Record<string, unknown>; plaintext: number[] };
+    expect(VectorCipher.fromHex(kat.key_hex).open(kat.envelope)).toEqual(kat.plaintext);
+  });
+
   it("round-trips seal then open bit-exactly", () => {
     const c = cipher();
     const v = [0.0, 1.0, -1.0, 0.5, -0.5, 7.25, 2.5, 42.0];

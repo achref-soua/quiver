@@ -10,6 +10,17 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Testing / CI
+
+- **Single canonical cross-language cipher KAT, gated in CI** (F-13). The client
+  ciphers' known-answer vectors (DCPE and the opaque-vector AEAD) now live in one
+  committed file, `kat/client-ciphers.json`, generated from the Rust reference. The
+  Rust, Python, and TypeScript test suites all load and assert **that** file
+  (previously each language hardcoded its own copy of the DCPE vector — a drift
+  risk), and CI now **runs the Python (`pytest`) and TypeScript (`vitest`) SDK
+  suites** (they were only built before), so any cross-language cipher drift fails
+  the build.
+
 ## [0.29.1] — 2026-06-28
 
 A documentation and tooling patch — no engine change; every published crate is

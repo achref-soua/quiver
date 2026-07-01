@@ -1,24 +1,32 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import { DcpeCipher, DcpeError, Normalization } from "../src/dcpe.js";
 
-// A known-answer vector produced by the Rust reference (`quiver_crypto::dcpe`,
-// cipher v2). Decrypting it exercises the whole construction — HKDF (the scale and
-// sub-keys), the ChaCha20 CSPRNG, the key-derived shuffle, Box-Muller, and HMAC —
-// proving the TS port matches Rust. The tag verifies bit-exact (HKDF + HMAC); the
-// plaintext is recovered within float tolerance (ChaCha20 + Box-Muller).
-const KAT_KEY = "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f";
-const KAT_BETA = 0.05;
-const KAT_SCALE = 1.95453267099551331;
-const KAT_IV = "112233445566778899aabbcc";
-const KAT_PLAIN = [0.1, -0.2, 0.3, -0.4, 0.5, 0.6, -0.7, 0.8];
-// v2: the ciphertext is the *shuffled* plaintext, scale-and-perturbed; the
-// key-derived permutation for this key at d=8 is [2, 6, 1, 5, 7, 0, 4, 3].
-const KAT_CT = [
-  0.5790184, -1.3649843, -0.3800147, 1.1816978, 1.5671049, 0.18977723, 0.98995024, -0.7886901,
-];
-const KAT_TAG = "0e37dacb37dd8b1bc6f2f2eced612fc66e9dd2ca1efe859817328680454ba176";
+// The single canonical cross-language KAT (F-13), generated from the Rust
+// reference and asserted identically by the Rust, Python, and TypeScript suites,
+// so a cipher change not mirrored across all three fails the build. Decrypting the
+// vector exercises the whole construction (HKDF, the ChaCha20 CSPRNG, the shuffle,
+// Box-Muller, HMAC): the tag/scale match bit-exact, the plaintext within tolerance.
+const KAT = JSON.parse(
+  readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../../../kat/client-ciphers.json"),
+    "utf8",
+  ),
+).dcpe as {
+  key_hex: string;
+  beta: number;
+  scale: number;
+  iv_hex: string;
+  tag_hex: string;
+  ciphertext: number[];
+  plaintext: number[];
+  plaintext_tolerance: number;
+};
 
 function hexToBytes(hex: string): Uint8Array {
   const out = new Uint8Array(hex.length / 2);
@@ -60,16 +68,16 @@ function dataset(n: number, d: number, seed: number): number[][] {
 
 describe("DcpeCipher", () => {
   it("decrypts a vector sealed by the Rust reference (cross-language KAT)", () => {
-    const cipher = DcpeCipher.fromHex(KAT_KEY, KAT_BETA);
-    expect(Math.abs(cipher.scale - KAT_SCALE)).toBeLessThan(1e-12);
+    const cipher = DcpeCipher.fromHex(KAT.key_hex, KAT.beta);
+    expect(Math.abs(cipher.scale - KAT.scale)).toBeLessThan(1e-12);
     const recovered = cipher.decrypt({
-      ciphertext: KAT_CT,
-      iv: hexToBytes(KAT_IV),
-      tag: hexToBytes(KAT_TAG),
+      ciphertext: KAT.ciphertext,
+      iv: hexToBytes(KAT.iv_hex),
+      tag: hexToBytes(KAT.tag_hex),
     });
-    expect(recovered.length).toBe(KAT_PLAIN.length);
+    expect(recovered.length).toBe(KAT.plaintext.length);
     recovered.forEach((got, i) => {
-      expect(Math.abs(got - KAT_PLAIN[i]!)).toBeLessThan(1e-3);
+      expect(Math.abs(got - KAT.plaintext[i]!)).toBeLessThan(KAT.plaintext_tolerance);
     });
   });
 
