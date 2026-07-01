@@ -1100,9 +1100,9 @@ impl AppState {
         self.authorize(principal, Action::Admin, "create_collection", &name)?;
         self.limits.check_dim(dim as usize)?;
         if let Some(c) = &self.cluster {
-            return c
+            let result = c
                 .create_collection(
-                    name,
+                    name.clone(),
                     dim,
                     metric,
                     index,
@@ -1111,6 +1111,13 @@ impl AppState {
                     vector_encryption,
                 )
                 .await;
+            self.audit.record(
+                principal.actor(),
+                "create_collection",
+                &name,
+                Outcome::of(&result),
+            );
+            return result;
         }
         // Per-shard Raft write path (ADR-0067): the leader prepares the op (which
         // assigns the new collection id) and proposes it through consensus; every
@@ -1179,12 +1186,26 @@ impl AppState {
         })
     }
 
+    // Reject an operation the cluster router does not yet route (ADR-0065):
+    // hybrid / text / multi-vector search, fetch, and metadata listing would
+    // otherwise query the router's own empty local engine and return wrong or
+    // empty results. Failing honestly with 501 beats a silent wrong answer.
+    fn reject_if_cluster(&self, op: &str) -> Result<(), Error> {
+        if self.cluster.is_some() {
+            return Err(Error::Unsupported(format!(
+                "{op} is not supported in cluster-router mode"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn get_collection(
         &self,
         principal: &Principal,
         name: String,
     ) -> Result<CollectionInfo, Error> {
         self.authorize(principal, Action::Read, "get_collection", &name)?;
+        self.reject_if_cluster("get_collection")?;
         self.read_blocking(move |db| {
             let descriptor = db
                 .descriptor(&name)
@@ -1216,6 +1237,7 @@ impl AppState {
         principal: &Principal,
     ) -> Result<Vec<CollectionInfo>, Error> {
         self.authorize_global(principal, Action::Read, "list_collections")?;
+        self.reject_if_cluster("list_collections")?;
         let mut infos = self
             .read_blocking(|db| {
                 let mut out = Vec::new();
@@ -1254,7 +1276,14 @@ impl AppState {
         self.ensure_writable("delete_collection")?;
         self.authorize(principal, Action::Admin, "delete_collection", &name)?;
         if let Some(c) = &self.cluster {
-            return c.drop_collection(&name).await;
+            let result = c.drop_collection(&name).await;
+            self.audit.record(
+                principal.actor(),
+                "delete_collection",
+                &name,
+                Outcome::of(&result),
+            );
+            return result;
         }
         let resource = name.clone();
         let result = self
@@ -1291,7 +1320,10 @@ impl AppState {
             self.limits.check_payload(&p.payload)?;
         }
         if let Some(c) = &self.cluster {
-            return c.upsert(&collection, points).await;
+            let result = c.upsert(&collection, points).await;
+            self.audit
+                .record(principal.actor(), "upsert", &collection, Outcome::of(&result));
+            return result;
         }
         // Per-shard Raft write path (ADR-0067): prepare each point's op on the
         // leader, then propose each through consensus. One op per point keeps the
@@ -1355,7 +1387,14 @@ impl AppState {
             self.limits.check_payload(&p.payload)?;
         }
         if let Some(c) = &self.cluster {
-            return c.upsert_bulk(&collection, points).await;
+            let result = c.upsert_bulk(&collection, points).await;
+            self.audit.record(
+                principal.actor(),
+                "upsert_bulk",
+                &collection,
+                Outcome::of(&result),
+            );
+            return result;
         }
         let resource = collection.clone();
         let result = self
@@ -1410,7 +1449,14 @@ impl AppState {
         self.ensure_writable("delete_points")?;
         self.authorize(principal, Action::Write, "delete_points", &collection)?;
         if let Some(c) = &self.cluster {
-            return c.delete_points(&collection, ids).await;
+            let result = c.delete_points(&collection, ids).await;
+            self.audit.record(
+                principal.actor(),
+                "delete_points",
+                &collection,
+                Outcome::of(&result),
+            );
+            return result;
         }
         // Per-shard Raft write path (ADR-0067): prepare each delete on the leader
         // (`None` for an absent point), then propose the present ones through
@@ -1592,6 +1638,7 @@ impl AppState {
         with_vector: bool,
     ) -> Result<Vec<MatchOut>, Error> {
         self.authorize(principal, Action::Read, "hybrid_search", &collection)?;
+        self.reject_if_cluster("hybrid_search")?;
         self.limits.check_search(k, ef_search)?;
         if let Some(v) = &dense {
             self.limits.check_vector_len(v.len())?;
@@ -1656,6 +1703,7 @@ impl AppState {
         rerank: bool,
     ) -> Result<Vec<MatchOut>, Error> {
         self.authorize(principal, Action::Read, "search_text", &collection)?;
+        self.reject_if_cluster("search_text")?;
         self.limits.check_search(k, ef_search)?;
         let embedder = self.embed.embedder(&collection).ok_or_else(|| {
             Error::BadRequest(format!(
@@ -1807,6 +1855,7 @@ impl AppState {
         with_vector: bool,
     ) -> Result<Vec<MatchOut>, Error> {
         self.authorize(principal, Action::Read, "fetch", &collection)?;
+        self.reject_if_cluster("fetch")?;
         self.limits.check_fetch(limit)?;
         self.read_blocking(move |db| {
             let matches = db.fetch(
@@ -1907,6 +1956,7 @@ impl AppState {
         with_vector: bool,
     ) -> Result<Vec<DocumentMatchOut>, Error> {
         self.authorize(principal, Action::Read, "search_multi_vector", &collection)?;
+        self.reject_if_cluster("search_multi_vector")?;
         self.limits.check_search(k, ef_search)?;
         for token in &query {
             self.limits.check_vector_len(token.len())?;

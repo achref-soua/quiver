@@ -54,6 +54,14 @@ pub enum Error {
         /// The current leader's gRPC base URL, if known.
         leader: Option<String>,
     },
+    /// The operation is not supported in the current node topology — e.g. hybrid
+    /// / text / multi-vector search, fetch, and metadata listing are not yet
+    /// routed by the cluster router (ADR-0065), so they must fail honestly rather
+    /// than query the router's own empty local engine and return wrong results.
+    /// Returned as HTTP 501 Not Implemented / gRPC `Unimplemented`. The message
+    /// carries only the operation name, so it is client-safe.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 impl Error {
@@ -71,6 +79,7 @@ impl Error {
             Error::BadRequest(_) => (StatusCode::BAD_REQUEST, tonic::Code::InvalidArgument),
             Error::Upstream(_) => (StatusCode::BAD_GATEWAY, tonic::Code::Unavailable),
             Error::NotLeader { .. } => (StatusCode::MISDIRECTED_REQUEST, tonic::Code::Unavailable),
+            Error::Unsupported(_) => (StatusCode::NOT_IMPLEMENTED, tonic::Code::Unimplemented),
             Error::Engine(EngineError::Core(CoreError::InvalidArgument(_)))
             | Error::Engine(EngineError::Index(_))
             | Error::Engine(EngineError::Unsupported(_))
@@ -86,7 +95,7 @@ impl Error {
         let (status, _) = self.category();
         // 5xx detail is sanitized, except an upstream-provider failure whose
         // message is client-safe and actionable (no secrets — names only).
-        if status.is_server_error() && !matches!(self, Error::Upstream(_)) {
+        if status.is_server_error() && !matches!(self, Error::Upstream(_) | Error::Unsupported(_)) {
             "internal error".to_owned()
         } else {
             self.to_string()

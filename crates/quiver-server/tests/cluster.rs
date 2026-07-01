@@ -192,3 +192,99 @@ async fn cluster_router_matches_single_node_ground_truth() {
         "routed delete did not remove across shards"
     );
 }
+
+#[tokio::test]
+async fn router_rejects_unrouted_ops_instead_of_returning_wrong_results() {
+    // hybrid/text/multi-vector search, fetch, and metadata listing are not yet
+    // routed; the router must fail honestly (501) rather than silently query its
+    // own empty local engine and return empty/wrong results.
+    let _tmp = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let http = reqwest::Client::new();
+    let shard0 = boot(Config {
+        data_dir: _tmp.0.path().into(),
+        ..Default::default()
+    })
+    .await;
+    let shard1 = boot(Config {
+        data_dir: _tmp.1.path().into(),
+        ..Default::default()
+    })
+    .await;
+    wait_ready(&http, &shard0).await;
+    wait_ready(&http, &shard1).await;
+    let router = boot(Config {
+        data_dir: _tmp.2.path().into(),
+        cluster_shards: vec![shard0.clone(), shard1.clone()],
+        ..Default::default()
+    })
+    .await;
+    wait_ready(&http, &router).await;
+    create(&http, &router).await;
+    upsert_all(&http, &router, 10).await;
+
+    // list_collections must not silently return an empty list.
+    let r = http
+        .get(format!("{router}/v1/collections"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 501, "list_collections should be 501 on a router");
+
+    // hybrid/text/fetch must 501, not hit the empty local engine.
+    for path in ["query/hybrid", "query/text", "fetch"] {
+        let r = http
+            .post(format!("{router}/v1/collections/c/{path}"))
+            .json(&json!({"vector": vec_for(0), "k": 5, "text": "hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 501, "{path} should be 501 on a router");
+    }
+}
+
+#[tokio::test]
+async fn router_audits_mutations() {
+    // A destructive mutation through the router must be recorded in the router's
+    // own audit log (it holds the acting principal; shards see only the shared key).
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let _tmp = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let http = reqwest::Client::new();
+    let shard0 = boot(Config {
+        data_dir: _tmp.0.path().into(),
+        ..Default::default()
+    })
+    .await;
+    wait_ready(&http, &shard0).await;
+    let router = boot(Config {
+        data_dir: _tmp.1.path().into(),
+        cluster_shards: vec![shard0.clone()],
+        audit_log: Some(audit_path.clone()),
+        ..Default::default()
+    })
+    .await;
+    wait_ready(&http, &router).await;
+    create(&http, &router).await;
+    http.request(
+        reqwest::Method::DELETE,
+        format!("{router}/v1/collections/c"),
+    )
+    .send()
+    .await
+    .unwrap();
+    // Give the audit writer a moment to flush the line.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let log = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    assert!(
+        log.contains("delete_collection"),
+        "router did not audit the delete; log was: {log:?}"
+    );
+    assert!(
+        log.contains("create_collection"),
+        "router did not audit the create; log was: {log:?}"
+    );
+}
