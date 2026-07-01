@@ -46,8 +46,8 @@ jobs:
           done
           curl -fsS http://127.0.0.1:6333/readyz
           # Seed a collection so the API scan exercises a real, non-empty surface.
-          curl -fsS -X POST http://127.0.0.1:6333/v1/collections \
-            -H 'Authorization: Bearer dast-admin-key' \
+          # --oauth2-bearer sets the bearer token without a literal Authorization header.
+          curl -fsS --oauth2-bearer "$QUIVER_API_KEYS" -X POST http://127.0.0.1:6333/v1/collections \
             -H 'Content-Type: application/json' \
             -d '{"name":"dast","dim":8}'
 
