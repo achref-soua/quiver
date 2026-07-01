@@ -282,7 +282,13 @@ mod tests {
         // The on-disk bytes must not depend on how the body is chunked across
         // `BlockWriter::write` calls — that is what keeps the streaming compaction
         // path (ADR-0068) format-compatible with `write_blocks`.
-        for len in [0usize, 1, PAGE_BODY_CAP - 1, PAGE_BODY_CAP, PAGE_BODY_CAP * 2 + 9] {
+        for len in [
+            0usize,
+            1,
+            PAGE_BODY_CAP - 1,
+            PAGE_BODY_CAP,
+            PAGE_BODY_CAP * 2 + 9,
+        ] {
             let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
             let dir = tempfile::tempdir().unwrap();
 

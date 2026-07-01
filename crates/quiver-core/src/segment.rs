@@ -538,13 +538,20 @@ mod tests {
             let i = produced;
             produced += 1;
             // Each row is generated on demand; no Vec of all rows ever exists.
-            Ok(Some((format!("k{i}"), i.to_le_bytes().to_vec(), b"{}".to_vec())))
+            Ok(Some((
+                format!("k{i}"),
+                i.to_le_bytes().to_vec(),
+                b"{}".to_vec(),
+            )))
         })
         .unwrap();
 
         let seg = open_segment(dir.path(), 1, &PlainCodec).unwrap();
         assert_eq!(seg.row_count(), n);
-        assert_eq!(seg.read_vector(&PlainCodec, 0, 4).unwrap(), 0u32.to_le_bytes());
+        assert_eq!(
+            seg.read_vector(&PlainCodec, 0, 4).unwrap(),
+            0u32.to_le_bytes()
+        );
         assert_eq!(
             seg.read_vector(&PlainCodec, n - 1, 4).unwrap(),
             (n - 1).to_le_bytes()

@@ -2171,7 +2171,11 @@ mod tests {
         let seg_dir = segments_dir(tmp.path(), cid);
         let orphan_id = 9_999u64;
         for ext in ["vec", "pay", "dir"] {
-            std::fs::write(seg_dir.join(format!("seg-{orphan_id:010}.{ext}")), b"partial").unwrap();
+            std::fs::write(
+                seg_dir.join(format!("seg-{orphan_id:010}.{ext}")),
+                b"partial",
+            )
+            .unwrap();
         }
 
         // Reopen: the pre-compaction two-segment state is intact and the orphan is
