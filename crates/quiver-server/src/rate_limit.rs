@@ -105,7 +105,7 @@ struct Bucket {
 /// An opt-in, in-memory, per-key token-bucket rate limiter.
 pub struct RateLimiter {
     config: RateLimitConfig,
-    // ponytail: one global Mutex over the bucket map — fine for a single-node
+    // TODO(perf): one global Mutex over the bucket map — fine for a single-node
     // server; shard by key hash if lock contention ever shows up under load.
     buckets: Mutex<HashMap<String, Bucket>>,
 }

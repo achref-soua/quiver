@@ -1296,7 +1296,7 @@ impl AppState {
         // Per-shard Raft write path (ADR-0067): prepare each point's op on the
         // leader, then propose each through consensus. One op per point keeps the
         // apply seam identical to a direct write; a batched Raft entry is a later
-        // optimization (ponytail: correctness first, opt-in path).
+        // optimization (NOTE: correctness first, opt-in path).
         #[cfg(feature = "raft")]
         if let Some(rs) = self.raft.clone() {
             self.ensure_raft_leader(&rs)?;
