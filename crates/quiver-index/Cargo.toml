@@ -23,7 +23,7 @@ thiserror = { workspace = true }
 # distance kernel with NVRTC, so a default build links nothing and the feature even
 # *builds* without a CUDA toolchain present (only *running* needs a GPU). The CPU
 # SIMD kernel stays the default and the fallback.
-cudarc = { version = "0.12", features = [
+cudarc = { version = "0.19", features = [
     "cuda-12010",
     "nvrtc",
     "driver",
