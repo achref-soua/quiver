@@ -31,9 +31,11 @@ fn f32s(v: &Value) -> Vec<f32> {
 fn dcpe_kat_matches_the_reference() {
     let kat: Value = serde_json::from_str(KAT).unwrap();
     let d = &kat["dcpe"];
-    let cipher =
-        DcpeCipher::from_hex(d["key_hex"].as_str().unwrap(), d["beta"].as_f64().unwrap() as f32)
-            .unwrap();
+    let cipher = DcpeCipher::from_hex(
+        d["key_hex"].as_str().unwrap(),
+        d["beta"].as_f64().unwrap() as f32,
+    )
+    .unwrap();
     // The HKDF-derived scale is byte-exact across languages.
     assert!((cipher.scale() - d["scale"].as_f64().unwrap()).abs() < 1e-12);
 
@@ -66,5 +68,8 @@ fn opaque_vector_kat_matches_the_reference() {
     let o = &kat["opaque_vector"];
     let cipher = VectorCipher::from_hex(o["key_hex"].as_str().unwrap()).unwrap();
     // Exact interop: the sealed message is raw f32 LE bytes, so decrypt is byte-exact.
-    assert_eq!(cipher.open(&o["envelope"]).expect("open kat"), f32s(&o["plaintext"]));
+    assert_eq!(
+        cipher.open(&o["envelope"]).expect("open kat"),
+        f32s(&o["plaintext"])
+    );
 }
