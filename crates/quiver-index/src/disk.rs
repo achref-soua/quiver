@@ -213,6 +213,11 @@ pub fn write(
     let file = w
         .into_inner()
         .map_err(std::io::IntoInnerError::into_error)?;
+    // sync_all persists the file contents but not the parent directory entry. The
+    // disk index is a derived, rebuildable artifact that never joins the crash
+    // path (ADR-0019): if a crash leaves it torn or unlinked, it is discarded and
+    // rebuilt from the store on open, so no parent-directory fsync is required
+    // here. Do not treat this file as authoritative recovery state.
     file.sync_all()?;
     Ok(())
 }

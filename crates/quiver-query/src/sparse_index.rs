@@ -164,6 +164,12 @@ impl SparseInvertedIndex {
     /// `ln(1 + (N − df + 0.5)/(df + 0.5))`, which is always non-negative, so even a
     /// term in most of the corpus contributes a small positive amount (no negative
     /// scores to clamp).
+    ///
+    /// **Modality note:** BM25's corpus statistics (`N`, average document length,
+    /// per-term document frequency) are derived from *every* document in this
+    /// index. A collection should use one sparse modality: mixing learned-sparse
+    /// vectors (arbitrary float weights, arbitrary dimension ids) with tokenized
+    /// text in the same collection pollutes `avgdl`/`df` and skews BM25 scores.
     pub fn bm25_search(&self, query_terms: &[u32], k1: f32, b: f32) -> Vec<(String, f32)> {
         if self.len == 0 {
             return Vec::new();

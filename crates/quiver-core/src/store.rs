@@ -511,10 +511,14 @@ impl Store {
 
     /// Crypto-shred a collection: drop it, checkpoint so the manifest no longer
     /// references it and its files are reclaimed, then destroy its key material.
-    /// After this its sealed segments and index are unrecoverable even to the
-    /// master-key holder (ADR-0010); with a single-codec key-ring there is no
-    /// per-collection key, so this is `drop` plus a checkpoint. Returns whether
-    /// the collection existed.
+    ///
+    /// Cryptographic erasure — where the sealed segments and index become
+    /// unrecoverable *even to a holder of a ciphertext backup* — requires a
+    /// per-collection-DEK key-ring (ADR-0010), which is **not** the default. With
+    /// the shipped single-codec key-ring everything is sealed under one root key,
+    /// so there is no per-collection key to destroy and this is `drop` plus a
+    /// checkpoint: file reclamation only, and a ciphertext backup plus the root
+    /// key still decrypts. Returns whether the collection existed.
     pub fn shred_collection(&mut self, name: &str) -> Result<bool> {
         let Some(id) = self.collection_id(name) else {
             return Ok(false);
