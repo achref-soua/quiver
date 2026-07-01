@@ -10,6 +10,16 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Fixed
+
+- **MVCC snapshot search no longer thins below top-k under overlay tombstones**
+  — `CollectionSnapshot::search` (the lock-free MVCC read path, ADR-0064) asked
+  the base index for exactly `k` then dropped overlay-tombstoned hits, so
+  deletes/updates shadowing base points (up to the ~20% overlay churn cap) could
+  return fewer than `k` live results. It now widens the base `k`/`ef` by the
+  live fraction — the same compensation the base indexes' own soft-delete paths
+  use — then filters, merges, and truncates to `k`. Opt-in MVCC path only; the
+  default locked read path is untouched.
 ### Documentation
 
 - **`upsert_batch` durability contract corrected** — the doc previously claimed
