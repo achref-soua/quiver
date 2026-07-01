@@ -10,6 +10,30 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Security
+
+- **Length-independent constant-time API-key comparison** (F-7). The key compare
+  no longer short-circuits on a length mismatch (which leaked the stored key's
+  length via timing); it compares fixed-size SHA-256 digests of both inputs, so
+  timing is independent of input length. The no-early-exit-across-keys property is
+  unchanged. Documented that API keys are shared bearer secrets, plaintext at rest
+  in config/env, and rotated by a zero-downtime add-new → migrate → remove-old
+  config change.
+- **Documented the rate limiter's post-authentication scope** (F-6). The token-
+  bucket limiter (ADR-0049) is keyed by the authenticated identity and bounded by
+  the configured keys — it does not throttle *unauthenticated* floods, which is
+  the upstream reverse proxy / WAF's job. Corrected the threat model (per-key rate
+  limiting is shipped, not deferred). No behavior change.
+
+### Performance
+
+- **Cache the HKDF PRK in the encryption-at-rest codec** (F-8). `AeadCodec`
+  precomputes the HKDF-extract of the root key once (its output, the PRK, is the
+  same for every page/record) and runs only the per-`info` HKDF-expand per derive,
+  instead of re-extracting on every page seal/open. Output is byte-identical to
+  the previous full-HKDF derivation (proven by test), so existing encrypted data
+  is unaffected; this removes redundant per-operation work (most noticeable on the
+  small-record WAL path — the 16 KiB page-decrypt still dominates a page read).
 ### Performance
 
 - **MVCC batch upserts coalesce into one overlay republish** (ADR-0064). Under

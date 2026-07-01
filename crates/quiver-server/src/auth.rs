@@ -28,9 +28,24 @@
 //! scoped to `acme.*` reaches `acme.orders` but not `beta.orders`. (Avoid `/`
 //! in collection names — the REST API addresses a collection as one path
 //! segment.)
+//!
+//! ## Key storage and rotation
+//!
+//! API keys are **plaintext at rest** in the server's configuration (the
+//! `QUIVER_API_KEYS` env var or the `api_keys` TOML entries) — they are shared
+//! bearer secrets, not password hashes, so the process must present them to
+//! callers-of-record verbatim; protect the config/env with the same care as any
+//! other secret (file permissions, a secrets manager, no commit to VCS). A
+//! presented secret is compared against every configured key with a
+//! constant-time, length-independent comparison (no early exit — see F-7).
+//! **Rotation** is a config change: add the new key, redeploy so both old and new
+//! are accepted, migrate clients, then remove the old key and redeploy. Keys are
+//! independent, so this is zero-downtime; there is no server-side key state to
+//! migrate.
 
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::sync::Arc;
 
@@ -233,13 +248,19 @@ pub(crate) fn authenticate(keys: &[ApiKey], presented: Option<&str>) -> Option<P
     matched.map(Principal::from_key)
 }
 
-// Length-checked constant-time byte comparison for API keys.
+// Constant-time API-key comparison with no length-dependent timing (F-7).
+//
+// A raw `a.len() != b.len()` short-circuit would let an attacker learn the stored
+// key's length by timing. Instead compare fixed-size SHA-256 digests of both
+// inputs: the length-independent 32-byte compare has no data-dependent branch, and
+// a second-preimage on SHA-256 is infeasible, so equal digests mean equal keys.
+// Callers still check *every* configured key with no early exit (see
+// [`authenticate`]), so which key matched never leaks either.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    let da = Sha256::digest(a);
+    let db = Sha256::digest(b);
     let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
+    for (x, y) in da.iter().zip(db.iter()) {
         diff |= x ^ y;
     }
     diff == 0
@@ -409,6 +430,17 @@ mod tests {
         );
         assert_eq!(id, ApiKey::admin("super-secret").actor_id());
         assert_ne!(id, ApiKey::admin("other-secret").actor_id());
+    }
+
+    #[test]
+    fn constant_time_eq_compares_by_content_regardless_of_length() {
+        // Equal content ⇒ true; any difference ⇒ false, including a length
+        // difference (the digest compare removes the length-timing leak, F-7).
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"reader-secret", b"reader-secret"));
+        assert!(!constant_time_eq(b"reader-secret", b"reader-secretx")); // differing length
+        assert!(!constant_time_eq(b"reader-secret", b"reader-secreT")); // same length, 1 bit
+        assert!(!constant_time_eq(b"", b"x"));
     }
 
     #[test]
