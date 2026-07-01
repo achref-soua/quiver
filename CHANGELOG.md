@@ -10,6 +10,15 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Performance
+
+- **MVCC batch upserts coalesce into one overlay republish** (ADR-0064). Under
+  lock-free MVCC reads, `upsert_batch` applied each point to a freshly-cloned,
+  growing overlay and republished per point — O(n·overlay) for a batch of n. It
+  now builds one overlay and publishes it once (O(overlay)), which also makes the
+  batch visible **atomically**, as a single published snapshot. Single-point
+  `upsert` behavior is unchanged (it routes through the same batched path with one
+  element). Opt-in MVCC path only.
 ### Changed
 
 - **Collection names are validated at creation** (behavior change). `create_collection`
