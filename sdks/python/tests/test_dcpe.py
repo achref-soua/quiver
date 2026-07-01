@@ -4,50 +4,38 @@ known-answer test against the Rust reference (``quiver_crypto::dcpe``)."""
 
 from __future__ import annotations
 
+import json
 import math
 import random
+from pathlib import Path
 
 import pytest
 
 from quiver.dcpe import DcpeCipher, DcpeError, EncryptedVector, Normalization
 
-# A known-answer vector produced by the Rust reference implementation. Decrypting
-# it here exercises the whole construction — HKDF (the scale and sub-keys), the
-# ChaCha20 CSPRNG, Box-Muller, and HMAC — and proves the Python port matches Rust.
-KAT_KEY = "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"
-KAT_BETA = 0.05
-KAT_SCALE = 1.95453267099551331
-KAT_IV = "112233445566778899aabbcc"
-KAT_PLAIN = [0.1, -0.2, 0.3, -0.4, 0.5, 0.6, -0.7, 0.8]
-# Cipher v2 (ADR-0035): the ciphertext components are the *shuffled* plaintext
-# scale-and-perturbed; the key-derived permutation for this key at d=8 is
-# [2, 6, 1, 5, 7, 0, 4, 3]. Decrypt un-shuffles to recover KAT_PLAIN.
-KAT_CT = [
-    0.5790184,
-    -1.3649843,
-    -0.3800147,
-    1.1816978,
-    1.5671049,
-    0.18977723,
-    0.98995024,
-    -0.7886901,
-]
-KAT_TAG = "0e37dacb37dd8b1bc6f2f2eced612fc66e9dd2ca1efe859817328680454ba176"
+# The single canonical cross-language KAT (F-13), generated from the Rust reference
+# and asserted identically by the Rust, Python, and TypeScript suites — so drift in
+# any one cipher fails the build. `parents[3]` is the repo root from tests/.
+_KAT = json.loads((Path(__file__).parents[3] / "kat" / "client-ciphers.json").read_text())
+KAT = _KAT["dcpe"]
 
 
 def test_kat_matches_the_rust_reference() -> None:
-    cipher = DcpeCipher.from_hex(KAT_KEY, KAT_BETA)
-    # The key-derived scaling factor matches Rust exactly (HKDF is byte-exact).
-    assert abs(cipher.scale - KAT_SCALE) < 1e-12
+    # Decrypting the reference vector exercises the whole construction — HKDF (the
+    # scale and sub-keys), the ChaCha20 CSPRNG, Box-Muller, and HMAC — proving the
+    # Python port matches Rust byte-for-byte where it must (tag, scale) and within
+    # the perturbation tolerance for the recovered plaintext.
+    cipher = DcpeCipher.from_hex(KAT["key_hex"], KAT["beta"])
+    assert abs(cipher.scale - KAT["scale"]) < 1e-12
     sealed = EncryptedVector(
-        ciphertext=KAT_CT, iv=bytes.fromhex(KAT_IV), tag=bytes.fromhex(KAT_TAG)
+        ciphertext=KAT["ciphertext"],
+        iv=bytes.fromhex(KAT["iv_hex"]),
+        tag=bytes.fromhex(KAT["tag_hex"]),
     )
-    # The tag must verify (an exact HKDF + HMAC match) and the plaintext must come
-    # back (the ChaCha20 + Box-Muller perturbation must match within float ULPs).
     recovered = cipher.decrypt(sealed)
-    assert len(recovered) == len(KAT_PLAIN)
-    for got, want in zip(recovered, KAT_PLAIN):
-        assert abs(got - want) < 1e-3, f"{got} vs {want}"
+    assert len(recovered) == len(KAT["plaintext"])
+    for got, want in zip(recovered, KAT["plaintext"]):
+        assert abs(got - want) < KAT["plaintext_tolerance"], f"{got} vs {want}"
 
 
 def test_round_trip_recovers_the_plaintext() -> None:
@@ -116,8 +104,8 @@ def test_rejects_invalid_inputs() -> None:
 
 def test_shuffle_matches_the_rust_reference() -> None:
     # The key-derived permutation for the KAT key at d=8 (cipher v2).
-    cipher = DcpeCipher.from_hex(KAT_KEY, KAT_BETA)
-    assert cipher._permutation(8) == [2, 6, 1, 5, 7, 0, 4, 3]
+    cipher = DcpeCipher.from_hex(KAT["key_hex"], KAT["beta"])
+    assert cipher._permutation(8) == KAT["permutation_d8"]
     # It is a valid permutation, deterministic, and key-dependent.
     perm = cipher._permutation(16)
     assert sorted(perm) == list(range(16))

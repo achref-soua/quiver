@@ -89,11 +89,14 @@ jobs:
         run: cargo package --workspace --no-verify
 
       - uses: astral-sh/setup-uv@v5
-      - name: Build + check the Python SDK distribution
+      - name: Build + test the Python SDK
         working-directory: sdks/python
         run: |
           uv build
           uvx twine check dist/*
+          # Run the SDK test suite — includes the cross-language cipher KAT (F-13),
+          # so drift from the shared kat/client-ciphers.json fails the build.
+          uv run pytest -q
 
       - uses: pnpm/action-setup@v4
         with:
@@ -101,11 +104,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Build + dry-run pack the TypeScript SDK
+      - name: Build + test + dry-run pack the TypeScript SDK
         working-directory: sdks/typescript
         run: |
           pnpm install --frozen-lockfile
           pnpm build
+          # Run the SDK test suite — includes the cross-language cipher KAT (F-13).
+          pnpm test
           npm pack --dry-run
 
   helm:
