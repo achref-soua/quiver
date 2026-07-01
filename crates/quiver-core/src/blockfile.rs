@@ -25,6 +25,88 @@ use memmap2::Mmap;
 use crate::error::{CoreError, Result};
 use crate::page::{PAGE_BODY_CAP, PAGE_SIZE, PageCodec, PageType, build_page, parse_page};
 
+/// A streaming writer for the block-file format: it seals and appends each page as
+/// soon as its body fills, holding one page in memory instead of the whole blob.
+/// Unlike [`crate::paged`], the format carries no length prefix — logical content
+/// is just the concatenated page bodies — so the total need not be known up front,
+/// and an empty blob writes a zero-page file. The page boundaries are identical to
+/// [`write_blocks`]'s regardless of how the body is chunked across
+/// [`BlockWriter::write`] calls, so the on-disk bytes are unchanged. Used by the
+/// streaming compaction path to bound memory to one page per column (ADR-0068).
+pub(crate) struct BlockWriter<'a> {
+    file: BufWriter<File>,
+    path: std::path::PathBuf,
+    codec: &'a dyn PageCodec,
+    page_type: PageType,
+    stamp: u64,
+    page_id: u64,
+    // The page currently being filled; flushed once it reaches `PAGE_BODY_CAP`.
+    body: Vec<u8>,
+    // Reused seal-output buffer (`codec.block_size()` bytes).
+    block: Vec<u8>,
+}
+
+impl<'a> BlockWriter<'a> {
+    /// Create a block file at `path` (truncating any existing content). `stamp` is
+    /// recorded in each page's `lsn` header field.
+    pub(crate) fn create(
+        path: &Path,
+        codec: &'a dyn PageCodec,
+        page_type: PageType,
+        stamp: u64,
+    ) -> Result<Self> {
+        let file = File::create(path).map_err(|e| CoreError::io(path, e))?;
+        Ok(Self {
+            file: BufWriter::new(file),
+            path: path.to_path_buf(),
+            codec,
+            page_type,
+            stamp,
+            page_id: 0,
+            body: Vec::with_capacity(PAGE_BODY_CAP),
+            block: vec![0u8; codec.block_size()],
+        })
+    }
+
+    /// Append `bytes` to the blob, sealing and writing whole pages as they fill.
+    pub(crate) fn write(&mut self, mut bytes: &[u8]) -> Result<()> {
+        while !bytes.is_empty() {
+            let take = (PAGE_BODY_CAP - self.body.len()).min(bytes.len());
+            self.body.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.body.len() == PAGE_BODY_CAP {
+                self.flush_page()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_page(&mut self) -> Result<()> {
+        let page = build_page(self.page_type, self.page_id, self.stamp, &self.body)?;
+        self.codec.seal(self.page_id, &page, &mut self.block)?;
+        self.file
+            .write_all(&self.block)
+            .map_err(|e| CoreError::io(&self.path, e))?;
+        self.page_id += 1;
+        self.body.clear();
+        Ok(())
+    }
+
+    /// Flush the trailing partial page (an empty blob writes no pages) and
+    /// `sync_data` the file. Does not `fsync` the directory.
+    pub(crate) fn finish(mut self) -> Result<()> {
+        if !self.body.is_empty() {
+            self.flush_page()?;
+        }
+        let file = self
+            .file
+            .into_inner()
+            .map_err(|e| CoreError::io(&self.path, e.into_error()))?;
+        file.sync_data().map_err(|e| CoreError::io(&self.path, e))?;
+        Ok(())
+    }
+}
+
 /// Write `body` to `path` as a sequence of sealed pages, then `fsync` the file.
 ///
 /// The file's logical content is exactly `body`: it is split into
@@ -39,19 +121,9 @@ pub(crate) fn write_blocks(
     stamp: u64,
     body: &[u8],
 ) -> Result<()> {
-    let file = File::create(path).map_err(|e| CoreError::io(path, e))?;
-    let mut w = BufWriter::new(file);
-    let mut block = vec![0u8; codec.block_size()];
-    for (page_id, chunk) in body.chunks(PAGE_BODY_CAP).enumerate() {
-        let page = build_page(page_type, page_id as u64, stamp, chunk)?;
-        codec.seal(page_id as u64, &page, &mut block)?;
-        w.write_all(&block).map_err(|e| CoreError::io(path, e))?;
-    }
-    let file = w
-        .into_inner()
-        .map_err(|e| CoreError::io(path, e.into_error()))?;
-    file.sync_data().map_err(|e| CoreError::io(path, e))?;
-    Ok(())
+    let mut w = BlockWriter::create(path, codec, page_type, stamp)?;
+    w.write(body)?;
+    w.finish()
 }
 
 /// A read-only, `mmap`-ed block file opened for random sub-range access.
@@ -203,6 +275,39 @@ mod tests {
                 (PAGE_BODY_CAP, PAGE_BODY_CAP + 1),
             ],
         );
+    }
+
+    #[test]
+    fn streaming_writer_matches_write_blocks_byte_for_byte() {
+        // The on-disk bytes must not depend on how the body is chunked across
+        // `BlockWriter::write` calls — that is what keeps the streaming compaction
+        // path (ADR-0068) format-compatible with `write_blocks`.
+        for len in [
+            0usize,
+            1,
+            PAGE_BODY_CAP - 1,
+            PAGE_BODY_CAP,
+            PAGE_BODY_CAP * 2 + 9,
+        ] {
+            let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let dir = tempfile::tempdir().unwrap();
+
+            let whole = dir.path().join("whole");
+            write_blocks(&whole, &PlainCodec, PageType::Segment, 7, &body).unwrap();
+
+            let streamed = dir.path().join("streamed");
+            let mut w = BlockWriter::create(&streamed, &PlainCodec, PageType::Segment, 7).unwrap();
+            for chunk in body.chunks(100) {
+                w.write(chunk).unwrap();
+            }
+            w.finish().unwrap();
+
+            assert_eq!(
+                std::fs::read(&whole).unwrap(),
+                std::fs::read(&streamed).unwrap(),
+                "chunked stream differs from write_blocks at len {len}"
+            );
+        }
     }
 
     #[test]
