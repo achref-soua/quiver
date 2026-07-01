@@ -39,6 +39,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloca"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5a7d05ea6aea7e9e64d25b9156ba2fee3fdd659e34e41063cd2fc7cd020d7f4"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -722,23 +731,22 @@ dependencies = [
 
 [[package]]
 name = "criterion"
-version = "0.5.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2b12d017a929603d80db1831cd3a24082f8137ce19c69e6447f54f5fc8d692f"
+checksum = "950046b2aa2492f9a536f5f4f9a3de7b9e2476e575e05bd6c333371add4d98f3"
 dependencies = [
+ "alloca",
  "anes",
  "cast",
  "ciborium",
  "clap",
  "criterion-plot",
- "is-terminal",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "num-traits",
- "once_cell",
  "oorandom",
+ "page_size",
  "regex",
  "serde",
- "serde_derive",
  "serde_json",
  "tinytemplate",
  "walkdir",
@@ -746,12 +754,12 @@ dependencies = [
 
 [[package]]
 name = "criterion-plot"
-version = "0.5.0"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b50826342786a51a89e2da3a28f1c32b06e387201bc2d19791f622c673706b1"
+checksum = "d8d80a2f4f5b554395e47b5d8305bc3d27813bacb73493eb1001e8f76dae29ea"
 dependencies = [
  "cast",
- "itertools 0.10.5",
+ "itertools 0.13.0",
 ]
 
 [[package]]
@@ -1357,12 +1365,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hermit-abi"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
-
-[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1527,9 +1529,9 @@ dependencies = [
 
 [[package]]
 name = "ico"
-version = "0.3.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3804960be0bb5e4edb1e1ad67afd321a9ecfd875c3e65c099468fd2717d7cae"
+checksum = "3e795dff5605e0f04bff85ca41b51a96b83e80b281e96231bcaaf1ac35103371"
 dependencies = [
  "byteorder",
  "png",
@@ -1698,17 +1700,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
-name = "is-terminal"
-version = "0.4.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
-dependencies = [
- "hermit-abi",
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1716,9 +1707,9 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "itertools"
-version = "0.10.5"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
 dependencies = [
  "either",
 ]
@@ -2144,6 +2135,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "page_size"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "palette"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2473,7 +2474,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -2494,7 +2495,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -2621,7 +2622,7 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quiverdb-cli"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2643,7 +2644,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-cluster"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2652,7 +2653,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-core"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "crc32c",
  "memmap2",
@@ -2667,7 +2668,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-crypto"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "base64",
  "chacha20 0.9.1",
@@ -2685,7 +2686,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-embed"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "arc-swap",
  "postcard",
@@ -2700,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-import"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "postgres",
  "quiverdb-embed",
@@ -2715,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-index"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "cudarc",
  "memmap2",
@@ -2730,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-mcp"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "quiverdb-crypto",
@@ -2745,7 +2746,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-proto"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -2756,7 +2757,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-providers"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "figment",
  "serde",
@@ -2768,7 +2769,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-query"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "rust-stemmers",
  "serde",
@@ -2777,7 +2778,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-server"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2815,7 +2816,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-simd"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "criterion",
  "serde",
@@ -2823,7 +2824,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-tui"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -3172,9 +3173,9 @@ dependencies = [
 
 [[package]]
 name = "roaring"
-version = "0.10.12"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19e8d2cfa184d94d0726d650a9f4a1be7f9b76ac9fdb954219878dc00c1c1e7b"
+checksum = "8ba9ce64a8f45d7fc86358410bb1a82e8c987504c0d4900e9141d69a9f26c885"
 dependencies = [
  "bytemuck",
  "byteorder",
