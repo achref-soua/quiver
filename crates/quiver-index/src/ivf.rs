@@ -162,6 +162,17 @@ fn report_distance(metric: Metric, q: &[f32], v: &[f32]) -> f32 {
     }
 }
 
+// Convert a rank value (smaller-is-closer ordering) back to the true metric
+// orientation (higher-is-closer for Cosine/Dot). Used by the PQ path, which has
+// no resident full vector to recompute the metric against and must derive the
+// reported distance from the approximate ordering score.
+fn report_from_rank(metric: Metric, rank: f32) -> f32 {
+    match metric {
+        Metric::L2 => rank,
+        Metric::Cosine | Metric::Dot => -rank,
+    }
+}
+
 impl Ivf {
     /// Build an IVF index over `ids` and their `vectors` (flat `n × dim`).
     ///
@@ -553,6 +564,10 @@ impl Ivf {
             .centroids
             .chunks_exact(self.dim)
             .enumerate()
+            // Skip tombstoned cells (sentinel centroid, empty postings): ranking
+            // them wastes probe slots and, for Cosine, the f32::MAX sentinel ties
+            // with genuinely orthogonal live cells instead of sorting last.
+            .filter(|&(c, _)| !self.is_tombstoned(c))
             .map(|(c, centroid)| (rank_distance(self.metric, &prepared, centroid), c))
             .collect();
         cells.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -579,9 +594,13 @@ impl Ivf {
                     for &node in &self.postings[cell] {
                         let start = node as usize * code_len;
                         let approx = scorer.distance(&codes[start..start + code_len]);
-                        // PQ mode reports the approximate score (no resident
-                        // full vectors to re-rank against — the frugal trade).
-                        scored.push((approx, node, approx));
+                        // `approx` is a rank value (smaller-is-closer). Report the
+                        // true metric orientation so callers (and the MVCC reader,
+                        // which re-derives an ordering key from the reported
+                        // distance) see a positive similarity for Cosine/Dot, not
+                        // the negated ordering score. No resident full vector to
+                        // re-rank against — the frugal PQ trade.
+                        scored.push((approx, node, report_from_rank(self.metric, approx)));
                     }
                 }
             }
@@ -916,6 +935,41 @@ mod tests {
         let idx = Ivf::build(&ids, &flat, dim, Metric::Cosine, cfg).unwrap();
         let r = recall(&idx, &data, Metric::Cosine, 10, 24, 30, &mut rng);
         assert!(r >= 0.95, "cosine IVF recall@10 was {r:.3}");
+    }
+
+    #[test]
+    fn ivf_pq_cosine_reports_true_similarity_orientation() {
+        // Regression: the PQ path must report the true metric orientation
+        // (higher-is-closer for Cosine), not the raw negated ordering score.
+        // A negative reported "similarity" here would invert the MVCC reader's
+        // ordering key and break client score thresholds.
+        let (dim, n) = (32, 1500);
+        let mut rng = SplitMix64::new(0x9E9);
+        let (_data, flat, ids) = dataset(&mut rng, n, dim);
+        let cfg = IvfConfig {
+            nlist: 32,
+            quantization: Some(8),
+            ..IvfConfig::default()
+        };
+        let idx = Ivf::build(&ids, &flat, dim, Metric::Cosine, cfg).unwrap();
+        // Query with a stored vector: its nearest neighbour's reported cosine
+        // similarity must be positive, and results ordered highest-first.
+        let q: Vec<f32> = flat[7 * dim..8 * dim].to_vec();
+        let res = idx.search(&q, 10, 32).unwrap();
+        assert!(!res.is_empty());
+        assert!(
+            res[0].distance > 0.0,
+            "nearest cosine similarity was {}, expected positive",
+            res[0].distance
+        );
+        for w in res.windows(2) {
+            assert!(
+                w[0].distance >= w[1].distance,
+                "results not ordered by descending similarity: {} then {}",
+                w[0].distance,
+                w[1].distance
+            );
+        }
     }
 
     #[test]
