@@ -76,7 +76,7 @@
     "@stablelib/hmac": "^2.0.1",
     "@stablelib/sha256": "^2.0.1",
     "@stablelib/xchacha20poly1305": "^2.0.1",
-    "@types/node": "^25.0.0",
+    "@types/node": "^26.1.0",
     "typescript": "^6.0.0",
     "vitest": "^4.1.0"
   },
