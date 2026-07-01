@@ -3630,7 +3630,12 @@ mod tests {
         lock_db.create_collection("c", desc()).unwrap();
         for i in 0..n {
             lock_db
-                .upsert("c", &format!("p{i}"), &[i as f32, 0.0, 0.0, 0.0], &json!({}))
+                .upsert(
+                    "c",
+                    &format!("p{i}"),
+                    &[i as f32, 0.0, 0.0, 0.0],
+                    &json!({}),
+                )
                 .unwrap();
         }
         for i in (0..n).filter(|&i| deleted(i)) {
@@ -3651,7 +3656,12 @@ mod tests {
         mv_db.create_collection("c", desc()).unwrap();
         for i in 0..n {
             mv_db
-                .upsert("c", &format!("p{i}"), &[i as f32, 0.0, 0.0, 0.0], &json!({}))
+                .upsert(
+                    "c",
+                    &format!("p{i}"),
+                    &[i as f32, 0.0, 0.0, 0.0],
+                    &json!({}),
+                )
                 .unwrap();
         }
         mv_db.ensure_indexed("c").unwrap(); // fold all upserts into the base
