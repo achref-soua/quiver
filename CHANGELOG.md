@@ -10,6 +10,21 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.30.2] — 2026-07-01
+
+An internal refactor — no behavior, API, on-disk, or wire change; every published
+crate is functionally identical.
+
+### Internal
+
+- **Split `quiver-embed`'s `lib.rs` into a module tree** — the lock-free MVCC
+  serving snapshot (`snapshot`), the single-writer MVCC write path (`mvcc`), the
+  on-disk index-snapshot envelopes (`envelope`), and the multi-vector token-id
+  machinery (`multivector`) each move to their own module, isolating the lock-free
+  code for review. Purely mechanical: items are re-exported from `lib.rs`, so the
+  public API and every internal reference are unchanged (verified by an unchanged
+  test suite).
+
 ## [0.30.1] — 2026-07-01
 
 A security and dependency patch — no engine behavior change.
@@ -830,7 +845,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.30.1...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.30.2...HEAD
+[0.30.2]: https://github.com/achref-soua/quiver/compare/v0.30.1...v0.30.2
 [0.30.1]: https://github.com/achref-soua/quiver/compare/v0.30.0...v0.30.1
 [0.30.0]: https://github.com/achref-soua/quiver/compare/v0.29.1...v0.30.0
 [0.29.1]: https://github.com/achref-soua/quiver/compare/v0.29.0...v0.29.1
