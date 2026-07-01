@@ -28,6 +28,26 @@ for the per-release rationale and Definitions of Done.
   manifest swap stays the sole commit point — an interrupted compaction leaves
   the pre-compaction state intact (new regression test). A fully off-lock
   background compaction worker is specified and deferred in ADR-0068.
+### Fixed
+
+- **MVCC snapshot search no longer thins below top-k under overlay tombstones**
+  — `CollectionSnapshot::search` (the lock-free MVCC read path, ADR-0064) asked
+  the base index for exactly `k` then dropped overlay-tombstoned hits, so
+  deletes/updates shadowing base points (up to the ~20% overlay churn cap) could
+  return fewer than `k` live results. It now widens the base `k`/`ef` by the
+  live fraction — the same compensation the base indexes' own soft-delete paths
+  use — then filters, merges, and truncates to `k`. Opt-in MVCC path only; the
+  default locked read path is untouched.
+### Documentation
+
+- **`upsert_batch` durability contract corrected** — the doc previously claimed
+  a crash before the batch's `fdatasync` leaves *none* of the batch durable.
+  That is false: WAL recovery is point-in-time and keeps every intact frame up
+  to the first torn one, so an un-acknowledged batch can leave a durable
+  **prefix**. The comment on `Store::upsert_batch` (and the `Database`
+  wrapper) now states standard WAL semantics — acknowledged only after `sync()`
+  returns; whole-batch retry is safe because upserts are idempotent by
+  `external_id`. No behavior or on-disk change.
 
 ## [0.29.1] — 2026-06-28
 
