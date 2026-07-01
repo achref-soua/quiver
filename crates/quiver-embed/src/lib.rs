@@ -438,20 +438,37 @@ fn overlay_rebuild_threshold(base_len: u64) -> u64 {
 
 // MVCC-mode single-vector upsert (ADR-0064): append to the published overlay
 // instead of mutating the immutable base, so lock-free readers stay race-free.
-// `ponytail`: republishes per write — O(overlay) each; coalesce per batch if
-// batched upserts under MVCC ever dominate.
+// A batch upsert coalesces the per-write clone-and-publish via
+// [`overlay_upsert_batch`].
 fn overlay_upsert(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32]) {
+    overlay_upsert_batch(handle, std::iter::once((ext_id, vector)));
+}
+
+// MVCC-mode batched single-vector upsert (ADR-0064): apply the whole batch to one
+// cloned overlay and publish it once, instead of cloning + republishing the
+// (growing) overlay per point — O(overlay) once, not O(n·overlay). Building on one
+// snapshot means the batch also becomes visible atomically, as a single published
+// snapshot. The single writer makes this safe. Identical to calling
+// [`overlay_upsert`] per point: internal ids are assigned in order from the fixed
+// base length, and an in-batch update tombstones the prior copy (the running
+// `ext_to_int` reflects earlier points in the same batch).
+fn overlay_upsert_batch<'a>(
+    handle: &mut CollectionHandle,
+    points: impl IntoIterator<Item = (&'a str, &'a [f32])>,
+) {
     bump_write_gen(handle);
     let cur = handle.snapshot.load_full();
     let mut overlay = cur.overlay.as_ref().clone();
-    // An update supersedes the prior copy (in the base or the overlay): tombstone it.
-    if let Some(&old) = handle.ext_to_int.get(ext_id) {
-        overlay.tombstones.insert(old);
+    for (ext_id, vector) in points {
+        // An update supersedes the prior copy (in the base or the overlay): tombstone it.
+        if let Some(&old) = handle.ext_to_int.get(ext_id) {
+            overlay.tombstones.insert(old);
+        }
+        let internal = cur.base_len + overlay.upserts.len() as u64;
+        overlay.upserts.push((Arc::from(vector), ext_id.to_owned()));
+        handle.ext_to_int.insert(ext_id.to_owned(), internal);
+        handle.int_to_ext.push(ext_id.to_owned());
     }
-    let internal = cur.base_len + overlay.upserts.len() as u64;
-    overlay.upserts.push((Arc::from(vector), ext_id.to_owned()));
-    handle.ext_to_int.insert(ext_id.to_owned(), internal);
-    handle.int_to_ext.push(ext_id.to_owned());
     let crowded = overlay.upserts.len() as u64 >= overlay_rebuild_threshold(cur.base_len);
     publish_overlay(handle, &cur, Arc::new(overlay));
     // Defer a consolidating rebuild once the overlay is large (the server runs it
@@ -922,12 +939,23 @@ impl Database {
             return Ok(records.len() as u64);
         }
 
-        for (id, vector, payload) in points {
-            let handle = self
-                .collections
-                .get_mut(collection)
-                .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
-            index_upsert_point(handle, id, vector)?;
+        let handle = self
+            .collections
+            .get_mut(collection)
+            .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
+        // Dense index maintenance. Under MVCC, coalesce the whole batch into a
+        // single overlay republish (ADR-0064) — one clone-and-publish instead of
+        // O(n·overlay) per-point ones — so the batch also becomes visible as one
+        // atomic snapshot. Otherwise fold each point into the live index in turn.
+        if mvcc_served(handle) {
+            overlay_upsert_batch(handle, points.iter().map(|(id, vector, _)| (*id, *vector)));
+        } else {
+            for (id, vector, _) in points {
+                index_upsert_point(handle, id, vector)?;
+            }
+        }
+        // Sparse index maintenance is per point (unchanged).
+        for (id, _, payload) in points {
             sparse_index_upsert_point(handle, id, payload);
         }
         Ok(records.len() as u64)
@@ -3570,6 +3598,75 @@ mod tests {
         assert_eq!(
             seq, bat,
             "batch and sequential produce different search results"
+        );
+    }
+
+    #[test]
+    fn mvcc_batch_upsert_is_one_atomic_snapshot_matching_sequential() {
+        // F-9 (ADR-0064): a batch upsert under MVCC coalesces into a single overlay
+        // republish — visible atomically as one snapshot — and yields the same
+        // result as the same points applied one at a time.
+        let params = SearchParams {
+            k: 8,
+            ..Default::default()
+        };
+        let query = [3.0f32, 0.0, 0.0, 0.0];
+        let pts: Vec<(String, [f32; 4])> = (0..40u32)
+            .map(|i| (format!("p{i}"), [i as f32, 0.0, 0.0, 0.0]))
+            .collect();
+        let payload = json!({});
+
+        // Sequential MVCC upserts (one overlay republish each).
+        let tmp_seq = tempfile::tempdir().unwrap();
+        let mut seq_db = open(tmp_seq.path());
+        seq_db.set_mvcc_reads(true);
+        seq_db.create_collection("c", desc()).unwrap();
+        for (id, v) in &pts {
+            seq_db.upsert("c", id, v, &payload).unwrap();
+        }
+        let seq_ids: Vec<String> = seq_db
+            .search_snapshot("c", &query, &params)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+
+        // Batched MVCC upsert (one coalesced overlay republish).
+        let tmp_bat = tempfile::tempdir().unwrap();
+        let mut bat_db = open(tmp_bat.path());
+        bat_db.set_mvcc_reads(true);
+        bat_db.create_collection("c", desc()).unwrap();
+        // The snapshot published before the batch must stay immutable afterwards.
+        let cell = bat_db.collection_snapshot("c").unwrap();
+        let before = cell.load_full();
+        let batch: Vec<(&str, &[f32], &serde_json::Value)> = pts
+            .iter()
+            .map(|(id, v)| (id.as_str(), v.as_slice(), &payload))
+            .collect();
+        bat_db.upsert_batch("c", &batch).unwrap();
+
+        // Atomicity: the pre-batch snapshot saw none of the batch, and exactly one
+        // new snapshot now holds the whole batch.
+        assert_eq!(
+            before.search(&query, params.k, params.ef_search).unwrap().len(),
+            0,
+            "pre-batch snapshot must not observe the batch"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&before, &cell.load_full()),
+            "the batch must publish a new snapshot"
+        );
+
+        let bat_ids: Vec<String> = bat_db
+            .search_snapshot("c", &query, &params)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(bat_ids.len(), params.k);
+        assert_eq!(
+            seq_ids, bat_ids,
+            "batch and sequential MVCC upserts must produce the same result"
         );
     }
 
