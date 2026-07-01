@@ -11,6 +11,18 @@
 //! refill/consume math is a pure function of an injected `Instant`, so it is
 //! deterministic and unit-tested with no sleeps.
 //!
+//! ## Scope: post-authentication by design (F-6)
+//!
+//! This limiter runs *after* authentication and is keyed by the authenticated
+//! actor identity, so it holds at most one bucket **per configured key** — a
+//! bounded map an attacker cannot inflate. The trade-off is that it does **not**
+//! throttle *unauthenticated* traffic (requests that never present a valid key):
+//! throttling anonymous floods by source IP is the job of an upstream reverse
+//! proxy / load balancer / WAF, which production deployments already terminate TLS
+//! at. A coarse pre-auth per-source limiter would need its own unbounded-by-source
+//! map (itself a memory-exhaustion vector) and is deliberately left to that layer;
+//! the bounded-by-keys property here is intentional, not an oversight.
+//!
 //! [token bucket]: https://en.wikipedia.org/wiki/Token_bucket
 
 use std::collections::HashMap;
@@ -105,7 +117,7 @@ struct Bucket {
 /// An opt-in, in-memory, per-key token-bucket rate limiter.
 pub struct RateLimiter {
     config: RateLimitConfig,
-    // ponytail: one global Mutex over the bucket map — fine for a single-node
+    // TODO(perf): one global Mutex over the bucket map — fine for a single-node
     // server; shard by key hash if lock contention ever shows up under load.
     buckets: Mutex<HashMap<String, Bucket>>,
 }

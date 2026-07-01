@@ -58,6 +58,12 @@ const WAL_INFO: &[u8] = b"quiver/v1/wal-record";
 /// the engine already threads through.
 pub struct AeadCodec {
     root_key: Zeroizing<[u8; KEY_LEN]>,
+    // HKDF is extract-then-expand. The extract step (an HMAC over the root key) is
+    // independent of the per-page/record `info`, so its output — the pseudo-random
+    // key (PRK) — is identical for every derive. Cache it and run only the cheap
+    // per-`info` expand per page (F-8). It is key material, so it lives in a
+    // zeroizing buffer like the root key.
+    prk: Zeroizing<[u8; KEY_LEN]>,
 }
 
 impl AeadCodec {
@@ -65,8 +71,12 @@ impl AeadCodec {
     /// zeroizing buffer; the caller should zeroize its own copy.
     #[must_use]
     pub fn new(root_key: [u8; KEY_LEN]) -> Self {
+        let (prk, _) = Hkdf::<Sha256>::extract(None, &root_key);
+        let mut prk_buf = Zeroizing::new([0u8; KEY_LEN]);
+        prk_buf.copy_from_slice(&prk);
         Self {
             root_key: Zeroizing::new(root_key),
+            prk: prk_buf,
         }
     }
 
@@ -77,11 +87,15 @@ impl AeadCodec {
         Ok(Self::new(decode_key_hex(hex)?))
     }
 
-    // Derive a 32-byte subkey from the root key under the given domain `info`
-    // parts. HKDF-expand on a 32-byte output never fails, but the result is
-    // still handled rather than unwrapped (no panics on the engine's paths).
+    // Derive a 32-byte subkey under the given domain `info` parts from the cached
+    // PRK — HKDF-expand only, since the extract is precomputed in `new` (F-8). This
+    // is exactly `HKDF(root_key, info)`: HKDF is `expand(extract(salt, ikm), info)`,
+    // and `from_prk(extract(None, root_key))` reproduces the same expand input.
+    // HKDF-expand on a 32-byte output never fails, but the result is still handled
+    // rather than unwrapped (no panics on the engine's paths).
     fn subkey(&self, info: &[&[u8]]) -> Result<Zeroizing<[u8; KEY_LEN]>> {
-        let hk = Hkdf::<Sha256>::new(None, self.root_key.as_slice());
+        let hk = Hkdf::<Sha256>::from_prk(self.prk.as_slice())
+            .map_err(|_| CoreError::MalformedPage("hkdf prk invalid".to_owned()))?;
         let mut okm = Zeroizing::new([0u8; KEY_LEN]);
         hk.expand_multi_info(info, okm.as_mut_slice())
             .map_err(|_| CoreError::MalformedPage("hkdf subkey derivation failed".to_owned()))?;
@@ -265,6 +279,29 @@ mod tests {
         let codec = AeadCodec::new(key(1));
         assert_eq!(codec.block_size(), PAGE_SIZE + NONCE_LEN + TAG_LEN);
         assert_eq!(codec.block_size(), PAGE_SIZE + 40);
+    }
+
+    #[test]
+    fn cached_prk_subkey_equals_uncached_hkdf() {
+        // The cached-PRK derivation (F-8) must be byte-identical to a full
+        // `HKDF::new(None, root).expand` for every domain, so encryption-at-rest is
+        // unchanged. If this ever diverged, existing data would fail to decrypt.
+        let root = key(0x5a);
+        let codec = AeadCodec::new(root);
+        let infos: &[&[&[u8]]] = &[
+            &[PAGE_INFO, &0u64.to_le_bytes()],
+            &[PAGE_INFO, &42u64.to_le_bytes()],
+            &[PAGE_INFO, &u64::MAX.to_le_bytes()],
+            &[WAL_INFO],
+        ];
+        for info in infos {
+            let cached = codec.subkey(info).unwrap();
+            let mut uncached = [0u8; KEY_LEN];
+            Hkdf::<Sha256>::new(None, &root)
+                .expand_multi_info(info, &mut uncached)
+                .unwrap();
+            assert_eq!(cached.as_slice(), &uncached, "cached PRK subkey diverged");
+        }
     }
 
     #[test]

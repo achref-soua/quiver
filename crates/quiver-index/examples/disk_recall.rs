@@ -120,7 +120,7 @@ fn serve(index_path: &Path, query_path: &Path, gt_path: &Path) -> Result<(), Box
     // can be sampled. `QUIVER_DISK_HOLD_SECS` makes the hold deterministic for a
     // scripted sampler (no TTY needed — e.g. scripts/bench-disk-frugality.ps1);
     // otherwise an interactive run waits for Enter.
-    // ponytail: env hold over a CLI flag — the example's arg parsing is positional.
+    // NOTE: env hold over a CLI flag — the example's arg parsing is positional.
     if let Some(secs) = env::var("QUIVER_DISK_HOLD_SECS")
         .ok()
         .and_then(|s| s.parse().ok())

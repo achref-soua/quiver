@@ -10,6 +10,119 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-07-01
+
+*Fortified* — an audit-remediation and robustness pass. Streaming, memory-bounded
+segment compaction moved off the checkpoint critical path; lock-free MVCC read
+correctness (top-k under overlay tombstones) and batch-atomicity fixes;
+collection-name validation; length-independent constant-time API-key comparison
+and an HKDF-PRK cache; a **release-blocking automated OWASP ZAP DAST gate**; and a
+single canonical cross-language cipher known-answer test gated in CI for Rust,
+Python, and TypeScript. No on-disk or wire format change; the single node is
+unchanged at zero overhead.
+
+### Testing / CI
+
+- **Single canonical cross-language cipher KAT, gated in CI** (F-13). The client
+  ciphers' known-answer vectors (DCPE and the opaque-vector AEAD) now live in one
+  committed file, `kat/client-ciphers.json`, generated from the Rust reference. The
+  Rust, Python, and TypeScript test suites all load and assert **that** file
+  (previously each language hardcoded its own copy of the DCPE vector — a drift
+  risk), and CI now **runs the Python (`pytest`) and TypeScript (`vitest`) SDK
+  suites** (they were only built before), so any cross-language cipher drift fails
+  the build.
+### CI
+
+- **Automated OWASP ZAP DAST gate that blocks a release** (ADR-0069). A new
+  reusable `dast` workflow boots a production-configured live server
+  (encryption-at-rest on, an admin key required, loopback bind), seeds a
+  collection, and runs the OWASP ZAP **baseline** (spider + passive) and **API**
+  (active rules over the committed OpenAPI spec, authenticated) scans. A
+  FAIL-level alert (`.zap/rules.tsv` promotes the injection/disclosure rule
+  classes to FAIL and IGNOREs reviewed benign findings) fails the job; the
+  `release` job `needs` it, so a failing scan blocks the release and every package
+  publish — no release until fixed. It also runs on `main`/`develop` pushes for
+  early signal (skipped on PRs, which stay on the fast `just verify` gate). The
+  ZAP reports are uploaded as artifacts on every run.
+### Security
+
+- **Length-independent constant-time API-key comparison** (F-7). The key compare
+  no longer short-circuits on a length mismatch (which leaked the stored key's
+  length via timing); it compares fixed-size SHA-256 digests of both inputs, so
+  timing is independent of input length. The no-early-exit-across-keys property is
+  unchanged. Documented that API keys are shared bearer secrets, plaintext at rest
+  in config/env, and rotated by a zero-downtime add-new → migrate → remove-old
+  config change.
+- **Documented the rate limiter's post-authentication scope** (F-6). The token-
+  bucket limiter (ADR-0049) is keyed by the authenticated identity and bounded by
+  the configured keys — it does not throttle *unauthenticated* floods, which is
+  the upstream reverse proxy / WAF's job. Corrected the threat model (per-key rate
+  limiting is shipped, not deferred). No behavior change.
+
+### Performance
+
+- **Cache the HKDF PRK in the encryption-at-rest codec** (F-8). `AeadCodec`
+  precomputes the HKDF-extract of the root key once (its output, the PRK, is the
+  same for every page/record) and runs only the per-`info` HKDF-expand per derive,
+  instead of re-extracting on every page seal/open. Output is byte-identical to
+  the previous full-HKDF derivation (proven by test), so existing encrypted data
+  is unaffected; this removes redundant per-operation work (most noticeable on the
+  small-record WAL path — the 16 KiB page-decrypt still dominates a page read).
+### Performance
+
+- **MVCC batch upserts coalesce into one overlay republish** (ADR-0064). Under
+  lock-free MVCC reads, `upsert_batch` applied each point to a freshly-cloned,
+  growing overlay and republished per point — O(n·overlay) for a batch of n. It
+  now builds one overlay and publishes it once (O(overlay)), which also makes the
+  batch visible **atomically**, as a single published snapshot. Single-point
+  `upsert` behavior is unchanged (it routes through the same batched path with one
+  element). Opt-in MVCC path only.
+### Changed
+
+- **Collection names are validated at creation** (behavior change). `create_collection`
+  now rejects, with `InvalidArgument`, an empty name, a name longer than 255 bytes,
+  or a name containing anything outside the documented path-safe charset (ASCII
+  letters, digits, `-`, `_`, `.`) — so a name is always a safe single REST path
+  segment (no `/`, control characters, whitespace, or non-ASCII). Previously any
+  string was accepted; pathological names now error on create. Enforced in
+  `quiver-core`, so the embedded API, REST gateway, and MCP server all inherit it.
+- **Streaming, memory-bounded segment compaction** (ADR-0068). Compaction no
+  longer materialises a collection's whole live set in RAM: a new streaming
+  block-file writer feeds the `.vec`/`.pay` columns page-by-page (byte-identical
+  to the old `write_blocks`, so no format change), and `compact_collection`
+  streams each row straight from the source segments' `mmap`s — one row resident
+  at a time instead of ~2× the collection's size. Disk-resident collections now
+  compact without pulling the dataset into RAM. The row directory and (for
+  filterable collections) the secondary index are still assembled in memory —
+  the smaller / opt-in residuals.
+- **Compaction bounded off the checkpoint critical path** (ADR-0068). A
+  checkpoint now auto-compacts **at most one** over-threshold collection instead
+  of fanning out across every one, so its added latency is a single collection's
+  streamed merge; the rest amortise across later checkpoints. The atomic
+  manifest swap stays the sole commit point — an interrupted compaction leaves
+  the pre-compaction state intact (new regression test). A fully off-lock
+  background compaction worker is specified and deferred in ADR-0068.
+### Fixed
+
+- **MVCC snapshot search no longer thins below top-k under overlay tombstones**
+  — `CollectionSnapshot::search` (the lock-free MVCC read path, ADR-0064) asked
+  the base index for exactly `k` then dropped overlay-tombstoned hits, so
+  deletes/updates shadowing base points (up to the ~20% overlay churn cap) could
+  return fewer than `k` live results. It now widens the base `k`/`ef` by the
+  live fraction — the same compensation the base indexes' own soft-delete paths
+  use — then filters, merges, and truncates to `k`. Opt-in MVCC path only; the
+  default locked read path is untouched.
+### Documentation
+
+- **`upsert_batch` durability contract corrected** — the doc previously claimed
+  a crash before the batch's `fdatasync` leaves *none* of the batch durable.
+  That is false: WAL recovery is point-in-time and keeps every intact frame up
+  to the first torn one, so an un-acknowledged batch can leave a durable
+  **prefix**. The comment on `Store::upsert_batch` (and the `Database`
+  wrapper) now states standard WAL semantics — acknowledged only after `sync()`
+  returns; whole-batch retry is safe because upserts are idempotent by
+  `external_id`. No behavior or on-disk change.
+
 ## [0.29.1] — 2026-06-28
 
 A documentation and tooling patch — no engine change; every published crate is
@@ -698,7 +811,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.29.1...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.30.0...HEAD
+[0.30.0]: https://github.com/achref-soua/quiver/compare/v0.29.1...v0.30.0
 [0.29.1]: https://github.com/achref-soua/quiver/compare/v0.29.0...v0.29.1
 [0.29.0]: https://github.com/achref-soua/quiver/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/achref-soua/quiver/compare/v0.27.0...v0.28.0

@@ -1032,7 +1032,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1705,7 +1705,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2621,7 +2621,7 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quiverdb-cli"
-version = "0.29.1"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2643,7 +2643,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-cluster"
-version = "0.29.1"
+version = "0.30.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2652,7 +2652,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-core"
-version = "0.29.1"
+version = "0.30.0"
 dependencies = [
  "crc32c",
  "memmap2",
@@ -2667,7 +2667,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-crypto"
-version = "0.29.1"
+version = "0.30.0"
 dependencies = [
  "base64",
  "chacha20 0.9.1",
@@ -2685,7 +2685,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-embed"
-version = "0.29.1"
+version = "0.30.0"
 dependencies = [
  "arc-swap",
  "postcard",
@@ -2700,7 +2700,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-import"
-version = "0.29.1"
+version = "0.30.0"
 dependencies = [
  "postgres",
  "quiverdb-embed",
@@ -2715,7 +2715,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-index"
-version = "0.29.1"
+version = "0.30.0"
 dependencies = [
  "cudarc",
  "memmap2",
@@ -2730,7 +2730,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-mcp"
-version = "0.29.1"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "quiverdb-crypto",
@@ -2745,7 +2745,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-proto"
-version = "0.29.1"
+version = "0.30.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -2756,7 +2756,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-providers"
-version = "0.29.1"
+version = "0.30.0"
 dependencies = [
  "figment",
  "serde",
@@ -2768,7 +2768,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-query"
-version = "0.29.1"
+version = "0.30.0"
 dependencies = [
  "rust-stemmers",
  "serde",
@@ -2777,7 +2777,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-server"
-version = "0.29.1"
+version = "0.30.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2815,7 +2815,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-simd"
-version = "0.29.1"
+version = "0.30.0"
 dependencies = [
  "criterion",
  "serde",
@@ -2823,7 +2823,7 @@ dependencies = [
 
 [[package]]
 name = "quiverdb-tui"
-version = "0.29.1"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -3235,7 +3235,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3652,7 +3652,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4574,7 +4574,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
