@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Per-shard Raft for write high availability (ADR-0067), increment 4a.
+//! Per-shard Raft for write high availability (ADR-0067), increments 4a–4d.
 //!
 //! This module wires the audited [`openraft`] consensus core to Quiver's engine.
 //! A committed Raft log entry is **one engine write op** ([`WalOp`]); when the
@@ -7,13 +7,21 @@
 //! engine through the same [`ADR-0030`] seam a replication follower already uses
 //! (`Database::apply_replicated`). Acknowledging a write only after a Raft commit
 //! is what makes a leader failover lose no acknowledged write and admit no
-//! split-brain — but that multi-member story is increments 4b–4d.
+//! split-brain.
 //!
-//! **Increment 4a is the low-risk foundation:** it runs a *single-member* group
-//! (a node that trivially commits to itself) to prove the adapter end to end. The
-//! single-node default and non-Raft clusters are untouched — the whole module is
+//! **The shipped production path is a real multi-member group.** [`start_member`]
+//! boots a node into an `n`-node group over the gRPC Raft network
+//! (`grpc::GrpcRaftNetwork`): automatic leader election and failover (4b),
+//! a crash-safe durable log (`durable_log`, 4c), online voter changes (4c —
+//! [`RaftShard::add_voter`]/`remove_voter`), and
+//! snapshot-based catch-up + partition/rejoin hardening (4d). The whole module is
 //! compiled only behind the off-by-default `raft` cargo feature, so a default
-//! build never links `openraft`.
+//! build never links `openraft` and the single-node default is untouched.
+//!
+//! [`start_single_member`] and [`NoNetwork`] are the original 4a single-member
+//! vehicle — retained as unit-test scaffolding for the applier and the log store
+//! (a one-member group commits to itself, so no peer RPC is exercised); they are
+//! not the production boot path.
 //!
 //! Storage follows openraft 0.9's `storage-v2` split:
 //!
@@ -297,8 +305,10 @@ impl<A: ApplyOp> RaftStateMachine<TypeConfig> for Arc<StateMachineStore<A>> {
     }
 }
 
-/// A no-op Raft network. A single-member group (4a) has no peers, so openraft
-/// never opens a client or sends an RPC; the real HTTP network arrives in 4b.
+/// A no-op Raft network for a **single-member** group: with one voter openraft
+/// never opens a client or sends an RPC. Used only by [`start_single_member`] as
+/// unit-test scaffolding; the production multi-member path uses the real gRPC
+/// network ([`grpc::GrpcRaftNetwork`]).
 #[derive(Debug, Clone, Default)]
 pub struct NoNetwork;
 
@@ -307,7 +317,7 @@ impl RaftNetworkFactory<TypeConfig> for NoNetwork {
 
     async fn new_client(&mut self, _target: NodeId, _node: &BasicNode) -> Self::Network {
         // Reached only when replicating to a peer — impossible with one member.
-        unreachable!("single-member raft (4a) has no peers; real RPC arrives in 4b")
+        unreachable!("single-member raft has no peers; the multi-member path uses GrpcRaftNetwork")
     }
 }
 
@@ -321,7 +331,7 @@ impl RaftNetwork<TypeConfig> for NoConnection {
         _req: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RpcError> {
-        unreachable!("single-member raft (4a) sends no RPCs; real network arrives in 4b")
+        unreachable!("single-member raft sends no RPCs; the multi-member path uses GrpcRaftNetwork")
     }
 
     async fn install_snapshot(
@@ -329,7 +339,7 @@ impl RaftNetwork<TypeConfig> for NoConnection {
         _req: InstallSnapshotRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<InstallSnapshotResponse<NodeId>, RpcError<InstallSnapshotError>> {
-        unreachable!("single-member raft (4a) sends no RPCs; real network arrives in 4b")
+        unreachable!("single-member raft sends no RPCs; the multi-member path uses GrpcRaftNetwork")
     }
 
     async fn vote(
@@ -337,14 +347,15 @@ impl RaftNetwork<TypeConfig> for NoConnection {
         _req: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RpcError> {
-        unreachable!("single-member raft (4a) sends no RPCs; real network arrives in 4b")
+        unreachable!("single-member raft sends no RPCs; the multi-member path uses GrpcRaftNetwork")
     }
 }
 
 /// Boot a **single-member** Raft group for `node_id` over `applier`, initialized
-/// so the node is the sole voter (and so becomes leader). This is the 4a proof
-/// vehicle: `client_write` an op, it commits to the one member, and the applier
-/// drives it into the engine.
+/// so the node is the sole voter (and so becomes leader). This is the original 4a
+/// proof vehicle, retained to unit-test the applier and log store in isolation:
+/// `client_write` an op, it commits to the one member, and the applier drives it
+/// into the engine. Production uses the multi-member [`start_member`] instead.
 ///
 /// # Errors
 /// Propagates openraft configuration, construction, or initialization errors.
