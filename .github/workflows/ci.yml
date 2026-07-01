@@ -120,3 +120,13 @@ jobs:
         run: helm template q infra/helm/quiver --set encryption.masterKey="$(openssl rand -hex 32)" > /dev/null
       - name: Helm template (insecure)
         run: helm template q infra/helm/quiver --set encryption.insecure=true > /dev/null
+
+  # Dynamic OWASP ZAP scan of a live server (ADR-0069). Skipped on pull requests
+  # (it builds and boots the server + pulls the ZAP image — too heavy for every
+  # push); it runs on main/develop pushes and manual dispatch so a DAST regression
+  # is caught on the mainline before a release tag hits the blocking gate in
+  # release.yml.
+  dast:
+    name: DAST (OWASP ZAP)
+    if: ${{ github.event_name != 'pull_request' }}
+    uses: ./.github/workflows/dast.yml

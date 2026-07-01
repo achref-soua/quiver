@@ -1,0 +1,106 @@
+# Dynamic application security testing (ADR-0069).
+#
+# Boots a live, production-configured Quiver server (encryption-at-rest on, an
+# admin API key required, loopback bind) and scans it with OWASP ZAP:
+#   1. a baseline scan  — spider + passive rules over the running server;
+#   2. an API scan      — ZAP's full active rule set over the committed OpenAPI
+#                         spec, authenticated with the admin key.
+# A FAIL-level alert (see `.zap/rules.tsv`) exits non-zero and fails the job; the
+# HTML/MD/XML reports are always uploaded for triage. Reusable via `workflow_call`
+# so CI (post-merge signal) and release (a hard, release-blocking gate) run the
+# identical scan.
+name: dast
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  zap:
+    name: OWASP ZAP (DAST)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the server binary
+        run: cargo build --release -p quiverdb-cli
+
+      - name: Start a production-configured server and seed a collection
+        env:
+          QUIVER_API_KEYS: dast-admin-key
+          QUIVER_REST_ADDR: 127.0.0.1:6333
+          QUIVER_GRPC_ADDR: 127.0.0.1:6334
+          QUIVER_DATA_DIR: ${{ runner.temp }}/quiver-dast
+        run: |
+          # Ephemeral throwaway key for the disposable CI database (never committed).
+          export QUIVER_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+          ./target/release/quiver serve &
+          echo $! > "${{ runner.temp }}/quiver.pid"
+          # Wait for readiness (the secure config must accept, or this times out and fails).
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:6333/readyz >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:6333/readyz
+          # Seed a collection so the API scan exercises a real, non-empty surface.
+          # --oauth2-bearer sets the bearer token without a literal Authorization header.
+          curl -fsS --oauth2-bearer "$QUIVER_API_KEYS" -X POST http://127.0.0.1:6333/v1/collections \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"dast","dim":8}'
+
+      - name: Prepare ZAP working directory
+        run: |
+          mkdir -p zap-out && chmod 777 zap-out
+          cp .zap/rules.tsv zap-out/rules.tsv
+          cp docs/api/openapi.yaml zap-out/openapi.yaml
+
+      - name: OWASP ZAP baseline scan (spider + passive rules)
+        run: |
+          set +e
+          docker run --rm --network host -v "$PWD/zap-out:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t http://127.0.0.1:6333 -c rules.tsv \
+            -r baseline-report.html -w baseline-report.md -x baseline-report.xml
+          rc=$?
+          set -e
+          echo "zap-baseline exit=$rc (0 clean · 1 FAIL · 2 warnings-only · 3 error)"
+          if [ "$rc" -eq 1 ] || [ "$rc" -eq 3 ]; then
+            echo '::error::OWASP ZAP baseline found a blocking issue — see the zap-reports artifact'
+            exit 1
+          fi
+
+      - name: OWASP ZAP API scan (active rules over the OpenAPI surface, authenticated)
+        run: |
+          set +e
+          docker run --rm --network host -v "$PWD/zap-out:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable zap-api-scan.py \
+            -t /zap/wrk/openapi.yaml -f openapi -c rules.tsv \
+            -r api-report.html -w api-report.md -x api-report.xml \
+            -z "-config replacer.full_list(0).description=auth \
+                -config replacer.full_list(0).enabled=true \
+                -config replacer.full_list(0).matchtype=REQ_HEADER \
+                -config replacer.full_list(0).matchstr=Authorization \
+                -config replacer.full_list(0).matchregex=false \
+                -config replacer.full_list(0).replacement=Bearer dast-admin-key"
+          rc=$?
+          set -e
+          echo "zap-api-scan exit=$rc (0 clean · 1 FAIL · 2 warnings-only · 3 error)"
+          if [ "$rc" -eq 1 ] || [ "$rc" -eq 3 ]; then
+            echo '::error::OWASP ZAP API scan found a blocking issue — see the zap-reports artifact'
+            exit 1
+          fi
+
+      - name: Stop the server
+        if: always()
+        run: kill "$(cat ${{ runner.temp }}/quiver.pid)" 2>/dev/null || true
+
+      - name: Upload ZAP reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-reports
+          path: zap-out/*-report.*
+          retention-days: 14

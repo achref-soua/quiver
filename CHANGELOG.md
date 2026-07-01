@@ -10,6 +10,19 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### CI
+
+- **Automated OWASP ZAP DAST gate that blocks a release** (ADR-0069). A new
+  reusable `dast` workflow boots a production-configured live server
+  (encryption-at-rest on, an admin key required, loopback bind), seeds a
+  collection, and runs the OWASP ZAP **baseline** (spider + passive) and **API**
+  (active rules over the committed OpenAPI spec, authenticated) scans. A
+  FAIL-level alert (`.zap/rules.tsv` promotes the injection/disclosure rule
+  classes to FAIL and IGNOREs reviewed benign findings) fails the job; the
+  `release` job `needs` it, so a failing scan blocks the release and every package
+  publish — no release until fixed. It also runs on `main`/`develop` pushes for
+  early signal (skipped on PRs, which stay on the fast `just verify` gate). The
+  ZAP reports are uploaded as artifacts on every run.
 ### Security
 
 - **Length-independent constant-time API-key comparison** (F-7). The key compare
