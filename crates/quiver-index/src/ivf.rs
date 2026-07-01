@@ -30,11 +30,37 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use std::borrow::Cow;
+
 use quiver_simd::{Metric, l2_sq_f32};
 
 use crate::kmeans::{kmeans, nearest_centroid};
 use crate::quant::Quantizer;
+use crate::rng::SplitMix64;
 use crate::{IndexError, Neighbor, ProductQuantizer};
+
+/// Cap on the number of rows kmeans / PQ codebooks train on. Above it, training
+/// uses a deterministic random sample, so build cost is O(n) only in the cheap
+/// cell-assignment and PQ-encode passes rather than O(n) in the expensive kmeans
+/// training (the standard FAISS-style trade — 256k rows is ample for 256-centroid
+/// codebooks). For n <= cap the full set trains, so small builds — and every
+/// existing test — are byte-identical.
+const TRAIN_SAMPLE: usize = 262_144;
+
+// Borrow the full prepared set when it fits the training cap, else gather a
+// deterministic random sample of `TRAIN_SAMPLE` rows.
+fn training_sample(prepared: &[f32], n: usize, dim: usize, seed: u64) -> (Cow<'_, [f32]>, usize) {
+    if n <= TRAIN_SAMPLE {
+        return (Cow::Borrowed(prepared), n);
+    }
+    let mut rng = SplitMix64::new(seed ^ 0x5A17_9E37_79B9_7C15);
+    let mut buf = vec![0f32; TRAIN_SAMPLE * dim];
+    for s in 0..TRAIN_SAMPLE {
+        let i = rng.below(n);
+        buf[s * dim..(s + 1) * dim].copy_from_slice(&prepared[i * dim..(i + 1) * dim]);
+    }
+    (Cow::Owned(buf), TRAIN_SAMPLE)
+}
 
 /// Reassignment fanout (SpFresh LIRE): after a split or merge, affected points
 /// are re-evaluated only against this many of the affected cell's nearest live
@@ -208,11 +234,15 @@ impl Ivf {
             prepared[i * dim..(i + 1) * dim].copy_from_slice(&p);
         }
 
+        // Codebooks train on at most TRAIN_SAMPLE rows; assignment/encoding below
+        // still cover every point.
+        let (train, train_n) = training_sample(&prepared, n, dim, config.seed);
+
         // Coarse quantizer + cell assignment.
         let centroids = if n == 0 {
             vec![0f32; nlist * dim]
         } else {
-            kmeans(&prepared, n, dim, nlist, config.kmeans_iters, config.seed)
+            kmeans(&train, train_n, dim, nlist, config.kmeans_iters, config.seed)
         };
         let mut postings = vec![Vec::new(); nlist];
         let mut node_cell = vec![0u32; n];
@@ -224,7 +254,7 @@ impl Ivf {
 
         let storage = match config.quantization {
             Some(m) => {
-                let pq = ProductQuantizer::train(&prepared, n, dim, m, metric, config.seed)?;
+                let pq = ProductQuantizer::train(&train, train_n, dim, m, metric, config.seed)?;
                 let code_len = pq.code_len();
                 let mut codes = vec![0u8; n * code_len];
                 for i in 0..n {

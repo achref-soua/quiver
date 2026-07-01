@@ -95,8 +95,10 @@ fn scale_ingest_and_query() {
     );
 
     let mut db = Database::open(data_dir.path()).unwrap();
-    // Frugal config: IVF + product quantization (~dim/2 subspaces → nlist auto).
-    let pq = (dim / 2).max(4) as u32;
+    // Frugal config: IVF + product quantization. PQ subspaces default to a
+    // standard m=16 (each subspace 8-dim at dim=128); dim/2 trains too many
+    // codebooks. Override with QUIVER_SCALE_PQ.
+    let pq = env_usize("QUIVER_SCALE_PQ", 16).clamp(1, dim / 2) as u32;
     db.create_collection(
         "scale",
         Descriptor::new(dim as u32, Dtype::F32, DistanceMetric::L2).with_index(IndexSpec {
