@@ -315,6 +315,11 @@ impl Store {
         // 3. Replay the WAL tail (records past the checkpoint), idempotently.
         let floor = mfst.last_checkpointed_lsn;
         let mut max_lsn = floor;
+        // Collection ids minted after the last checkpoint live only in the WAL
+        // tail, not the manifest. Track the high-water mark so `next_collection_id`
+        // is never rewound to reuse a live id after a crash before checkpoint
+        // (mirrors the replication path's `max(id + 1)` guard).
+        let mut wal_max_collection_id: u64 = 0;
         let wal_files = list_wal_files(&wal_dir)?;
         let mut max_seq = 0u64;
         let mut keep_seqs: HashSet<u64> = HashSet::new();
@@ -329,6 +334,9 @@ impl Store {
                 had_live = true;
                 if entry.lsn > max_lsn {
                     max_lsn = entry.lsn;
+                }
+                if let WalOp::CreateCollection { collection_id, .. } = &entry.op {
+                    wal_max_collection_id = wal_max_collection_id.max(collection_id.0 + 1);
                 }
                 apply_wal_entry(&mut collections, &mut name_index, &entry, keyring.as_ref())?;
             }
@@ -362,7 +370,7 @@ impl Store {
             collections,
             name_index,
             next_lsn,
-            next_collection_id: mfst.next_collection_id,
+            next_collection_id: mfst.next_collection_id.max(wal_max_collection_id),
             next_segment_id: mfst.next_segment_id,
             manifest_version: mfst.version,
             last_checkpointed_lsn: floor,
@@ -1781,6 +1789,59 @@ mod tests {
         assert_eq!(s.len(c).unwrap(), 10);
         let got = s.get(c, "k7").unwrap().unwrap();
         assert_eq!(got.vector, vec![7.0; 4]);
+    }
+
+    #[test]
+    fn recovery_does_not_reuse_collection_id_created_after_last_checkpoint() {
+        // Regression: a collection created after the last checkpoint lives only
+        // in the WAL tail, so `next_collection_id` must be recovered from the
+        // replayed creates — not rewound to the stale manifest value, which
+        // would re-hand-out a live id and overwrite the recovered collection.
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut s = open(tmp.path());
+            let a = s.create_collection("a", desc()).unwrap();
+            for i in 0..5u32 {
+                s.upsert(a, &format!("k{i}"), &[i as f32; 4], b"{}")
+                    .unwrap();
+            }
+            // Crash before any checkpoint: manifest still carries the pre-create
+            // next_collection_id (0).
+        }
+        let mut s = open(tmp.path());
+        let a = s.collection_id("a").unwrap();
+        // A newly created collection must get a fresh id, not `a`'s.
+        let b = s.create_collection("b", desc()).unwrap();
+        assert_ne!(a, b, "b reused a's collection id");
+        // `a` and its data survive untouched.
+        assert_eq!(s.len(a).unwrap(), 5);
+        assert_eq!(s.get(a, "k3").unwrap().unwrap().vector, vec![3.0; 4]);
+        assert_eq!(s.len(b).unwrap(), 0);
+    }
+
+    #[test]
+    fn recovery_does_not_reuse_id_for_post_checkpoint_create() {
+        // Same hazard with a prior checkpoint plus a post-checkpoint create.
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut s = open(tmp.path());
+            let a = s.create_collection("a", desc()).unwrap();
+            s.upsert(a, "k0", &[1.0; 4], b"{}").unwrap();
+            s.checkpoint().unwrap();
+            // Created after the checkpoint → only in the WAL tail.
+            let b = s.create_collection("b", desc()).unwrap();
+            s.upsert(b, "z0", &[9.0; 4], b"{}").unwrap();
+            assert_ne!(a, b);
+        }
+        let mut s = open(tmp.path());
+        let a = s.collection_id("a").unwrap();
+        let b = s.collection_id("b").unwrap();
+        let cc = s.create_collection("c", desc()).unwrap();
+        assert_ne!(cc, a);
+        assert_ne!(cc, b);
+        assert_eq!(s.len(a).unwrap(), 1);
+        assert_eq!(s.len(b).unwrap(), 1);
+        assert_eq!(s.get(b, "z0").unwrap().unwrap().vector, vec![9.0; 4]);
     }
 
     #[test]
