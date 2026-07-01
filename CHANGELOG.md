@@ -10,6 +10,16 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Changed
+
+- **Collection names are validated at creation** (behavior change). `create_collection`
+  now rejects, with `InvalidArgument`, an empty name, a name longer than 255 bytes,
+  or a name containing anything outside the documented path-safe charset (ASCII
+  letters, digits, `-`, `_`, `.`) — so a name is always a safe single REST path
+  segment (no `/`, control characters, whitespace, or non-ASCII). Previously any
+  string was accepted; pathological names now error on create. Enforced in
+  `quiver-core`, so the embedded API, REST gateway, and MCP server all inherit it.
+
 ## [0.29.1] — 2026-06-28
 
 A documentation and tooling patch — no engine change; every published crate is

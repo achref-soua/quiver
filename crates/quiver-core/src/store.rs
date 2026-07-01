@@ -61,6 +61,40 @@ use crate::wal::{self, WalEntry, WalOp, WalWriter};
 /// merging them to keep reads and recovery from fanning out across many files.
 const COMPACT_MIN_SEGMENTS: usize = 8;
 
+/// Maximum length of a collection name, in bytes. A name is addressed as a single
+/// URL path segment by the REST layer, so it is kept short and path-safe.
+pub const MAX_COLLECTION_NAME_LEN: usize = 255;
+
+/// Validate a collection name at creation: non-empty, at most
+/// [`MAX_COLLECTION_NAME_LEN`] bytes, and every character an ASCII letter, digit,
+/// `-`, `_`, or `.`. That charset makes a name always a safe single URL path
+/// segment — no `/`, control characters, whitespace, or non-ASCII — since the REST
+/// gateway addresses a collection as one path segment. Rejected names error with
+/// [`CoreError::InvalidArgument`] and no collection is created.
+fn validate_collection_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(CoreError::InvalidArgument(
+            "collection name must not be empty".to_owned(),
+        ));
+    }
+    if name.len() > MAX_COLLECTION_NAME_LEN {
+        return Err(CoreError::InvalidArgument(format!(
+            "collection name must be at most {MAX_COLLECTION_NAME_LEN} bytes, got {}",
+            name.len()
+        )));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    {
+        return Err(CoreError::InvalidArgument(format!(
+            "collection name {name:?} contains an invalid character {bad:?}; \
+             allowed: ASCII letters, digits, '-', '_', '.'"
+        )));
+    }
+    Ok(())
+}
+
 /// A stored record returned by reads: the decoded vector and opaque payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record {
@@ -412,6 +446,7 @@ impl Store {
         name: &str,
         descriptor: Descriptor,
     ) -> Result<CollectionId> {
+        validate_collection_name(name)?;
         if self.name_index.contains_key(name) {
             return Err(CoreError::AlreadyExists(format!("collection {name}")));
         }
@@ -2100,6 +2135,39 @@ mod tests {
         assert_eq!(s.len(c).unwrap(), 24);
         assert_eq!(s.get(c, "k0").unwrap().unwrap().vector, vec![0.0; 4]);
         assert_eq!(s.get(c, "k23").unwrap().unwrap().vector, vec![23.0; 4]);
+    }
+
+    #[test]
+    fn rejects_pathological_collection_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = open(tmp.path());
+        let too_long = "a".repeat(MAX_COLLECTION_NAME_LEN + 1);
+        let rejected: &[&str] = &[
+            "",           // empty
+            "a/b",        // path separator (a name is one REST path segment)
+            "/leading",   // path separator
+            "has space",  // whitespace
+            "tab\tname",  // control character
+            "new\nline",  // control character
+            "café",       // non-ASCII
+            "emoji😀",    // non-ASCII
+            &too_long,    // over the length cap
+        ];
+        for &name in rejected {
+            assert!(
+                matches!(
+                    s.create_collection(name, desc()),
+                    Err(CoreError::InvalidArgument(_))
+                ),
+                "name {name:?} should be rejected"
+            );
+        }
+        // Accepted: the documented charset, up to the length cap.
+        let max_len = "a".repeat(MAX_COLLECTION_NAME_LEN);
+        for name in ["a", "my-collection", "v2.name_1", max_len.as_str()] {
+            s.create_collection(name, desc())
+                .unwrap_or_else(|e| panic!("name {name:?} should be accepted: {e}"));
+        }
     }
 
     #[test]
