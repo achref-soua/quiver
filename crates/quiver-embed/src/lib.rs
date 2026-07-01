@@ -2676,7 +2676,13 @@ fn sparse_vector_from_payload(payload: &[u8]) -> Option<SparseVector> {
 // BM25 over text alone.
 fn sparse_vector_from_value(payload: &Value) -> Option<SparseVector> {
     if let Some(raw) = payload.get(SPARSE_KEY) {
-        return serde_json::from_value::<SparseVector>(raw.clone()).ok();
+        let sv = serde_json::from_value::<SparseVector>(raw.clone()).ok()?;
+        // Enforce the documented "malformed → None" contract: a shape-invalid
+        // vector (unequal indices/values lengths, duplicate dims) is dropped
+        // rather than silently truncated by the zip in the index, which would
+        // under-score the point. Symmetric with the query side, which rejects
+        // the same mismatch.
+        return sv.validate().ok().map(|()| sv);
     }
     let text = payload.get(TEXT_KEY)?.as_str()?;
     Some(text_to_sparse(text))
@@ -2845,6 +2851,19 @@ fn sec_value(field_type: FieldType, value: &Value) -> Option<SecValue> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn malformed_stored_sparse_is_dropped_not_truncated() {
+        // A stored sparse vector with unequal indices/values lengths must be
+        // dropped (None), not silently truncated by the index zip. A valid one
+        // still parses.
+        let bad = json!({ SPARSE_KEY: { "indices": [1, 2, 3], "values": [1.0] } });
+        assert!(sparse_vector_from_value(&bad).is_none());
+        let dup = json!({ SPARSE_KEY: { "indices": [1, 1], "values": [1.0, 2.0] } });
+        assert!(sparse_vector_from_value(&dup).is_none());
+        let good = json!({ SPARSE_KEY: { "indices": [1, 2], "values": [1.0, 2.0] } });
+        assert!(sparse_vector_from_value(&good).is_some());
+    }
 
     fn desc() -> Descriptor {
         Descriptor::new(4, Dtype::F32, DistanceMetric::L2)
