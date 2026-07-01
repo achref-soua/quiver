@@ -27,21 +27,40 @@ use quiver_embed::{
     Database, Descriptor, DistanceMetric, Dtype, IndexKind, IndexSpec, SearchParams,
 };
 
-// Deterministic per-index synthetic vector: SplitMix64 seeded by the point index,
-// so any vector can be regenerated for brute-force ground truth without storing
-// the whole corpus in RAM.
-fn synth(i: u64, dim: usize, out: &mut Vec<f32>) {
-    out.clear();
-    let mut z = i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x1234_5678);
-    for _ in 0..dim {
+// A SplitMix64 stream from a seed, mapping each draw to [-1, 1). Deterministic.
+fn stream(seed: u64, dim: usize, scale: f32, out: &mut Vec<f32>, add: bool) {
+    let mut z = seed;
+    for d in 0..dim {
         z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut x = z;
         x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         x ^= x >> 31;
-        // Map to [-1, 1).
-        out.push((x >> 40) as f32 / f32::from(1u16 << 11) - 1.0);
+        let v = ((x >> 40) as f32 / f32::from(1u16 << 11) - 1.0) * scale;
+        if add {
+            out[d] += v;
+        } else {
+            out.push(v);
+        }
     }
+}
+
+// Number of latent clusters — gives the corpus realistic ANN structure (uniform
+// random is the pathological near-equidistant case where recall is meaningless).
+const CLUSTERS: u64 = 4096;
+
+// Deterministic clustered synthetic vector: a per-cluster centre plus small
+// per-point noise, so nearest neighbours are well-defined (same-cluster points)
+// and recall is a meaningful measurement. Regenerable from `i` alone (no corpus
+// held in RAM for the brute-force ground truth).
+fn synth(i: u64, dim: usize, out: &mut Vec<f32>) {
+    out.clear();
+    // Deterministic cluster assignment for point i.
+    let mut h = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 29;
+    let cluster = h % CLUSTERS;
+    stream(cluster.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1, dim, 1.0, out, false);
+    stream(i.wrapping_add(0xA0761D65) | 1, dim, 0.10, out, true);
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -97,13 +116,16 @@ fn scale_ingest_and_query() {
     let mut db = Database::open(data_dir.path()).unwrap();
     // Frugal config: IVF + product quantization. PQ subspaces default to a
     // standard m=16 (each subspace 8-dim at dim=128); dim/2 trains too many
-    // codebooks. Override with QUIVER_SCALE_PQ.
-    let pq = env_usize("QUIVER_SCALE_PQ", 16).clamp(1, dim / 2) as u32;
+    // codebooks. QUIVER_SCALE_PQ=0 uses IVF-Flat (exact vectors, no PQ) — the
+    // recall oracle that isolates IVF coverage from PQ compression loss.
+    let pq_env = env_usize("QUIVER_SCALE_PQ", 16);
+    let pq = if pq_env == 0 { 0 } else { pq_env.clamp(1, dim / 2) as u32 };
+    let quant = if pq == 0 { None } else { Some(pq) };
     db.create_collection(
         "scale",
         Descriptor::new(dim as u32, Dtype::F32, DistanceMetric::L2).with_index(IndexSpec {
             kind: IndexKind::Ivf,
-            pq_subspaces: Some(pq),
+            pq_subspaces: quant,
         }),
     )
     .unwrap();
@@ -200,7 +222,8 @@ fn scale_ingest_and_query() {
     let disk = dir_bytes(data_dir.path());
 
     eprintln!("\n================ SCALE RESULT (measured) ================");
-    eprintln!("vectors ...... {n}  (dim {dim}, IVF+PQ subspaces {pq})");
+    let idx_desc = if pq == 0 { "IVF-Flat (exact)".to_string() } else { format!("IVF+PQ m={pq}") };
+    eprintln!("vectors ...... {n}  (dim {dim}, {idx_desc})");
     eprintln!("ingest ....... {ingest_s:.1}s  → {rate:.0} vec/s (bulk)");
     eprintln!("first-build .. {build_s:.1}s (lazy index build on first query)");
     eprintln!("peak RSS ..... {} MiB", peak_rss_kib() / 1024);
