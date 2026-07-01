@@ -179,7 +179,7 @@ tokio-postgres-rustls = { version = "0.14", default-features = false, features =
 ] }
 # Mozilla CA roots to verify the Postgres TLS peer; pinned to the same 0.26 line
 # `ureq` already uses, so no third webpki-roots major lands in the tree.
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 
 # Icon embedding: ICO container writer for build.rs; winresource embeds the ICO
 # into the Windows PE binary so Explorer / taskbar show the Quiver arrowhead.
