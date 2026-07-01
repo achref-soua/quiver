@@ -20,7 +20,7 @@ jobs:
     name: fmt · clippy · test · doc
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -77,7 +77,7 @@ jobs:
     name: package (publishability)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -88,17 +88,17 @@ jobs:
       - name: cargo package (metadata + tarball)
         run: cargo package --workspace --no-verify
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
       - name: Build + check the Python SDK distribution
         working-directory: sdks/python
         run: |
           uv build
           uvx twine check dist/*
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: "11.6.0" # matches packageManager; pnpm 11 needs Node >= 22.13
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
       - name: Build + dry-run pack the TypeScript SDK
@@ -112,8 +112,8 @@ jobs:
     name: helm lint + template
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
       - name: Helm lint
         run: helm lint infra/helm/quiver --set encryption.masterKey="$(openssl rand -hex 32)"
       - name: Helm template (with key)
