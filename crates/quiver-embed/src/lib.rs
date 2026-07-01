@@ -917,10 +917,15 @@ impl Database {
 
     /// Upsert a batch of points with a single WAL `fdatasync` (ADR-0038).
     ///
-    /// `points` is `(id, vector, payload)` tuples.  The batch is committed
-    /// atomically — all points or none (from the client's perspective).  This
-    /// is the preferred path for the REST `POST /v1/collections/{c}/points`
-    /// handler which already delivers a batch per HTTP request.
+    /// `points` is `(id, vector, payload)` tuples. The batch is acknowledged
+    /// only after the one `fdatasync` returns, at which point it is durable. A
+    /// crash before acknowledgement may leave a durable *prefix* (WAL recovery
+    /// is point-in-time, not all-or-nothing); retrying the whole batch is safe
+    /// because upserts are idempotent by `id`. See
+    /// [`quiver_core::Store::upsert_batch`] for the full
+    /// durability contract. This is the preferred path for the REST
+    /// `POST /v1/collections/{c}/points` handler which already delivers a batch
+    /// per HTTP request.
     pub fn upsert_batch(
         &mut self,
         collection: &str,

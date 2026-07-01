@@ -20,6 +20,16 @@ for the per-release rationale and Definitions of Done.
   live fraction — the same compensation the base indexes' own soft-delete paths
   use — then filters, merges, and truncates to `k`. Opt-in MVCC path only; the
   default locked read path is untouched.
+### Documentation
+
+- **`upsert_batch` durability contract corrected** — the doc previously claimed
+  a crash before the batch's `fdatasync` leaves *none* of the batch durable.
+  That is false: WAL recovery is point-in-time and keeps every intact frame up
+  to the first torn one, so an un-acknowledged batch can leave a durable
+  **prefix**. The comment on `Store::upsert_batch` (and the `Database`
+  wrapper) now states standard WAL semantics — acknowledged only after `sync()`
+  returns; whole-batch retry is safe because upserts are idempotent by
+  `external_id`. No behavior or on-disk change.
 
 ## [0.29.1] — 2026-06-28
 
