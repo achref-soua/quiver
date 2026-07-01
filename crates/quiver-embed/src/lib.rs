@@ -333,8 +333,11 @@ impl CollectionSnapshot {
     /// overlay (ADR-0064 increment 1) — **pure vector reads**: no payload filter
     /// and no payload/vector fetch (those need the store and land in increment 2).
     /// Returns the `k` nearest live points, closest first, scored in the true
-    /// collection metric — identical ordering and scores to the locked
-    /// [`Database::search_snapshot`] path for the same case.
+    /// collection metric — within recall tolerance of the locked
+    /// [`Database::search_snapshot`] path for the same case. (Ordering and scores
+    /// match exactly whenever the ANN base returns the same candidate set; the
+    /// only divergence is the base index's own approximation, identical to what
+    /// the locked path sees.)
     ///
     /// # Errors
     /// Propagates an index search error.
@@ -342,10 +345,36 @@ impl CollectionSnapshot {
         if k == 0 {
             return Ok(Vec::new());
         }
+        // Overlay tombstones that shadow *base* points (internal id < base_len) get
+        // dropped from the base hits below, so asking the base for exactly k would
+        // thin the result under a true top-k (up to the ~20% overlay churn cap).
+        // Compensate by widening the base's k/ef by the live-fraction — the same
+        // trick the base indexes' own soft-delete paths use (ADR-0064). Overlay
+        // upserts (id >= base_len) are brute-scored below and need no widening.
+        let base_tombstones = self
+            .overlay
+            .tombstones
+            .iter()
+            .filter(|&&id| id < self.base_len)
+            .count() as u64;
+        let (k_base, ef_base) = if base_tombstones == 0 || self.base_len == 0 {
+            (k, ef_search)
+        } else {
+            let live_base = self.base_len.saturating_sub(base_tombstones).max(1);
+            // n * base_len / live_base, capped at base_len, floored at n (never shrink).
+            let widen = |n: usize| -> usize {
+                (n as u64)
+                    .saturating_mul(self.base_len)
+                    .div_ceil(live_base)
+                    .clamp(n as u64, self.base_len) as usize
+            };
+            let k_base = widen(k);
+            (k_base, widen(ef_search).max(k_base))
+        };
         // Collect candidates in "smaller is closer" ordering space (uniform across
         // metrics — `score::ordering_distance`), dropping tombstoned ids.
         let mut cands: Vec<(f32, u64)> = Vec::new();
-        for n in self.base.search(query, k, ef_search)? {
+        for n in self.base.search(query, k_base, ef_base)? {
             if !self.overlay.tombstones.contains(&n.id) {
                 // `Neighbor.distance` is the reported metric; `report_metric` is its
                 // own inverse (identity for L2, negation for similarities), so it
@@ -905,10 +934,15 @@ impl Database {
 
     /// Upsert a batch of points with a single WAL `fdatasync` (ADR-0038).
     ///
-    /// `points` is `(id, vector, payload)` tuples.  The batch is committed
-    /// atomically — all points or none (from the client's perspective).  This
-    /// is the preferred path for the REST `POST /v1/collections/{c}/points`
-    /// handler which already delivers a batch per HTTP request.
+    /// `points` is `(id, vector, payload)` tuples. The batch is acknowledged
+    /// only after the one `fdatasync` returns, at which point it is durable. A
+    /// crash before acknowledgement may leave a durable *prefix* (WAL recovery
+    /// is point-in-time, not all-or-nothing); retrying the whole batch is safe
+    /// because upserts are idempotent by `id`. See
+    /// [`quiver_core::Store::upsert_batch`] for the full
+    /// durability contract. This is the preferred path for the REST
+    /// `POST /v1/collections/{c}/points` handler which already delivers a batch
+    /// per HTTP request.
     pub fn upsert_batch(
         &mut self,
         collection: &str,
@@ -3648,7 +3682,10 @@ mod tests {
         // Atomicity: the pre-batch snapshot saw none of the batch, and exactly one
         // new snapshot now holds the whole batch.
         assert_eq!(
-            before.search(&query, params.k, params.ef_search).unwrap().len(),
+            before
+                .search(&query, params.k, params.ef_search)
+                .unwrap()
+                .len(),
             0,
             "pre-batch snapshot must not observe the batch"
         );
@@ -3667,6 +3704,87 @@ mod tests {
         assert_eq!(
             seq_ids, bat_ids,
             "batch and sequential MVCC upserts must produce the same result"
+        );
+    }
+
+    #[test]
+    fn mvcc_snapshot_search_compensates_for_overlay_tombstones() {
+        // F-2 (ADR-0064): a base with ~20% of its points tombstoned by the overlay
+        // must still return a full top-k. Without widening the base is asked for
+        // exactly k and the overlay tombstones thin the result below k. Compare the
+        // MVCC snapshot path against the locked path over the identical deletes.
+        let n = 300u32;
+        let query = [150.0f32, 0.0, 0.0, 0.0];
+        let params = SearchParams {
+            k: 10,
+            ..Default::default()
+        };
+        // Delete every 5th id: 20% churn, evenly spread across the line so the
+        // query's neighbourhood is tombstoned at the same fraction as the whole.
+        let deleted = |i: u32| i % 5 == 2;
+
+        // Locked reference: MVCC off, so `delete` mutates the live index directly and
+        // its own soft-delete path fills k. This is the path F-2 must not regress.
+        let tmp_lock = tempfile::tempdir().unwrap();
+        let mut lock_db = open(tmp_lock.path());
+        lock_db.create_collection("c", desc()).unwrap();
+        for i in 0..n {
+            lock_db
+                .upsert(
+                    "c",
+                    &format!("p{i}"),
+                    &[i as f32, 0.0, 0.0, 0.0],
+                    &json!({}),
+                )
+                .unwrap();
+        }
+        for i in (0..n).filter(|&i| deleted(i)) {
+            lock_db.delete("c", &format!("p{i}")).unwrap();
+        }
+        let locked: Vec<String> = lock_db
+            .search("c", &query, &params)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+
+        // MVCC path: publish a base (base_len = n, empty overlay), then delete via the
+        // overlay so the tombstones shadow base ids (< base_len).
+        let tmp_mvcc = tempfile::tempdir().unwrap();
+        let mut mv_db = open(tmp_mvcc.path());
+        mv_db.set_mvcc_reads(true);
+        mv_db.create_collection("c", desc()).unwrap();
+        for i in 0..n {
+            mv_db
+                .upsert(
+                    "c",
+                    &format!("p{i}"),
+                    &[i as f32, 0.0, 0.0, 0.0],
+                    &json!({}),
+                )
+                .unwrap();
+        }
+        mv_db.ensure_indexed("c").unwrap(); // fold all upserts into the base
+        for i in (0..n).filter(|&i| deleted(i)) {
+            mv_db.delete("c", &format!("p{i}")).unwrap();
+        }
+        let mvcc: Vec<String> = mv_db
+            .search_snapshot("c", &query, &params)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+
+        assert_eq!(
+            mvcc.len(),
+            params.k,
+            "MVCC snapshot thinned below k under overlay tombstones: {mvcc:?}"
+        );
+        let hits = mvcc.iter().filter(|id| locked.contains(id)).count();
+        let recall = hits as f64 / params.k as f64;
+        assert!(
+            recall >= 0.9,
+            "recall {recall} below tolerance vs the locked path: mvcc={mvcc:?} locked={locked:?}"
         );
     }
 
