@@ -532,10 +532,23 @@ impl Store {
     }
 
     /// Upsert a batch of points with a **single** `fdatasync` instead of one
-    /// per point.  All records are acknowledged atomically — if the server
-    /// crashes before the sync completes, none of the batch is durable (the
-    /// caller, seeing no response, should retry the whole batch).  This is the
-    /// standard batch-commit pattern used by every production database.
+    /// per point — the standard batch-commit pattern used by every production
+    /// database.
+    ///
+    /// ## Durability (standard WAL semantics)
+    /// The batch is appended as one WAL frame per record followed by a single
+    /// `sync()`. The call is **acknowledged** (returns `Ok`) only after that
+    /// `sync()` returns, at which point the whole batch is durable. If the
+    /// process crashes before the `sync()` returns the batch was never
+    /// acknowledged — but recovery is point-in-time, not all-or-nothing: WAL
+    /// replay keeps every intact frame up to the first torn one (see
+    /// [`wal::read_all`]), so an un-acknowledged batch may leave a durable
+    /// **prefix** rather than nothing. A caller that sees no response should
+    /// retry the *whole* batch; that is safe because upserts are idempotent by
+    /// `external_id` — a replayed row shadows any earlier copy and the shadowed
+    /// bytes are reclaimed by compaction. If you need true all-or-nothing batch
+    /// atomicity across a crash, that requires a WAL commit-marker frame (a
+    /// format change) and is not provided here.
     ///
     /// `records` is `(external_id, vector, payload_bytes)` slices; the vectors
     /// must match the collection's dimensionality or the call returns an error
