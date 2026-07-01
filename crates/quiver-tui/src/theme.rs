@@ -97,7 +97,7 @@ impl Theme {
 }
 
 thread_local! {
-    // ponytail: thread-local active theme — the cockpit renders on one thread,
+    // NOTE: thread-local active theme — the cockpit renders on one thread,
     // so this avoids threading a palette param through ~30 render call sites.
     // Thread a param instead if the renderer ever goes multi-threaded.
     static ACTIVE: Cell<Theme> = const { Cell::new(Theme::Bronze) };

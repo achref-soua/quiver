@@ -82,9 +82,17 @@ jobs:
             ${{ matrix.asset_name }}.sha256
           retention-days: 1
 
+  # Dynamic security gate (ADR-0069): a live OWASP ZAP scan of a production-
+  # configured server. A FAIL-level alert fails this job, and because `release`
+  # needs it, a failing scan blocks the release and every downstream publish —
+  # "no release until fixed".
+  dast:
+    name: DAST gate
+    uses: ./.github/workflows/dast.yml
+
   release:
     name: publish release
-    needs: build
+    needs: [build, dast]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
