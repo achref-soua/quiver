@@ -10,6 +10,25 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.30.1] — 2026-07-01
+
+A security and dependency patch — no engine behavior change.
+
+### Security
+
+- **Supply-chain hardening** — bumped `aquasecurity/trivy-action` to `v0.36.0`
+  (GHSA-69fq-xp46-6x23; the action's tree was briefly compromised before 0.35.0).
+
+### Changed
+
+- **Dependency bumps** — `roaring` 0.10 → 0.11 (verified the on-disk `.del`
+  tombstone-bitmap format round-trips: the crash-recovery gate and segment tests
+  are green), plus `ico` and `criterion` (build/dev). GitHub Actions group updated
+  (`actions/checkout` v7, `docker/setup-buildx-action` v4). Dependabot is now
+  scoped to the `develop` branch and configured to skip trait-linked / hardware-
+  validated major bumps (the RustCrypto stack, `cudarc`, `webpki-roots`), which
+  are handled by deliberate coordinated upgrades.
+
 ## [0.30.0] — 2026-07-01
 
 *Fortified* — an audit-remediation and robustness pass. Streaming, memory-bounded
@@ -811,7 +830,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.30.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.30.1...HEAD
+[0.30.1]: https://github.com/achref-soua/quiver/compare/v0.30.0...v0.30.1
 [0.30.0]: https://github.com/achref-soua/quiver/compare/v0.29.1...v0.30.0
 [0.29.1]: https://github.com/achref-soua/quiver/compare/v0.29.0...v0.29.1
 [0.29.0]: https://github.com/achref-soua/quiver/compare/v0.28.0...v0.29.0
