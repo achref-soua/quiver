@@ -82,7 +82,11 @@ impl SecPredicate {
 // order then matches numeric order, negatives included. (NaN has no order and is
 // rejected by the caller.)
 fn encode_f64(x: f64) -> [u8; 8] {
-    let bits = x.to_bits();
+    // Canonicalise signed zero: IEEE `-0.0 == +0.0`, but they have distinct bit
+    // patterns, so without this a stored `-0.0` would sort one unit below `+0.0`
+    // and be missed by `== 0` / `>= 0` filters and wrongly matched by `< 0`.
+    // `x + 0.0` maps `-0.0 → +0.0` and is the identity for every other value.
+    let bits = (x + 0.0).to_bits();
     let ordered = if bits >> 63 == 0 {
         bits | (1 << 63)
     } else {
@@ -460,6 +464,53 @@ mod tests {
                 .unwrap()
             ),
             vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn signed_zero_matches_positive_zero() {
+        // A stored -0.0 must behave exactly like 0 under ==, >=, and <.
+        let p: Vec<Vec<u8>> = [-0.0f64, 5.0, -3.0]
+            .iter()
+            .map(|x| json!({ "t": x }).to_string().into_bytes())
+            .collect();
+        let refs: Vec<&[u8]> = p.iter().map(Vec::as_slice).collect();
+        let idx = SecIndex::build(&[FilterableField::numeric("t")], &refs).unwrap();
+        // t == 0 matches the -0.0 row (index 0).
+        assert_eq!(
+            rows(idx
+                .query(&SecPredicate::Eq {
+                    field: "t".into(),
+                    value: SecValue::Numeric(0.0),
+                })
+                .unwrap()),
+            vec![0]
+        );
+        // t < 0 excludes -0.0 (it equals 0), leaving only -3.0 (index 2).
+        assert_eq!(
+            rows(idx
+                .query(&SecPredicate::Range {
+                    field: "t".into(),
+                    lo: None,
+                    hi: Some(SecValue::Numeric(0.0)),
+                    lo_inclusive: true,
+                    hi_inclusive: false,
+                })
+                .unwrap()),
+            vec![2]
+        );
+        // t >= 0 includes -0.0 and 5.0 (indices 0 and 1).
+        assert_eq!(
+            rows(idx
+                .query(&SecPredicate::Range {
+                    field: "t".into(),
+                    lo: Some(SecValue::Numeric(0.0)),
+                    hi: None,
+                    lo_inclusive: true,
+                    hi_inclusive: true,
+                })
+                .unwrap()),
+            vec![0, 1]
         );
     }
 
