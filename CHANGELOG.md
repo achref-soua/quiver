@@ -10,6 +10,25 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Changed
+
+- **Streaming, memory-bounded segment compaction** (ADR-0068). Compaction no
+  longer materialises a collection's whole live set in RAM: a new streaming
+  block-file writer feeds the `.vec`/`.pay` columns page-by-page (byte-identical
+  to the old `write_blocks`, so no format change), and `compact_collection`
+  streams each row straight from the source segments' `mmap`s — one row resident
+  at a time instead of ~2× the collection's size. Disk-resident collections now
+  compact without pulling the dataset into RAM. The row directory and (for
+  filterable collections) the secondary index are still assembled in memory —
+  the smaller / opt-in residuals.
+- **Compaction bounded off the checkpoint critical path** (ADR-0068). A
+  checkpoint now auto-compacts **at most one** over-threshold collection instead
+  of fanning out across every one, so its added latency is a single collection's
+  streamed merge; the rest amortise across later checkpoints. The atomic
+  manifest swap stays the sole commit point — an interrupted compaction leaves
+  the pre-compaction state intact (new regression test). A fully off-lock
+  background compaction worker is specified and deferred in ADR-0068.
+
 ## [0.29.1] — 2026-06-28
 
 A documentation and tooling patch — no engine change; every published crate is
