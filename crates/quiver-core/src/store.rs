@@ -1194,13 +1194,22 @@ impl Store {
         Ok(())
     }
 
-    // Compact only collections that have crossed the automatic threshold; run at
-    // the end of a checkpoint.
+    // Compact at the end of a checkpoint, but bound the work so compaction stays
+    // off the checkpoint's critical path: at most **one** collection is compacted
+    // per checkpoint (the first over-threshold in id order), so a checkpoint's added
+    // latency is a single collection's streamed (memory-bounded, ADR-0068) merge
+    // rather than a fan-out across every over-threshold collection. The rest compact
+    // on subsequent checkpoints, so multi-collection compaction amortizes across the
+    // checkpoint stream. Building the merged segment fully off the write lock — a
+    // background worker mirroring ADR-0062's plan→build→commit-or-abort-on-race — is
+    // the documented next step (ADR-0068); today's engine is single-writer.
     fn auto_compact(&mut self) -> Result<()> {
-        for cid in self.sorted_cids() {
-            if self.needs_compaction(cid) {
-                self.compact_collection(cid)?;
-            }
+        if let Some(cid) = self
+            .sorted_cids()
+            .into_iter()
+            .find(|&cid| self.needs_compaction(cid))
+        {
+            self.compact_collection(cid)?;
         }
         Ok(())
     }
@@ -1247,25 +1256,25 @@ impl Store {
             .ok_or_else(|| CoreError::NotFound(format!("collection {cid}")))?
             .codec
             .clone_box();
-        // Gather the live sealed rows (active rows are untouched). `primary` is
-        // ordered, so the rewritten segment is deterministic.
-        let live: Vec<(String, Vec<u8>, Vec<u8>)> = {
+        // Plan the merge from directory metadata only — the ordered (segment, row)
+        // of every live sealed row (active rows are untouched). `primary` is
+        // ordered, so the rewritten segment is deterministic. This holds O(rows) of
+        // 8-byte locations, never the vectors or payloads — those stream one row at
+        // a time into the writer below, so a large collection compacts within a
+        // bounded memory envelope (ADR-0068).
+        let (plan, row_count, stride) = {
             let state = self
                 .collections
                 .get(&cid)
                 .ok_or_else(|| CoreError::NotFound(format!("collection {cid}")))?;
-            let mut out = Vec::with_capacity(state.primary.len());
-            for (ext_id, &loc) in &state.primary {
+            let mut plan: Vec<(u32, u32)> = Vec::new();
+            for &loc in state.primary.values() {
                 if let Loc::Sealed { seg, row } = loc {
-                    let segment = state.sealed.get(seg as usize).ok_or_else(|| {
-                        CoreError::MalformedPage(format!("dangling segment index {seg}"))
-                    })?;
-                    let vector = segment.read_vector(codec.as_ref(), row, state.stride)?;
-                    let payload = segment.read_payload(codec.as_ref(), row)?;
-                    out.push((ext_id.clone(), vector, payload));
+                    plan.push((seg, row));
                 }
             }
-            out
+            let row_count = plan.len();
+            (plan, row_count, state.stride)
         };
 
         // The merged segment spans the full lsn range of its inputs.
@@ -1292,28 +1301,44 @@ impl Store {
         self.next_segment_id += 1;
         let seg_dir = segments_dir(&self.dir, cid);
         fs::create_dir_all(&seg_dir).map_err(|e| CoreError::io(&seg_dir, e))?;
-        let seal_rows: Vec<SealRow<'_>> = live
-            .iter()
-            .map(|(id, v, p)| SealRow {
-                external_id: id,
-                vector: v,
-                payload: p,
-            })
-            .collect();
-        segment::write_segment(
-            &seg_dir,
-            seg_id,
-            codec.as_ref(),
-            &seal_rows,
-            &self.collections[&cid].descriptor.filterable,
-        )?;
+        // Stream the planned rows straight from the source segments' mmaps into the
+        // new segment; only one row's vector + payload is resident at a time.
+        {
+            let state = &self.collections[&cid];
+            let mut rows = plan.into_iter();
+            segment::write_segment_streaming(
+                &seg_dir,
+                seg_id,
+                codec.as_ref(),
+                row_count,
+                &state.descriptor.filterable,
+                || match rows.next() {
+                    None => Ok(None),
+                    Some((seg, row)) => {
+                        let segment = state.sealed.get(seg as usize).ok_or_else(|| {
+                            CoreError::MalformedPage(format!("dangling segment index {seg}"))
+                        })?;
+                        let ext_id = segment
+                            .row_ids()
+                            .get(row as usize)
+                            .ok_or_else(|| {
+                                CoreError::MalformedPage(format!("segment {seg} has no row {row}"))
+                            })?
+                            .clone();
+                        let vector = segment.read_vector(codec.as_ref(), row, stride)?;
+                        let payload = segment.read_payload(codec.as_ref(), row)?;
+                        Ok(Some((ext_id, vector, payload)))
+                    }
+                },
+            )?;
+        }
         fsync_dir(&seg_dir)?;
         fsync_dir(&collection_dir(&self.dir, cid))?;
         fsync_dir(&self.dir.join("collections"))?;
         fsync_dir(&self.dir)?;
         let new_ref = SegmentRef {
             id: seg_id,
-            row_count: seal_rows.len() as u64,
+            row_count: row_count as u64,
             lsn_low,
             lsn_high,
         };
@@ -2113,6 +2138,61 @@ mod tests {
         assert_eq!(s.len(c).unwrap(), 24);
         assert_eq!(s.get(c, "k0").unwrap().unwrap().vector, vec![0.0; 4]);
         assert_eq!(s.get(c, "k23").unwrap().unwrap().vector, vec![23.0; 4]);
+    }
+
+    #[test]
+    fn interrupted_compaction_before_manifest_swap_leaves_state_intact() {
+        // `compact_collection` writes and fsyncs the merged segment, then the
+        // manifest swap is the sole commit point (ADR-0005/0066). A crash in that
+        // window leaves the merged segment orphaned — unreferenced by the still-old
+        // manifest — so recovery serves the pre-compaction segments and GCs the
+        // orphan, exactly like an interrupted checkpoint.
+        let tmp = tempfile::tempdir().unwrap();
+        let cid;
+        {
+            let mut s = open(tmp.path());
+            let c = s.create_collection("c", desc()).unwrap();
+            cid = c;
+            for i in 0..6u32 {
+                s.upsert(c, &format!("k{i}"), &[i as f32; 4], b"{}")
+                    .unwrap();
+            }
+            s.checkpoint().unwrap(); // seg 0: k0..k5
+            for i in 6..12u32 {
+                s.upsert(c, &format!("k{i}"), &[i as f32; 4], b"{}")
+                    .unwrap();
+            }
+            s.checkpoint().unwrap(); // seg 1: k6..k11
+            assert_eq!(s.collections[&c].sealed.len(), 2);
+        }
+
+        // Simulate the interrupted compaction: a merged segment's files exist on
+        // disk, but the manifest was never swapped to reference it.
+        let seg_dir = segments_dir(tmp.path(), cid);
+        let orphan_id = 9_999u64;
+        for ext in ["vec", "pay", "dir"] {
+            std::fs::write(
+                seg_dir.join(format!("seg-{orphan_id:010}.{ext}")),
+                b"partial",
+            )
+            .unwrap();
+        }
+
+        // Reopen: the pre-compaction two-segment state is intact and the orphan is
+        // reclaimed — no data lost, no half-merged segment adopted.
+        let s = open(tmp.path());
+        assert_eq!(
+            s.collections[&cid].sealed.len(),
+            2,
+            "pre-compaction segments still referenced"
+        );
+        assert_eq!(s.len(cid).unwrap(), 12);
+        assert_eq!(s.get(cid, "k5").unwrap().unwrap().vector, vec![5.0; 4]);
+        assert_eq!(s.get(cid, "k11").unwrap().unwrap().vector, vec![11.0; 4]);
+        assert!(
+            !seg_dir.join(format!("seg-{orphan_id:010}.vec")).exists(),
+            "orphan merged segment reclaimed on recovery"
+        );
     }
 
     #[test]
