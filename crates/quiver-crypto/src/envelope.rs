@@ -149,6 +149,10 @@ impl EnvelopeKeyRing {
                     "dek unwrap failed: wrong master key or tampered key file".to_owned(),
                 )
             })?;
+        // The AEAD returns the DEK plaintext in a plain Vec; wrap it so the
+        // transient copy is wiped on drop rather than lingering in freed heap —
+        // this is the exact secret crypto-shredding relies on.
+        let plaintext = Zeroizing::new(plaintext);
         let mut dek = Zeroizing::new([0u8; KEY_LEN]);
         dek.copy_from_slice(&plaintext);
         Ok(dek)
