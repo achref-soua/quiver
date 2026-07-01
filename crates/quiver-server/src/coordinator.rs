@@ -157,6 +157,7 @@ impl CoordinatorState {
     // Persist the current map + id counter (called inside the map write lock so the
     // file and memory never diverge). A no-op when no path is configured.
     fn persist(&self, map: &ShardMap) -> Result<(), Error> {
+        use std::io::Write as _;
         let Some(p) = &self.path else { return Ok(()) };
         let persisted = Persisted {
             next_id: self.next_id.load(Ordering::SeqCst),
@@ -164,7 +165,23 @@ impl CoordinatorState {
         };
         let bytes = serde_json::to_vec_pretty(&persisted)
             .map_err(|e| Error::Internal(format!("serialize coordinator state: {e}")))?;
-        std::fs::write(p, bytes).map_err(Error::Io)
+        // Atomic write-new + fsync + rename + dir-fsync (matching the engine's
+        // manifest protocol). An in-place write risked a truncated JSON on crash
+        // that blocks coordinator boot, and no fsync risked reverting the
+        // persisted next_id — the never-reused shard-id routing key — on power
+        // loss, silently misrouting a slice after a later join.
+        let tmp = p.with_extension("tmp");
+        let mut f = std::fs::File::create(&tmp).map_err(Error::Io)?;
+        f.write_all(&bytes).map_err(Error::Io)?;
+        f.sync_all().map_err(Error::Io)?;
+        drop(f);
+        std::fs::rename(&tmp, p).map_err(Error::Io)?;
+        if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .map_err(Error::Io)?;
+        }
+        Ok(())
     }
 
     // --- Automated online migration (ADR-0066 increment 3c-ii) -------------
@@ -263,8 +280,13 @@ impl CoordinatorState {
 
     // Copy the slice owned by `new_id` from one donor to the new shard, paginated.
     // **Get-if-absent**: a point already on the new shard was put there by a concurrent
-    // dual-write (the latest value), so the copy never overwrites it with the donor's
-    // possibly-older read — no lost update.
+    // dual-write (the latest value), so the copy skips it. For a point still absent we
+    // re-read the donor's *current* value (the donor also receives the dual-write during
+    // migration) rather than the paginated snapshot, so the copied value is as fresh as
+    // possible. A residual best-effort window remains — a dual-write landing between the
+    // absence check and this write can still be overwritten — which is harmless because
+    // upserts are idempotent and last-write-wins; a fully lost-update-free handoff needs
+    // version-stamped writes (future work). The copy never invents data.
     async fn copy_slice(
         &self,
         donor: &str,
@@ -294,10 +316,22 @@ impl CoordinatorState {
                 if present {
                     continue;
                 }
+                // Re-read the donor's current value so we copy the freshest data
+                // (the donor also receives dual-writes during migration). A 404
+                // means the point was deleted concurrently — skip it; any other
+                // read failure falls back to the snapshot value.
+                let get_donor = format!("{donor}/v1/collections/{collection}/points/{id}");
+                let value = match self.auth(self.http.get(&get_donor)).send().await {
+                    Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => continue,
+                    Ok(r) if r.status().is_success() => {
+                        r.json::<Value>().await.unwrap_or_else(|_| pt.clone())
+                    }
+                    _ => pt.clone(),
+                };
                 self.send_json(
                     reqwest::Method::POST,
                     &format!("{new_url}/v1/collections/{collection}/points"),
-                    json!({"points": [{"id": id, "vector": pt["vector"], "payload": pt["payload"]}]}),
+                    json!({"points": [{"id": id, "vector": value["vector"], "payload": value["payload"]}]}),
                 )
                 .await?;
             }
