@@ -103,12 +103,12 @@ hkdf = "0.12"
 memmap2 = "0.9"
 sha2 = "0.10"
 zeroize = "1"
-criterion = { version = "0.5", default-features = false, features = [
+criterion = { version = "0.8", default-features = false, features = [
     "cargo_bench_support",
 ] }
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 prost = "0.14"
-roaring = "0.10"
+roaring = "0.11"
 # Snowball (Porter2) stemmer for the BM25 tokenizer (ADR-0048). Pure Rust, MIT.
 rust-stemmers = "1"
 figment = { version = "0.10", features = ["env", "toml"] }
@@ -183,7 +183,7 @@ webpki-roots = "0.26"
 
 # Icon embedding: ICO container writer for build.rs; winresource embeds the ICO
 # into the Windows PE binary so Explorer / taskbar show the Quiver arrowhead.
-ico = "0.3"
+ico = "0.5"
 winresource = "0.1"
 
 # Dev-only dependencies (tests, property tests, fixtures).
