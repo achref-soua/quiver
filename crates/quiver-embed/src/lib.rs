@@ -490,6 +490,17 @@ impl Database {
     /// # Errors
     /// Propagates a store apply error.
     pub fn apply_replicated(&mut self, op: WalOp) -> Result<()> {
+        // Idempotent replay: re-applying a CreateCollection for a name already
+        // loaded would overwrite the live collection with a fresh empty state and
+        // lose its data. This happens in the Raft crash window (an entry applied to
+        // the engine but not yet recorded in the durable applied-state pointer is
+        // replayed on restart) and on a duplicate replication frame — skip it.
+        // Collection ids are never reused, so a name maps to one collection ever.
+        if let WalOp::CreateCollection { name, .. } = &op
+            && self.collections.contains_key(name)
+        {
+            return Ok(());
+        }
         let target = match &op {
             WalOp::CreateCollection { collection_id, .. }
             | WalOp::DropCollection { collection_id }

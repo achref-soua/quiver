@@ -132,7 +132,7 @@ pub struct StateMachineData {
 }
 
 /// A captured state-machine snapshot: its Raft metadata and serialized data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredSnapshot {
     /// Snapshot metadata (covered log id, membership, snapshot id).
     pub meta: SnapshotMeta<NodeId, BasicNode>,
@@ -162,18 +162,93 @@ pub struct StateMachineStore<A: ApplyOp> {
     /// Monotonic-ish snapshot counter (uniqueness only; gaps are fine).
     snapshot_idx: AtomicU64,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
+    /// Directory the applied-state pointer and snapshot are persisted under.
+    /// `None` for the in-memory test scaffolding (which never restarts).
+    dir: Option<std::path::PathBuf>,
 }
 
+const SM_STATE_FILE: &str = "sm-state.json";
+const SM_SNAPSHOT_FILE: &str = "sm-snapshot.bin";
+
 impl<A: ApplyOp> StateMachineStore<A> {
-    /// Build a fresh state machine over an engine applier.
+    /// Build a fresh, **volatile** state machine over an engine applier. Used only
+    /// by the in-memory single-member test scaffolding; production uses
+    /// [`StateMachineStore::open`], which persists and reloads the applied state.
     pub fn new(applier: A) -> Self {
         Self {
             applier,
             state_machine: RwLock::default(),
             snapshot_idx: AtomicU64::new(0),
             current_snapshot: RwLock::default(),
+            dir: None,
         }
     }
+
+    /// Open a **durable** state machine, reloading the last applied-state pointer
+    /// (last-applied log id + membership) and snapshot from `dir`. This is what
+    /// stops a restarted voter from re-applying its whole committed log onto the
+    /// already-durable engine, and lets a post-compaction cold restart recover:
+    /// `applied_state()` reports where the engine truly is, so openraft replays
+    /// only the entries after it (ADR-0067).
+    pub fn open(applier: A, dir: &std::path::Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let state_path = dir.join(SM_STATE_FILE);
+        let state_machine = match std::fs::read(&state_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| std::io::Error::other(format!("corrupt raft sm state: {e}")))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => StateMachineData::default(),
+            Err(e) => return Err(e),
+        };
+        let snap_path = dir.join(SM_SNAPSHOT_FILE);
+        let current_snapshot: Option<StoredSnapshot> = match std::fs::read(&snap_path) {
+            Ok(bytes) => Some(
+                postcard::from_bytes(&bytes)
+                    .map_err(|e| std::io::Error::other(format!("corrupt raft sm snapshot: {e}")))?,
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        Ok(Self {
+            applier,
+            state_machine: RwLock::new(state_machine),
+            snapshot_idx: AtomicU64::new(0),
+            current_snapshot: RwLock::new(current_snapshot),
+            dir: Some(dir.to_path_buf()),
+        })
+    }
+
+    // Durably persist the applied-state pointer (small file, atomic write + fsync +
+    // rename + dir fsync). A no-op for the volatile test store.
+    fn persist_state(&self, sm: &StateMachineData) -> std::io::Result<()> {
+        let Some(dir) = &self.dir else { return Ok(()) };
+        let bytes = serde_json::to_vec(sm).map_err(std::io::Error::other)?;
+        atomic_write(&dir.join(SM_STATE_FILE), &bytes)
+    }
+
+    // Durably persist the current snapshot (periodic, so the larger engine payload
+    // is written at most once per snapshot policy interval). A no-op when volatile.
+    fn persist_snapshot(&self, snap: &StoredSnapshot) -> std::io::Result<()> {
+        let Some(dir) = &self.dir else { return Ok(()) };
+        let bytes = postcard::to_allocvec(snap).map_err(std::io::Error::other)?;
+        atomic_write(&dir.join(SM_SNAPSHOT_FILE), &bytes)
+    }
+}
+
+// Write `bytes` to `path` atomically: temp file + fsync + rename + parent-dir
+// fsync, so a crash mid-write never leaves a torn file and the durable content
+// survives power loss (the same discipline as the engine manifest).
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 impl<A: ApplyOp> RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore<A>> {
@@ -204,10 +279,15 @@ impl<A: ApplyOp> RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore<A>> {
             last_membership,
             snapshot_id,
         };
-        *self.current_snapshot.write().await = Some(StoredSnapshot {
+        let stored = StoredSnapshot {
             meta: meta.clone(),
             data: data.clone(),
-        });
+        };
+        // Persist the snapshot so a purged log prefix stays recoverable and a
+        // just-restarted leader can serve catch-up without rebuilding first.
+        self.persist_snapshot(&stored)
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        *self.current_snapshot.write().await = Some(stored);
 
         Ok(Snapshot {
             meta,
@@ -252,6 +332,14 @@ impl<A: ApplyOp> RaftStateMachine<TypeConfig> for Arc<StateMachineStore<A>> {
             }
             responses.push(RaftResponse);
         }
+        // Durably record how far the state machine has applied before returning, so
+        // a restart replays only entries after this point rather than the whole
+        // committed log onto the already-durable engine. The one crash window
+        // (engine applied, this persist not yet done) re-applies at most this
+        // batch, which is idempotent: upsert/delete are deterministic and a
+        // replayed CreateCollection is skipped (Database::apply_replicated).
+        self.persist_state(&sm)
+            .map_err(|e| StorageIOError::write_state_machine(&e))?;
         Ok(responses)
     }
 
@@ -282,11 +370,22 @@ impl<A: ApplyOp> RaftStateMachine<TypeConfig> for Arc<StateMachineStore<A>> {
             .restore(payload.engine)
             .await
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        *self.state_machine.write().await = payload.sm;
-        *self.current_snapshot.write().await = Some(StoredSnapshot {
+        {
+            let mut sm = self.state_machine.write().await;
+            *sm = payload.sm;
+            // Durably record the adopted applied-state before returning, so a
+            // restart after installing a snapshot does not fall back to replaying
+            // the whole log.
+            self.persist_state(&sm)
+                .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        }
+        let stored = StoredSnapshot {
             meta: meta.clone(),
             data,
-        });
+        };
+        self.persist_snapshot(&stored)
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        *self.current_snapshot.write().await = Some(stored);
         Ok(())
     }
 
@@ -565,7 +664,10 @@ pub async fn start_member(
     // recovers its log + vote and rejoins safely. The volatile `LogStore` stays for
     // the in-process consensus tests, which never restart.
     let log_store = durable_log::DurableLogStore::open(log_dir)?;
-    let state_machine = Arc::new(StateMachineStore::new(applier));
+    // Durable state machine (ADR-0067): reloads the applied-state pointer so a
+    // restarted voter does not re-apply its whole committed log, and a
+    // post-compaction cold restart recovers from the persisted snapshot + engine.
+    let state_machine = Arc::new(StateMachineStore::open(applier, log_dir)?);
     let raft = openraft::Raft::new(
         node_id,
         config,
@@ -720,6 +822,81 @@ mod tests {
         assert!(ids.contains("a") && ids.contains("b"), "both points served");
 
         raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_state_machine_survives_restart_without_reapplying_log() {
+        // Ops that recreate a small engine (create + two upserts).
+        let src_dir = tempfile::tempdir().unwrap();
+        let mut src = Database::open(src_dir.path()).unwrap();
+        src.create_collection("docs", Descriptor::new(4, Dtype::F32, DistanceMetric::L2))
+            .unwrap();
+        src.upsert("docs", "a", &[1.0, 0.0, 0.0, 0.0], &serde_json::json!({"t": "a"}))
+            .unwrap();
+        src.upsert("docs", "b", &[0.0, 1.0, 0.0, 0.0], &serde_json::json!({"t": "b"}))
+            .unwrap();
+        let ops = src.replication_snapshot().unwrap();
+        let last_index = ops.len() as u64;
+
+        let sm_dir = tempfile::tempdir().unwrap();
+        let eng_dir = tempfile::tempdir().unwrap();
+
+        let entry = |i: u64, op: WalOp| Entry::<TypeConfig> {
+            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), i),
+            payload: EntryPayload::Normal(op),
+        };
+
+        // Apply every op through a durable state machine over a real engine.
+        {
+            let engine = Arc::new(Mutex::new(Database::open(eng_dir.path()).unwrap()));
+            let mut sm =
+                Arc::new(StateMachineStore::open(EngineApplier(engine), sm_dir.path()).unwrap());
+            let entries: Vec<_> = ops
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(i, op)| entry((i + 1) as u64, op))
+                .collect();
+            sm.apply(entries).await.unwrap();
+            let (applied, _) = sm.applied_state().await.unwrap();
+            assert_eq!(applied.map(|l| l.index), Some(last_index));
+        } // drop the SM and engine — simulate a process restart.
+
+        // Reopen the engine and a fresh durable state machine from the same dirs.
+        let engine2 = Arc::new(Mutex::new(Database::open(eng_dir.path()).unwrap()));
+        let mut sm2 =
+            Arc::new(StateMachineStore::open(EngineApplier(engine2.clone()), sm_dir.path()).unwrap());
+
+        // The applied-state pointer survived: openraft replays only entries AFTER
+        // it, not the whole committed log (the critical-bug fix).
+        let (applied, _) = sm2.applied_state().await.unwrap();
+        assert_eq!(
+            applied.map(|l| l.index),
+            Some(last_index),
+            "restart lost the applied-state pointer — the whole log would be re-applied"
+        );
+
+        // Re-applying the crash-window create must be idempotent, not wipe the
+        // recovered collection.
+        sm2.apply(vec![entry(1, ops[0].clone())]).await.unwrap();
+
+        let params = SearchParams {
+            k: 2,
+            ef_search: 16,
+            with_payload: false,
+            with_vector: false,
+            filter: None,
+        };
+        let hits = engine2
+            .lock()
+            .await
+            .search("docs", &[1.0, 0.0, 0.0, 0.0], &params)
+            .unwrap();
+        let ids: HashSet<_> = hits.iter().map(|m| m.id.clone()).collect();
+        assert!(
+            ids.contains("a") && ids.contains("b"),
+            "data lost after restart + create re-apply: {ids:?}"
+        );
     }
 
     /// An applier whose engine apply always fails — to prove the adapter does not
