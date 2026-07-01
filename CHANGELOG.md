@@ -34,6 +34,60 @@ for the per-release rationale and Definitions of Done.
   the previous full-HKDF derivation (proven by test), so existing encrypted data
   is unaffected; this removes redundant per-operation work (most noticeable on the
   small-record WAL path — the 16 KiB page-decrypt still dominates a page read).
+### Performance
+
+- **MVCC batch upserts coalesce into one overlay republish** (ADR-0064). Under
+  lock-free MVCC reads, `upsert_batch` applied each point to a freshly-cloned,
+  growing overlay and republished per point — O(n·overlay) for a batch of n. It
+  now builds one overlay and publishes it once (O(overlay)), which also makes the
+  batch visible **atomically**, as a single published snapshot. Single-point
+  `upsert` behavior is unchanged (it routes through the same batched path with one
+  element). Opt-in MVCC path only.
+### Changed
+
+- **Collection names are validated at creation** (behavior change). `create_collection`
+  now rejects, with `InvalidArgument`, an empty name, a name longer than 255 bytes,
+  or a name containing anything outside the documented path-safe charset (ASCII
+  letters, digits, `-`, `_`, `.`) — so a name is always a safe single REST path
+  segment (no `/`, control characters, whitespace, or non-ASCII). Previously any
+  string was accepted; pathological names now error on create. Enforced in
+  `quiver-core`, so the embedded API, REST gateway, and MCP server all inherit it.
+- **Streaming, memory-bounded segment compaction** (ADR-0068). Compaction no
+  longer materialises a collection's whole live set in RAM: a new streaming
+  block-file writer feeds the `.vec`/`.pay` columns page-by-page (byte-identical
+  to the old `write_blocks`, so no format change), and `compact_collection`
+  streams each row straight from the source segments' `mmap`s — one row resident
+  at a time instead of ~2× the collection's size. Disk-resident collections now
+  compact without pulling the dataset into RAM. The row directory and (for
+  filterable collections) the secondary index are still assembled in memory —
+  the smaller / opt-in residuals.
+- **Compaction bounded off the checkpoint critical path** (ADR-0068). A
+  checkpoint now auto-compacts **at most one** over-threshold collection instead
+  of fanning out across every one, so its added latency is a single collection's
+  streamed merge; the rest amortise across later checkpoints. The atomic
+  manifest swap stays the sole commit point — an interrupted compaction leaves
+  the pre-compaction state intact (new regression test). A fully off-lock
+  background compaction worker is specified and deferred in ADR-0068.
+### Fixed
+
+- **MVCC snapshot search no longer thins below top-k under overlay tombstones**
+  — `CollectionSnapshot::search` (the lock-free MVCC read path, ADR-0064) asked
+  the base index for exactly `k` then dropped overlay-tombstoned hits, so
+  deletes/updates shadowing base points (up to the ~20% overlay churn cap) could
+  return fewer than `k` live results. It now widens the base `k`/`ef` by the
+  live fraction — the same compensation the base indexes' own soft-delete paths
+  use — then filters, merges, and truncates to `k`. Opt-in MVCC path only; the
+  default locked read path is untouched.
+### Documentation
+
+- **`upsert_batch` durability contract corrected** — the doc previously claimed
+  a crash before the batch's `fdatasync` leaves *none* of the batch durable.
+  That is false: WAL recovery is point-in-time and keeps every intact frame up
+  to the first torn one, so an un-acknowledged batch can leave a durable
+  **prefix**. The comment on `Store::upsert_batch` (and the `Database`
+  wrapper) now states standard WAL semantics — acknowledged only after `sync()`
+  returns; whole-batch retry is safe because upserts are idempotent by
+  `external_id`. No behavior or on-disk change.
 
 ## [0.29.1] — 2026-06-28
 
