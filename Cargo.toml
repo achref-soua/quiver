@@ -183,7 +183,7 @@ webpki-roots = "0.26"
 
 # Icon embedding: ICO container writer for build.rs; winresource embeds the ICO
 # into the Windows PE binary so Explorer / taskbar show the Quiver arrowhead.
-ico = "0.3"
+ico = "0.5"
 winresource = "0.1"
 
 # Dev-only dependencies (tests, property tests, fixtures).
