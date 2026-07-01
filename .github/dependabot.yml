@@ -5,6 +5,7 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directory: "/"
+    target-branch: "develop"
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
@@ -36,6 +37,7 @@ updates:
 
   - package-ecosystem: github-actions
     directory: "/"
+    target-branch: "develop"
     schedule:
       interval: weekly
     groups:
@@ -44,12 +46,14 @@ updates:
 
   - package-ecosystem: pip
     directory: "/sdks/python"
+    target-branch: "develop"
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
 
   - package-ecosystem: npm
     directory: "/sdks/typescript"
+    target-branch: "develop"
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
