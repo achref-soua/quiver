@@ -1,0 +1,32 @@
+# OWASP ZAP alert policy for the automated DAST release gate (ADR-0069).
+# Format: <ruleID><TAB><IGNORE|WARN|FAIL><TAB><comment>. The zap-baseline.py /
+# zap-api-scan.py runs read this via `-c rules.tsv`. The CI step blocks a release
+# on a FAIL-level alert (exit 1); WARN-level findings are uploaded as reports for
+# triage. Promote a WARN to FAIL here to make it block; IGNORE a reviewed
+# false-positive (with a reason) so the gate stays a true 0-FAIL signal.
+#
+# --- Reviewed benign findings (IGNORE) ---
+10049	IGNORE	Non-Storable Content on 401 responses is correct: auth failures are intentionally non-cacheable and the JSON API serves no static/robots/sitemap content (audit-0.29.0).
+#
+# --- Security-critical active rules promoted to FAIL (block the release) ---
+40018	FAIL	SQL Injection
+40019	FAIL	SQL Injection - MySQL
+40020	FAIL	SQL Injection - Hypersonic
+40021	FAIL	SQL Injection - Oracle
+40022	FAIL	SQL Injection - PostgreSQL
+40024	FAIL	SQL Injection - SQLite
+90020	FAIL	Remote OS Command Injection
+90019	FAIL	Server Side Code Injection
+90035	FAIL	Server Side Template Injection
+90036	FAIL	Server Side Template Injection (Blind)
+40012	FAIL	Cross Site Scripting (Reflected)
+40014	FAIL	Cross Site Scripting (Persistent)
+40016	FAIL	Cross Site Scripting (Persistent - Prime)
+40017	FAIL	Cross Site Scripting (Persistent - Spider)
+6	FAIL	Path Traversal
+7	FAIL	Remote File Inclusion
+90023	FAIL	XML External Entity Attack
+40015	FAIL	LDAP Injection
+40003	FAIL	CRLF Injection
+90034	FAIL	Cloud Metadata Potentially Exposed
+40028	FAIL	ELMAH Information Leak
