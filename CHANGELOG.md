@@ -10,6 +10,17 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-07-01
+
+*Fortified* — an audit-remediation and robustness pass. Streaming, memory-bounded
+segment compaction moved off the checkpoint critical path; lock-free MVCC read
+correctness (top-k under overlay tombstones) and batch-atomicity fixes;
+collection-name validation; length-independent constant-time API-key comparison
+and an HKDF-PRK cache; a **release-blocking automated OWASP ZAP DAST gate**; and a
+single canonical cross-language cipher known-answer test gated in CI for Rust,
+Python, and TypeScript. No on-disk or wire format change; the single node is
+unchanged at zero overhead.
+
 ### Testing / CI
 
 - **Single canonical cross-language cipher KAT, gated in CI** (F-13). The client
@@ -800,7 +811,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.29.1...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.30.0...HEAD
+[0.30.0]: https://github.com/achref-soua/quiver/compare/v0.29.1...v0.30.0
 [0.29.1]: https://github.com/achref-soua/quiver/compare/v0.29.0...v0.29.1
 [0.29.0]: https://github.com/achref-soua/quiver/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/achref-soua/quiver/compare/v0.27.0...v0.28.0

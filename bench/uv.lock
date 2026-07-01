@@ -2995,7 +2995,7 @@ dev = [{ name = "pytest", specifier = ">=8" }]
 
 [[package]]
 name = "quiver-client"
-version = "0.29.1"
+version = "0.30.0"
 source = { directory = "../sdks/python" }
 dependencies = [
     { name = "httpx" },
