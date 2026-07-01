@@ -1,17 +1,18 @@
 # gitleaks configuration.
 #
 # Extends the default ruleset (so real-secret detection is unchanged) and
-# allowlists the DAST workflow, which legitimately contains a throwaway, non-secret
-# CI API key ("dast-admin-key") and the Authorization header the OWASP ZAP scan
-# authenticates with (ADR-0069). The real encryption key is generated at runtime
-# with `openssl rand` and never committed.
+# allowlists only the DAST workflow's throwaway, non-secret CI API key value
+# ("dast-admin-key", ADR-0069) — scoped to that exact string, not the whole file,
+# so a genuine secret accidentally committed to any workflow is still caught. The
+# real encryption key is generated at runtime with `openssl rand` and never
+# committed.
 title = "Quiver gitleaks config"
 
 [extend]
 useDefault = true
 
 [allowlist]
-description = "DAST workflow: throwaway CI credentials, not real secrets"
-paths = [
-  '''\.github/workflows/dast\.yml''',
+description = "DAST workflow throwaway CI credential (not a real secret)"
+regexes = [
+  '''dast-admin-key''',
 ]
