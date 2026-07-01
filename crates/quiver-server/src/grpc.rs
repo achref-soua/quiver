@@ -412,7 +412,7 @@ impl Quiver for QuiverService {
         let mut stream = request.into_inner();
         // The whole stream is one bulk load: collection comes from the first
         // chunk; later chunks must agree. Buffer points, then a single
-        // `upsert_bulk` (one fsync + one index build). ponytail: the server
+        // `upsert_bulk` (one fsync + one index build). TODO(perf): the server
         // buffers the full stream before the build; a chunked flush is the
         // upgrade path if a stream ever outgrows memory — bounded here by the
         // bulk-batch cap so it cannot OOM the node.

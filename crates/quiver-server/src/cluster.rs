@@ -9,7 +9,7 @@
 //! (dynamic, elastic membership — ADR-0065) without restarting the router; here it
 //! is seeded once from the operator-declared shard URLs. Scatter is sequential for
 //! now — correct and simple; concurrent fan-out is a perf follow-up.
-//! `ponytail`: sequential scatter, parallelise when shard count / latency matters.
+//! TODO(perf): sequential scatter, parallelise when shard count / latency matters.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,7 +21,7 @@ use quiver_cluster::{ShardMap, merge_top_k};
 /// How often a router polls the coordinator for a newer shard map (ADR-0066).
 /// Fixed: membership changes are rare and reads self-correct, so a few seconds of
 /// staleness is fine.
-// ponytail: fixed interval; make it configurable if an operator ever needs to tune it.
+// NOTE: fixed interval; make it configurable if an operator ever needs to tune it.
 pub(crate) const MAP_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 use quiver_embed::{
     DistanceMetric, Filter, FilterableField, IndexKind, IndexSpec, VectorEncryption,
@@ -56,7 +56,7 @@ pub(crate) struct Cluster {
 }
 
 // How long a write keeps hunting for a shard's Raft leader before giving up — the
-// window an election takes to settle. ponytail: fixed ~3 s ceiling (60 × 50 ms);
+// window an election takes to settle. NOTE: fixed ~3 s ceiling (60 × 50 ms);
 // make it configurable only if a deployment's elections run longer.
 const WRITE_LEADER_ATTEMPTS: usize = 60;
 const WRITE_LEADER_BACKOFF: Duration = Duration::from_millis(50);

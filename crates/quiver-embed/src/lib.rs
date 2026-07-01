@@ -2136,7 +2136,7 @@ impl Database {
         // copied tree opens with no replay (ADR-0050).
         self.checkpoint()?;
         let (files, bytes) = copy_tree(self.store.dir(), dest)?;
-        // ponytail: flush the snapshot root's metadata only; a backup target is
+        // NOTE: flush the snapshot root's metadata only; a backup target is
         // re-takeable, so per-file fsync isn't warranted. Add it if snapshots
         // must survive an immediate post-copy crash.
         let _ = std::fs::File::open(dest).and_then(|f| f.sync_all());

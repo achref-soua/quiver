@@ -810,7 +810,7 @@ impl App {
                     _ => return Effect::None,
                 };
                 // Enter on an empty input repeats the most recent search.
-                // ponytail: shell-style last-query recall — no full history picker.
+                // NOTE: shell-style last-query recall — no full history picker.
                 let query = if typed.is_empty() {
                     self.recent_searches.first().cloned()
                 } else {
