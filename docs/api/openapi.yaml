@@ -8,7 +8,7 @@
 openapi: 3.1.0
 info:
   title: Quiver REST API
-  version: 0.29.0
+  version: 0.30.0
   summary: The security-first vector database — REST surface.
   description: |
     Every `/v1/*` and `/cluster/*` endpoint requires a Bearer API key

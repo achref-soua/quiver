@@ -89,11 +89,14 @@ jobs:
         run: cargo package --workspace --no-verify
 
       - uses: astral-sh/setup-uv@v5
-      - name: Build + check the Python SDK distribution
+      - name: Build + test the Python SDK
         working-directory: sdks/python
         run: |
           uv build
           uvx twine check dist/*
+          # Run the SDK test suite — includes the cross-language cipher KAT (F-13),
+          # so drift from the shared kat/client-ciphers.json fails the build.
+          uv run pytest -q
 
       - uses: pnpm/action-setup@v4
         with:
@@ -101,11 +104,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Build + dry-run pack the TypeScript SDK
+      - name: Build + test + dry-run pack the TypeScript SDK
         working-directory: sdks/typescript
         run: |
           pnpm install --frozen-lockfile
           pnpm build
+          # Run the SDK test suite — includes the cross-language cipher KAT (F-13).
+          pnpm test
           npm pack --dry-run
 
   helm:
@@ -120,3 +125,13 @@ jobs:
         run: helm template q infra/helm/quiver --set encryption.masterKey="$(openssl rand -hex 32)" > /dev/null
       - name: Helm template (insecure)
         run: helm template q infra/helm/quiver --set encryption.insecure=true > /dev/null
+
+  # Dynamic OWASP ZAP scan of a live server (ADR-0069). Skipped on pull requests
+  # (it builds and boots the server + pulls the ZAP image — too heavy for every
+  # push); it runs on main/develop pushes and manual dispatch so a DAST regression
+  # is caught on the mainline before a release tag hits the blocking gate in
+  # release.yml.
+  dast:
+    name: DAST (OWASP ZAP)
+    if: ${{ github.event_name != 'pull_request' }}
+    uses: ./.github/workflows/dast.yml

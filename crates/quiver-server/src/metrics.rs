@@ -57,7 +57,7 @@ struct Inner {
 
 /// Process-wide metrics registry, rendered as Prometheus text on `/metrics`.
 ///
-/// ponytail: one global mutex (mirrors the rate limiter, ADR-0049). Recording is
+/// TODO(perf): one global mutex (mirrors the rate limiter, ADR-0049). Recording is
 /// a HashMap lookup + a few integer adds under the lock; per-route sharded
 /// atomics are the upgrade path if a profile ever shows contention here.
 #[derive(Default)]

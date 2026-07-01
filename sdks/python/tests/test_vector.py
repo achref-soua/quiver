@@ -2,6 +2,8 @@
 """Tests for client-side opaque vector encryption (quiver.vector)."""
 
 import base64
+import json
+from pathlib import Path
 
 import pytest
 
@@ -19,6 +21,16 @@ KEY_HEX = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
 
 def cipher() -> VectorCipher:
     return VectorCipher.from_hex(KEY_HEX)
+
+
+def test_cross_language_kat_decrypts_the_rust_reference_envelope() -> None:
+    # The single canonical KAT (F-13), shared with the Rust and TypeScript suites:
+    # decrypting the reference envelope proves byte-exact interop (ADR-0032).
+    kat = json.loads(
+        (Path(__file__).parents[3] / "kat" / "client-ciphers.json").read_text()
+    )["opaque_vector"]
+    c = VectorCipher.from_hex(kat["key_hex"])
+    assert c.open(kat["envelope"]) == kat["plaintext"]
 
 
 def test_seal_then_open_round_trips_bit_exactly():
