@@ -1096,8 +1096,8 @@ impl AppState {
         multivector: bool,
         vector_encryption: VectorEncryption,
     ) -> Result<CollectionInfo, Error> {
-        self.ensure_writable("create_collection")?;
         self.authorize(principal, Action::Admin, "create_collection", &name)?;
+        self.ensure_writable("create_collection")?;
         self.limits.check_dim(dim as usize)?;
         if let Some(c) = &self.cluster {
             let result = c
@@ -1273,8 +1273,8 @@ impl AppState {
         principal: &Principal,
         name: String,
     ) -> Result<bool, Error> {
-        self.ensure_writable("delete_collection")?;
         self.authorize(principal, Action::Admin, "delete_collection", &name)?;
+        self.ensure_writable("delete_collection")?;
         if let Some(c) = &self.cluster {
             let result = c.drop_collection(&name).await;
             self.audit.record(
@@ -1312,8 +1312,8 @@ impl AppState {
         collection: String,
         points: Vec<PointIn>,
     ) -> Result<u64, Error> {
-        self.ensure_writable("upsert")?;
         self.authorize(principal, Action::Write, "upsert", &collection)?;
+        self.ensure_writable("upsert")?;
         self.limits.check_batch(points.len())?;
         for p in &points {
             self.limits.check_vector_len(p.vector.len())?;
@@ -1321,8 +1321,12 @@ impl AppState {
         }
         if let Some(c) = &self.cluster {
             let result = c.upsert(&collection, points).await;
-            self.audit
-                .record(principal.actor(), "upsert", &collection, Outcome::of(&result));
+            self.audit.record(
+                principal.actor(),
+                "upsert",
+                &collection,
+                Outcome::of(&result),
+            );
             return result;
         }
         // Per-shard Raft write path (ADR-0067): prepare each point's op on the
@@ -1379,8 +1383,8 @@ impl AppState {
         collection: String,
         points: Vec<PointIn>,
     ) -> Result<u64, Error> {
-        self.ensure_writable("upsert")?;
         self.authorize(principal, Action::Write, "upsert", &collection)?;
+        self.ensure_writable("upsert")?;
         self.limits.check_bulk_batch(points.len())?;
         for p in &points {
             self.limits.check_vector_len(p.vector.len())?;
@@ -1427,8 +1431,8 @@ impl AppState {
         principal: &Principal,
         destination: String,
     ) -> Result<SnapshotInfo, Error> {
-        self.ensure_writable("snapshot")?;
         self.authorize_global(principal, Action::Admin, "snapshot")?;
+        self.ensure_writable("snapshot")?;
         let dest = std::path::PathBuf::from(&destination);
         let result = self.write_blocking(move |db| db.snapshot(&dest)).await;
         self.audit.record(
@@ -1446,8 +1450,8 @@ impl AppState {
         collection: String,
         ids: Vec<String>,
     ) -> Result<u64, Error> {
-        self.ensure_writable("delete_points")?;
         self.authorize(principal, Action::Write, "delete_points", &collection)?;
+        self.ensure_writable("delete_points")?;
         if let Some(c) = &self.cluster {
             let result = c.delete_points(&collection, ids).await;
             self.audit.record(
