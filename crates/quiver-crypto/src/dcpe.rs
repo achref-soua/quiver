@@ -525,6 +525,19 @@ impl DcpeCipher {
         for &c in ciphertext {
             mac.update(&c.to_le_bytes());
         }
+        // Bind the normalization parameters (when present) so a shift/scale
+        // mismatch between the encrypting and decrypting cipher fails the tag
+        // (fail-closed) instead of silently denormalizing to a wrong plaintext,
+        // matching the fail-closed treatment of `approximation_factor`. Absent
+        // normalization updates nothing, preserving the tag for existing
+        // ciphertexts (the shipped path carries no normalization).
+        if let Some(n) = &self.normalization {
+            mac.update(b"quiver/dcpe/v2/norm");
+            mac.update(&n.scale.to_le_bytes());
+            for &s in &n.shift {
+                mac.update(&s.to_le_bytes());
+            }
+        }
         Ok(mac)
     }
 
@@ -683,6 +696,26 @@ mod tests {
         let mut sealed = cipher.encrypt(&[0.1, 0.2, 0.3, 0.4]).expect("encrypt");
         sealed.ciphertext[0] += 0.5;
         assert!(matches!(cipher.decrypt(&sealed), Err(DcpeError::Integrity)));
+    }
+
+    #[test]
+    fn normalization_mismatch_fails_integrity() {
+        // The tag binds the normalization params, so decrypting a normalized
+        // ciphertext with a cipher that lacks or changes the normalization
+        // fails closed rather than returning silently wrong plaintext.
+        let norm = Normalization::new(vec![0.1, 0.2, 0.3, 0.4], 3.0).expect("normalization");
+        let enc = cipher(0.1)
+            .with_normalization(norm)
+            .encrypt(&[0.5, 0.6, 0.7, 0.8])
+            .expect("encrypt");
+        // Same key and beta, but no normalization → tag mismatch.
+        assert!(matches!(cipher(0.1).decrypt(&enc), Err(DcpeError::Integrity)));
+        // A different normalization scale also fails closed.
+        let other = Normalization::new(vec![0.1, 0.2, 0.3, 0.4], 4.0).expect("normalization");
+        assert!(matches!(
+            cipher(0.1).with_normalization(other).decrypt(&enc),
+            Err(DcpeError::Integrity)
+        ));
     }
 
     // THE core property: top-k nearest neighbours over ciphertexts match the
