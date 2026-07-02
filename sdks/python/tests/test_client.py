@@ -206,6 +206,18 @@ def test_get_point_found_and_missing():
 
 
 @respx.mock
+def test_path_segments_are_percent_encoded():
+    # An id/name containing URL-reserved characters must be escaped, not split
+    # the path. respx matches the escaped URL, so the call routes correctly.
+    route = respx.get(f"{BASE}/v1/collections/items/points/a%2Fb%3Fc").mock(
+        return_value=httpx.Response(200, json={"id": "a/b?c", "payload": {}, "vector": [1.0]})
+    )
+    with Client(BASE) as q:
+        assert q.get_point("items", "a/b?c") == Match("a/b?c", 0.0, {}, [1.0])
+    assert route.called
+
+
+@respx.mock
 def test_search_parses_matches_and_forwards_filter():
     route = respx.post(f"{BASE}/v1/collections/items/query").mock(
         return_value=httpx.Response(

@@ -31,6 +31,7 @@ from .client import (
     _document_dict,
     _point_dict,
     _raise_for_status,
+    _seg,
 )
 
 if TYPE_CHECKING:
@@ -113,11 +114,11 @@ class AsyncClient:
 
     async def get_collection(self, name: str) -> CollectionInfo:
         """Fetch one collection's metadata."""
-        return _collection((await self._send("GET", f"/v1/collections/{name}")).json())
+        return _collection((await self._send("GET", f"/v1/collections/{_seg(name)}")).json())
 
     async def delete_collection(self, name: str) -> bool:
         """Delete a collection; returns whether it existed."""
-        body = (await self._send("DELETE", f"/v1/collections/{name}")).json()
+        body = (await self._send("DELETE", f"/v1/collections/{_seg(name)}")).json()
         return bool(body["existed"])
 
     # --- points ---
@@ -125,18 +126,18 @@ class AsyncClient:
     async def upsert(self, collection: str, points: Iterable[PointInput]) -> int:
         """Insert or replace points; returns the number upserted."""
         body = {"points": [_point_dict(p) for p in points]}
-        resp = await self._send("POST", f"/v1/collections/{collection}/points", body)
+        resp = await self._send("POST", f"/v1/collections/{_seg(collection)}/points", body)
         return int(resp.json()["upserted"])
 
     async def delete_points(self, collection: str, ids: Sequence[str]) -> int:
         """Delete points by id; returns the number deleted."""
         body = {"ids": list(ids)}
-        resp = await self._send("DELETE", f"/v1/collections/{collection}/points", body)
+        resp = await self._send("DELETE", f"/v1/collections/{_seg(collection)}/points", body)
         return int(resp.json()["deleted"])
 
     async def get_point(self, collection: str, id: str) -> Optional[Match]:
         """Fetch a point by id, or ``None`` if it does not exist."""
-        resp = await self._http.request("GET", f"/v1/collections/{collection}/points/{id}")
+        resp = await self._http.request("GET", f"/v1/collections/{_seg(collection)}/points/{_seg(id)}")
         if resp.status_code == 404:
             return None
         _raise_for_status(resp)
@@ -164,7 +165,7 @@ class AsyncClient:
         }
         if filter is not None:
             body["filter"] = filter
-        resp = await self._send("POST", f"/v1/collections/{collection}/query", body)
+        resp = await self._send("POST", f"/v1/collections/{_seg(collection)}/query", body)
         return [
             Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
             for m in resp.json()["matches"]
@@ -208,7 +209,7 @@ class AsyncClient:
             body["sparse_values"] = [float(v) for v in sparse.values]
         if filter is not None:
             body["filter"] = filter
-        resp = await self._send("POST", f"/v1/collections/{collection}/query/hybrid", body)
+        resp = await self._send("POST", f"/v1/collections/{_seg(collection)}/query/hybrid", body)
         return [
             Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
             for m in resp.json()["matches"]
@@ -223,7 +224,7 @@ class AsyncClient:
                 for p in points
             ]
         }
-        resp = await self._send("POST", f"/v1/collections/{collection}/points:text", body)
+        resp = await self._send("POST", f"/v1/collections/{_seg(collection)}/points:text", body)
         return int(resp.json()["upserted"])
 
     async def search_text(
@@ -252,7 +253,7 @@ class AsyncClient:
         }
         if filter is not None:
             body["filter"] = filter
-        resp = await self._send("POST", f"/v1/collections/{collection}/query/text", body)
+        resp = await self._send("POST", f"/v1/collections/{_seg(collection)}/query/text", body)
         return [
             Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
             for m in resp.json()["matches"]
@@ -275,7 +276,7 @@ class AsyncClient:
         }
         if filter is not None:
             body["filter"] = filter
-        resp = await self._send("POST", f"/v1/collections/{collection}/fetch", body)
+        resp = await self._send("POST", f"/v1/collections/{_seg(collection)}/fetch", body)
         return [
             Match(id=p["id"], score=0.0, payload=p.get("payload"), vector=p.get("vector"))
             for p in resp.json()["points"]
@@ -323,13 +324,13 @@ class AsyncClient:
     async def upsert_documents(self, collection: str, documents: Iterable[Document]) -> int:
         """Insert or replace multi-vector documents; returns the number upserted."""
         body = {"documents": [_document_dict(d) for d in documents]}
-        resp = await self._send("POST", f"/v1/collections/{collection}/documents", body)
+        resp = await self._send("POST", f"/v1/collections/{_seg(collection)}/documents", body)
         return int(resp.json()["upserted"])
 
     async def delete_documents(self, collection: str, ids: Sequence[str]) -> int:
         """Delete multi-vector documents by id; returns the number deleted."""
         body = {"ids": list(ids)}
-        resp = await self._send("DELETE", f"/v1/collections/{collection}/documents", body)
+        resp = await self._send("DELETE", f"/v1/collections/{_seg(collection)}/documents", body)
         return int(resp.json()["deleted"])
 
     async def search_multi_vector(
@@ -353,7 +354,7 @@ class AsyncClient:
         }
         if filter is not None:
             body["filter"] = filter
-        resp = await self._send("POST", f"/v1/collections/{collection}/documents/query", body)
+        resp = await self._send("POST", f"/v1/collections/{_seg(collection)}/documents/query", body)
         return [
             DocumentMatch(
                 id=m["id"], score=m["score"], payload=m.get("payload"), vectors=m.get("vectors")

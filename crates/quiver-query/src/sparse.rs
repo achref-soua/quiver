@@ -98,6 +98,11 @@ impl SparseVector {
 /// makes it the standard, robust hybrid fuser. Ties break by id for determinism.
 pub fn rrf_fuse(rankings: &[Vec<String>], k0: f32, top_k: usize) -> Vec<(String, f32)> {
     use std::collections::HashMap;
+    // The rank-bias constant is defined for k0 >= 0. Floor it so the denominator
+    // `k0 + rank + 1` is always >= 1: a caller-supplied negative k0 (e.g. -1.0)
+    // would otherwise divide by zero (+inf) at rank 0 or, fractional, invert the
+    // fusion by giving early ranks negative weight.
+    let k0 = k0.max(0.0);
     let mut scores: HashMap<String, f32> = HashMap::new();
     for ranking in rankings {
         for (rank, id) in ranking.iter().enumerate() {
@@ -190,5 +195,17 @@ mod tests {
     fn rrf_truncates_to_top_k() {
         let r = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
         assert_eq!(rrf_fuse(&[r], DEFAULT_RRF_K0, 2).len(), 2);
+    }
+
+    #[test]
+    fn rrf_tolerates_non_positive_k0() {
+        // A negative k0 must not divide by zero (+inf) or invert the ranking:
+        // the first-ranked doc must still score highest and all scores finite.
+        let r = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let fused = rrf_fuse(&[r], -1.0, 3);
+        assert_eq!(fused.len(), 3);
+        assert!(fused.iter().all(|(_, s)| s.is_finite()));
+        assert_eq!(fused[0].0, "a", "first-ranked doc should score highest");
+        assert!(fused[0].1 >= fused[1].1 && fused[1].1 >= fused[2].1);
     }
 }

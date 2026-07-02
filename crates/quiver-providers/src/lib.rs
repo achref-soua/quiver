@@ -226,22 +226,44 @@ fn openai_body(model: &str, texts: &[String]) -> Value {
     json!({ "model": model, "input": texts })
 }
 
-/// Parse an OpenAI `/v1/embeddings` response into vectors (order preserved). Pure.
+/// Parse an OpenAI `/v1/embeddings` response into vectors, keyed by each row's
+/// `index` back-reference — not array position. The OpenAI contract does not
+/// guarantee `data` is returned in input order, and OpenAI-compatible servers
+/// (vLLM, LM Studio, llama.cpp) can reorder rows under continuous batching;
+/// trusting position would attach the wrong vector to a point. Pure.
 fn parse_openai(body: &Value) -> Result<Vec<Vec<f32>>, ProviderError> {
     let data = body
         .get("data")
         .and_then(Value::as_array)
         .ok_or_else(|| ProviderError::Parse("missing `data` array".into()))?;
-    data.iter()
-        .map(|row| {
-            row.get("embedding")
-                .and_then(Value::as_array)
-                .ok_or_else(|| ProviderError::Parse("a `data` row had no `embedding` array".into()))
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_f64().map(|f| f as f32))
-                        .collect()
-                })
+    let mut out: Vec<Option<Vec<f32>>> = vec![None; data.len()];
+    for (pos, row) in data.iter().enumerate() {
+        let embedding: Vec<f32> = row
+            .get("embedding")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ProviderError::Parse("a `data` row had no `embedding` array".into()))?
+            .iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect();
+        // Fall back to position when `index` is absent (some minimal servers).
+        let idx = row
+            .get("index")
+            .and_then(Value::as_u64)
+            .map_or(pos, |i| i as usize);
+        let slot = out
+            .get_mut(idx)
+            .ok_or_else(|| ProviderError::Parse(format!("`data` row index {idx} out of range")))?;
+        if slot.is_some() {
+            return Err(ProviderError::Parse(format!(
+                "duplicate `data` row index {idx}"
+            )));
+        }
+        *slot = Some(embedding);
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(i, e)| {
+            e.ok_or_else(|| ProviderError::Parse(format!("missing embedding for input {i}")))
         })
         .collect()
 }
@@ -612,6 +634,33 @@ mod tests {
     fn parse_openai_rejects_malformed() {
         assert!(parse_openai(&json!({"oops": 1})).is_err());
         assert!(parse_openai(&json!({"data":[{"no_embedding": 1}]})).is_err());
+    }
+
+    #[test]
+    fn parse_openai_honours_index_when_rows_are_reordered() {
+        // A server may return rows out of input order (continuous batching);
+        // parse must key by `index`, not array position.
+        let resp = json!({"data":[
+            {"index":1,"embedding":[9.0,9.0]},
+            {"index":0,"embedding":[1.0,1.0]},
+        ]});
+        assert_eq!(
+            parse_openai(&resp).unwrap(),
+            vec![vec![1.0_f32, 1.0], vec![9.0_f32, 9.0]]
+        );
+        // A duplicate or out-of-range index is an error, not silent corruption.
+        assert!(
+            parse_openai(&json!({"data":[
+                {"index":0,"embedding":[1.0]},
+                {"index":0,"embedding":[2.0]},
+            ]}))
+            .is_err()
+        );
+        // Absent `index` falls back to position (order preserved).
+        assert_eq!(
+            parse_openai(&json!({"data":[{"embedding":[1.0]},{"embedding":[2.0]}]})).unwrap(),
+            vec![vec![1.0_f32], vec![2.0_f32]]
+        );
     }
 
     #[test]

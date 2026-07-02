@@ -340,6 +340,23 @@ pub struct Database {
     // `QUIVER_MVCC_READS` at open and overridable via `set_mvcc_reads`. When off,
     // the proven in-place RwLock read path is used with zero overhead.
     mvcc: bool,
+    // Auto-checkpoint budget: seal the active buffer once this many un-checkpointed
+    // bytes accumulate, so a large bulk load stays memory-frugal by default rather
+    // than holding the whole active segment in RAM until an explicit checkpoint.
+    // Dim-independent (counts vector + payload bytes). `0` disables it.
+    checkpoint_after_bytes: usize,
+    active_bytes: usize,
+}
+
+/// Default active-buffer budget before an automatic checkpoint (256 MiB).
+const DEFAULT_CHECKPOINT_BYTES: usize = 256 << 20;
+
+// Active-buffer byte budget before an automatic checkpoint (`QUIVER_CHECKPOINT_BYTES`).
+fn checkpoint_bytes_from_env() -> usize {
+    std::env::var("QUIVER_CHECKPOINT_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_CHECKPOINT_BYTES)
 }
 
 // Whether `QUIVER_MVCC_READS` requests lock-free MVCC reads (ADR-0064).
@@ -412,7 +429,26 @@ impl Database {
             store,
             collections,
             mvcc,
+            checkpoint_after_bytes: checkpoint_bytes_from_env(),
+            active_bytes: 0,
         })
+    }
+
+    /// Set the active-buffer byte budget that triggers an automatic checkpoint
+    /// during ingest; `0` disables auto-checkpointing (the caller then controls
+    /// checkpoint timing). Defaults to 256 MiB (`QUIVER_CHECKPOINT_BYTES`).
+    pub fn set_checkpoint_after_bytes(&mut self, bytes: usize) {
+        self.checkpoint_after_bytes = bytes;
+    }
+
+    // Account for `added` newly-written bytes and seal the active buffer if the
+    // un-checkpointed total crossed the budget, keeping ingest memory-frugal.
+    fn note_written(&mut self, added: usize) -> Result<()> {
+        self.active_bytes = self.active_bytes.saturating_add(added);
+        if self.checkpoint_after_bytes > 0 && self.active_bytes >= self.checkpoint_after_bytes {
+            self.checkpoint()?;
+        }
+        Ok(())
     }
 
     /// Create a collection. Errors if the name already exists, or if the index
@@ -490,6 +526,17 @@ impl Database {
     /// # Errors
     /// Propagates a store apply error.
     pub fn apply_replicated(&mut self, op: WalOp) -> Result<()> {
+        // Idempotent replay: re-applying a CreateCollection for a name already
+        // loaded would overwrite the live collection with a fresh empty state and
+        // lose its data. This happens in the Raft crash window (an entry applied to
+        // the engine but not yet recorded in the durable applied-state pointer is
+        // replayed on restart) and on a duplicate replication frame — skip it.
+        // Collection ids are never reused, so a name maps to one collection ever.
+        if let WalOp::CreateCollection { name, .. } = &op
+            && self.collections.contains_key(name)
+        {
+            return Ok(());
+        }
         let target = match &op {
             WalOp::CreateCollection { collection_id, .. }
             | WalOp::DropCollection { collection_id }
@@ -683,9 +730,12 @@ impl Database {
             .collect();
 
         self.store.upsert_batch(coll_id, &records)?;
+        let batch_bytes: usize = records.iter().map(|(_, v, p)| v.len() * 4 + p.len()).sum();
+        let count = records.len() as u64;
 
         if is_client_side {
-            return Ok(records.len() as u64);
+            self.note_written(batch_bytes)?;
+            return Ok(count);
         }
 
         let handle = self
@@ -707,7 +757,8 @@ impl Database {
         for (id, _, payload) in points {
             sparse_index_upsert_point(handle, id, payload);
         }
-        Ok(records.len() as u64)
+        self.note_written(batch_bytes)?;
+        Ok(count)
     }
 
     /// Upsert a large batch for a bulk load, deferring all index work to a single
@@ -743,6 +794,8 @@ impl Database {
             .collect();
 
         self.store.upsert_batch(coll_id, &records)?;
+        let batch_bytes: usize = records.iter().map(|(_, v, p)| v.len() * 4 + p.len()).sum();
+        let count = records.len() as u64;
 
         // Defer the dense and sparse index maintenance to a single rebuild on the
         // next read (a client-side-encrypted collection has no index to rebuild, but
@@ -752,7 +805,8 @@ impl Database {
             .get_mut(collection)
             .ok_or_else(|| Error::CollectionNotFound(collection.to_owned()))?;
         mark_stale(handle);
-        Ok(records.len() as u64)
+        self.note_written(batch_bytes)?;
+        Ok(count)
     }
 
     /// Delete a point by id. Returns whether it existed.
@@ -1806,6 +1860,8 @@ impl Database {
             }
         }
         self.store.checkpoint_with_index_snapshots(&snapshots)?;
+        // The active buffer is sealed to disk; reset the auto-checkpoint budget.
+        self.active_bytes = 0;
         Ok(())
     }
 
@@ -2119,7 +2175,13 @@ fn build_in_memory_index(
         // The disk-resident artifact is sealed through the store, not here.
         IndexKind::DiskVamana => return Ok(None),
         IndexKind::Ivf => {
+            // Scale the coarse quantizer with the corpus (~√n, like the Colbert
+            // path and FAISS guidance) so a query probes a small fraction of cells
+            // instead of scanning every posting. A fixed nlist made large
+            // collections a full scan (O(n) queries); √n keeps them sublinear.
+            let nlist = ((ids.len() as f64).sqrt().ceil() as usize).clamp(64, 65_536);
             let cfg = IvfConfig {
+                nlist,
                 quantization: descriptor.index.pq_subspaces.map(|m| m as usize),
                 ..IvfConfig::default()
             };
@@ -2676,7 +2738,13 @@ fn sparse_vector_from_payload(payload: &[u8]) -> Option<SparseVector> {
 // BM25 over text alone.
 fn sparse_vector_from_value(payload: &Value) -> Option<SparseVector> {
     if let Some(raw) = payload.get(SPARSE_KEY) {
-        return serde_json::from_value::<SparseVector>(raw.clone()).ok();
+        let sv = serde_json::from_value::<SparseVector>(raw.clone()).ok()?;
+        // Enforce the documented "malformed → None" contract: a shape-invalid
+        // vector (unequal indices/values lengths, duplicate dims) is dropped
+        // rather than silently truncated by the zip in the index, which would
+        // under-score the point. Symmetric with the query side, which rejects
+        // the same mismatch.
+        return sv.validate().ok().map(|()| sv);
     }
     let text = payload.get(TEXT_KEY)?.as_str()?;
     Some(text_to_sparse(text))
@@ -2845,6 +2913,49 @@ fn sec_value(field_type: FieldType, value: &Value) -> Option<SecValue> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn malformed_stored_sparse_is_dropped_not_truncated() {
+        // A stored sparse vector with unequal indices/values lengths must be
+        // dropped (None), not silently truncated by the index zip. A valid one
+        // still parses.
+        let bad = json!({ SPARSE_KEY: { "indices": [1, 2, 3], "values": [1.0] } });
+        assert!(sparse_vector_from_value(&bad).is_none());
+        let dup = json!({ SPARSE_KEY: { "indices": [1, 1], "values": [1.0, 2.0] } });
+        assert!(sparse_vector_from_value(&dup).is_none());
+        let good = json!({ SPARSE_KEY: { "indices": [1, 2], "values": [1.0, 2.0] } });
+        assert!(sparse_vector_from_value(&good).is_some());
+    }
+
+    #[test]
+    fn auto_checkpoint_bounds_the_active_buffer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        db.create_collection("c", desc()).unwrap();
+        let vecs: Vec<Vec<f32>> = (0..20).map(|i| vec![i as f32; 4]).collect();
+        let ids: Vec<String> = (0..20).map(|i| format!("k{i}")).collect();
+        let empty = serde_json::json!({});
+        let points: Vec<(&str, &[f32], &serde_json::Value)> = ids
+            .iter()
+            .zip(&vecs)
+            .map(|(id, v)| (id.as_str(), v.as_slice(), &empty))
+            .collect();
+
+        // A tiny budget makes this batch cross it → an automatic checkpoint seals
+        // the active buffer and resets the counter.
+        db.set_checkpoint_after_bytes(64);
+        db.upsert_bulk("c", &points).unwrap();
+        assert_eq!(db.active_bytes, 0, "auto-checkpoint did not fire");
+        assert_eq!(db.len("c").unwrap(), 20);
+
+        // Disabled: the counter accumulates and never triggers a checkpoint.
+        db.set_checkpoint_after_bytes(0);
+        db.upsert_bulk("c", &points).unwrap();
+        assert!(
+            db.active_bytes > 0,
+            "disabled auto-checkpoint should accumulate"
+        );
+    }
 
     fn desc() -> Descriptor {
         Descriptor::new(4, Dtype::F32, DistanceMetric::L2)
