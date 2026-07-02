@@ -377,7 +377,14 @@ impl Ivf {
         let centroids = if n == 0 {
             vec![0f32; nlist * dim]
         } else {
-            kmeans(&sample, train_n, dim, nlist, config.kmeans_iters, config.seed)
+            kmeans(
+                &sample,
+                train_n,
+                dim,
+                nlist,
+                config.kmeans_iters,
+                config.seed,
+            )
         };
 
         // Pass 2 — stream every row again; assign to a cell and encode. No
@@ -1160,16 +1167,20 @@ mod tests {
                 ..IvfConfig::default()
             };
             let batch = Ivf::build(&ids, &flat, dim, metric, cfg()).unwrap();
-            let stream =
-                Ivf::build_streaming(&ids, dim, metric, cfg(), || flat.chunks(dim).map(<[f32]>::to_vec))
-                    .unwrap();
+            let stream = Ivf::build_streaming(&ids, dim, metric, cfg(), || {
+                flat.chunks(dim).map(<[f32]>::to_vec)
+            })
+            .unwrap();
             for qi in [0usize, 7, 123, 599] {
                 let q: Vec<f32> = flat[qi * dim..(qi + 1) * dim].to_vec();
                 let a = batch.search(&q, 10, 24).unwrap();
                 let b = stream.search(&q, 10, 24).unwrap();
                 assert_eq!(a.len(), b.len(), "{metric:?}: result count differs");
                 for (x, y) in a.iter().zip(&b) {
-                    assert_eq!(x.id, y.id, "{metric:?}: streaming build diverged from batch");
+                    assert_eq!(
+                        x.id, y.id,
+                        "{metric:?}: streaming build diverged from batch"
+                    );
                     assert_eq!(
                         x.distance.to_bits(),
                         y.distance.to_bits(),

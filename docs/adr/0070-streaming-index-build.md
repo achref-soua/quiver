@@ -85,15 +85,24 @@ recovery, the manifest protocol, and the write path are all unchanged.
 
 Shipped incrementally, correctness-first:
 
-- **Increment A (this ADR):** `Store::stream_vectors` over the live segments'
-  `mmap`'d `.vec`; an `Ivf::build_streaming` that takes the chunked source and runs
-  the sample-train + encode-stream passes, byte-identical in result to `Ivf::build`
-  on the same rows and seed (a property test asserts parity on small collections);
-  `build_in_memory_index` routes the IVF+PQ path through it while keeping IVF-Flat
-  and the other index kinds on the in-RAM path. A scale-harness tier (`≥ 20M`)
-  proves the build peak RSS no longer tracks `n·dim`.
-- **Sequenced next:** the on-disk / sharded primary index (the other O(n) resident
-  cost), then a 100M reference-hardware run recorded honestly.
+- **Increment A (shipped):** `Ivf::build_streaming` — the two-pass (reservoir-sample
+  train, stream-encode) build over a re-iterable vector source, byte-identical in
+  result to `Ivf::build` on the same rows and seed (a parity test asserts this on
+  small collections, for both L2 and Cosine). This is the tested core that de-risks
+  the design; it holds only the sample, codebooks, codes, and postings resident.
+- **Increment B (sequenced next — the lock-model-careful part):** a `Store`
+  immutable-segment **vector stream** — a lock-free handle over the sealed `.vec`
+  `mmap`s at a captured manifest version, valid for the life of an off-lock rebuild
+  (the segments are write-once and pinned against GC until the manifest advances) —
+  threaded through `RebuildScan` / the off-lock rebuild (ADR-0062) so
+  `build_in_memory_index` routes the IVF+PQ path through `build_streaming` without
+  ever materialising `flat`. This is the piece that turns the primitive into a real
+  memory win on the live path; it touches the storage/rebuild seam and the lock
+  model, so it is a focused, separately-reviewed increment rather than rushed.
+  Validated by a scale-harness tier (`≥ 20M`) asserting build peak RSS no longer
+  tracks `n·dim`.
+- **Increment C (sequenced):** the on-disk / sharded primary index (the other O(n)
+  resident cost), then a 100M reference-hardware run recorded honestly.
 
 Until Increment A lands and is measured, the ceiling stays exactly what the scale
 characterization states: **~10M full build on a 15 GiB box, 100M pending.** No
