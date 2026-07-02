@@ -101,6 +101,10 @@ fn scale_ingest_and_query() {
     let batch = env_usize("QUIVER_SCALE_BATCH", 20_000);
     let queries = env_usize("QUIVER_SCALE_QUERIES", 200);
     let recall_cap = env_usize("QUIVER_SCALE_RECALL_CAP", 2_000_000);
+    // Seal to disk this often so the active buffer (and RAM) stays bounded during
+    // a large ingest; rounded to a whole number of batches.
+    let checkpoint_every =
+        (env_usize("QUIVER_SCALE_CHECKPOINT", 1_000_000) / batch).max(1) * batch;
 
     // Keep data on the real disk (a tempdir under a caller-chosen root; NOT /tmp,
     // which may be RAM-backed and would OOM at scale).
@@ -152,6 +156,12 @@ fn scale_ingest_and_query() {
             .collect();
         db.upsert_bulk("scale", &points).unwrap();
         i += this as u64;
+        // Seal the active buffer to disk periodically so ingest stays memory-frugal
+        // — without this the whole active segment (vectors + primary index)
+        // accumulates in RAM until the first checkpoint.
+        if (i as usize) % checkpoint_every == 0 {
+            db.checkpoint().unwrap();
+        }
         if (i as usize) % (batch * 20) == 0 || i as usize == n {
             eprintln!(
                 "  ingested {i}/{n}  ({:.0} vec/s, RSS {} MiB)",
