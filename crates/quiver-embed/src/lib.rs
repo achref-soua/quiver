@@ -2951,7 +2951,10 @@ mod tests {
         // Disabled: the counter accumulates and never triggers a checkpoint.
         db.set_checkpoint_after_bytes(0);
         db.upsert_bulk("c", &points).unwrap();
-        assert!(db.active_bytes > 0, "disabled auto-checkpoint should accumulate");
+        assert!(
+            db.active_bytes > 0,
+            "disabled auto-checkpoint should accumulate"
+        );
     }
 
     fn desc() -> Descriptor {
