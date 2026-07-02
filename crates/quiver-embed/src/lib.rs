@@ -436,7 +436,7 @@ impl Database {
 
     /// Set the active-buffer byte budget that triggers an automatic checkpoint
     /// during ingest; `0` disables auto-checkpointing (the caller then controls
-    /// checkpoint timing). Defaults to [`DEFAULT_CHECKPOINT_BYTES`].
+    /// checkpoint timing). Defaults to 256 MiB (`QUIVER_CHECKPOINT_BYTES`).
     pub fn set_checkpoint_after_bytes(&mut self, bytes: usize) {
         self.checkpoint_after_bytes = bytes;
     }
