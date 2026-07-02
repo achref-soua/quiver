@@ -159,10 +159,10 @@ fn scale_ingest_and_query() {
         // Seal the active buffer to disk periodically so ingest stays memory-frugal
         // — without this the whole active segment (vectors + primary index)
         // accumulates in RAM until the first checkpoint.
-        if (i as usize) % checkpoint_every == 0 {
+        if (i as usize).is_multiple_of(checkpoint_every) {
             db.checkpoint().unwrap();
         }
-        if (i as usize) % (batch * 20) == 0 || i as usize == n {
+        if (i as usize).is_multiple_of(batch * 20) || i as usize == n {
             eprintln!(
                 "  ingested {i}/{n}  ({:.0} vec/s, RSS {} MiB)",
                 i as f64 / t0.elapsed().as_secs_f64(),
