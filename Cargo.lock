@@ -2784,6 +2784,7 @@ dependencies = [
  "axum",
  "axum-server",
  "figment",
+ "futures-util",
  "openraft",
  "opentelemetry",
  "opentelemetry-otlp",
