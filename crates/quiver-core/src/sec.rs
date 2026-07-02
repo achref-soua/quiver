@@ -82,7 +82,11 @@ impl SecPredicate {
 // order then matches numeric order, negatives included. (NaN has no order and is
 // rejected by the caller.)
 fn encode_f64(x: f64) -> [u8; 8] {
-    let bits = x.to_bits();
+    // Canonicalise signed zero: IEEE `-0.0 == +0.0`, but they have distinct bit
+    // patterns, so without this a stored `-0.0` would sort one unit below `+0.0`
+    // and be missed by `== 0` / `>= 0` filters and wrongly matched by `< 0`.
+    // `x + 0.0` maps `-0.0 → +0.0` and is the identity for every other value.
+    let bits = (x + 0.0).to_bits();
     let ordered = if bits >> 63 == 0 {
         bits | (1 << 63)
     } else {
@@ -183,20 +187,21 @@ impl FieldIndex {
             },
             None => None,
         };
+        // Keys are sorted ascending and order-preserving, so binary-search the
+        // [lo, hi] window and scan only it — O(log n + matches) rather than a full
+        // O(n_keys) scan of every distinct value.
+        let start = match &lo_key {
+            Some(l) if lo_inclusive => self.keys.partition_point(|k| k.as_slice() < l.as_slice()),
+            Some(l) => self.keys.partition_point(|k| k.as_slice() <= l.as_slice()),
+            None => 0,
+        };
+        let end = match &hi_key {
+            Some(h) if hi_inclusive => self.keys.partition_point(|k| k.as_slice() <= h.as_slice()),
+            Some(h) => self.keys.partition_point(|k| k.as_slice() < h.as_slice()),
+            None => self.keys.len(),
+        };
         let mut out = RoaringBitmap::new();
-        for (i, key) in self.keys.iter().enumerate() {
-            if let Some(l) = &lo_key {
-                let c = key.as_slice().cmp(l.as_slice());
-                if c == Ordering::Less || (c == Ordering::Equal && !lo_inclusive) {
-                    continue;
-                }
-            }
-            if let Some(h) = &hi_key {
-                let c = key.as_slice().cmp(h.as_slice());
-                if c == Ordering::Greater || (c == Ordering::Equal && !hi_inclusive) {
-                    continue;
-                }
-            }
+        for i in start..end {
             out |= self.bitmap_at(i)?;
         }
         Ok(out)
@@ -460,6 +465,84 @@ mod tests {
                 .unwrap()
             ),
             vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn bounded_range_window_respects_inclusivity() {
+        // Values 0..10; check both-bounds windows with each inclusivity setting.
+        let p: Vec<Vec<u8>> = (0..10)
+            .map(|x| json!({ "t": x as f64 }).to_string().into_bytes())
+            .collect();
+        let refs: Vec<&[u8]> = p.iter().map(Vec::as_slice).collect();
+        let idx = SecIndex::build(&[FilterableField::numeric("t")], &refs).unwrap();
+        let q = |lo: f64, hi: f64, li: bool, hi_inc: bool| {
+            rows(
+                idx.query(&SecPredicate::Range {
+                    field: "t".into(),
+                    lo: Some(SecValue::Numeric(lo)),
+                    hi: Some(SecValue::Numeric(hi)),
+                    lo_inclusive: li,
+                    hi_inclusive: hi_inc,
+                })
+                .unwrap(),
+            )
+        };
+        assert_eq!(q(3.0, 6.0, true, true), vec![3, 4, 5, 6]);
+        assert_eq!(q(3.0, 6.0, false, false), vec![4, 5]);
+        assert_eq!(q(3.0, 6.0, true, false), vec![3, 4, 5]);
+        assert_eq!(q(3.0, 6.0, false, true), vec![4, 5, 6]);
+        // Empty window (lo > hi) yields nothing, not a panic.
+        assert!(q(6.0, 3.0, true, true).is_empty());
+    }
+
+    #[test]
+    fn signed_zero_matches_positive_zero() {
+        // A stored -0.0 must behave exactly like 0 under ==, >=, and <.
+        let p: Vec<Vec<u8>> = [-0.0f64, 5.0, -3.0]
+            .iter()
+            .map(|x| json!({ "t": x }).to_string().into_bytes())
+            .collect();
+        let refs: Vec<&[u8]> = p.iter().map(Vec::as_slice).collect();
+        let idx = SecIndex::build(&[FilterableField::numeric("t")], &refs).unwrap();
+        // t == 0 matches the -0.0 row (index 0).
+        assert_eq!(
+            rows(
+                idx.query(&SecPredicate::Eq {
+                    field: "t".into(),
+                    value: SecValue::Numeric(0.0),
+                })
+                .unwrap()
+            ),
+            vec![0]
+        );
+        // t < 0 excludes -0.0 (it equals 0), leaving only -3.0 (index 2).
+        assert_eq!(
+            rows(
+                idx.query(&SecPredicate::Range {
+                    field: "t".into(),
+                    lo: None,
+                    hi: Some(SecValue::Numeric(0.0)),
+                    lo_inclusive: true,
+                    hi_inclusive: false,
+                })
+                .unwrap()
+            ),
+            vec![2]
+        );
+        // t >= 0 includes -0.0 and 5.0 (indices 0 and 1).
+        assert_eq!(
+            rows(
+                idx.query(&SecPredicate::Range {
+                    field: "t".into(),
+                    lo: Some(SecValue::Numeric(0.0)),
+                    hi: None,
+                    lo_inclusive: true,
+                    hi_inclusive: true,
+                })
+                .unwrap()
+            ),
+            vec![0, 1]
         );
     }
 

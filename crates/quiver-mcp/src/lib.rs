@@ -223,7 +223,7 @@ fn call_tool_embed(
         "list_collections" => to_text(&json!({ "collections": db.collection_names() })),
         "create_collection" => {
             let collection = want_str(args, "name")?;
-            let dim = want_u64(args, "dim")? as u32;
+            let dim = want_dim(args)?;
             let metric = want_metric(args)?;
             let index = want_index_spec(args)?;
             let filterable = want_filterable(args)?;
@@ -257,7 +257,7 @@ fn call_tool_embed(
         "search" => {
             let collection = want_str(args, "collection")?;
             let vector = want_vector(args, "vector")?;
-            let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+            let k = want_k(args);
             let filter = match args.get("filter") {
                 Some(f) if !f.is_null() => Some(
                     serde_json::from_value::<Filter>(f.clone())
@@ -300,7 +300,7 @@ fn call_tool_embed(
                     );
                 }
             };
-            let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+            let k = want_k(args);
             let filter = match args.get("filter") {
                 Some(f) if !f.is_null() => Some(
                     serde_json::from_value::<Filter>(f.clone())
@@ -339,7 +339,8 @@ fn call_tool_embed(
         }
         "fetch" => {
             let collection = want_str(args, "collection")?;
-            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+            let limit = (args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize)
+                .min(MCP_MAX_FETCH);
             let filter = match args.get("filter") {
                 Some(f) if !f.is_null() => Some(
                     serde_json::from_value::<Filter>(f.clone())
@@ -391,7 +392,7 @@ fn call_tool_embed(
         "search_multi_vector" => {
             let collection = want_str(args, "collection")?;
             let query = want_vectors(args, "query")?;
-            let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+            let k = want_k(args);
             let filter = match args.get("filter") {
                 Some(f) if !f.is_null() => Some(
                     serde_json::from_value::<Filter>(f.clone())
@@ -496,7 +497,7 @@ fn call_tool_embed(
         "search_text" => {
             let collection = want_str(args, "collection")?;
             let text = want_str(args, "text")?;
-            let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+            let k = want_k(args);
             let filter = match args.get("filter") {
                 Some(f) if !f.is_null() => Some(
                     serde_json::from_value::<Filter>(f.clone())
@@ -893,6 +894,29 @@ fn want_u64(args: &Value, key: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("missing or non-integer argument '{key}'"))
 }
 
+// Upper bounds on agent-supplied result sizes so a single MCP call cannot force
+// an unbounded allocation against the memory-frugal engine (the network server
+// applies the equivalent bound through its request limits). Local stdio agents
+// are trusted-but-fallible; these are guardrails, not a security boundary.
+const MCP_MAX_K: usize = 10_000;
+const MCP_MAX_FETCH: usize = 100_000;
+const MCP_MAX_DIM: u64 = 1 << 20; // 1,048,576 — far above any real embedding.
+
+// Read an optional `k` (default 10), bounded to [`MCP_MAX_K`].
+fn want_k(args: &Value) -> usize {
+    (args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize).min(MCP_MAX_K)
+}
+
+// Read and validate a collection `dim`: present, non-zero, and within u32 range
+// (a bare `as u32` silently wrapped an out-of-range value to a wrong dimension).
+fn want_dim(args: &Value) -> Result<u32, String> {
+    let dim = want_u64(args, "dim")?;
+    if dim == 0 || dim > MCP_MAX_DIM {
+        return Err(format!("'dim' must be between 1 and {MCP_MAX_DIM}"));
+    }
+    Ok(dim as u32)
+}
+
 fn want_vector(args: &Value, key: &str) -> Result<Vec<f32>, String> {
     let arr = args
         .get(key)
@@ -999,6 +1023,21 @@ fn want_filterable(args: &Value) -> Result<Vec<FilterableField>, String> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn want_dim_rejects_out_of_range_and_zero() {
+        // A bare `as u32` wrapped 2^32+1 to 1; validate the bound instead.
+        assert!(want_dim(&json!({ "dim": 4_294_967_297u64 })).is_err());
+        assert!(want_dim(&json!({ "dim": 0 })).is_err());
+        assert_eq!(want_dim(&json!({ "dim": 768 })).unwrap(), 768);
+    }
+
+    #[test]
+    fn want_k_is_bounded() {
+        assert_eq!(want_k(&json!({ "k": 999_999_999u64 })), MCP_MAX_K);
+        assert_eq!(want_k(&json!({ "k": 5 })), 5);
+        assert_eq!(want_k(&json!({})), 10);
+    }
 
     fn db() -> (tempfile::TempDir, Database) {
         let tmp = tempfile::tempdir().unwrap();

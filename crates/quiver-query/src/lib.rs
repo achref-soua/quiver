@@ -133,10 +133,7 @@ fn field_value<'a>(payload: &'a Value, field: &str) -> Option<&'a Value> {
 // Equality with numeric coercion: 1 and 1.0 compare equal.
 fn values_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
-            (Some(x), Some(y)) => x == y,
-            _ => false,
-        },
+        (Value::Number(x), Value::Number(y)) => number_cmp(x, y) == Some(Ordering::Equal),
         _ => a == b,
     }
 }
@@ -144,10 +141,28 @@ fn values_eq(a: &Value, b: &Value) -> bool {
 // Order two values when comparable (number/number or string/string).
 fn order(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => x.as_f64()?.partial_cmp(&y.as_f64()?),
+        (Value::Number(x), Value::Number(y)) => number_cmp(x, y),
         (Value::String(x), Value::String(y)) => Some(x.cmp(y)),
         _ => None,
     }
+}
+
+// Compare two JSON numbers, exact for integers — both i64 and u64 fit in i128 —
+// and falling back to f64 only when at least one side is a float. This avoids
+// the f64 mantissa rounding (53 bits) that made distinct integers above 2^53
+// (nanosecond epochs, Snowflake ids) compare equal or flip range predicates.
+fn number_cmp(x: &serde_json::Number, y: &serde_json::Number) -> Option<Ordering> {
+    if let (Some(xi), Some(yi)) = (num_as_i128(x), num_as_i128(y)) {
+        return Some(xi.cmp(&yi));
+    }
+    x.as_f64()?.partial_cmp(&y.as_f64()?)
+}
+
+// An integer JSON number as i128 (holds every i64 and u64); `None` for floats.
+fn num_as_i128(n: &serde_json::Number) -> Option<i128> {
+    n.as_i64()
+        .map(i128::from)
+        .or_else(|| n.as_u64().map(i128::from))
 }
 
 fn compares(payload: &Value, field: &str, value: &Value, pred: impl Fn(Ordering) -> bool) -> bool {
@@ -163,6 +178,43 @@ mod tests {
 
     fn p() -> Value {
         json!({"city": "paris", "age": 30, "score": 4.5, "tags": ["a", "b"], "user": {"vip": true}})
+    }
+
+    #[test]
+    fn large_integer_comparisons_are_exact() {
+        // Integers beyond 2^53 must compare exactly, not coerce through f64.
+        let pay = json!({ "ts": 1_750_000_000_000_000_001i64, "id": 10_000_000_000_000_000u64 });
+        // Gt against the value one below must be true (both round to the same f64).
+        assert!(
+            Filter::Gt {
+                field: "ts".into(),
+                value: json!(1_750_000_000_000_000_000i64)
+            }
+            .matches(&pay)
+        );
+        // Eq must not match a neighbouring integer that shares an f64 image.
+        assert!(
+            !Filter::Eq {
+                field: "id".into(),
+                value: json!(10_000_000_000_000_001u64)
+            }
+            .matches(&pay)
+        );
+        assert!(
+            Filter::Eq {
+                field: "id".into(),
+                value: json!(10_000_000_000_000_000u64)
+            }
+            .matches(&pay)
+        );
+        // Mixed sign still orders correctly.
+        assert!(
+            Filter::Lt {
+                field: "neg".into(),
+                value: json!(0)
+            }
+            .matches(&json!({ "neg": -5 }))
+        );
     }
 
     #[test]

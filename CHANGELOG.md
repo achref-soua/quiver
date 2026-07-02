@@ -10,6 +10,63 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.31.0] — Reinforced — 2026-07-02
+
+An adversarial-audit remediation, hardening, and scale pass: **18 confirmed bugs
+plus one plausible finding fixed** (each regression-tested), security/robustness
+hardening, and IVF scale enhancements proven to **10M vectors on a laptop-class
+box**. No on-disk or wire format change; the single node is unchanged at zero
+overhead when the new knobs are left at their defaults.
+
+### Fixed
+
+- **Critical — Raft state-machine durability.** The applied-state pointer and
+  snapshot were held only in memory, so a voter restart re-applied the entire
+  committed log onto the already-durable engine, and a post-compaction cold restart
+  could not reconstruct state or membership. They are now persisted on
+  apply/build/install and reloaded on open, with a create-idempotency guard for the
+  one crash window, and a durable restart-without-reapply regression test.
+- **`next_collection_id` recovery** from replayed WAL creates — closes an id-reuse /
+  silent-data-loss window after a crash before the first checkpoint.
+- **IVF-PQ metric orientation** — the PQ path reported the raw ordering value instead
+  of the true metric, inverting cosine ranking under MVCC and returning negative
+  scores; it now reports the true orientation.
+- Exact large-integer payload filters (no `f64` coercion above 2⁵³); cluster-router
+  mutations are audited; un-routed router ops return `501` instead of silently
+  querying the empty local engine; durable raft-log directory fsync; atomic
+  coordinator state writes; fresher online-migration copy; the Python SDK
+  percent-encodes path segments; plus signed-zero secondary-index filters, DCPE tag
+  normalization binding, IVF tombstone-cell skipping, status-based `404`
+  classification, MCP `k`/`limit` caps + dim validation, an `rrf_k0` guard,
+  malformed-sparse rejection, and out-of-order-safe OpenAI-embedding indexing.
+
+### Security
+
+- Authorize **before** the write-guard (no follower-role disclosure to out-of-scope
+  keys); `GET /cluster/map` requires Admin; the decrypted DEK is zeroized before its
+  transient buffer drops; secondary-index range queries binary-search their window.
+
+### Performance
+
+- **IVF scale to 10M on a laptop.** Codebooks now train on a deterministic 262k
+  sample instead of all N (1M codebook+index build ~15× faster in isolation);
+  `nlist ≈ √n` replaces the fixed 64, so a query probes a small fraction of cells
+  instead of scanning all of them (**1M query p50 66 ms → 13.8 ms**, ~10× at scale);
+  the redundant L2/Dot build copy is elided via `Cow` (what let 10M fit in 15 GiB
+  RAM); and a large bulk load **auto-checkpoints** at a byte budget
+  (`QUIVER_CHECKPOINT_BYTES`, default 256 MiB) so ingest stays memory-frugal.
+  Measured on a 15 GiB laptop-class box: **10M vectors built and served at query
+  p50 75.8 ms, 529 B/vector on disk**; IVF-Flat (exact) recall@10 = 0.998.
+
+### Docs
+
+- A measured scale characterization (`docs/benchmarks/scale-characterization.md`), a
+  new "Scale characterization" section in *Quiver, Explained* (§7.4), and a roadmap
+  **Future / next** section naming the streaming/chunked index build as the
+  single-box **100M** enabler. Honest limits stated plainly: 100M was **not** run on
+  the box (the batch build still materializes all vectors in RAM) — it awaits the
+  streaming build.
+
 ## [0.30.2] — 2026-07-01
 
 An internal refactor — no behavior, API, on-disk, or wire change; every published
@@ -845,7 +902,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.30.2...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.31.0...HEAD
+[0.31.0]: https://github.com/achref-soua/quiver/compare/v0.30.2...v0.31.0
 [0.30.2]: https://github.com/achref-soua/quiver/compare/v0.30.1...v0.30.2
 [0.30.1]: https://github.com/achref-soua/quiver/compare/v0.30.0...v0.30.1
 [0.30.0]: https://github.com/achref-soua/quiver/compare/v0.29.1...v0.30.0
