@@ -30,21 +30,44 @@ Test box: WSL2, 15 GiB RAM (~12 GiB available), 20 cores, single NVMe. dim 128, 
 | N | index | ingest | index build | peak RSS | disk | q p50 | q p95 | recall@10 |
 |--:|-------|-------:|------------:|---------:|-----:|------:|------:|----------:|
 | 200k | IVF-Flat (exact) | 271k vec/s | 2.8 s | 485 MiB | 537 B/vec | 27 ms | 34 ms | **0.998** |
-| 1M | IVF+PQ m=16 | 187k vec/s | 115 s | 2.67 GiB | 537 B/vec | 66 ms | 91 ms | see note |
-| 8M | IVF+PQ m=16 | 43k vec/s¹ | 267 s | 13.3 GiB² | 528 B/vec | 816 ms³ | 965 ms | n/a⁴ |
+| 1M | IVF+PQ m=16 | 111k vec/s¹ | 183 s | 2.1 GiB | 532 B/vec | 13.8 ms | 16.7 ms | see note |
+| 10M | IVF+PQ m=16 | 46.6k vec/s¹ | 762 s | 13.1 GiB² | 529 B/vec | 75.8 ms | 89.6 ms | n/a³ |
 
-1. 8M ingest is slower because it checkpoints 8× (sealing to disk to stay frugal);
-   raw bulk ingest without checkpoints runs at ~160–270k vec/s.
-2. 13.3 GiB peak is the **index build**, not steady state — see finding 2. Steady-state
-   (query-serving) RSS is far lower; storage is `~528 B/vec` on disk.
-3. 816 ms p50 is a full PQ scan — see finding 3 (no cell pruning at the fixed nlist).
-4. Recall skipped above the 2M brute-force cap.
+1. Ingest slows at scale because the pipeline **auto-checkpoints** (seals segments to
+   disk) to keep RSS bounded; raw bulk ingest without checkpoints runs at ~160–270k vec/s.
+2. 13.1 GiB peak is the **index build**, not steady state — see finding 2 — and it fit
+   at all only because of the elided-copy enhancement (below). Steady-state
+   (query-serving) RSS is far lower; storage is `~529 B/vec` on disk.
+3. Recall skipped above the 2M brute-force cap.
 
 **Recall note.** IVF-Flat (exact) measures **0.998** recall@10 — the IVF cell routing
 and search are correct. IVF+PQ recall on this synthetic corpus is low only because
 the ground-truth top-10 are *within-cluster* neighbours separated by noise finer
 than PQ's resolution; the in-tree PQ recall suite on structured data holds ≥ 0.70.
 PQ is a documented accuracy-for-memory trade, not a defect.
+
+## Enhancements
+
+Four scale enhancements landed between the first characterization (200k / 1M / 8M)
+and the table above (200k / 1M / 10M). Each is measured, and the wins compound.
+
+- **Training on a sample, not all N.** IVF coarse-kmeans and PQ codebooks trained over
+  every vector (O(N)); they now train on a deterministic 262k-row sample and
+  assign/encode all N — **1M build 1718 s → 115 s (~15×)**, byte-identical for small N.
+- **`nlist ~ √N` (was a fixed 64).** A query used to probe all 64 cells — a full PQ
+  scan, O(N). It now probes a small fraction, so queries are sublinear:
+  **1M query p50 66 ms → 13.8 ms (4.8×)**, and at 10M the p50 is **75.8 ms versus the
+  pre-enhancement 8M's 815 ms** — more data at roughly an order of magnitude lower
+  latency. The extra cells shift some cost onto the build, which is why the 1M build
+  settles at **115 s → 183 s** (the 183 s in the table).
+- **Elided L2/Dot build copy.** The build materialized every vector a second time into a
+  normalized `prepared` arena even for L2/Dot, where `prepare()` is the identity; it now
+  borrows via `Cow`. Halving the build's extra copy is **what let 10M fit in 15 GiB RAM**
+  (previously ~18 GiB → OOM).
+- **Auto-checkpoint during ingest.** The active segment used to accumulate in RAM until
+  an explicit `checkpoint()`; it now seals automatically at a byte budget (default
+  256 MiB, `QUIVER_CHECKPOINT_BYTES`), so **ingest RSS is bounded — 768 MiB at 1M** versus
+  climbing into the GiB before.
 
 ## What scales well
 
@@ -57,32 +80,36 @@ PQ is a documented accuracy-for-memory trade, not a defect.
 
 ## Ceilings and the road to 100M-on-a-laptop
 
-Four findings bound scale today. Finding 1 is **fixed**; 2–4 are the concrete,
-evidence-backed roadmap to a true 100M single-box build.
+Four findings bounded scale. Findings 1, 3, and 4 are now **fixed** (see Enhancements
+above); finding 2 — the batch build's RAM footprint — is the one remaining step to a
+true 100M single-box build.
 
 1. **FIXED — codebooks trained on the full set.** `ivf::build` trained the coarse
    kmeans and PQ codebooks over all N vectors (O(N) build: 1718 s for 1M). It now
-   trains on a deterministic 256k-row sample (FAISS-style) and assigns/encodes all
+   trains on a deterministic 262k-row sample (FAISS-style) and assigns/encodes all
    N — **1718 s → 115 s at 1M (~15×)**, byte-identical for small N (all tests green).
 
-2. **Build materializes N×dim floats in RAM.** The build reads every vector into a
-   `flat` arena and copies it to a normalized `prepared` arena, so peak build RSS is
-   ~2·N·dim·4 bytes — 13.3 GiB at 8M, and ~102 GiB at 100M. This is why the test box
-   tops out near 8–10M. **The frugal wedge holds for storage and query but not the
-   batch build.** Fix: a streaming/chunked build (sample-train from a store scan,
-   stream-encode) and eliding the redundant `prepared` copy for L2/Dot (where
-   `prepare()` is the identity). ADR-worthy.
+2. **REMAINING — the batch build still materializes N×dim floats in RAM.** The
+   redundant normalized `prepared` copy is now elided for L2/Dot (see Enhancements),
+   which halved the build's extra allocation and is what let 10M fit. But
+   `scan_collection` still reads every vector into one resident `flat` arena —
+   **~5 GiB at 10M, ~51 GiB at 100M** — so the test box tops out near 10M, and a
+   single-box 100M build needs a **streaming/chunked build** (sample-train from a
+   store scan, stream-encode). That is an ADR-level change with lock-model
+   implications, deliberately not rushed. **The frugal wedge holds for storage and
+   query; the batch build is the last piece.**
 
-3. **IVF nlist fixed at 64.** With `nprobe = ef_search = nlist = 64` every query is a
-   full PQ scan (no pruning), so query latency grows O(N) — 816 ms at 8M. nlist should
-   scale ~√N with a proportional nprobe for sublinear queries.
+3. **FIXED — IVF `nlist` was fixed at 64.** With `nprobe = ef_search = nlist = 64`
+   every query was a full PQ scan (no pruning), so query latency grew O(N) — 815 ms at
+   8M pre-enhancement. `nlist` now scales ~√N with a proportional `nprobe`, giving
+   sublinear queries: **1M p50 66 ms → 13.8 ms**, and 10M p50 **75.8 ms** on more data.
 
-4. **No automatic checkpoint during ingest.** The active segment accumulates in RAM
-   until an explicit `checkpoint()`; there is no size/time-triggered policy in the
-   store, engine, or server ingest path. An un-checkpointed 8M ingest reached ~6 GiB
-   and OOM-killed the box on the following build. Periodic checkpoints keep ingest
-   bounded (the engine *is* frugal when checkpointed), but frugal-by-default needs an
-   auto-checkpoint policy (seal when the active buffer crosses a byte/row threshold).
+4. **FIXED — no automatic checkpoint during ingest.** The active segment accumulated in
+   RAM until an explicit `checkpoint()`, with no size/time-triggered policy in the
+   store, engine, or server ingest path; an un-checkpointed 8M ingest reached ~6 GiB and
+   OOM-killed the box on the following build. Ingest now seals the active segment
+   automatically at a byte budget (default 256 MiB, `QUIVER_CHECKPOINT_BYTES`), so
+   **ingest RSS is bounded — 768 MiB at 1M**.
 
 Related: the primary index (`ext_id → location`) is fully resident (~316 B/point),
 an inherent O(N) RAM cost (~31 GiB at 100M) that a large single box or an on-disk

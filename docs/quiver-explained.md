@@ -360,7 +360,7 @@ flowchart LR
 
 The size of that shortlist is the **`rerank_factor`** — the master dial trading recall against latency/memory. A deeper shortlist can only *add* true matches, so recall rises monotonically as you widen it. (Quiver's tests prove exactly this property.)
 
-> **Under the hood.** PQ uses **asymmetric distance computation (ADC)**: the query stays full-precision and a small lookup table is precomputed once per query, so scoring each compressed code is just a few table lookups and adds — extremely fast. Binary quantization leans on the SIMD **Hamming kernel** from §4.1: it XORs the sign-bit codes and counts the differing bits, which a CPU does blisteringly fast, making it ideal as a coarse pre-filter for high-dimensional vectors before the exact re-rank.
+> **Under the hood.** PQ uses **asymmetric distance computation (ADC)**: the query stays full-precision and a small lookup table is precomputed once per query, so scoring each compressed code is just a few table lookups and adds — extremely fast. Binary quantization leans on the SIMD **Hamming kernel** from §4.1: it XORs the sign-bit codes and counts the differing bits, which a CPU does blisteringly fast, making it ideal as a coarse pre-filter for high-dimensional vectors before the exact re-rank. When PQ is paired with IVF on a large collection, the number of IVF cells (`nlist`) is now sized to roughly **√n** rather than a fixed constant, so a query probes only a small fraction of the cells and search stays *sublinear* as the collection grows (measured in §7.4).
 
 ## 4.4 Putting it together: the disk-resident path (the "32×" headline)
 
@@ -445,7 +445,7 @@ In Quiver, every mutation (create collection, upsert, delete) is:
 3. **`fsync`'d** — forced all the way down to the physical disk, not just the OS cache,
 4. *Only then* acknowledged to the client.
 
-That ordering is the entire guarantee. Once you get the "ok," the record is physically on disk. The actual index update happens *after* the ack — and if the machine dies before it completes, recovery replays the log to redo it.
+That ordering is the entire guarantee. Once you get the "ok," the record is physically on disk. The actual index update happens *after* the ack — and if the machine dies before it completes, recovery replays the log to redo it. A large bulk load never has to hold its whole active segment in RAM, either: once the in-memory buffer passes a byte budget (default 256 MiB, `QUIVER_CHECKPOINT_BYTES`) the engine **auto-checkpoints**, sealing it into on-disk segments so ingesting millions of vectors stays memory-frugal instead of climbing toward an OOM.
 
 ## 5.2 Catching corruption: checksums and torn writes
 
@@ -682,6 +682,50 @@ The v0.22.0 release added four measurement dimensions (ADR-0061), all on the sam
 | 25% | 0.970 | 5 | 189.2 | post-filter · recovering |
 | 50% | 0.981 | 4 | 253.6 | post-filter |
 | 100% | 0.986 | 878 | 1.1 | no filter · pure ANN |
+
+---
+
+## 7.4 Scale characterization: millions of vectors, on a laptop
+
+The head-to-head in §7.2 was an *in-memory* comparison at exactly 1M vectors. But the wedge is what happens when you push a single modest box toward its ceiling. This is the honest scale characterization: hundreds of thousands, then a million, then ten million vectors, all on one machine.
+
+The box is deliberately unglamorous — **WSL2, 15 GiB RAM (~12 GiB usable), 20 cores, a single NVMe SSD** — and every row below comes from a reproducible harness (`crates/quiver-embed/tests/scale.rs`, dim 128, L2):
+
+| N | index | ingest | build | peak RSS | disk/vec | q p50 | q p95 | recall@10 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 200k | IVF-Flat (exact) | 271k vec/s | 2.8 s | 485 MiB | 537 B | 27 ms | 34 ms | **0.998** |
+| 1M | IVF+PQ m=16 | 111k vec/s | 183 s | 2.1 GiB | 532 B | 13.8 ms | 16.7 ms | see note |
+| 10M | IVF+PQ m=16 | 46.6k vec/s | 762 s | 13.1 GiB ¹ | 529 B | 75.8 ms | 89.6 ms | n/a ² |
+
+- ¹ The 13.1 GiB is the *index build's* high-water mark, not steady-state serving — and 10M fit inside a 15 GiB box **only** because of the elided-copy enhancement below (without it the build peaked ~18 GiB and OOM'd).
+- ² Recall is skipped above the 2M brute-force cap: with no exact ground truth to compare against, a recall number here would be a guess, so none is reported.
+
+### What made it scale — four enhancements, each measured
+
+Getting from "OOMs at 8M" to "10M with room to spare" was four specific changes, each with a before→after number:
+
+- **`nlist` now scales ~√n** (it was a fixed 64). With a fixed cell count, a query eventually had to probe *every* cell — a full PQ scan, `O(n)`. Sizing the number of IVF cells to roughly √n means a query touches only a small fraction of them. Measured on 1M: **query p50 66 ms → 13.8 ms (4.8×)**, and the win widens with scale (see the "before" contrast below).
+- **Codebooks trained on a sample, not the whole set.** IVF/PQ codebook training was `O(n)` over the full dataset; it now trains on a deterministic 262k sample. In an isolated build benchmark this cut the **1M codebook+index build from 1718 s to 115 s (~15×)**, and small collections stay byte-identical to before (every existing test passes unchanged). *(That is the isolated build-speedup measurement; the scale-harness "build" column above measures the full end-to-end build and so reads differently.)*
+- **Auto-checkpoint keeps ingest memory-bounded.** Ingest used to accumulate the whole active segment in RAM until an explicit checkpoint (~6 GiB at 8M — enough to OOM). It now seals segments automatically at a byte budget (default 256 MiB, `QUIVER_CHECKPOINT_BYTES`), so **ingest RSS at 1M holds ~768 MiB** instead of climbing into the gigabytes.
+- **Eliding the redundant build copy.** For L2/Dot, the vector-preparation step is the identity function, yet the build still copied *every* vector into a second arena. It now borrows via `Cow` instead — halving the build's extra copy. This is the single change that let **10M fit in 15 GiB** (≈18 GiB → OOM before).
+
+> 🔑 **The "before" contrast, stated plainly.** Pre-enhancement, an **8M** build measured a query **p50 of 815 ms** (the fixed-`nlist` full scan) and peaked at **13.3 GiB**. After the enhancements, **10M** — *more* data — serves at **75.8 ms p50** and peaks at a comparable 13.1 GiB. So the box now holds more vectors at roughly **~10× lower query latency**, not less.
+
+### Correctness vs. the PQ recall caveat — read this carefully
+
+Two very different things are being measured here, and conflating them would be dishonest:
+
+- The **200k IVF-Flat (exact)** row measures **recall@10 = 0.998** — this is the engine's *coverage* being correct: exact search finds essentially all the true neighbours.
+- The **IVF+PQ** rows deliberately carry *no* headline recall number, and the honest reason is the corpus. On this particular *synthetic, tightly-clustered* dataset the ground-truth top-10 are within-cluster neighbours finer than PQ's resolution can distinguish, so a raw PQ recall on it would look artificially low — not because the engine is wrong, but because PQ is a **memory-for-accuracy trade** and this corpus is adversarial to it. The in-tree PQ recall suite on *structured* data holds **≥ 0.70**, and §7.3 already shows the disk-Vamana+PQ path holding recall@10 ≈ 0.97 on SIFT1M. Presenting a misleading low PQ-recall figure from the synthetic scale corpus would be exactly the kind of fabrication this project refuses.
+
+### The honest ceiling: ~10M today, 100M pending a streaming build
+
+This box tops out around **10M** vectors for a full index build, and that limit is understood precisely rather than hand-waved:
+
+- The batch build still **materializes all `n × dim` floats in RAM** at once (the `flat` buffer in `scan_collection`): ~5 GiB at 10M, and a projected **~51 GiB at 100M**. A single-box 100M build therefore needs a **streaming build** — read the collection from the store in chunks, sample-train the codebooks, and stream-encode — which is an ADR-level change with real lock-model implications and is deliberately **not** being rushed.
+- Separately, the primary index (`ext_id → location`) is **fully resident** at ~316 B/point — a projected **~31 GiB at 100M** — so 100M also wants either a larger box or an on-disk primary index.
+
+> 💡 **What this means, without spin.** On this modest laptop-class box the full build tops out at ~10M; **100M is functional-by-design, pending the streaming build** — it was **not** run here, and this guide does not claim it was. The streaming/chunked build is the named next step, and until it is built and measured, the ceiling is stated as exactly what it is.
 
 ---
 
