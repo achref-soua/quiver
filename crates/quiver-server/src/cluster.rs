@@ -154,7 +154,21 @@ impl Cluster {
         url: String,
         body: Option<Value>,
     ) -> Result<Value, Error> {
-        let mut rb = self.http.request(method, &url);
+        let (status, text) = self.send_raw(method, &url, body).await?;
+        parse_shard_body(&url, status, text)
+    }
+
+    // Send a request and return the raw (status, body) without interpreting the
+    // status. Lets callers distinguish specific statuses (e.g. a genuine 404)
+    // from the actual status field rather than substring-matching an error
+    // string, whose id/collection/body could incidentally contain the code.
+    async fn send_raw(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<Value>,
+    ) -> Result<(reqwest::StatusCode, String), Error> {
+        let mut rb = self.http.request(method, url);
         if let Some(b) = body {
             rb = rb.json(&b);
         }
@@ -165,16 +179,22 @@ impl Cluster {
             .map_err(|e| Error::Internal(format!("shard {url} unreachable: {e}")))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(Error::Internal(format!(
-                "shard {url} returned {status}: {text}"
-            )));
+        Ok((status, text))
+    }
+
+    // Send a request whose target may legitimately be absent: a genuine 404
+    // status maps to `Ok(None)`, any other non-success status to an error.
+    async fn send_optional(
+        &self,
+        method: reqwest::Method,
+        url: String,
+        body: Option<Value>,
+    ) -> Result<Option<Value>, Error> {
+        let (status, text) = self.send_raw(method, &url, body).await?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
         }
-        if text.is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_str(&text)
-            .map_err(|e| Error::Internal(format!("shard {url} bad response: {e}")))
+        parse_shard_body(&url, status, text).map(Some)
     }
 
     // Query one shard, trying its read targets ({primary} ∪ replicas) in the
@@ -514,11 +534,11 @@ impl Cluster {
                 "{}/v1/collections/{collection}/points/{id}",
                 shard.primary_url
             );
-            let resp = match self.send(reqwest::Method::GET, url, None).await {
-                Ok(v) => v,
-                // A 404 (point not found) surfaces as an error from `send`; treat a
-                // missing point as "skip", any other failure as fatal.
-                Err(Error::Internal(msg)) if msg.contains("404") => continue,
+            let resp = match self.send_optional(reqwest::Method::GET, url, None).await {
+                // A genuine 404 (point absent on this shard) is a skip; any other
+                // non-success status is fatal, distinguished by the status field.
+                Ok(None) => continue,
+                Ok(Some(v)) => v,
                 Err(e) => return Err(e),
             };
             if let Some(p) = point_from_json(&resp, with_vector) {
@@ -680,6 +700,21 @@ fn matches_from_json(resp: &Value, with_vector: bool) -> Vec<MatchOut> {
         .unwrap_or_default()
 }
 
+// Interpret a shard response body given its status: a non-success status is an
+// error, an empty body is JSON null, otherwise parse the JSON.
+fn parse_shard_body(url: &str, status: reqwest::StatusCode, text: String) -> Result<Value, Error> {
+    if !status.is_success() {
+        return Err(Error::Internal(format!(
+            "shard {url} returned {status}: {text}"
+        )));
+    }
+    if text.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&text)
+        .map_err(|e| Error::Internal(format!("shard {url} bad response: {e}")))
+}
+
 // Parse one shard point-fetch response into a `PointOut`.
 fn point_from_json(resp: &Value, with_vector: bool) -> Option<PointOut> {
     Some(PointOut {
@@ -700,6 +735,24 @@ fn point_from_json(resp: &Value, with_vector: bool) -> Option<PointOut> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_shard_body_uses_status_not_substring() {
+        // A non-success status is an error even when the body/url contains "404",
+        // and a real success is parsed regardless of its content.
+        let u = "http://s0/v1/collections/c/points/order-4042";
+        assert!(
+            parse_shard_body(u, reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom".into()).is_err()
+        );
+        assert_eq!(
+            parse_shard_body(u, reqwest::StatusCode::OK, "{\"id\":\"order-4042\"}".into()).unwrap(),
+            serde_json::json!({ "id": "order-4042" })
+        );
+        assert_eq!(
+            parse_shard_body(u, reqwest::StatusCode::OK, String::new()).unwrap(),
+            Value::Null
+        );
+    }
 
     fn shards() -> Vec<String> {
         vec!["http://s0:6333".into(), "http://s1:6333".into()]

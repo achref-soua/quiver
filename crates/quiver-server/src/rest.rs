@@ -203,7 +203,16 @@ async fn metrics(Extension(metrics): Extension<std::sync::Arc<crate::metrics::Me
 
 // The shard map this router has currently adopted (ADR-0066). 404 when the server is
 // not a cluster router, so the endpoint doubles as a "am I a router?" probe.
-async fn cluster_map(State(state): State<AppState>) -> Response {
+async fn cluster_map(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    // Shard topology (internal base URLs) is admin-only: a least-privilege read
+    // key must not be able to enumerate the cluster's infrastructure, matching
+    // the raft voter endpoints which also require global Admin.
+    if let Err(e) = principal.require(crate::auth::Action::Admin, None) {
+        return e.into_response();
+    }
     match &state.cluster {
         Some(c) => Json(c.current_map()).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),

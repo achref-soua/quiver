@@ -131,6 +131,12 @@ impl DurableLogStore {
         }
 
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // Persist the newly-created file's directory entry. `durable()` fdatasyncs
+        // the file contents, but that does not make a fresh dirent durable, so a
+        // power loss right after the first vote/append could otherwise lose the
+        // `log` file entirely — double-voting or losing acknowledged entries.
+        // Matches the engine's fsync_dir discipline (quiver-core paged.rs).
+        File::open(dir)?.sync_all()?;
         Ok(Self {
             mem: Arc::new(Mutex::new(mem)),
             file: Arc::new(StdMutex::new(file)),

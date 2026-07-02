@@ -11,8 +11,20 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence, Union
+from urllib.parse import quote
 
 import httpx
+
+
+def _seg(value: str) -> str:
+    """Percent-encode a single URL path segment (collection name or point id).
+
+    Collection names and point ids are arbitrary caller-supplied strings; without
+    encoding, a ``/``, ``?`` or ``#`` would be interpreted structurally and route
+    to the wrong URL (matching the TypeScript ``encodeURIComponent`` and Go
+    ``pathEscape`` helpers). ``safe=''`` escapes ``/`` too.
+    """
+    return quote(str(value), safe="")
 
 if TYPE_CHECKING:
     from .vector import VectorCipher
@@ -217,11 +229,11 @@ class Client:
 
     def get_collection(self, name: str) -> CollectionInfo:
         """Fetch one collection's metadata."""
-        return _collection(self._send("GET", f"/v1/collections/{name}").json())
+        return _collection(self._send("GET", f"/v1/collections/{_seg(name)}").json())
 
     def delete_collection(self, name: str) -> bool:
         """Delete a collection; returns whether it existed."""
-        return bool(self._send("DELETE", f"/v1/collections/{name}").json()["existed"])
+        return bool(self._send("DELETE", f"/v1/collections/{_seg(name)}").json()["existed"])
 
     # --- points ---
 
@@ -229,19 +241,19 @@ class Client:
         """Insert or replace points; returns the number upserted."""
         body = {"points": [_point_dict(p) for p in points]}
         return int(
-            self._send("POST", f"/v1/collections/{collection}/points", body).json()["upserted"]
+            self._send("POST", f"/v1/collections/{_seg(collection)}/points", body).json()["upserted"]
         )
 
     def delete_points(self, collection: str, ids: Sequence[str]) -> int:
         """Delete points by id; returns the number deleted."""
         body = {"ids": list(ids)}
         return int(
-            self._send("DELETE", f"/v1/collections/{collection}/points", body).json()["deleted"]
+            self._send("DELETE", f"/v1/collections/{_seg(collection)}/points", body).json()["deleted"]
         )
 
     def get_point(self, collection: str, id: str) -> Optional[Match]:
         """Fetch a point by id, or ``None`` if it does not exist."""
-        resp = self._http.request("GET", f"/v1/collections/{collection}/points/{id}")
+        resp = self._http.request("GET", f"/v1/collections/{_seg(collection)}/points/{_seg(id)}")
         if resp.status_code == 404:
             return None
         _raise_for_status(resp)
@@ -273,7 +285,7 @@ class Client:
         }
         if filter is not None:
             body["filter"] = filter
-        matches = self._send("POST", f"/v1/collections/{collection}/query", body).json()["matches"]
+        matches = self._send("POST", f"/v1/collections/{_seg(collection)}/query", body).json()["matches"]
         return [
             Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
             for m in matches
@@ -321,7 +333,7 @@ class Client:
         if filter is not None:
             body["filter"] = filter
         matches = self._send(
-            "POST", f"/v1/collections/{collection}/query/hybrid", body
+            "POST", f"/v1/collections/{_seg(collection)}/query/hybrid", body
         ).json()["matches"]
         return [
             Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
@@ -344,7 +356,7 @@ class Client:
         }
         return int(
             self._send(
-                "POST", f"/v1/collections/{collection}/points:text", body
+                "POST", f"/v1/collections/{_seg(collection)}/points:text", body
             ).json()["upserted"]
         )
 
@@ -378,7 +390,7 @@ class Client:
         if filter is not None:
             body["filter"] = filter
         matches = self._send(
-            "POST", f"/v1/collections/{collection}/query/text", body
+            "POST", f"/v1/collections/{_seg(collection)}/query/text", body
         ).json()["matches"]
         return [
             Match(id=m["id"], score=m["score"], payload=m.get("payload"), vector=m.get("vector"))
@@ -410,7 +422,7 @@ class Client:
         }
         if filter is not None:
             body["filter"] = filter
-        points = self._send("POST", f"/v1/collections/{collection}/fetch", body).json()[
+        points = self._send("POST", f"/v1/collections/{_seg(collection)}/fetch", body).json()[
             "points"
         ]
         return [
@@ -472,14 +484,14 @@ class Client:
         """Insert or replace multi-vector documents; returns the number upserted."""
         body = {"documents": [_document_dict(d) for d in documents]}
         return int(
-            self._send("POST", f"/v1/collections/{collection}/documents", body).json()["upserted"]
+            self._send("POST", f"/v1/collections/{_seg(collection)}/documents", body).json()["upserted"]
         )
 
     def delete_documents(self, collection: str, ids: Sequence[str]) -> int:
         """Delete multi-vector documents by id; returns the number deleted."""
         body = {"ids": list(ids)}
         return int(
-            self._send("DELETE", f"/v1/collections/{collection}/documents", body).json()["deleted"]
+            self._send("DELETE", f"/v1/collections/{_seg(collection)}/documents", body).json()["deleted"]
         )
 
     def search_multi_vector(
@@ -508,7 +520,7 @@ class Client:
         if filter is not None:
             body["filter"] = filter
         matches = self._send(
-            "POST", f"/v1/collections/{collection}/documents/query", body
+            "POST", f"/v1/collections/{_seg(collection)}/documents/query", body
         ).json()["matches"]
         return [
             DocumentMatch(

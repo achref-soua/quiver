@@ -36,9 +36,10 @@ lint:
 fmt:
     cargo fmt --all
 
-# Build the API documentation.
+# Build the API documentation. `-D warnings` matches CI so a broken intra-doc
+# link fails the local gate too (not just in CI).
 doc:
-    cargo doc --workspace --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # Build the documentation site (requires mdbook: `cargo install mdbook`).
 docs:
