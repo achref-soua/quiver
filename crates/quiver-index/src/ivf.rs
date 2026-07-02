@@ -307,6 +307,133 @@ impl Ivf {
         })
     }
 
+    /// Build an IVF index by **streaming** the vectors from a re-iterable `source`
+    /// instead of holding the whole `n × dim` corpus in RAM (ADR-0070). `source`
+    /// must yield the `n` rows' raw vectors (each of length `dim`) in id order and
+    /// be callable twice — a sampling pass and an encode pass. For a PQ config this
+    /// keeps only the training sample, codebooks, codes, and postings resident, so
+    /// the build's peak memory no longer scales with the full-precision corpus.
+    ///
+    /// It is **byte-identical** to [`Ivf::build`] for any collection that fits the
+    /// training sample (`n ≤ TRAIN_SAMPLE`, which is every case the codebooks train
+    /// on the full set); above that the streaming reservoir sample differs from the
+    /// random-access sample but is of equal quality.
+    ///
+    /// # Errors
+    /// As [`Ivf::build`], plus a [`IndexError::DimensionMismatch`] if a streamed row
+    /// is not `dim` long or the stream does not yield exactly `n` rows.
+    pub fn build_streaming<F, I>(
+        ids: &[u64],
+        dim: usize,
+        metric: Metric,
+        config: IvfConfig,
+        source: F,
+    ) -> Result<Self, IndexError>
+    where
+        F: Fn() -> I,
+        I: Iterator<Item = Vec<f32>>,
+    {
+        if metric == Metric::Dot {
+            return Err(IndexError::InvalidConfig(
+                "IVF supports L2 and Cosine; use HNSW for inner product",
+            ));
+        }
+        let n = ids.len();
+        let nlist = config.nlist.max(1).min(n.max(1));
+
+        // Pass 1 — reservoir-sample up to TRAIN_SAMPLE prepared rows, in id order.
+        // For n ≤ TRAIN_SAMPLE this is the full set in order, identical to `build`'s
+        // `training_sample`, so the two builds agree byte-for-byte.
+        let mut rng = SplitMix64::new(config.seed ^ 0x5A17_9E37_79B9_7C15);
+        let mut sample: Vec<f32> = Vec::new();
+        let mut seen = 0usize;
+        for v in source() {
+            if v.len() != dim {
+                return Err(IndexError::DimensionMismatch {
+                    expected: dim,
+                    got: v.len(),
+                });
+            }
+            let p = prepare(metric, &v);
+            if seen < TRAIN_SAMPLE {
+                sample.extend_from_slice(&p);
+            } else {
+                let j = rng.below(seen + 1);
+                if j < TRAIN_SAMPLE {
+                    sample[j * dim..(j + 1) * dim].copy_from_slice(&p);
+                }
+            }
+            seen += 1;
+        }
+        if seen != n {
+            return Err(IndexError::DimensionMismatch {
+                expected: n,
+                got: seen,
+            });
+        }
+        let train_n = n.min(TRAIN_SAMPLE);
+
+        // Train the coarse quantizer (and, for PQ, the codebooks) on the sample.
+        let centroids = if n == 0 {
+            vec![0f32; nlist * dim]
+        } else {
+            kmeans(&sample, train_n, dim, nlist, config.kmeans_iters, config.seed)
+        };
+
+        // Pass 2 — stream every row again; assign to a cell and encode. No
+        // full-precision `n × dim` arena is ever held (except IVF-Flat, which stores
+        // the vectors resident by definition and gains nothing from streaming).
+        let mut postings = vec![Vec::new(); nlist];
+        let mut node_cell = vec![0u32; n];
+        let storage = match config.quantization {
+            Some(m) => {
+                let pq = ProductQuantizer::train(&sample, train_n, dim, m, metric, config.seed)?;
+                let code_len = pq.code_len();
+                let mut codes = vec![0u8; n * code_len];
+                for (i, v) in source().enumerate() {
+                    let p = prepare(metric, &v);
+                    let cell = nearest_centroid(&p, &centroids, dim);
+                    postings[cell].push(i as u32);
+                    node_cell[i] = cell as u32;
+                    pq.encode_into(&p, &mut codes[i * code_len..(i + 1) * code_len]);
+                }
+                Storage::Pq { pq, codes }
+            }
+            None => {
+                let mut vectors = vec![0f32; n * dim];
+                for (i, v) in source().enumerate() {
+                    let p = prepare(metric, &v);
+                    vectors[i * dim..(i + 1) * dim].copy_from_slice(&p);
+                    let cell = nearest_centroid(&p, &centroids, dim);
+                    postings[cell].push(i as u32);
+                    node_cell[i] = cell as u32;
+                }
+                Storage::Flat { vectors }
+            }
+        };
+
+        let id_to_node = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, i as u32))
+            .collect();
+
+        Ok(Self {
+            dim,
+            metric,
+            centroids,
+            postings,
+            ids: ids.to_vec(),
+            id_to_node,
+            node_cell,
+            free: Vec::new(),
+            free_cells: Vec::new(),
+            storage,
+            config,
+            splits: 0,
+        })
+    }
+
     /// Number of live vectors in the index.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1015,6 +1142,41 @@ mod tests {
                 w[0].distance,
                 w[1].distance
             );
+        }
+    }
+
+    #[test]
+    fn build_streaming_matches_build_for_small_collections() {
+        // For n <= TRAIN_SAMPLE the streaming build trains on the full set in the
+        // same order as the batch build, so the two must be byte-identical — same
+        // search results, same distances (ADR-0070 parity claim).
+        let (dim, n) = (24, 600);
+        for metric in [Metric::L2, Metric::Cosine] {
+            let mut rng = SplitMix64::new(0xBEEF);
+            let (_data, flat, ids) = dataset(&mut rng, n, dim);
+            let cfg = || IvfConfig {
+                nlist: 24,
+                quantization: Some(8),
+                ..IvfConfig::default()
+            };
+            let batch = Ivf::build(&ids, &flat, dim, metric, cfg()).unwrap();
+            let stream =
+                Ivf::build_streaming(&ids, dim, metric, cfg(), || flat.chunks(dim).map(<[f32]>::to_vec))
+                    .unwrap();
+            for qi in [0usize, 7, 123, 599] {
+                let q: Vec<f32> = flat[qi * dim..(qi + 1) * dim].to_vec();
+                let a = batch.search(&q, 10, 24).unwrap();
+                let b = stream.search(&q, 10, 24).unwrap();
+                assert_eq!(a.len(), b.len(), "{metric:?}: result count differs");
+                for (x, y) in a.iter().zip(&b) {
+                    assert_eq!(x.id, y.id, "{metric:?}: streaming build diverged from batch");
+                    assert_eq!(
+                        x.distance.to_bits(),
+                        y.distance.to_bits(),
+                        "{metric:?}: distance differs"
+                    );
+                }
+            }
         }
     }
 
