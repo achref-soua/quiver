@@ -227,12 +227,19 @@ impl Ivf {
         }
         let nlist = config.nlist.max(1).min(n.max(1));
 
-        // Prepare (normalize for cosine) into a flat arena.
-        let mut prepared = vec![0f32; n * dim];
-        for i in 0..n {
-            let p = prepare(metric, &vectors[i * dim..(i + 1) * dim]);
-            prepared[i * dim..(i + 1) * dim].copy_from_slice(&p);
-        }
+        // Prepare (normalize for cosine) into a flat arena. For L2/Dot `prepare`
+        // is the identity, so borrow the input directly and skip a full n×dim
+        // copy — halving peak build memory for the common (non-cosine) case.
+        let prepared: Cow<'_, [f32]> = if metric == Metric::Cosine {
+            let mut buf = vec![0f32; n * dim];
+            for i in 0..n {
+                let p = prepare(metric, &vectors[i * dim..(i + 1) * dim]);
+                buf[i * dim..(i + 1) * dim].copy_from_slice(&p);
+            }
+            Cow::Owned(buf)
+        } else {
+            Cow::Borrowed(vectors)
+        };
 
         // Codebooks train on at most TRAIN_SAMPLE rows; assignment/encoding below
         // still cover every point.
@@ -273,7 +280,9 @@ impl Ivf {
                 }
                 Storage::Pq { pq, codes }
             }
-            None => Storage::Flat { vectors: prepared },
+            None => Storage::Flat {
+                vectors: prepared.into_owned(),
+            },
         };
 
         let id_to_node = ids
