@@ -59,12 +59,21 @@ fn synth(i: u64, dim: usize, out: &mut Vec<f32>) {
     let mut h = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     h ^= h >> 29;
     let cluster = h % CLUSTERS;
-    stream(cluster.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1, dim, 1.0, out, false);
+    stream(
+        cluster.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1,
+        dim,
+        1.0,
+        out,
+        false,
+    );
     stream(i.wrapping_add(0xA0761D65) | 1, dim, 0.10, out, true);
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn peak_rss_kib() -> u64 {
@@ -86,7 +95,11 @@ fn dir_bytes(p: &std::path::Path) -> u64 {
         for e in rd.flatten() {
             let meta = e.metadata();
             if let Ok(m) = meta {
-                total += if m.is_dir() { dir_bytes(&e.path()) } else { m.len() };
+                total += if m.is_dir() {
+                    dir_bytes(&e.path())
+                } else {
+                    m.len()
+                };
             }
         }
     }
@@ -103,14 +116,16 @@ fn scale_ingest_and_query() {
     let recall_cap = env_usize("QUIVER_SCALE_RECALL_CAP", 2_000_000);
     // Seal to disk this often so the active buffer (and RAM) stays bounded during
     // a large ingest; rounded to a whole number of batches.
-    let checkpoint_every =
-        (env_usize("QUIVER_SCALE_CHECKPOINT", 1_000_000) / batch).max(1) * batch;
+    let checkpoint_every = (env_usize("QUIVER_SCALE_CHECKPOINT", 1_000_000) / batch).max(1) * batch;
 
     // Keep data on the real disk (a tempdir under a caller-chosen root; NOT /tmp,
     // which may be RAM-backed and would OOM at scale).
     let root = std::env::var("QUIVER_SCALE_DIR").unwrap_or_else(|_| ".scratch/scale-data".into());
     std::fs::create_dir_all(&root).unwrap();
-    let data_dir = tempfile::Builder::new().prefix("scale-").tempdir_in(&root).unwrap();
+    let data_dir = tempfile::Builder::new()
+        .prefix("scale-")
+        .tempdir_in(&root)
+        .unwrap();
 
     eprintln!(
         "scale: N={n} dim={dim} batch={batch} queries={queries} dir={}",
@@ -123,7 +138,11 @@ fn scale_ingest_and_query() {
     // codebooks. QUIVER_SCALE_PQ=0 uses IVF-Flat (exact vectors, no PQ) — the
     // recall oracle that isolates IVF coverage from PQ compression loss.
     let pq_env = env_usize("QUIVER_SCALE_PQ", 16);
-    let pq = if pq_env == 0 { 0 } else { pq_env.clamp(1, dim / 2) as u32 };
+    let pq = if pq_env == 0 {
+        0
+    } else {
+        pq_env.clamp(1, dim / 2) as u32
+    };
     let quant = if pq == 0 { None } else { Some(pq) };
     db.create_collection(
         "scale",
@@ -180,7 +199,13 @@ fn scale_ingest_and_query() {
         synth(0, dim, &mut v);
         v
     };
-    let params = SearchParams { k: 10, ef_search: 64, with_payload: false, with_vector: false, filter: None };
+    let params = SearchParams {
+        k: 10,
+        ef_search: 64,
+        with_payload: false,
+        with_vector: false,
+        filter: None,
+    };
     let _ = db.search("scale", &warm, &params).unwrap();
     let build_s = tb.elapsed().as_secs_f64();
 
@@ -232,16 +257,27 @@ fn scale_ingest_and_query() {
     let disk = dir_bytes(data_dir.path());
 
     eprintln!("\n================ SCALE RESULT (measured) ================");
-    let idx_desc = if pq == 0 { "IVF-Flat (exact)".to_string() } else { format!("IVF+PQ m={pq}") };
+    let idx_desc = if pq == 0 {
+        "IVF-Flat (exact)".to_string()
+    } else {
+        format!("IVF+PQ m={pq}")
+    };
     eprintln!("vectors ...... {n}  (dim {dim}, {idx_desc})");
     eprintln!("ingest ....... {ingest_s:.1}s  → {rate:.0} vec/s (bulk)");
     eprintln!("first-build .. {build_s:.1}s (lazy index build on first query)");
     eprintln!("peak RSS ..... {} MiB", peak_rss_kib() / 1024);
-    eprintln!("on-disk ...... {} MiB ({} bytes/vec)", disk / (1024 * 1024), disk / n as u64);
+    eprintln!(
+        "on-disk ...... {} MiB ({} bytes/vec)",
+        disk / (1024 * 1024),
+        disk / n as u64
+    );
     eprintln!("query p50 .... {:.2} ms", p(0.50));
     eprintln!("query p95 .... {:.2} ms", p(0.95));
     match recall {
-        Some(r) => eprintln!("recall@10 .... {r:.3} (brute-force ground truth, {}q)", queries.min(50)),
+        Some(r) => eprintln!(
+            "recall@10 .... {r:.3} (brute-force ground truth, {}q)",
+            queries.min(50)
+        ),
         None => eprintln!("recall@10 .... skipped (N > recall cap; measure at a smaller tier)"),
     }
     eprintln!("========================================================\n");

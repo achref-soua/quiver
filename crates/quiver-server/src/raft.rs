@@ -831,10 +831,20 @@ mod tests {
         let mut src = Database::open(src_dir.path()).unwrap();
         src.create_collection("docs", Descriptor::new(4, Dtype::F32, DistanceMetric::L2))
             .unwrap();
-        src.upsert("docs", "a", &[1.0, 0.0, 0.0, 0.0], &serde_json::json!({"t": "a"}))
-            .unwrap();
-        src.upsert("docs", "b", &[0.0, 1.0, 0.0, 0.0], &serde_json::json!({"t": "b"}))
-            .unwrap();
+        src.upsert(
+            "docs",
+            "a",
+            &[1.0, 0.0, 0.0, 0.0],
+            &serde_json::json!({"t": "a"}),
+        )
+        .unwrap();
+        src.upsert(
+            "docs",
+            "b",
+            &[0.0, 1.0, 0.0, 0.0],
+            &serde_json::json!({"t": "b"}),
+        )
+        .unwrap();
         let ops = src.replication_snapshot().unwrap();
         let last_index = ops.len() as u64;
 
@@ -864,8 +874,9 @@ mod tests {
 
         // Reopen the engine and a fresh durable state machine from the same dirs.
         let engine2 = Arc::new(Mutex::new(Database::open(eng_dir.path()).unwrap()));
-        let mut sm2 =
-            Arc::new(StateMachineStore::open(EngineApplier(engine2.clone()), sm_dir.path()).unwrap());
+        let mut sm2 = Arc::new(
+            StateMachineStore::open(EngineApplier(engine2.clone()), sm_dir.path()).unwrap(),
+        );
 
         // The applied-state pointer survived: openraft replays only entries AFTER
         // it, not the whole committed log (the critical-bug fix).

@@ -741,7 +741,9 @@ mod tests {
         // A non-success status is an error even when the body/url contains "404",
         // and a real success is parsed regardless of its content.
         let u = "http://s0/v1/collections/c/points/order-4042";
-        assert!(parse_shard_body(u, reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom".into()).is_err());
+        assert!(
+            parse_shard_body(u, reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom".into()).is_err()
+        );
         assert_eq!(
             parse_shard_body(u, reqwest::StatusCode::OK, "{\"id\":\"order-4042\"}".into()).unwrap(),
             serde_json::json!({ "id": "order-4042" })

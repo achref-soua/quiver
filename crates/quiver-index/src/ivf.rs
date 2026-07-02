@@ -242,7 +242,14 @@ impl Ivf {
         let centroids = if n == 0 {
             vec![0f32; nlist * dim]
         } else {
-            kmeans(&train, train_n, dim, nlist, config.kmeans_iters, config.seed)
+            kmeans(
+                &train,
+                train_n,
+                dim,
+                nlist,
+                config.kmeans_iters,
+                config.seed,
+            )
         };
         let mut postings = vec![Vec::new(); nlist];
         let mut node_cell = vec![0u32; n];

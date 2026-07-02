@@ -232,7 +232,11 @@ async fn router_rejects_unrouted_ops_instead_of_returning_wrong_results() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status().as_u16(), 501, "list_collections should be 501 on a router");
+    assert_eq!(
+        r.status().as_u16(),
+        501,
+        "list_collections should be 501 on a router"
+    );
 
     // hybrid/text/fetch must 501, not hit the empty local engine.
     for path in ["query/hybrid", "query/text", "fetch"] {

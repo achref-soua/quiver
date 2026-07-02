@@ -339,7 +339,8 @@ fn call_tool_embed(
         }
         "fetch" => {
             let collection = want_str(args, "collection")?;
-            let limit = (args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize).min(MCP_MAX_FETCH);
+            let limit = (args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize)
+                .min(MCP_MAX_FETCH);
             let filter = match args.get("filter") {
                 Some(f) if !f.is_null() => Some(
                     serde_json::from_value::<Filter>(f.clone())

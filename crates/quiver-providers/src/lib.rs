@@ -254,13 +254,17 @@ fn parse_openai(body: &Value) -> Result<Vec<Vec<f32>>, ProviderError> {
             .get_mut(idx)
             .ok_or_else(|| ProviderError::Parse(format!("`data` row index {idx} out of range")))?;
         if slot.is_some() {
-            return Err(ProviderError::Parse(format!("duplicate `data` row index {idx}")));
+            return Err(ProviderError::Parse(format!(
+                "duplicate `data` row index {idx}"
+            )));
         }
         *slot = Some(embedding);
     }
     out.into_iter()
         .enumerate()
-        .map(|(i, e)| e.ok_or_else(|| ProviderError::Parse(format!("missing embedding for input {i}"))))
+        .map(|(i, e)| {
+            e.ok_or_else(|| ProviderError::Parse(format!("missing embedding for input {i}")))
+        })
         .collect()
 }
 
@@ -645,11 +649,13 @@ mod tests {
             vec![vec![1.0_f32, 1.0], vec![9.0_f32, 9.0]]
         );
         // A duplicate or out-of-range index is an error, not silent corruption.
-        assert!(parse_openai(&json!({"data":[
-            {"index":0,"embedding":[1.0]},
-            {"index":0,"embedding":[2.0]},
-        ]}))
-        .is_err());
+        assert!(
+            parse_openai(&json!({"data":[
+                {"index":0,"embedding":[1.0]},
+                {"index":0,"embedding":[2.0]},
+            ]}))
+            .is_err()
+        );
         // Absent `index` falls back to position (order preserved).
         assert_eq!(
             parse_openai(&json!({"data":[{"embedding":[1.0]},{"embedding":[2.0]}]})).unwrap(),

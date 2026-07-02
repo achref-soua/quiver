@@ -709,7 +709,10 @@ mod tests {
             .encrypt(&[0.5, 0.6, 0.7, 0.8])
             .expect("encrypt");
         // Same key and beta, but no normalization → tag mismatch.
-        assert!(matches!(cipher(0.1).decrypt(&enc), Err(DcpeError::Integrity)));
+        assert!(matches!(
+            cipher(0.1).decrypt(&enc),
+            Err(DcpeError::Integrity)
+        ));
         // A different normalization scale also fails closed.
         let other = Normalization::new(vec![0.1, 0.2, 0.3, 0.4], 4.0).expect("normalization");
         assert!(matches!(
