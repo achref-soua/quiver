@@ -7,9 +7,9 @@
 //!
 //! The shard map is held behind an [`ArcSwap`] so a later increment can refresh it
 //! (dynamic, elastic membership — ADR-0065) without restarting the router; here it
-//! is seeded once from the operator-declared shard URLs. Scatter is sequential for
-//! now — correct and simple; concurrent fan-out is a perf follow-up.
-//! TODO(perf): sequential scatter, parallelise when shard count / latency matters.
+//! is seeded once from the operator-declared shard URLs. Searches scatter to the
+//! shards **concurrently** (`try_join_all`), so cluster search latency tracks the
+//! slowest shard rather than the sum of all shards.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -582,18 +582,24 @@ impl Cluster {
         // donor still holds the authoritative slice (ADR-0066 increment 3c) — querying
         // both would double-count. With no migration in flight this is every shard.
         let active = map.active_shards();
-        let mut per_shard: Vec<Vec<MatchOut>> = Vec::with_capacity(active.len());
-        for shard in &active {
-            let resp = self
-                .shard_query(
-                    shard,
-                    base.wrapping_add(shard.id as usize),
-                    collection,
-                    &body,
-                )
-                .await?;
-            per_shard.push(matches_from_json(&resp, with_vector));
-        }
+        // Scatter to every active shard concurrently, so total latency is the
+        // slowest shard rather than the sum of all shards. Each shard returns its
+        // own local top-k, so the gather below is unchanged and the result is
+        // identical to the sequential version; a single shard error fails the query.
+        let body = &body;
+        let per_shard: Vec<Vec<MatchOut>> =
+            futures_util::future::try_join_all(active.iter().map(|shard| async move {
+                let resp = self
+                    .shard_query(
+                        shard,
+                        base.wrapping_add(shard.id as usize),
+                        collection,
+                        body,
+                    )
+                    .await?;
+                Ok::<_, Error>(matches_from_json(&resp, with_vector))
+            }))
+            .await?;
         // Gather: dedup by id, then merge to the exact global top-k by score. The
         // dedup absorbs the brief post-flip window where a just-promoted shard and its
         // donor both still hold a slice point, so it is never double-counted.
