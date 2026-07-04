@@ -10,6 +10,26 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.33.0] — Unburdened — 2026-07-04
+
+### Added
+
+- **Streaming, memory-bounded index build — the live wiring** ([ADR-0071](docs/adr/0071-streaming-rebuild-vector-source.md), completing [ADR-0070](docs/adr/0070-streaming-index-build.md) Increment B).
+  The IVF index rebuild — both the server's off-lock path (ADR-0062) and the
+  embedded open/`ensure_indexed` path — now streams its vectors from the immutable
+  on-disk `.vec` segments instead of materialising the whole `n·dim` corpus in a
+  resident `flat` array (~51 GiB at 100M×128). `Store::capture_vector_source`
+  reopens the referenced segments' `.vec` `mmap`s as owned, lock-free handles that
+  a concurrent checkpoint cannot disturb; `scan_collection` captures one for a
+  dense IVF collection and rebuilds the (usually empty) sparse index from a
+  payload-only scan, and both rebuild entry points feed `Ivf::build_streaming`.
+  Peak build memory for the vectors drops from `O(n·dim)` to
+  `O(sample + nlist·dim + n·m_bytes)`; the corpus stays on disk, read on demand.
+  No on-disk or wire format change; defaults unchanged. The reference-hardware RSS
+  measurement (≥ 20M) is deferred to the dedicated box and no number is claimed —
+  the change lands on correctness tests (a rebuild spanning a reopened sealed
+  segment and the active buffer) and the code-level elimination of the arena.
+
 ## [0.32.0] — Streaming — 2026-07-04
 
 Foundational work toward the single-box **100M** build, plus a cluster-search
@@ -928,7 +948,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.32.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.33.0...HEAD
+[0.33.0]: https://github.com/achref-soua/quiver/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/achref-soua/quiver/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/achref-soua/quiver/compare/v0.30.2...v0.31.0
 [0.30.2]: https://github.com/achref-soua/quiver/compare/v0.30.1...v0.30.2

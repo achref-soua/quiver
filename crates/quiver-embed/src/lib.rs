@@ -47,7 +47,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use quiver_core::{SecPredicate, SecValue, Store};
+use quiver_core::{SecPredicate, SecValue, Store, VectorSource};
 use quiver_index::{
     ColbertConfig, ColbertIndex, DiskVamana, FreshDiskVamana, FreshVamana, Hnsw, HnswConfig, Index,
     Ivf, IvfConfig, Metric, Neighbor, ProductQuantizer, Vamana, VamanaConfig, max_sim,
@@ -2130,6 +2130,46 @@ const PQ_SEED: u64 = 0x5176_5044_5141_5453;
 // the previous handle (unmapping the file) first.
 const DISK_INDEX_FILE: &str = "vamana.qvx";
 
+// The IVF configuration for a collection of `n` points. Scale the coarse
+// quantizer with the corpus (~√n, like the Colbert path and FAISS guidance) so a
+// query probes a small fraction of cells instead of scanning every posting. A
+// fixed nlist made large collections a full scan (O(n) queries); √n keeps them
+// sublinear. Shared by the materialized and streaming builds so the two agree.
+fn ivf_config(descriptor: &Descriptor, n: usize) -> IvfConfig {
+    let nlist = ((n as f64).sqrt().ceil() as usize).clamp(64, 65_536);
+    IvfConfig {
+        nlist,
+        quantization: descriptor.index.pq_subspaces.map(|m| m as usize),
+        ..IvfConfig::default()
+    }
+}
+
+// Build a dense IVF index by streaming its vectors from disk (ADR-0070) instead
+// of a materialized `flat` corpus — the low-memory path for a streaming-eligible
+// collection ([`streams_rebuild`]). Byte-identical to the `flat` build for any
+// collection within the training sample; equal-quality above it. A read error in
+// the (lock-free) source surfaces in place of the generic row-count mismatch.
+fn build_ivf_streaming(
+    descriptor: &Descriptor,
+    ids: &[u64],
+    source: &VectorSource,
+) -> Result<CollectionIndex> {
+    debug_assert_eq!(
+        ids.len(),
+        source.len(),
+        "id count must match the vector stream"
+    );
+    let dim = descriptor.dim as usize;
+    let metric = to_index_metric(descriptor.metric);
+    let cfg = ivf_config(descriptor, ids.len());
+    let ivf = Ivf::build_streaming(ids, dim, metric, cfg, || source.iter()).map_err(|e| {
+        source
+            .take_error()
+            .map_or_else(|| Error::from(e), Error::from)
+    })?;
+    Ok(CollectionIndex::Ivf(Some(ivf)))
+}
+
 fn build_index(
     store: &Store,
     cid: CollectionId,
@@ -2175,16 +2215,7 @@ fn build_in_memory_index(
         // The disk-resident artifact is sealed through the store, not here.
         IndexKind::DiskVamana => return Ok(None),
         IndexKind::Ivf => {
-            // Scale the coarse quantizer with the corpus (~√n, like the Colbert
-            // path and FAISS guidance) so a query probes a small fraction of cells
-            // instead of scanning every posting. A fixed nlist made large
-            // collections a full scan (O(n) queries); √n keeps them sublinear.
-            let nlist = ((ids.len() as f64).sqrt().ceil() as usize).clamp(64, 65_536);
-            let cfg = IvfConfig {
-                nlist,
-                quantization: descriptor.index.pq_subspaces.map(|m| m as usize),
-                ..IvfConfig::default()
-            };
+            let cfg = ivf_config(descriptor, ids.len());
             CollectionIndex::Ivf(Some(Ivf::build(ids, flat, dim, metric, cfg)?))
         }
         IndexKind::Colbert => {
@@ -2596,17 +2627,42 @@ fn index_delete_point(handle: &mut CollectionHandle, ext_id: &str) {
 struct RebuildScan {
     int_to_ext: Vec<String>,
     ext_to_int: HashMap<String, u64>,
+    // The full-precision corpus, materialized for the standard build path. Empty
+    // when `source` is set (a streaming IVF build reads vectors from disk instead).
     flat: Vec<f32>,
     docs: Option<BTreeMap<String, u32>>,
     sparse: Option<SparseInvertedIndex>,
+    // A lock-free, on-disk vector stream for a streaming IVF build (ADR-0070):
+    // present iff the collection is streaming-eligible, so the off-lock build
+    // never materializes the `n × dim` corpus in RAM. See [`streams_rebuild`].
+    source: Option<VectorSource>,
+}
+
+// Whether a collection's index rebuild streams its vectors from disk (ADR-0070)
+// instead of materializing the whole corpus in `flat`. Scoped to the dense IVF
+// case — the one with an `Ivf::build_streaming` primitive and the one that hits
+// the RAM wall at scale (100M × dim × 4 B ≫ box RAM). Multi-vector, client-side,
+// and non-IVF collections keep the materialized path.
+// ponytail: IVF-only; extend to the disk-Vamana build when it grows a streaming
+// primitive of its own.
+fn streams_rebuild(descriptor: &Descriptor) -> bool {
+    descriptor.index.kind == IndexKind::Ivf
+        && !descriptor.multivector
+        && descriptor.vector_encryption != VectorEncryption::ClientSide
 }
 
 // Scan a collection's live rows into a [`RebuildScan`]. Rebuilds the derived sparse
 // inverted index (ADR-0045) and, for a multi-vector collection, the document
 // grouping (doc id → token count) authoritatively from those rows. `&self` on the
 // store, so it runs under a shared read lock.
+//
+// For a streaming-eligible collection ([`streams_rebuild`]) the vectors are *not*
+// read here: their (large) column is captured as a [`VectorSource`] for an
+// off-lock, low-memory build, and only the (small) payloads are scanned for the
+// id maps and sparse index.
 fn scan_collection(store: &Store, handle: &CollectionHandle) -> Result<RebuildScan> {
     let multivector = handle.descriptor.multivector;
+    let streaming = streams_rebuild(&handle.descriptor);
     let mut int_to_ext = Vec::new();
     let mut ext_to_int = HashMap::new();
     let mut flat: Vec<f32> = Vec::new();
@@ -2614,26 +2670,47 @@ fn scan_collection(store: &Store, handle: &CollectionHandle) -> Result<RebuildSc
     // Only single-vector, server-searchable collections carry a sparse index, and
     // only non-empty payloads are parsed, so non-sparse collections pay nothing.
     let mut sparse = uses_sparse_index(&handle.descriptor).then(SparseInvertedIndex::new);
-    for (ext_id, record) in store.scan(handle.id)? {
-        let internal = int_to_ext.len() as u64;
-        flat.extend_from_slice(&record.vector);
-        if multivector && let Some((doc, _)) = parse_token_id(&ext_id) {
-            *docs.entry(doc.to_owned()).or_insert(0) += 1;
+
+    if streaming {
+        // Payload-only pass (no vectors) + a separate lock-free vector capture;
+        // both walk the store's primary index in the same id order.
+        for (ext_id, payload) in store.scan_payloads(handle.id)? {
+            let internal = int_to_ext.len() as u64;
+            if let Some(idx) = sparse.as_mut()
+                && let Some(sv) = sparse_vector_from_payload(&payload)
+            {
+                idx.upsert(&ext_id, &sv);
+            }
+            ext_to_int.insert(ext_id.clone(), internal);
+            int_to_ext.push(ext_id);
         }
-        if let Some(idx) = sparse.as_mut()
-            && let Some(sv) = sparse_vector_from_payload(&record.payload)
-        {
-            idx.upsert(&ext_id, &sv);
+    } else {
+        for (ext_id, record) in store.scan(handle.id)? {
+            let internal = int_to_ext.len() as u64;
+            flat.extend_from_slice(&record.vector);
+            if multivector && let Some((doc, _)) = parse_token_id(&ext_id) {
+                *docs.entry(doc.to_owned()).or_insert(0) += 1;
+            }
+            if let Some(idx) = sparse.as_mut()
+                && let Some(sv) = sparse_vector_from_payload(&record.payload)
+            {
+                idx.upsert(&ext_id, &sv);
+            }
+            ext_to_int.insert(ext_id.clone(), internal);
+            int_to_ext.push(ext_id);
         }
-        ext_to_int.insert(ext_id.clone(), internal);
-        int_to_ext.push(ext_id);
     }
+
+    let source = streaming
+        .then(|| store.capture_vector_source(handle.id))
+        .transpose()?;
     Ok(RebuildScan {
         int_to_ext,
         ext_to_int,
         flat,
-        docs: multivector.then_some(docs),
+        docs: (multivector && !streaming).then_some(docs),
         sparse,
+        source,
     })
 }
 
@@ -2646,7 +2723,10 @@ fn rebuild_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
     // Drop the previous index before rebuilding: a disk index `mmap`s a file we
     // are about to overwrite in place, and the mapping assumes an immutable file.
     handle.index = empty_index(&handle.descriptor);
-    handle.index = build_index(store, handle.id, &handle.descriptor, &ids, &scan.flat)?;
+    handle.index = match &scan.source {
+        Some(source) => build_ivf_streaming(&handle.descriptor, &ids, source)?,
+        None => build_index(store, handle.id, &handle.descriptor, &ids, &scan.flat)?,
+    };
     handle.int_to_ext = scan.int_to_ext;
     handle.ext_to_int = scan.ext_to_int;
     handle.docs = scan.docs;
@@ -2698,13 +2778,23 @@ impl RebuildInputs {
     /// sealed later by `commit_rebuild` under the write lock.
     pub fn build(self) -> Result<RebuiltIndex> {
         let ids: Vec<u64> = (0..self.scan.int_to_ext.len() as u64).collect();
-        let kind = match build_in_memory_index(&self.descriptor, &ids, &self.scan.flat)? {
-            Some(index) => RebuiltKind::Ready(Box::new(index)),
-            None => {
-                let (graph, pq) = build_disk_graph_pq(&self.descriptor, &ids, &self.scan.flat)?;
-                RebuiltKind::Disk {
-                    graph: Box::new(graph),
-                    pq: Box::new(pq),
+        // A streaming-eligible collection builds its dense IVF index from the
+        // captured on-disk vector stream (ADR-0070) — no `n × dim` corpus in RAM.
+        let kind = if let Some(source) = &self.scan.source {
+            RebuiltKind::Ready(Box::new(build_ivf_streaming(
+                &self.descriptor,
+                &ids,
+                source,
+            )?))
+        } else {
+            match build_in_memory_index(&self.descriptor, &ids, &self.scan.flat)? {
+                Some(index) => RebuiltKind::Ready(Box::new(index)),
+                None => {
+                    let (graph, pq) = build_disk_graph_pq(&self.descriptor, &ids, &self.scan.flat)?;
+                    RebuiltKind::Disk {
+                        graph: Box::new(graph),
+                        pq: Box::new(pq),
+                    }
                 }
             }
         };
@@ -3754,6 +3844,31 @@ mod tests {
             kind,
             pq_subspaces: None,
         })
+    }
+
+    #[test]
+    fn scan_collection_streams_ivf_and_materializes_others() {
+        // The streaming path (ADR-0070) is selected exactly for dense IVF: it
+        // captures an on-disk vector source and leaves `flat` empty, while every
+        // other index kind keeps the materialized `flat` corpus.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = open(tmp.path());
+        for (name, kind) in [("ivf", IndexKind::Ivf), ("hnsw", IndexKind::Hnsw)] {
+            db.create_collection(name, desc_with(kind)).unwrap();
+            db.upsert(name, "a", &[1.0, 0.0, 0.0, 0.0], &json!({}))
+                .unwrap();
+        }
+        let ivf = scan_collection(&db.store, &db.collections["ivf"]).unwrap();
+        assert!(ivf.source.is_some(), "IVF rebuild streams its vectors");
+        assert!(
+            ivf.flat.is_empty(),
+            "streamed scan leaves `flat` unmaterialized"
+        );
+        assert_eq!(ivf.source.as_ref().unwrap().len(), 1);
+
+        let hnsw = scan_collection(&db.store, &db.collections["hnsw"]).unwrap();
+        assert!(hnsw.source.is_none(), "HNSW keeps the materialized path");
+        assert!(!hnsw.flat.is_empty(), "materialized scan fills `flat`");
     }
 
     #[test]
