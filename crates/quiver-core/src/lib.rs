@@ -41,5 +41,5 @@ pub use error::{CoreError, Result};
 pub use ids::{CollectionId, Lsn};
 pub use keyring::{KeyRing, SingleCodecKeyRing};
 pub use sec::{SecPredicate, SecValue};
-pub use store::{CommitObserver, Record, Store};
+pub use store::{CommitObserver, Record, Store, VectorSource};
 pub use wal::{WalEntry, WalOp};

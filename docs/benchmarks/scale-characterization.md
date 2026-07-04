@@ -80,24 +80,30 @@ and the table above (200k / 1M / 10M). Each is measured, and the wins compound.
 
 ## Ceilings and the road to 100M-on-a-laptop
 
-Four findings bounded scale. Findings 1, 3, and 4 are now **fixed** (see Enhancements
-above); finding 2 — the batch build's RAM footprint — is the one remaining step to a
-true 100M single-box build.
+Four findings bounded scale. Findings 1, 3, and 4 are **fixed** (see Enhancements
+above); finding 2 — the batch build's RAM footprint — is now **addressed on the IVF
+rebuild path** by the streaming build (ADR-0070/0071), with the resident primary
+index (below) the remaining O(N) cost before a 15 GiB-box 100M run.
 
 1. **FIXED — codebooks trained on the full set.** `ivf::build` trained the coarse
    kmeans and PQ codebooks over all N vectors (O(N) build: 1718 s for 1M). It now
    trains on a deterministic 262k-row sample (FAISS-style) and assigns/encodes all
    N — **1718 s → 115 s at 1M (~15×)**, byte-identical for small N (all tests green).
 
-2. **REMAINING — the batch build still materializes N×dim floats in RAM.** The
-   redundant normalized `prepared` copy is now elided for L2/Dot (see Enhancements),
-   which halved the build's extra allocation and is what let 10M fit. But
-   `scan_collection` still reads every vector into one resident `flat` arena —
-   **~5 GiB at 10M, ~51 GiB at 100M** — so the test box tops out near 10M, and a
-   single-box 100M build needs a **streaming/chunked build** (sample-train from a
-   store scan, stream-encode). That is an ADR-level change with lock-model
-   implications, deliberately not rushed. **The frugal wedge holds for storage and
-   query; the batch build is the last piece.**
+2. **ADDRESSED (IVF rebuild path) — the build no longer materializes N×dim floats.**
+   The redundant normalized `prepared` copy was elided for L2/Dot (see Enhancements),
+   which halved the build's extra allocation and is what let 10M fit. The remaining
+   `flat` arena — every vector read into one resident array, **~5 GiB at 10M,
+   ~51 GiB at 100M** — is now gone on the live IVF rebuild: `scan_collection` skips
+   `flat` and captures a lock-free `VectorSource` over the immutable `.vec` `mmap`s
+   (ADR-0070 `Ivf::build_streaming` + ADR-0071 wiring), so the build reads each row
+   from disk in two bounded passes and holds only the sample, codebooks, PQ codes,
+   and postings resident. Peak build memory for the vectors drops from `O(N·dim)` to
+   `O(sample + nlist·dim + N·m_bytes)`. The end-to-end **RSS measurement at ≥ 20M is
+   deferred to the dedicated reference box and no number is claimed here** — the
+   change lands on correctness tests (a rebuild spanning a reopened sealed segment
+   and the active buffer) and the code-level elimination of the arena; the resident
+   **primary index** below is the next O(N) cost to remove (Increment C).
 
 3. **FIXED — IVF `nlist` was fixed at 64.** With `nprobe = ef_search = nlist = 64`
    every query was a full PQ scan (no pruning), so query latency grew O(N) — 815 ms at

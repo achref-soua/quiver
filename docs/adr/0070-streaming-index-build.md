@@ -90,17 +90,17 @@ Shipped incrementally, correctness-first:
   result to `Ivf::build` on the same rows and seed (a parity test asserts this on
   small collections, for both L2 and Cosine). This is the tested core that de-risks
   the design; it holds only the sample, codebooks, codes, and postings resident.
-- **Increment B (sequenced next — the lock-model-careful part):** a `Store`
-  immutable-segment **vector stream** — a lock-free handle over the sealed `.vec`
-  `mmap`s at a captured manifest version, valid for the life of an off-lock rebuild
-  (the segments are write-once and pinned against GC until the manifest advances) —
-  threaded through `RebuildScan` / the off-lock rebuild (ADR-0062) so
-  `build_in_memory_index` routes the IVF+PQ path through `build_streaming` without
-  ever materialising `flat`. This is the piece that turns the primitive into a real
-  memory win on the live path; it touches the storage/rebuild seam and the lock
-  model, so it is a focused, separately-reviewed increment rather than rushed.
-  Validated by a scale-harness tier (`≥ 20M`) asserting build peak RSS no longer
-  tracks `n·dim`.
+- **Increment B (shipped — [ADR-0071](0071-streaming-rebuild-vector-source.md)):**
+  a `Store` immutable-segment **vector stream** (`capture_vector_source` →
+  `VectorSource`) threaded through `RebuildScan` and both rebuild entry points, so
+  the live IVF rebuild routes through `build_streaming` without ever materialising
+  `flat`. Implementation refined the sketch above: the source **reopens** the
+  sealed `.vec` `mmap`s as owned, independent handles (rather than borrowing the
+  store's) so it is `Send` across the off-lock `spawn_blocking` boundary and immune
+  to a concurrent checkpoint's in-place segment mutation — see ADR-0071 for why
+  `Arc`-sharing and the borrowed-slice sketch were both rejected. The reference-HW
+  RSS validation (`≥ 20M`) is deferred to the dedicated box, honestly, and no
+  number is claimed until it is run; the increment lands on correctness tests.
 - **Increment C (sequenced):** the on-disk / sharded primary index (the other O(n)
   resident cost), then a 100M reference-hardware run recorded honestly.
 
