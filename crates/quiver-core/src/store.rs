@@ -37,6 +37,7 @@
 //! `&self`. The lock-free MVCC snapshot model (ADR-0006) arrives with the
 //! server integration; until then a server wraps the store in a lock.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,6 +45,7 @@ use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
+use crate::blockfile::BlockFile;
 use crate::descriptor::Descriptor;
 use crate::error::{CoreError, Result};
 use crate::ids::{CollectionId, Lsn};
@@ -123,6 +125,98 @@ pub struct RecoveryTail {
 enum Loc {
     Active(u32),
     Sealed { seg: u32, row: u32 },
+}
+
+/// A captured, re-iterable, **lock-free** source of a collection's live vectors
+/// in primary (external-id) order — the same order [`Store::scan`] yields
+/// (ADR-0070, streaming index build). Produced under the store's read lock by
+/// [`Store::capture_vector_source`], then iterated with no lock held, so an
+/// off-lock index rebuild (ADR-0062) never materializes the whole `n × dim`
+/// corpus in RAM: the vectors stay on disk, read through `mmap` on demand.
+///
+/// It owns fresh `mmap`s of the referenced segments' immutable `.vec` columns
+/// and clones of the (bounded) active-buffer vectors, so a concurrent checkpoint
+/// that compacts, mutates, or unlinks those segments cannot disturb an in-flight
+/// scan — the mappings outlive the store's own handles.
+pub struct VectorSource {
+    // Reopened `.vec` mmaps for the referenced segments; `SourceRow::Sealed.file`
+    // indexes this. Only segments carrying a live row are reopened.
+    vec_files: Vec<BlockFile>,
+    // The collection's page codec, to decrypt each row off-lock.
+    codec: Box<dyn PageCodec>,
+    // Bytes per vector; a sealed row lives at `row × stride` in its `.vec`.
+    stride: usize,
+    // Vector dimensionality (`stride / size_of::<f32>()`), cached for the build.
+    dim: usize,
+    // One entry per live row, in primary order (identical to `scan`/`scan_payloads`).
+    rows: Vec<SourceRow>,
+    // Cloned little-endian bytes of active-buffer vectors; `SourceRow::Active`
+    // indexes this. Bounded by the checkpoint cadence, so small.
+    active: Vec<Vec<u8>>,
+    // First read/decrypt error hit during iteration, surfaced after the build.
+    err: Cell<Option<CoreError>>,
+}
+
+// A live row's captured location within a [`VectorSource`].
+enum SourceRow {
+    Sealed { file: u32, row: u32 },
+    Active(u32),
+}
+
+impl VectorSource {
+    /// The number of live rows (the index's `n`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the collection has no live rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The vector dimensionality.
+    #[must_use]
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Iterate the live vectors in primary order. Re-callable — a streaming build
+    /// runs a sampling pass then an encode pass. A read/decrypt error ends the
+    /// iteration early and is recorded for [`Self::take_error`]; the shortened
+    /// stream makes the consuming build fail loudly (a row-count mismatch) rather
+    /// than silently drop a row.
+    pub fn iter(&self) -> impl Iterator<Item = Vec<f32>> + '_ {
+        self.rows.iter().map_while(move |r| match self.read_row(r) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                self.err.set(Some(e));
+                None
+            }
+        })
+    }
+
+    // Read and decrypt one row's vector — from the reopened `.vec` mmap for a
+    // sealed row, or the cloned active bytes for a buffered one.
+    fn read_row(&self, row: &SourceRow) -> Result<Vec<f32>> {
+        let bytes = match *row {
+            SourceRow::Sealed { file, row } => self.vec_files[file as usize].read_range(
+                self.codec.as_ref(),
+                row as usize * self.stride,
+                self.stride,
+            )?,
+            SourceRow::Active(i) => self.active[i as usize].clone(),
+        };
+        Ok(le_bytes_to_f32(&bytes))
+    }
+
+    /// Take the first read/decrypt error hit during iteration, if any — the true
+    /// cause behind a streaming build's row-count mismatch.
+    #[must_use]
+    pub fn take_error(&self) -> Option<CoreError> {
+        self.err.take()
+    }
 }
 
 // A row buffered in RAM since the last checkpoint. Also durable in the WAL until
@@ -791,6 +885,114 @@ impl Store {
         let mut out = Vec::with_capacity(state.primary.len());
         for (id, &loc) in &state.primary {
             out.push((id.clone(), self.record_at(state, loc)?));
+        }
+        Ok(out)
+    }
+
+    /// Capture a [`VectorSource`] over a collection's current live rows for a
+    /// lock-free, off-lock streaming index build (ADR-0070). Reopens the
+    /// referenced sealed segments' `.vec` columns and clones the (bounded)
+    /// active-buffer vectors, but reads **no** vector bytes here — the
+    /// decrypt/scan happens later, off-lock, so this stays cheap under the lock.
+    /// The ids are captured in primary order, identical to [`Self::scan`].
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`] if the collection is unknown, [`CoreError::MalformedPage`]
+    /// on a dangling location, or an I/O error reopening a segment's `.vec` column.
+    pub fn capture_vector_source(&self, collection: CollectionId) -> Result<VectorSource> {
+        let state = self
+            .collections
+            .get(&collection)
+            .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
+        let seg_dir = segments_dir(&self.dir, collection);
+        let codec = state.codec.clone_box();
+
+        let mut vec_files: Vec<BlockFile> = Vec::new();
+        let mut seg_slot: HashMap<u32, u32> = HashMap::new();
+        let mut rows: Vec<SourceRow> = Vec::with_capacity(state.primary.len());
+        let mut active: Vec<Vec<u8>> = Vec::new();
+
+        for &loc in state.primary.values() {
+            let row = match loc {
+                Loc::Sealed { seg, row } => {
+                    let slot = match seg_slot.get(&seg) {
+                        Some(&s) => s,
+                        None => {
+                            let seg_id = state
+                                .sealed
+                                .get(seg as usize)
+                                .ok_or_else(|| {
+                                    CoreError::MalformedPage(format!(
+                                        "dangling segment index {seg}"
+                                    ))
+                                })?
+                                .seg_id;
+                            let s = vec_files.len() as u32;
+                            vec_files.push(segment::open_vec_column(
+                                &seg_dir,
+                                seg_id,
+                                codec.as_ref(),
+                            )?);
+                            seg_slot.insert(seg, s);
+                            s
+                        }
+                    };
+                    SourceRow::Sealed { file: slot, row }
+                }
+                Loc::Active(r) => {
+                    let ar = state.active.get(r as usize).ok_or_else(|| {
+                        CoreError::MalformedPage(format!("dangling active row {r}"))
+                    })?;
+                    let i = active.len() as u32;
+                    active.push(ar.vector.clone());
+                    SourceRow::Active(i)
+                }
+            };
+            rows.push(row);
+        }
+
+        Ok(VectorSource {
+            vec_files,
+            codec,
+            stride: state.stride,
+            dim: state.descriptor.dim as usize,
+            rows,
+            active,
+            err: Cell::new(None),
+        })
+    }
+
+    /// Iterate every live `(external_id, payload)` in a collection, in primary
+    /// (id) order — the same order as [`Self::scan`] and [`Self::capture_vector_source`],
+    /// but reading **only** payloads, not the (large) vector column. Used by a
+    /// streaming rebuild to repopulate the id maps and the derived sparse index
+    /// while the vectors are captured separately for an off-lock, low-memory build.
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`] if the collection is unknown, or an I/O / decrypt /
+    /// page-integrity error reading a payload.
+    pub fn scan_payloads(&self, collection: CollectionId) -> Result<Vec<(String, Vec<u8>)>> {
+        let state = self
+            .collections
+            .get(&collection)
+            .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
+        let mut out = Vec::with_capacity(state.primary.len());
+        for (ext_id, &loc) in &state.primary {
+            let payload = match loc {
+                Loc::Active(r) => state
+                    .active
+                    .get(r as usize)
+                    .ok_or_else(|| CoreError::MalformedPage(format!("dangling active row {r}")))?
+                    .payload
+                    .clone(),
+                Loc::Sealed { seg, row } => {
+                    let segment = state.sealed.get(seg as usize).ok_or_else(|| {
+                        CoreError::MalformedPage(format!("dangling segment index {seg}"))
+                    })?;
+                    segment.read_payload(state.codec.as_ref(), row)?
+                }
+            };
+            out.push((ext_id.clone(), payload));
         }
         Ok(out)
     }

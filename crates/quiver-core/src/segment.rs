@@ -404,6 +404,19 @@ pub(crate) fn open_segment(
     })
 }
 
+/// Open just a sealed segment's immutable `.vec` column as a standalone `mmap`,
+/// for a lock-free off-lock vector stream (ADR-0070). Cheaper than
+/// [`open_segment`], which also loads the payload directory, tombstones, and
+/// secondary index a pure vector scan never touches. Rows are read at
+/// `row × stride` exactly as [`SealedSegment::read_vector`] does.
+pub(crate) fn open_vec_column(
+    seg_dir: &Path,
+    segment_id: u64,
+    codec: &dyn PageCodec,
+) -> Result<BlockFile> {
+    BlockFile::open(&vec_path(seg_dir, segment_id), codec, PageType::Segment)
+}
+
 /// File name of a segment's vector column.
 fn vec_path(seg_dir: &Path, seg_id: u64) -> PathBuf {
     seg_dir.join(format!("seg-{seg_id:010}.vec"))
