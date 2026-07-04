@@ -10,6 +10,8 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.33.0] — Unburdened — 2026-07-04
+
 ### Added
 
 - **Streaming, memory-bounded index build — the live wiring** ([ADR-0071](docs/adr/0071-streaming-rebuild-vector-source.md), completing [ADR-0070](docs/adr/0070-streaming-index-build.md) Increment B).
@@ -946,7 +948,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.32.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.33.0...HEAD
+[0.33.0]: https://github.com/achref-soua/quiver/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/achref-soua/quiver/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/achref-soua/quiver/compare/v0.30.2...v0.31.0
 [0.30.2]: https://github.com/achref-soua/quiver/compare/v0.30.1...v0.30.2
