@@ -10,6 +10,32 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.32.0] — Streaming — 2026-07-04
+
+Foundational work toward the single-box **100M** build, plus a cluster-search
+latency win. No on-disk or wire format change; defaults are unchanged.
+
+### Added
+
+- **Streaming, memory-bounded index build — the primitive** ([ADR-0070](docs/adr/0070-streaming-index-build.md)).
+  `Ivf::build_streaming` builds an IVF+PQ index by streaming vectors from a
+  re-iterable source in two bounded passes — a deterministic reservoir-sample
+  train pass, then a stream-encode pass — instead of materializing the whole
+  `n·dim` corpus in RAM. It is **byte-identical** to `Ivf::build` for collections
+  within the training sample, proven by a parity test over L2 and Cosine. This is
+  the core primitive that lifts the batch build's `O(n·dim)` RAM ceiling toward a
+  single-box 100M; **wiring it into the embedded scan→build path is the next
+  increment and is not yet in effect** — this release ships the primitive and the
+  accepted ADR, not the end-to-end memory win.
+
+### Performance
+
+- **Concurrent cluster scatter-gather.** A cluster search queried each shard
+  sequentially, so its latency was the *sum* of the per-shard latencies. It now
+  fans out with `try_join_all` and tracks the **slowest** shard instead. Each
+  shard still returns its local top-k, so the merge and the final result are
+  identical — the exact-ground-truth cluster test passes unchanged.
+
 ## [0.31.0] — Reinforced — 2026-07-02
 
 An adversarial-audit remediation, hardening, and scale pass: **18 confirmed bugs
@@ -902,7 +928,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.31.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.32.0...HEAD
+[0.32.0]: https://github.com/achref-soua/quiver/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/achref-soua/quiver/compare/v0.30.2...v0.31.0
 [0.30.2]: https://github.com/achref-soua/quiver/compare/v0.30.1...v0.30.2
 [0.30.1]: https://github.com/achref-soua/quiver/compare/v0.30.0...v0.30.1
