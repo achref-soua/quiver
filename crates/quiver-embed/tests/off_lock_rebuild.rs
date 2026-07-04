@@ -168,11 +168,62 @@ fn disk_index_rebuilds_off_lock() {
 
 #[test]
 fn ivf_index_rebuilds_off_lock() {
-    // A non-HNSW in-memory kind through the `RebuiltKind::Ready` commit arm.
+    // A non-HNSW in-memory kind through the `RebuiltKind::Ready` commit arm. The
+    // `seed` corpus is all in the active buffer, so this pins the streaming
+    // rebuild (ADR-0070) reading vectors from the in-RAM active rows.
     let (_tmp, mut db) = seed(IndexKind::Ivf);
     defer_move_p0_to_z(&mut db);
     let inputs = db.snapshot_rebuild_inputs("c").unwrap().expect("stale");
     let rebuilt = inputs.build().unwrap();
     assert!(!db.commit_rebuild(rebuilt).unwrap());
     assert_eq!(top(&db, &Z), "p0");
+}
+
+#[test]
+fn ivf_streaming_rebuild_reads_sealed_and_active_rows() {
+    // A dense IVF rebuild streams its vectors from disk (ADR-0070) rather than
+    // materializing the corpus. A checkpoint first seals half the collection into
+    // a segment, so the lock-free source must read across both a reopened sealed
+    // `.vec` mmap and the in-RAM active buffer — and still build a correct index.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = Database::open(tmp.path()).unwrap();
+    db.create_collection("c", desc(IndexKind::Ivf)).unwrap();
+    // First half → sealed into a segment by the checkpoint.
+    for i in 0..64u32 {
+        db.upsert(
+            "c",
+            &format!("p{i}"),
+            &[i as f32 * 0.01, 1.0, 0.0, 0.0],
+            &json!({ "i": i }),
+        )
+        .unwrap();
+    }
+    db.upsert("c", "p0", &X, &json!({ "i": 0 })).unwrap();
+    db.checkpoint().unwrap();
+    // Second half → left in the active buffer.
+    for i in 64..96u32 {
+        db.upsert(
+            "c",
+            &format!("p{i}"),
+            &[i as f32 * 0.01, 1.0, 0.0, 0.0],
+            &json!({ "i": i }),
+        )
+        .unwrap();
+    }
+    db.ensure_indexed("c").unwrap();
+    assert_eq!(top(&db, &X), "p0");
+
+    // Defer + rebuild off-lock; the streamed source spans the sealed segment and
+    // the active buffer (p0 now lives in the active buffer, shadowing its sealed row).
+    defer_move_p0_to_z(&mut db);
+    let inputs = db.snapshot_rebuild_inputs("c").unwrap().expect("stale");
+    let rebuilt = inputs.build().unwrap();
+    assert!(!db.commit_rebuild(rebuilt).unwrap());
+    assert!(!db.needs_rebuild("c").unwrap());
+
+    // The rebuilt index answers correctly for a moved point, a sealed row, and an
+    // active row — each recalls itself under the exact-match query.
+    assert_eq!(top(&db, &Z), "p0");
+    assert_eq!(top(&db, &[0.30, 1.0, 0.0, 0.0]), "p30"); // read from the sealed segment
+    assert_eq!(top(&db, &[0.80, 1.0, 0.0, 0.0]), "p80"); // read from the active buffer
 }
