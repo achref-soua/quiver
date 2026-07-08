@@ -2505,7 +2505,7 @@ mod tests {
         // disk, but the manifest was never swapped to reference it.
         let seg_dir = segments_dir(tmp.path(), cid);
         let orphan_id = 9_999u64;
-        for ext in ["vec", "pay", "dir"] {
+        for ext in ["vec", "pay", "ids", "dir"] {
             std::fs::write(
                 seg_dir.join(format!("seg-{orphan_id:010}.{ext}")),
                 b"partial",
