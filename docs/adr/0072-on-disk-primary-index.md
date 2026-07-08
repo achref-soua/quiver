@@ -100,6 +100,26 @@ columns.
   decrypting the candidate row's id from `.ids` to compare. No resident id
   fingerprint yet; it stays the named upgrade path.
 
+**Implementation notes (C2, landed 2026-07-08):**
+
+- `primary` is **removed outright**, not shrunk: the overlay it would have become
+  is exactly the pre-existing `active_index` (id → active row) and
+  `dead_this_window` (segment → rows shadowed/deleted this window), so no new
+  structure was needed. `SealedSegment`'s materialised `row_ids` vector is dropped
+  too — the second copy of the resident ids.
+- `len` is derived in **O(segments)** as `active_index.len() + Σ (segment
+  live_count − this-window tombstones)`, not by walking rows. This-window
+  tombstones are live-when-recorded, hence disjoint from persisted `.del`, so
+  never double-subtracted.
+- `scan`/`scan_payloads`/`capture_vector_source`/the compaction plan share one
+  helper that reads each surviving row's id (row-sequential, for page locality)
+  and sorts — preserving the id-sorted order those callers contract on. The
+  one-live-segment invariant (no id survives in two segments) is asserted in debug
+  builds.
+- **Scope:** the embedded index's own `int_to_ext`/`ext_to_int` residency is a
+  separate resident term (indexed collections only) and is left to a follow-up;
+  C2 is the store-layer primary index only.
+
 ## Consequences
 
 - **Win:** the ~31 GiB@100M resident term collapses to a bounded overlay plus

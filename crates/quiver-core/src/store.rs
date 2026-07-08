@@ -8,12 +8,14 @@
 //! so an acknowledged write survives `kill -9`.
 //!
 //! ## Memory model
-//! Vectors and payloads live on disk in sealed segments and are read through an
-//! `mmap`, decrypted on demand — only the working set is resident. The engine
-//! keeps in RAM a **primary index** (external id → row location) per collection,
-//! plus the **active buffer**: the rows upserted since the last checkpoint, which
-//! are also durable in the WAL. A read resolves the id to either an active row or
-//! a `(segment, row)` and fetches the bytes from the active buffer or the segment.
+//! Vectors, payloads, and external ids live on disk in sealed segments and are
+//! read through an `mmap`, decrypted on demand — only the working set is resident.
+//! The engine keeps no resident id→location index (ADR-0072); it holds per
+//! collection only the **active buffer** (rows upserted since the last checkpoint,
+//! also durable in the WAL, indexed by a small `active_index`) and each segment's
+//! O(rows) byte offsets, sorted-row forward index, and tombstone bitmap. A read
+//! resolves an id through `active_index`, else probes the sealed segments'
+//! on-disk forward index newest-first, then fetches the bytes.
 //!
 //! ## Write path
 //! `upsert`/`delete`/`create_collection`/`drop_collection` append a WAL record,
@@ -24,9 +26,10 @@
 //! garbage-collects superseded files.
 //!
 //! ## Recovery (on open)
-//! Read `CURRENT` → load the manifest → for each referenced segment, read its
-//! row directory and tombstone bitmap and rebuild the primary index (a row marked
-//! dead in its segment is skipped, so each id is live in exactly one segment) →
+//! Read `CURRENT` → load the manifest → for each referenced segment, `mmap` its
+//! columns and read its row directory and tombstone bitmap (ids stay on disk; a
+//! row marked dead in its segment is simply skipped by reads, so each id is live
+//! in exactly one segment) →
 //! replay every WAL record with `lsn > last_checkpointed_lsn` idempotently into
 //! the active buffer → garbage-collect orphan segment files a crash left between a
 //! flush and the manifest swap. A torn trailing WAL record fails its frame check
@@ -239,9 +242,6 @@ struct CollectionState {
     codec: Box<dyn PageCodec>,
     // Bytes per vector (`dim × dtype size`), cached from the descriptor.
     stride: usize,
-    // Live external id → location. The authority for `get`/`len`/`scan`; ordered
-    // so `scan` yields ids deterministically.
-    primary: BTreeMap<String, Loc>,
     // Sealed segments in creation order; `Loc::Sealed.seg` indexes this.
     sealed: Vec<SealedSegment>,
     // Manifest segment refs, parallel to `sealed`.
@@ -272,7 +272,6 @@ impl CollectionState {
             descriptor,
             codec,
             stride,
-            primary: BTreeMap::new(),
             sealed: Vec::new(),
             segments_meta: Vec::new(),
             active: Vec::new(),
@@ -286,41 +285,115 @@ impl CollectionState {
         !self.active_index.is_empty() || !self.dead_this_window.is_empty()
     }
 
+    // Whether a sealed row is dead: tombstoned in a prior window (`.del`) or this
+    // window (`dead_this_window`, not yet folded into the bitmap).
+    fn sealed_dead(&self, seg: u32, row: u32) -> bool {
+        self.sealed[seg as usize].is_dead(row)
+            || self
+                .dead_this_window
+                .get(&seg)
+                .is_some_and(|d| d.contains(row))
+    }
+
+    // Resolve an external id to its single live location, or `None` if absent
+    // (ADR-0072). Replaces the former resident `primary` index: the active buffer
+    // shadows everything, else the sealed segments are probed newest-first and the
+    // first segment physically holding the id decides — moves are forward-only, so
+    // a newer write always tombstones the older row, meaning that first hit is the
+    // only place the id can still be live. A per-probe binary search decrypts
+    // O(log rows) ids to compare (the named upgrade path is a resident fingerprint).
+    fn locate(&self, external_id: &str) -> Result<Option<Loc>> {
+        if let Some(&row) = self.active_index.get(external_id) {
+            return Ok(Some(Loc::Active(row)));
+        }
+        for seg in (0..self.sealed.len() as u32).rev() {
+            if let Some(row) = self.sealed[seg as usize].lookup(self.codec.as_ref(), external_id)? {
+                return Ok((!self.sealed_dead(seg, row)).then_some(Loc::Sealed { seg, row }));
+            }
+        }
+        Ok(None)
+    }
+
+    // The live row count, derived without a resident index: the active overlay
+    // plus each segment's live rows, minus this window's not-yet-folded tombstones.
+    // `dead_this_window` rows are always live-when-recorded, so they are disjoint
+    // from `.del` and never double-subtracted. O(segments), no id reads.
+    fn live_len(&self) -> usize {
+        let mut n = self.active_index.len();
+        for (seg_idx, seg) in self.sealed.iter().enumerate() {
+            let window_dead = self
+                .dead_this_window
+                .get(&(seg_idx as u32))
+                .map_or(0, RoaringBitmap::len);
+            n += (seg.live_count() - window_dead) as usize;
+        }
+        n
+    }
+
+    // Every live `(external_id, location)` in external-id order — the deterministic
+    // order `scan`/`scan_payloads`/`capture_vector_source` all share so an index
+    // rebuild pairs each vector with the same row's payload. Reads each surviving
+    // sealed row's id on demand (row-sequential for page locality), then sorts;
+    // the result is transient (callers already materialize O(n) here), so the id
+    // residency Increment C removed is not reintroduced. Per the one-live-segment
+    // invariant no id repeats, asserted in debug builds.
+    fn live_locs_sorted(&self) -> Result<Vec<(String, Loc)>> {
+        let codec = self.codec.as_ref();
+        let mut out: Vec<(String, Loc)> = Vec::with_capacity(self.live_len());
+        for (id, &row) in &self.active_index {
+            out.push((id.clone(), Loc::Active(row)));
+        }
+        for (seg_idx, seg) in self.sealed.iter().enumerate() {
+            let seg_idx = seg_idx as u32;
+            let window_dead = self.dead_this_window.get(&seg_idx);
+            for row in 0..seg.row_count() {
+                if seg.is_dead(row) || window_dead.is_some_and(|d| d.contains(row)) {
+                    continue;
+                }
+                out.push((seg.read_id(codec, row)?, Loc::Sealed { seg: seg_idx, row }));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        debug_assert!(
+            out.windows(2).all(|w| w[0].0 != w[1].0),
+            "live_locs_sorted yielded a duplicate id — one-live-segment invariant violated"
+        );
+        Ok(out)
+    }
+
     // Apply an upsert to in-memory state (shared by the write path and WAL
     // replay). If the id currently lives in a sealed segment, that row is now
     // shadowed and recorded for tombstoning at the next checkpoint.
-    fn apply_upsert(&mut self, external_id: &str, vector: Vec<u8>, payload: Vec<u8>) {
-        if let Some(Loc::Sealed { seg, row }) = self.primary.get(external_id).copied() {
+    fn apply_upsert(&mut self, external_id: &str, vector: Vec<u8>, payload: Vec<u8>) -> Result<()> {
+        if let Some(Loc::Sealed { seg, row }) = self.locate(external_id)? {
             self.dead_this_window.entry(seg).or_default().insert(row);
         }
         let row = self.active.len() as u32;
         self.active.push(ActiveRow { vector, payload });
         self.active_index.insert(external_id.to_owned(), row);
-        self.primary
-            .insert(external_id.to_owned(), Loc::Active(row));
+        Ok(())
     }
 
     // Apply a delete to in-memory state (shared by the write path and WAL
     // replay). Returns whether the id existed. A deleted sealed row is recorded
     // for tombstoning; a deleted active row is simply dropped from the buffer.
-    fn apply_delete(&mut self, external_id: &str) -> bool {
-        match self.primary.remove(external_id) {
-            Some(Loc::Sealed { seg, row }) => {
-                self.dead_this_window.entry(seg).or_default().insert(row);
-                self.active_index.remove(external_id);
-                true
-            }
-            Some(Loc::Active(_)) => {
-                self.active_index.remove(external_id);
-                true
-            }
-            None => false,
+    fn apply_delete(&mut self, external_id: &str) -> Result<bool> {
+        // The active buffer shadows any sealed row (already in `dead_this_window`
+        // from the upsert that shadowed it), so removing it here is sufficient.
+        if self.active_index.remove(external_id).is_some() {
+            return Ok(true);
         }
+        if let Some(Loc::Sealed { seg, row }) = self.locate(external_id)? {
+            self.dead_this_window.entry(seg).or_default().insert(row);
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
 // A segment written during a checkpoint, opened and ready to install after the
-// manifest swap commits. The repointing ids come from `sealed.row_ids()`.
+// manifest swap commits. Its rows become discoverable through the segment's own
+// on-disk forward index once pushed onto `sealed` — no resident repointing.
 struct PendingSegment {
     seg_ref: SegmentRef,
     sealed: SealedSegment,
@@ -377,9 +450,10 @@ impl Store {
         // 1. Load the manifest (or start empty).
         let mfst = manifest::read_current(dir, keyring.catalog_codec())?.unwrap_or_default();
 
-        // 2. Rebuild the primary index from the sealed segments the manifest
-        //    references. A row tombstoned in its segment's `.del` is skipped, so
-        //    each external id is added from the single segment in which it is live.
+        // 2. Open the sealed segments the manifest references (memory-mapping their
+        //    columns). No id→location index is built (ADR-0072): reads resolve ids
+        //    on demand through each segment's on-disk forward index, skipping rows a
+        //    segment's `.del` marks dead — so each id is live in exactly one segment.
         let mut collections: HashMap<CollectionId, CollectionState> = HashMap::new();
         let mut name_index: HashMap<String, CollectionId> = HashMap::new();
         for entry in &mfst.collections {
@@ -391,15 +465,6 @@ impl Store {
             let seg_dir = segments_dir(dir, entry.id);
             for seg in &entry.segments {
                 let sealed = segment::open_segment(&seg_dir, seg.id, state.codec.as_ref())?;
-                let seg_idx = state.sealed.len() as u32;
-                for (row, ext_id) in sealed.row_ids().iter().enumerate() {
-                    let row = row as u32;
-                    if !sealed.is_dead(row) {
-                        state
-                            .primary
-                            .insert(ext_id.clone(), Loc::Sealed { seg: seg_idx, row });
-                    }
-                }
                 state.sealed.push(sealed);
             }
             name_index.insert(state.name.clone(), state.id);
@@ -668,7 +733,7 @@ impl Store {
             .collections
             .get_mut(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
-        state.apply_upsert(external_id, vector_bytes, payload.to_vec());
+        state.apply_upsert(external_id, vector_bytes, payload.to_vec())?;
         Ok(lsn)
     }
 
@@ -753,7 +818,7 @@ impl Store {
                     .collections
                     .get_mut(&collection)
                     .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
-                state.apply_upsert(external_id, vector.clone(), payload.clone());
+                state.apply_upsert(external_id, vector.clone(), payload.clone())?;
             }
         }
         Ok(records.len() as u64)
@@ -765,8 +830,8 @@ impl Store {
             .collections
             .get(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?
-            .primary
-            .contains_key(external_id);
+            .locate(external_id)?
+            .is_some();
         if !existed {
             return Ok(false);
         }
@@ -785,7 +850,7 @@ impl Store {
             .collections
             .get_mut(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
-        state.apply_delete(external_id);
+        state.apply_delete(external_id)?;
         Ok(true)
     }
 
@@ -855,8 +920,8 @@ impl Store {
             .collections
             .get(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?
-            .primary
-            .contains_key(external_id);
+            .locate(external_id)?
+            .is_some();
         Ok(existed.then(|| WalOp::Delete {
             collection_id: collection,
             external_id: external_id.to_owned(),
@@ -869,7 +934,7 @@ impl Store {
             .collections
             .get(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
-        match state.primary.get(external_id).copied() {
+        match state.locate(external_id)? {
             Some(loc) => Ok(Some(self.record_at(state, loc)?)),
             None => Ok(None),
         }
@@ -882,9 +947,10 @@ impl Store {
             .collections
             .get(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
-        let mut out = Vec::with_capacity(state.primary.len());
-        for (id, &loc) in &state.primary {
-            out.push((id.clone(), self.record_at(state, loc)?));
+        let locs = state.live_locs_sorted()?;
+        let mut out = Vec::with_capacity(locs.len());
+        for (id, loc) in locs {
+            out.push((id, self.record_at(state, loc)?));
         }
         Ok(out)
     }
@@ -907,12 +973,13 @@ impl Store {
         let seg_dir = segments_dir(&self.dir, collection);
         let codec = state.codec.clone_box();
 
+        let locs = state.live_locs_sorted()?;
         let mut vec_files: Vec<BlockFile> = Vec::new();
         let mut seg_slot: HashMap<u32, u32> = HashMap::new();
-        let mut rows: Vec<SourceRow> = Vec::with_capacity(state.primary.len());
+        let mut rows: Vec<SourceRow> = Vec::with_capacity(locs.len());
         let mut active: Vec<Vec<u8>> = Vec::new();
 
-        for &loc in state.primary.values() {
+        for (_id, loc) in locs {
             let row = match loc {
                 Loc::Sealed { seg, row } => {
                     let slot = match seg_slot.get(&seg) {
@@ -976,8 +1043,9 @@ impl Store {
             .collections
             .get(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?;
-        let mut out = Vec::with_capacity(state.primary.len());
-        for (ext_id, &loc) in &state.primary {
+        let locs = state.live_locs_sorted()?;
+        let mut out = Vec::with_capacity(locs.len());
+        for (ext_id, loc) in locs {
             let payload = match loc {
                 Loc::Active(r) => state
                     .active
@@ -992,7 +1060,7 @@ impl Store {
                     segment.read_payload(state.codec.as_ref(), row)?
                 }
             };
-            out.push((ext_id.clone(), payload));
+            out.push((ext_id, payload));
         }
         Ok(out)
     }
@@ -1120,11 +1188,10 @@ impl Store {
         let mut deleted = Vec::new();
         for (&seg_idx, bitmap) in &state.dead_this_window {
             if let Some(seg) = state.sealed.get(seg_idx as usize) {
-                let row_ids = seg.row_ids();
+                // `dead_this_window` is bounded by the checkpoint cadence, so reading
+                // each dead row's id on demand here is cheap (ADR-0072).
                 for row in bitmap.iter() {
-                    if let Some(ext) = row_ids.get(row as usize) {
-                        deleted.push(ext.clone());
-                    }
+                    deleted.push(seg.read_id(state.codec.as_ref(), row)?);
                 }
             }
         }
@@ -1137,8 +1204,7 @@ impl Store {
             .collections
             .get(&collection)
             .ok_or_else(|| CoreError::NotFound(format!("collection {collection}")))?
-            .primary
-            .len())
+            .live_len())
     }
 
     /// Whether a collection has no live rows.
@@ -1183,25 +1249,25 @@ impl Store {
             })?;
 
         let mut out: Vec<String> = Vec::new();
-        // Sealed segments: query each `.sec`, keeping rows still live here (a row
-        // dead or shadowed no longer has the primary index pointing at it).
+        // Sealed segments: query each `.sec`, keeping only rows still live here — a
+        // row tombstoned in a prior window (`.del`), shadowed/deleted this window
+        // (`dead_this_window`), or shadowed by an active upsert is not a live hit.
         for (seg_idx, segment) in state.sealed.iter().enumerate() {
             let seg_idx = seg_idx as u32;
             let Some(rows) = segment.sec_query(predicate)? else {
                 continue;
             };
+            let window_dead = state.dead_this_window.get(&seg_idx);
             for row in rows {
-                if segment.is_dead(row) {
+                if segment.is_dead(row) || window_dead.is_some_and(|d| d.contains(row)) {
                     continue;
                 }
-                let Some(ext_id) = segment.row_ids().get(row as usize) else {
-                    continue;
-                };
-                if matches!(
-                    state.primary.get(ext_id),
-                    Some(Loc::Sealed { seg: s, row: r }) if *s == seg_idx && *r == row
-                ) {
-                    out.push(ext_id.clone());
+                let ext_id = segment.read_id(state.codec.as_ref(), row)?;
+                // A surviving sealed row is the id's live location unless an active
+                // upsert shadows it (the invariant keeps these disjoint; the check
+                // is belt-and-braces and mirrors the former primary-index test).
+                if !state.active_index.contains_key(&ext_id) {
+                    out.push(ext_id);
                 }
             }
         }
@@ -1403,18 +1469,10 @@ impl Store {
                     seg.mark_dead(&bitmap);
                 }
             }
-            // Install the new segment, if any, repointing its now-sealed ids.
+            // Install the new segment, if any. Its rows become discoverable through
+            // the segment's own on-disk forward index — no resident repointing
+            // (ADR-0072); the just-sealed ids leave the active overlay below.
             if let Some(p) = pending.remove(&cid) {
-                let seg_idx = state.sealed.len() as u32;
-                for (row, ext_id) in p.sealed.row_ids().iter().enumerate() {
-                    state.primary.insert(
-                        ext_id.clone(),
-                        Loc::Sealed {
-                            seg: seg_idx,
-                            row: row as u32,
-                        },
-                    );
-                }
                 state.sealed.push(p.sealed);
                 state.segments_meta.push(p.seg_ref);
             }
@@ -1505,23 +1563,24 @@ impl Store {
             .ok_or_else(|| CoreError::NotFound(format!("collection {cid}")))?
             .codec
             .clone_box();
-        // Plan the merge from directory metadata only — the ordered (segment, row)
-        // of every live sealed row (active rows are untouched). `primary` is
-        // ordered, so the rewritten segment is deterministic. This holds O(rows) of
-        // 8-byte locations, never the vectors or payloads — those stream one row at
-        // a time into the writer below, so a large collection compacts within a
-        // bounded memory envelope (ADR-0068).
+        // Plan the merge as the id-ordered (segment, row) of every live sealed row
+        // (active rows are untouched). The order is deterministic, so the rewritten
+        // segment is too. This holds O(rows) of 8-byte locations, never the vectors
+        // or payloads — those stream one row at a time into the writer below, so a
+        // large collection compacts within a bounded memory envelope (ADR-0068).
         let (plan, row_count, stride) = {
             let state = self
                 .collections
                 .get(&cid)
                 .ok_or_else(|| CoreError::NotFound(format!("collection {cid}")))?;
-            let mut plan: Vec<(u32, u32)> = Vec::new();
-            for &loc in state.primary.values() {
-                if let Loc::Sealed { seg, row } = loc {
-                    plan.push((seg, row));
-                }
-            }
+            let plan: Vec<(u32, u32)> = state
+                .live_locs_sorted()?
+                .into_iter()
+                .filter_map(|(_id, loc)| match loc {
+                    Loc::Sealed { seg, row } => Some((seg, row)),
+                    Loc::Active(_) => None,
+                })
+                .collect();
             let row_count = plan.len();
             (plan, row_count, state.stride)
         };
@@ -1567,13 +1626,7 @@ impl Store {
                         let segment = state.sealed.get(seg as usize).ok_or_else(|| {
                             CoreError::MalformedPage(format!("dangling segment index {seg}"))
                         })?;
-                        let ext_id = segment
-                            .row_ids()
-                            .get(row as usize)
-                            .ok_or_else(|| {
-                                CoreError::MalformedPage(format!("segment {seg} has no row {row}"))
-                            })?
-                            .clone();
+                        let ext_id = segment.read_id(codec.as_ref(), row)?;
                         let vector = segment.read_vector(codec.as_ref(), row, stride)?;
                         let payload = segment.read_payload(codec.as_ref(), row)?;
                         Ok(Some((ext_id, vector, payload)))
@@ -1622,24 +1675,15 @@ impl Store {
         };
         manifest::write_manifest(&self.dir, &new_manifest, self.keyring.catalog_codec())?;
 
-        // Commit: replace the segments (dropping the old mmaps before the files
-        // are reclaimed), repoint the now-merged ids, and drop pending tombstones
-        // (their rows no longer exist).
+        // Commit: replace the segments (dropping the old mmaps before the files are
+        // reclaimed) and drop pending tombstones (the rows they marked were excluded
+        // from the merge, so they no longer exist). The merged segment's rows are
+        // discoverable through its own on-disk forward index — no resident repoint.
         self.manifest_version = new_version;
-        let row_ids: Vec<String> = sealed.row_ids().to_vec();
         if let Some(state) = self.collections.get_mut(&cid) {
             state.sealed = vec![sealed];
             state.segments_meta = vec![new_ref];
             state.dead_this_window.clear();
-            for (row, ext_id) in row_ids.into_iter().enumerate() {
-                state.primary.insert(
-                    ext_id,
-                    Loc::Sealed {
-                        seg: 0,
-                        row: row as u32,
-                    },
-                );
-            }
         }
         gc_orphan_segments(&self.dir, &new_manifest, self.keyring.as_ref())?;
         gc_orphan_index_snapshots(&self.dir, &new_manifest)?;
@@ -1703,7 +1747,7 @@ fn apply_wal_entry(
             payload,
         } => {
             if let Some(state) = collections.get_mut(collection_id) {
-                state.apply_upsert(external_id, vector.clone(), payload.clone());
+                state.apply_upsert(external_id, vector.clone(), payload.clone())?;
             }
         }
         WalOp::Delete {
@@ -1711,7 +1755,7 @@ fn apply_wal_entry(
             external_id,
         } => {
             if let Some(state) = collections.get_mut(collection_id) {
-                state.apply_delete(external_id);
+                state.apply_delete(external_id)?;
             }
         }
         // The manifest is the authoritative checkpoint record; explicit
@@ -2367,6 +2411,63 @@ mod tests {
         let got = s.get(c, "k2").unwrap().unwrap();
         assert_eq!(got.vector, vec![99.0; 4]);
         assert_eq!(got.payload, b"v2");
+    }
+
+    // With no resident id index (ADR-0072), `get`/`len`/`scan` are derived from the
+    // active overlay and the sealed segments' on-disk forward index. This exercises
+    // the derivation across several segments: a newest-first lookup that must skip
+    // an older shadowed copy, a deleted sealed row that must read as absent, an
+    // active row shadowing a sealed one within a window, and the sorted scan order.
+    #[test]
+    fn derived_reads_span_segments_and_the_active_overlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = open(tmp.path());
+        let c = s.create_collection("c", desc()).unwrap();
+        // seg 0: a, b, c
+        s.upsert(c, "a", &[1.0; 4], b"a0").unwrap();
+        s.upsert(c, "b", &[2.0; 4], b"b0").unwrap();
+        s.upsert(c, "c", &[3.0; 4], b"c0").unwrap();
+        s.checkpoint().unwrap();
+        // seg 1: b re-upserted (shadows seg 0's b), d added
+        s.upsert(c, "b", &[9.0; 4], b"b1").unwrap();
+        s.upsert(c, "d", &[4.0; 4], b"d0").unwrap();
+        s.checkpoint().unwrap();
+        // a deleted from seg 0, persisted to its `.del`
+        assert!(s.delete(c, "a").unwrap());
+        s.checkpoint().unwrap();
+
+        let live = |s: &Store| {
+            (
+                s.len(c).unwrap(),
+                s.scan(c)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, r)| (id, r.payload))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let expected = vec![
+            ("b".to_owned(), b"b1".to_vec()), // newest-first lookup returns seg 1
+            ("c".to_owned(), b"c0".to_vec()),
+            ("d".to_owned(), b"d0".to_vec()),
+        ];
+        assert_eq!(s.get(c, "a").unwrap(), None); // deleted sealed row reads absent
+        assert_eq!(s.get(c, "b").unwrap().unwrap().payload, b"b1");
+        assert_eq!(live(&s), (3, expected.clone()));
+
+        // Reopen: the same state, resolved purely through the segments (no WAL tail).
+        let s = open(tmp.path());
+        assert_eq!(live(&s), (3, expected.clone()));
+
+        // Within-window overlay: an active upsert shadows the sealed `b`, then a
+        // delete removes it — all without a checkpoint.
+        let mut s = s;
+        s.upsert(c, "b", &[7.0; 4], b"b2").unwrap();
+        assert_eq!(s.get(c, "b").unwrap().unwrap().payload, b"b2");
+        assert_eq!(s.len(c).unwrap(), 3); // still b, c, d
+        assert!(s.delete(c, "b").unwrap());
+        assert_eq!(s.get(c, "b").unwrap(), None);
+        assert_eq!(s.len(c).unwrap(), 2); // c, d
     }
 
     #[test]
