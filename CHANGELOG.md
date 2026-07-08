@@ -10,6 +10,26 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Added
+
+- **On-disk id column + forward index — the storage primitive** ([ADR-0072](docs/adr/0072-on-disk-primary-index.md), Increment C1).
+  Groundwork for moving the primary index (external id → row location) out of RAM,
+  the dominant remaining resident term (~316 B/pt, ~31 GiB at 100M) after Increments
+  A/B moved vectors to disk. Sealed segments now store their external ids in a new
+  on-demand-paged `.ids` column — read and decrypted per row, like the payload heap —
+  and the row directory carries a `sorted_rows` forward index. `SealedSegment` gains
+  `read_id` (row → id, on demand) and `lookup` (id → row, binary search over
+  `sorted_rows`, decrypting the candidate id to compare). No live-path change yet:
+  `row_ids()` is still materialised at open, so the store is untouched; C2 will drop
+  the resident map and route `get` through `lookup`.
+
+### Changed
+
+- **BREAKING (on-disk): segment format v3 → v4.** External ids moved from the `.dir`
+  into the `.ids` column and the directory gained `sorted_rows`. A v3 store fails
+  loud on open (the existing version gate); migrate by compacting. Quiver is pre-1.0
+  and freshly public, so no automatic-rewrite path is provided.
+
 ## [0.33.0] — Unburdened — 2026-07-04
 
 ### Added
