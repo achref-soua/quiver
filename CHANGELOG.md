@@ -19,9 +19,23 @@ for the per-release rationale and Definitions of Done.
   on-demand-paged `.ids` column — read and decrypted per row, like the payload heap —
   and the row directory carries a `sorted_rows` forward index. `SealedSegment` gains
   `read_id` (row → id, on demand) and `lookup` (id → row, binary search over
-  `sorted_rows`, decrypting the candidate id to compare). No live-path change yet:
-  `row_ids()` is still materialised at open, so the store is untouched; C2 will drop
-  the resident map and route `get` through `lookup`.
+  `sorted_rows`, decrypting the candidate id to compare).
+
+### Changed
+
+- **The resident primary index is gone — external ids no longer live in RAM**
+  ([ADR-0072](docs/adr/0072-on-disk-primary-index.md), Increment C2). The per-collection
+  `BTreeMap<external_id, location>` and each segment's materialised `row_ids` vector —
+  together the ~316 B/pt (~31 GiB at 100M) resident wall — are removed. `get` now
+  resolves an id through the small active-buffer overlay, else probes the sealed
+  segments' on-disk forward index newest-first (the first segment physically holding
+  the id decides liveness, since writes are forward-only); `len` is derived in
+  O(segments); `scan`/`scan_payloads`/the compaction plan read each surviving row's id
+  on demand and sort. Resident state per collection drops to the active overlay plus
+  each segment's O(rows) byte offsets, forward index, and tombstone bitmap (~1.6 GiB at
+  100M). Trade-off (accepted in the ADR): a point read decrypts O(log rows) ids per
+  segment probe; the named upgrade path is a resident per-segment id fingerprint.
+  Behaviour, crash-recovery, and MVCC semantics are unchanged.
 
 ### Changed
 

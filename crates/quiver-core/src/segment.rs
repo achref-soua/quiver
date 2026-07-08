@@ -106,20 +106,15 @@ pub(crate) struct SealedSegment {
     pub seg_id: u64,
     vec: BlockFile,
     pay: BlockFile,
-    // `ids`/`idlocs`/`sorted_rows` back `read_id`/`lookup`, exercised by tests in
-    // C1 and consumed by the live read path in C2 (ADR-0072) — hence the allow.
-    #[allow(dead_code)]
+    // `ids`/`idlocs`/`sorted_rows` back the on-demand `read_id`/`lookup` read path
+    // (ADR-0072). External ids are no longer RAM-resident — that was the ~316 B/pt
+    // wall Increment C removes; callers read a row's id on demand instead.
     ids: BlockFile,
     paylocs: Vec<ByteLoc>,
     // Where each row's external id lives in the `.ids` column (row order).
-    #[allow(dead_code)]
     idlocs: Vec<ByteLoc>,
     // Row numbers ordered by external id (ADR-0072): the forward-lookup index.
-    #[allow(dead_code)]
     sorted_rows: Vec<u32>,
-    // Row-order external ids, materialized from `.ids` at open. RAM-resident in
-    // C1 so callers are unchanged; C2 (ADR-0072) drops this for on-demand reads.
-    row_ids: Vec<String>,
     // Rows of this segment that are no longer live.
     dead: RoaringBitmap,
     // Secondary index over the collection's filterable fields (empty if none).
@@ -127,14 +122,9 @@ pub(crate) struct SealedSegment {
 }
 
 impl SealedSegment {
-    /// The external ids of this segment's rows, in row order.
-    pub(crate) fn row_ids(&self) -> &[String] {
-        &self.row_ids
-    }
-
     /// Read row `row`'s external id from the `.ids` column, decrypting the page(s)
-    /// it touches. The on-demand path the forward lookup and (in C2) scans use.
-    #[allow(dead_code)] // wired into the live read path in C2 (ADR-0072)
+    /// it touches. The on-demand path the forward lookup and live scans use in
+    /// place of a RAM-resident id vector (ADR-0072).
     pub(crate) fn read_id(&self, codec: &dyn PageCodec, row: u32) -> Result<String> {
         let loc = self.idlocs.get(row as usize).ok_or_else(|| {
             CoreError::MalformedPage(format!(
@@ -159,7 +149,6 @@ impl SealedSegment {
     /// to compare (ADR-0072, decrypt-on-compare). Ignores tombstones — liveness is
     /// the caller's concern, as with the in-RAM primary index. Within a segment
     /// each id is unique, so the match (if any) is the single owning row.
-    #[allow(dead_code)] // wired into the live read path in C2 (ADR-0072)
     pub(crate) fn lookup(&self, codec: &dyn PageCodec, id: &str) -> Result<Option<u32>> {
         let mut lo = 0usize;
         let mut hi = self.sorted_rows.len();
@@ -468,9 +457,10 @@ fn read_sec(seg_dir: &Path, segment_id: u64, codec: &dyn PageCodec) -> Result<Se
     SecIndex::decode(&blob)
 }
 
-/// Open a sealed segment for reads. The returned handle carries the row →
-/// external-id map (used to rebuild the primary index, minus the segment's dead
-/// rows) and the secondary index.
+/// Open a sealed segment for reads. The returned handle memory-maps the columns
+/// and holds only O(rows) of byte offsets, the sorted-row forward index, the
+/// tombstone bitmap, and the secondary index — external ids are read on demand
+/// from the `.ids` column (ADR-0072), not resident.
 pub(crate) fn open_segment(
     seg_dir: &Path,
     segment_id: u64,
@@ -503,15 +493,8 @@ pub(crate) fn open_segment(
             len: r.pay_len,
         });
     }
-    // Materialize the row-order ids from the `.ids` column (C1: keeps `row_ids()`
-    // callers unchanged; C2 drops this in favor of on-demand `read_id`).
-    let mut row_ids = Vec::with_capacity(idlocs.len());
-    for loc in &idlocs {
-        let bytes = ids.read_range(codec, loc.off as usize, loc.len as usize)?;
-        row_ids.push(String::from_utf8(bytes).map_err(|e| {
-            CoreError::MalformedPage(format!("segment {segment_id} id is not valid UTF-8: {e}"))
-        })?);
-    }
+    // External ids stay on disk in the `.ids` column and are read on demand via
+    // `read_id`/`lookup` — never materialized here (ADR-0072, Increment C).
     Ok(SealedSegment {
         seg_id: segment_id,
         vec,
@@ -520,7 +503,6 @@ pub(crate) fn open_segment(
         paylocs,
         idlocs,
         sorted_rows: dir.sorted_rows,
-        row_ids,
         dead,
         sec,
     })
@@ -614,7 +596,8 @@ mod tests {
         let seg_dir = dir.path();
         write_segment(seg_dir, 1, &PlainCodec, &rows(), &[]).unwrap();
         let seg = open_segment(seg_dir, 1, &PlainCodec).unwrap();
-        assert_eq!(seg.row_ids(), &["a".to_owned(), "b".to_owned()]);
+        assert_eq!(seg.read_id(&PlainCodec, 0).unwrap(), "a");
+        assert_eq!(seg.read_id(&PlainCodec, 1).unwrap(), "b");
         assert_eq!(seg.row_count(), 2);
         assert_eq!(seg.live_count(), 2);
         assert!(!seg.is_dead(0));
@@ -724,7 +707,7 @@ mod tests {
             seg.read_vector(&PlainCodec, n - 1, 4).unwrap(),
             (n - 1).to_le_bytes()
         );
-        assert_eq!(seg.row_ids()[12_345], "k12345");
+        assert_eq!(seg.read_id(&PlainCodec, 12_345).unwrap(), "k12345");
     }
 
     #[test]
@@ -787,7 +770,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_segment(dir.path(), 5, &PlainCodec, &[], &[]).unwrap();
         let seg = open_segment(dir.path(), 5, &PlainCodec).unwrap();
-        assert!(seg.row_ids().is_empty());
+        assert_eq!(seg.row_count(), 0);
         assert_eq!(seg.row_count(), 0);
         assert!(seg.read_payload(&PlainCodec, 0).is_err());
     }
