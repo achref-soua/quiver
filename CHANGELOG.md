@@ -10,16 +10,24 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.34.0] — Weightless — 2026-07-08
+
+The on-disk primary index ([ADR-0072](docs/adr/0072-on-disk-primary-index.md)):
+external ids leave RAM, removing the last O(n) resident wall. After Increments
+A/B moved the vectors off-heap, the per-collection external-id → location map was
+the dominant remaining resident term (~316 B/point, ~31 GiB at 100M). It is now
+served from disk, and resident state per collection drops to ~1.6 GiB at 100M.
+Delivered in two increments (both in this release): C1 adds the on-disk storage
+primitive, C2 wires it into the live read path and removes the resident index.
+
 ### Added
 
 - **On-disk id column + forward index — the storage primitive** ([ADR-0072](docs/adr/0072-on-disk-primary-index.md), Increment C1).
-  Groundwork for moving the primary index (external id → row location) out of RAM,
-  the dominant remaining resident term (~316 B/pt, ~31 GiB at 100M) after Increments
-  A/B moved vectors to disk. Sealed segments now store their external ids in a new
-  on-demand-paged `.ids` column — read and decrypted per row, like the payload heap —
-  and the row directory carries a `sorted_rows` forward index. `SealedSegment` gains
-  `read_id` (row → id, on demand) and `lookup` (id → row, binary search over
-  `sorted_rows`, decrypting the candidate id to compare).
+  Sealed segments now store their external ids in a new on-demand-paged `.ids`
+  column — read and decrypted per row, like the payload heap — and the row
+  directory carries a `sorted_rows` forward index. `SealedSegment` gains `read_id`
+  (row → id, on demand) and `lookup` (id → row, binary search over `sorted_rows`,
+  decrypting the candidate id to compare).
 
 ### Changed
 
@@ -36,9 +44,6 @@ for the per-release rationale and Definitions of Done.
   100M). Trade-off (accepted in the ADR): a point read decrypts O(log rows) ids per
   segment probe; the named upgrade path is a resident per-segment id fingerprint.
   Behaviour, crash-recovery, and MVCC semantics are unchanged.
-
-### Changed
-
 - **BREAKING (on-disk): segment format v3 → v4.** External ids moved from the `.dir`
   into the `.ids` column and the directory gained `sorted_rows`. A v3 store fails
   loud on open (the existing version gate); migrate by compacting. Quiver is pre-1.0
@@ -982,7 +987,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.33.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.34.0...HEAD
+[0.34.0]: https://github.com/achref-soua/quiver/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/achref-soua/quiver/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/achref-soua/quiver/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/achref-soua/quiver/compare/v0.30.2...v0.31.0
