@@ -10,6 +10,23 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.35.0] — Gossamer — 2026-07-12
+
+The on-disk id map for the embedded index
+([ADR-0073](docs/adr/0073-on-disk-embed-id-map.md)): the last resident id term for
+an indexed collection leaves RAM. After ADR-0072 moved the store's primary index
+to disk, the embedded ANN index still held its internal-id ↔ external-id map fully
+resident (`int_to_ext` + `ext_to_int` — the external ids twice over, ~90–110 B/pt,
+~9–11 GiB at 100M), and re-serialized it on every checkpoint. The base ids now live
+in a new codec-sealed, on-demand-paged `ExtIdColumn` (a `BlockFile` with a compact
+resident `offsets` + `sorted` forward index, decrypt-on-compare lookup); only a
+bounded resident tail stays in RAM. Resident id state drops from ~90–110 B/pt to
+~12 B/pt, and the checkpoint envelope no longer carries the base ids. The durable
+index-snapshot envelope bumps v1 → v2 (dropping `int_to_ext` for `base_count` +
+`tail`); it is a rebuildable cache, so a version/count mismatch falls back to a
+rebuild — no migration. IVF rebuild behaviour is unchanged; the RSS validation is
+deferred to the dedicated-box `scale` run, never fabricated.
+
 ## [0.34.0] — Weightless — 2026-07-08
 
 The on-disk primary index ([ADR-0072](docs/adr/0072-on-disk-primary-index.md)):
@@ -987,7 +1004,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.34.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.35.0...HEAD
+[0.35.0]: https://github.com/achref-soua/quiver/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/achref-soua/quiver/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/achref-soua/quiver/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/achref-soua/quiver/compare/v0.31.0...v0.32.0
