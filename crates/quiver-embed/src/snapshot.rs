@@ -44,7 +44,13 @@ pub(crate) struct Overlay {
 /// the next snapshot.
 pub struct CollectionSnapshot {
     pub(crate) base: Arc<CollectionIndex>,
-    pub(crate) base_int_to_ext: Arc<Vec<String>>,
+    // Base id resolution (ADR-0073), frozen at `publish_base`: internal ids
+    // `< base_count` read from the on-disk column (shared by `Arc` with the writer's
+    // `IdMap`), `base_count..base_len` from the resident tail. Overlay ids
+    // (`>= base_len`) index the overlay's upserts.
+    pub(crate) base_col: Option<Arc<ExtIdColumn>>,
+    pub(crate) base_tail: Arc<Vec<String>>,
+    pub(crate) base_count: u64,
     pub(crate) base_len: u64,
     pub(crate) overlay: Arc<Overlay>,
     pub(crate) metric: Metric,
@@ -56,25 +62,34 @@ impl CollectionSnapshot {
     pub(crate) fn empty(metric: Metric) -> Self {
         Self {
             base: Arc::new(CollectionIndex::None),
-            base_int_to_ext: Arc::new(Vec::new()),
+            base_col: None,
+            base_tail: Arc::new(Vec::new()),
+            base_count: 0,
             base_len: 0,
             overlay: Arc::new(Overlay::default()),
             metric,
         }
     }
 
-    // Map an internal id to its external id: base ids index the base map, overlay
-    // ids (`>= base_len`) index the overlay's upserts.
-    fn ext_id(&self, internal: u64) -> Option<&str> {
-        if internal < self.base_len {
-            self.base_int_to_ext
-                .get(internal as usize)
-                .map(String::as_str)
+    // Map an internal id to its external id: base-column ids decrypt on demand, tail
+    // and overlay ids index their resident vectors. Fallible — a base read decrypts.
+    fn ext_id(&self, internal: u64) -> Result<Option<String>> {
+        if internal < self.base_count {
+            match &self.base_col {
+                Some(c) => Ok(Some(c.read(internal)?)),
+                None => Ok(None),
+            }
+        } else if internal < self.base_len {
+            Ok(self
+                .base_tail
+                .get((internal - self.base_count) as usize)
+                .cloned())
         } else {
-            self.overlay
+            Ok(self
+                .overlay
                 .upserts
                 .get((internal - self.base_len) as usize)
-                .map(|(_, e)| e.as_str())
+                .map(|(_, e)| e.clone()))
         }
     }
 
@@ -141,9 +156,9 @@ impl CollectionSnapshot {
         cands.truncate(k);
         let mut out = Vec::with_capacity(cands.len());
         for (ordering, internal) in cands {
-            if let Some(ext) = self.ext_id(internal) {
+            if let Some(ext) = self.ext_id(internal)? {
                 out.push(Match {
-                    id: ext.to_owned(),
+                    id: ext,
                     score: report_metric(self.metric, ordering),
                     payload: None,
                     vector: None,

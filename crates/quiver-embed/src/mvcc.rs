@@ -33,7 +33,9 @@ pub(crate) fn publish_overlay(
 ) {
     handle.snapshot.store(Arc::new(CollectionSnapshot {
         base: prior.base.clone(),
-        base_int_to_ext: prior.base_int_to_ext.clone(),
+        base_col: prior.base_col.clone(),
+        base_tail: prior.base_tail.clone(),
+        base_count: prior.base_count,
         base_len: prior.base_len,
         overlay,
         metric: prior.metric,
@@ -48,8 +50,10 @@ pub(crate) fn publish_base(handle: &mut CollectionHandle) {
     let metric = to_index_metric(handle.descriptor.metric);
     handle.snapshot.store(Arc::new(CollectionSnapshot {
         base: Arc::new(base),
-        base_int_to_ext: Arc::new(handle.int_to_ext.clone()),
-        base_len: handle.int_to_ext.len() as u64,
+        base_col: handle.idmap.base(),
+        base_tail: Arc::new(handle.idmap.tail().to_vec()),
+        base_count: handle.idmap.base_count(),
+        base_len: handle.idmap.len(),
         overlay: Arc::new(Overlay::default()),
         metric,
     }));
@@ -66,8 +70,12 @@ pub(crate) fn overlay_rebuild_threshold(base_len: u64) -> u64 {
 // instead of mutating the immutable base, so lock-free readers stay race-free.
 // A batch upsert coalesces the per-write clone-and-publish via
 // [`overlay_upsert_batch`].
-pub(crate) fn overlay_upsert(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32]) {
-    overlay_upsert_batch(handle, std::iter::once((ext_id, vector)));
+pub(crate) fn overlay_upsert(
+    handle: &mut CollectionHandle,
+    ext_id: &str,
+    vector: &[f32],
+) -> Result<()> {
+    overlay_upsert_batch(handle, std::iter::once((ext_id, vector)))
 }
 
 // MVCC-mode batched single-vector upsert (ADR-0064): apply the whole batch to one
@@ -81,19 +89,25 @@ pub(crate) fn overlay_upsert(handle: &mut CollectionHandle, ext_id: &str, vector
 pub(crate) fn overlay_upsert_batch<'a>(
     handle: &mut CollectionHandle,
     points: impl IntoIterator<Item = (&'a str, &'a [f32])>,
-) {
+) -> Result<()> {
     bump_write_gen(handle);
     let cur = handle.snapshot.load_full();
     let mut overlay = cur.overlay.as_ref().clone();
     for (ext_id, vector) in points {
-        // An update supersedes the prior copy (in the base or the overlay): tombstone it.
-        if let Some(&old) = handle.ext_to_int.get(ext_id) {
+        // An update supersedes the prior copy (in the base or the overlay): tombstone
+        // it. The lookup may decrypt a base id (ADR-0073).
+        if let Some(old) = handle.idmap.internal(ext_id)? {
             overlay.tombstones.insert(old);
         }
         let internal = cur.base_len + overlay.upserts.len() as u64;
         overlay.upserts.push((Arc::from(vector), ext_id.to_owned()));
-        handle.ext_to_int.insert(ext_id.to_owned(), internal);
-        handle.int_to_ext.push(ext_id.to_owned());
+        // Keep the writer's id map in lockstep with the overlay: the base is frozen
+        // at the last `publish_base`, so `idmap.len()` == `base_len + upserts`.
+        let pushed = handle.idmap.push(ext_id);
+        debug_assert_eq!(
+            pushed, internal,
+            "id-map tail and overlay must stay in lockstep"
+        );
     }
     let crowded = overlay.upserts.len() as u64 >= overlay_rebuild_threshold(cur.base_len);
     publish_overlay(handle, &cur, Arc::new(overlay));
@@ -102,17 +116,19 @@ pub(crate) fn overlay_upsert_batch<'a>(
     if crowded {
         handle.stale = true;
     }
+    Ok(())
 }
 
 // MVCC-mode single-vector delete (ADR-0064): tombstone the id in the published
 // overlay; the base stays immutable.
-pub(crate) fn overlay_delete(handle: &mut CollectionHandle, ext_id: &str) {
+pub(crate) fn overlay_delete(handle: &mut CollectionHandle, ext_id: &str) -> Result<()> {
     bump_write_gen(handle);
-    let Some(&internal) = handle.ext_to_int.get(ext_id) else {
-        return;
+    let Some(internal) = handle.idmap.internal(ext_id)? else {
+        return Ok(());
     };
     let cur = handle.snapshot.load_full();
     let mut overlay = cur.overlay.as_ref().clone();
     overlay.tombstones.insert(internal);
     publish_overlay(handle, &cur, Arc::new(overlay));
+    Ok(())
 }

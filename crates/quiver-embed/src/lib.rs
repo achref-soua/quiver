@@ -47,7 +47,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use quiver_core::{SecPredicate, SecValue, Store, VectorSource};
+use quiver_core::{ExtIdColumn, SecPredicate, SecValue, Store, VectorSource};
 use quiver_index::{
     ColbertConfig, ColbertIndex, DiskVamana, FreshDiskVamana, FreshVamana, Hnsw, HnswConfig, Index,
     Ivf, IvfConfig, Metric, Neighbor, ProductQuantizer, Vamana, VamanaConfig, max_sim,
@@ -255,6 +255,8 @@ impl CollectionIndex {
     }
 }
 
+mod idmap;
+pub(crate) use idmap::IdMap;
 mod mvcc;
 mod snapshot;
 
@@ -271,8 +273,8 @@ struct CollectionHandle {
     id: CollectionId,
     descriptor: Descriptor,
     index: CollectionIndex,
-    int_to_ext: Vec<String>,
-    ext_to_int: HashMap<String, u64>,
+    // Internal-id ↔ external-id map, base on disk + resident tail (ADR-0073).
+    idmap: IdMap,
     stale: bool,
     // Monotonic per-collection write counter, bumped every time a write defers a
     // rebuild (`mark_stale`). An off-lock rebuild (ADR-0062) captures it before
@@ -405,8 +407,7 @@ impl Database {
                 id,
                 index: empty_index(&descriptor),
                 descriptor,
-                int_to_ext: Vec::new(),
-                ext_to_int: HashMap::new(),
+                idmap: IdMap::empty(),
                 stale: true,
                 write_gen: 0,
                 docs: None,
@@ -470,8 +471,7 @@ impl Database {
                 id,
                 descriptor,
                 index,
-                int_to_ext: Vec::new(),
-                ext_to_int: HashMap::new(),
+                idmap: IdMap::empty(),
                 stale: false,
                 write_gen: 0,
                 docs,
@@ -568,8 +568,7 @@ impl Database {
                         id,
                         descriptor,
                         index,
-                        int_to_ext: Vec::new(),
-                        ext_to_int: HashMap::new(),
+                        idmap: IdMap::empty(),
                         stale: false,
                         write_gen: 0,
                         docs,
@@ -747,7 +746,7 @@ impl Database {
         // O(n·overlay) per-point ones — so the batch also becomes visible as one
         // atomic snapshot. Otherwise fold each point into the live index in turn.
         if mvcc_served(handle) {
-            overlay_upsert_batch(handle, points.iter().map(|(id, vector, _)| (*id, *vector)));
+            overlay_upsert_batch(handle, points.iter().map(|(id, vector, _)| (*id, *vector)))?;
         } else {
             for (id, vector, _) in points {
                 index_upsert_point(handle, id, vector)?;
@@ -830,7 +829,7 @@ impl Database {
         // (ADR-0033); other kinds defer to a rebuild. The id->internal mapping is
         // kept so a later re-insert allocates afresh — a removed or soft-deleted
         // internal is simply never returned by the index.
-        index_delete_point(handle, id);
+        index_delete_point(handle, id)?;
         // Drop the point from the derived sparse inverted index too (ADR-0045).
         sparse_index_delete_point(handle, id);
         Ok(true)
@@ -1028,8 +1027,7 @@ impl Database {
                 handle.index = CollectionIndex::Disk(Some(FreshDiskVamana::new(disk)?));
             }
         }
-        handle.int_to_ext = rebuilt.int_to_ext;
-        handle.ext_to_int = rebuilt.ext_to_int;
+        handle.idmap = build_idmap(store, handle.id, &rebuilt.int_to_ext)?;
         handle.docs = rebuilt.docs;
         handle.sparse = rebuilt.sparse;
         // Clear stale only if no write landed since the inputs were captured;
@@ -1128,11 +1126,11 @@ impl Database {
             if out.len() >= params.k {
                 break;
             }
-            let Some(ext_id) = handle.int_to_ext.get(neighbor.id as usize) else {
+            let Some(ext_id) = handle.idmap.ext(neighbor.id)? else {
                 continue;
             };
             let record = if need_record {
-                self.store.get(handle.id, ext_id)?
+                self.store.get(handle.id, &ext_id)?
             } else {
                 None
             };
@@ -1149,7 +1147,7 @@ impl Database {
                 }
             }
             out.push(Match {
-                id: ext_id.clone(),
+                id: ext_id,
                 score: neighbor.distance,
                 payload: if params.with_payload {
                     payload_value
@@ -1381,13 +1379,13 @@ impl Database {
         }
         let raw = handle.index.search(query, depth, ef_search.max(depth))?;
         for neighbor in raw {
-            let Some(ext_id) = handle.int_to_ext.get(neighbor.id as usize) else {
+            let Some(ext_id) = handle.idmap.ext(neighbor.id)? else {
                 continue;
             };
-            if !self.passes_filter(handle.id, ext_id, filter)? {
+            if !self.passes_filter(handle.id, &ext_id, filter)? {
                 continue;
             }
-            ids.push(ext_id.clone());
+            ids.push(ext_id);
             if ids.len() >= depth {
                 break;
             }
@@ -1606,7 +1604,7 @@ impl Database {
         for j in vectors.len()..previous {
             self.store.delete(handle.id, &token_id(doc_id, j))?;
             // Tombstone the dropped token row in the ANN index too (ADR-0034).
-            index_delete_point(handle, &token_id(doc_id, j));
+            index_delete_point(handle, &token_id(doc_id, j))?;
         }
         let payload_bytes = serde_json::to_vec(payload)?;
         for (j, vector) in vectors.iter().enumerate() {
@@ -1696,8 +1694,8 @@ impl Database {
             let mut set = BTreeSet::new();
             for token in query_tokens {
                 for neighbor in handle.index.search(token, per_token_k, params.ef_search)? {
-                    if let Some(ext) = handle.int_to_ext.get(neighbor.id as usize)
-                        && let Some((doc, _)) = parse_token_id(ext)
+                    if let Some(ext) = handle.idmap.ext(neighbor.id)?
+                        && let Some((doc, _)) = parse_token_id(&ext)
                     {
                         set.insert(doc.to_owned());
                     }
@@ -1785,7 +1783,7 @@ impl Database {
         for j in 0..count as usize {
             self.store.delete(handle.id, &token_id(doc_id, j))?;
             // Tombstone each token row in the ANN index incrementally (ADR-0034).
-            index_delete_point(handle, &token_id(doc_id, j));
+            index_delete_point(handle, &token_id(doc_id, j))?;
         }
         if let Some(docs) = handle.docs.as_mut() {
             docs.remove(doc_id);
@@ -1840,7 +1838,8 @@ impl Database {
                 }
                 let envelope = IndexEnvelope {
                     version: INDEX_ENVELOPE_VERSION,
-                    int_to_ext: handle.int_to_ext.clone(),
+                    base_count: handle.idmap.base_count(),
+                    tail: handle.idmap.tail().to_vec(),
                     ivf: ivf.snapshot()?,
                 };
                 snapshots.insert(handle.id, postcard::to_allocvec(&envelope)?);
@@ -1852,8 +1851,8 @@ impl Database {
                 // back to the store scan until the next rebuild — correct, not fast.
                 let envelope = DiskEnvelope {
                     version: INDEX_ENVELOPE_VERSION,
-                    int_to_ext: handle.int_to_ext.clone(),
-                    base_row_count: fresh.base_len() as u64,
+                    base_count: handle.idmap.base_count(),
+                    tail: handle.idmap.tail().to_vec(),
                     deleted_ids: fresh.deleted_ids(),
                 };
                 snapshots.insert(handle.id, postcard::to_allocvec(&envelope)?);
@@ -2130,6 +2129,34 @@ const PQ_SEED: u64 = 0x5176_5044_5141_5453;
 // the previous handle (unmapping the file) first.
 const DISK_INDEX_FILE: &str = "vamana.qvx";
 
+// The on-disk base id column (ADR-0073), sealed under the collection's index dir at
+// every rebuild.
+const IDMAP_FILE: &str = "idmap.qic";
+
+// Seal a collection's base id column to disk from `ids` (internal-id order) and open
+// it into a fresh [`IdMap`]. Called at every index rebuild; atomic tmp-rename like
+// the DiskVamana base, so a crash leaves the previous complete column or none.
+fn build_idmap(store: &Store, cid: CollectionId, ids: &[String]) -> Result<IdMap> {
+    let dir = store.index_dir(cid);
+    std::fs::create_dir_all(&dir).map_err(|e| quiver_core::CoreError::io(&dir, e))?;
+    let path = dir.join(IDMAP_FILE);
+    let codec = store.collection_codec_clone(cid)?;
+    let tmp = dir.join(format!("{IDMAP_FILE}.tmp"));
+    ExtIdColumn::write(&tmp, codec.as_ref(), ids)?;
+    std::fs::rename(&tmp, &path).map_err(|e| quiver_core::CoreError::io(&path, e))?;
+    let _ = std::fs::File::open(&dir).and_then(|f| f.sync_all());
+    Ok(IdMap::from_base(ExtIdColumn::open(&path, codec)?))
+}
+
+// Reopen a collection's base id column and restore an [`IdMap`] over it plus the
+// resident `tail` from the durable snapshot. Errors (absent/torn/wrong-codec column)
+// propagate so the durable load path falls back to a rebuild.
+fn open_idmap(store: &Store, cid: CollectionId, tail: Vec<String>) -> Result<IdMap> {
+    let path = store.index_dir(cid).join(IDMAP_FILE);
+    let codec = store.collection_codec_clone(cid)?;
+    Ok(IdMap::restore(ExtIdColumn::open(&path, codec)?, tail))
+}
+
 // The IVF configuration for a collection of `n` points. Scale the coarse
 // quantizer with the corpus (~√n, like the Colbert path and FAISS guidance) so a
 // query probes a small fraction of cells instead of scanning every posting. A
@@ -2348,26 +2375,26 @@ fn restore_disk_snapshot(store: &Store, handle: &mut CollectionHandle, blob: &[u
         ));
     }
     let base = open_disk_index(store, handle.id, store.collection_codec_clone(handle.id)?)?;
-    // The blob's base count must match the opened file, or the (base, blob) pair is
-    // inconsistent (e.g. a base torn or replaced after the blob was sealed).
-    if base.len() as u64 != envelope.base_row_count {
+    // The blob's base count must match both the opened base file and the id column,
+    // or the (base, column, blob) triple is inconsistent (torn or replaced after the
+    // blob was sealed) — fall back to a rebuild.
+    if base.len() as u64 != envelope.base_count {
         return Err(Error::Unsupported(
             "disk base count disagrees with snapshot",
         ));
     }
-    handle.ext_to_int = envelope
-        .int_to_ext
-        .iter()
-        .enumerate()
-        .map(|(i, ext)| (ext.clone(), i as u64))
-        .collect();
-    handle.int_to_ext = envelope.int_to_ext;
+    handle.idmap = open_idmap(store, handle.id, envelope.tail)?;
+    if handle.idmap.base_count() != envelope.base_count {
+        return Err(Error::Unsupported(
+            "id column count disagrees with snapshot",
+        ));
+    }
     let mut fresh = FreshDiskVamana::new(base)?;
-    // Reconstruct the delta: the ids above the base were inserted since the last
-    // consolidation; their vectors live in the store, fetched by id (a row that
-    // died this window is simply absent and need not enter the delta).
-    for internal in envelope.base_row_count..handle.int_to_ext.len() as u64 {
-        let ext = &handle.int_to_ext[internal as usize];
+    // Reconstruct the delta: the ids above the base are exactly the resident tail,
+    // inserted since the last consolidation; their vectors live in the store, fetched
+    // by id (a row that died this window is simply absent and need not enter the delta).
+    for (j, ext) in handle.idmap.tail().iter().enumerate() {
+        let internal = envelope.base_count + j as u64;
         if let Some(record) = store.get(handle.id, ext)? {
             fresh.insert(internal, &record.vector)?;
         }
@@ -2387,7 +2414,7 @@ fn restore_disk_snapshot(store: &Store, handle: &mut CollectionHandle, blob: &[u
 fn replay_recovery_tail(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
     let tail = store.recovery_tail(handle.id)?;
     for ext in &tail.deleted {
-        index_delete_point(handle, ext);
+        index_delete_point(handle, ext)?;
     }
     for (ext, record) in tail.upserts {
         index_upsert_point(handle, &ext, &record.vector)?;
@@ -2407,19 +2434,18 @@ fn restore_ivf_snapshot(store: &Store, handle: &mut CollectionHandle, blob: &[u8
         ));
     }
     let ivf = Ivf::restore(&envelope.ivf)?;
-    handle.ext_to_int = envelope
-        .int_to_ext
-        .iter()
-        .enumerate()
-        .map(|(i, ext)| (ext.clone(), i as u64))
-        .collect();
-    handle.int_to_ext = envelope.int_to_ext;
+    handle.idmap = open_idmap(store, handle.id, envelope.tail)?;
+    if handle.idmap.base_count() != envelope.base_count {
+        return Err(Error::Unsupported(
+            "id column count disagrees with snapshot",
+        ));
+    }
     handle.index = CollectionIndex::Ivf(Some(ivf));
     handle.stale = false;
 
     let tail = store.recovery_tail(handle.id)?;
     for ext in &tail.deleted {
-        let Some(&internal) = handle.ext_to_int.get(ext) else {
+        let Some(internal) = handle.idmap.internal(ext)? else {
             continue;
         };
         if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
@@ -2427,14 +2453,11 @@ fn restore_ivf_snapshot(store: &Store, handle: &mut CollectionHandle, blob: &[u8
         }
     }
     for (ext, record) in tail.upserts {
-        let internal = match handle.ext_to_int.get(&ext) {
-            Some(&i) => i,
-            None => {
-                let i = handle.int_to_ext.len() as u64;
-                handle.ext_to_int.insert(ext.clone(), i);
-                handle.int_to_ext.push(ext);
-                i
-            }
+        // Reuse the internal id for an in-place update; allocate a fresh, dense tail
+        // id for an unseen one (mirrors `index_upsert_point`'s IVF branch).
+        let internal = match handle.idmap.internal(&ext)? {
+            Some(i) => i,
+            None => handle.idmap.push(&ext),
         };
         if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
             ivf.insert(internal, &record.vector)?;
@@ -2456,8 +2479,7 @@ fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32
     // base index (ADR-0064), keeping lock-free readers race-free. Bumps the write
     // generation itself.
     if mvcc_served(handle) {
-        overlay_upsert(handle, ext_id, vector);
-        return Ok(());
+        return overlay_upsert(handle, ext_id, vector);
     }
     // Every write bumps the generation, even one skipped here because a rebuild is
     // already pending — an in-flight off-lock rebuild must still notice it (ADR-0062).
@@ -2465,7 +2487,11 @@ fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32
     if handle.stale {
         return Ok(());
     }
-    let known = handle.ext_to_int.contains_key(ext_id);
+    // One id-map lookup serves the whole function: `existing` is the current internal
+    // id (base column or resident tail), `known` its presence. A base-id lookup costs
+    // an on-demand decrypt (ADR-0073).
+    let existing = handle.idmap.internal(ext_id)?;
+    let known = existing.is_some();
     let is_hnsw = matches!(handle.index, CollectionIndex::Hnsw(_));
     let is_live_ivf = matches!(&handle.index, CollectionIndex::Ivf(Some(ivf)) if !ivf.is_empty());
     let is_live_graph = matches!(
@@ -2474,31 +2500,26 @@ fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32
     );
     let is_live_colbert = matches!(handle.index, CollectionIndex::Colbert(Some(_)));
     if is_hnsw && !known {
-        let internal = handle.int_to_ext.len() as u64;
+        let internal = handle.idmap.next_internal();
         if let CollectionIndex::Hnsw(h) = &mut handle.index {
             h.insert(internal, vector)?;
         }
-        handle.ext_to_int.insert(ext_id.to_owned(), internal);
-        handle.int_to_ext.push(ext_id.to_owned());
+        handle.idmap.push(ext_id);
     } else if is_live_ivf {
         // Reuse the internal id for an in-place update; allocate a fresh, dense one
-        // for a new id (so `int_to_ext` stays index-addressable).
-        let internal = if known {
-            handle.ext_to_int[ext_id]
-        } else {
-            let i = handle.int_to_ext.len() as u64;
-            handle.ext_to_int.insert(ext_id.to_owned(), i);
-            handle.int_to_ext.push(ext_id.to_owned());
-            i
-        };
+        // for a new id (so the id map stays index-addressable).
+        let internal = existing.unwrap_or_else(|| handle.idmap.next_internal());
         if let CollectionIndex::Ivf(Some(ivf)) = &mut handle.index {
             ivf.insert(internal, vector)?;
+        }
+        if !known {
+            handle.idmap.push(ext_id);
         }
     } else if is_live_graph {
         // A graph cannot update a node in place: append a new delta node under a
         // fresh internal id and tombstone the prior copy on an update (ADR-0033).
-        let old = handle.ext_to_int.get(ext_id).copied();
-        let internal = handle.int_to_ext.len() as u64;
+        let old = existing;
+        let internal = handle.idmap.next_internal();
         let mut pending = 0.0;
         match &mut handle.index {
             CollectionIndex::Vamana(Some(fresh)) => {
@@ -2517,8 +2538,7 @@ fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32
             }
             _ => {}
         }
-        handle.ext_to_int.insert(ext_id.to_owned(), internal);
-        handle.int_to_ext.push(ext_id.to_owned());
+        handle.idmap.push(ext_id);
         if pending >= GRAPH_REBUILD_PENDING_FRACTION {
             mark_stale(handle);
         }
@@ -2526,8 +2546,8 @@ fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32
         // ColBERT appends a new token and tombstones the prior copy on an update —
         // its centroids are fixed until a rebuild (ADR-0034); the deletion fraction
         // drives consolidation, as for HNSW.
-        let old = handle.ext_to_int.get(ext_id).copied();
-        let internal = handle.int_to_ext.len() as u64;
+        let old = existing;
+        let internal = handle.idmap.next_internal();
         let mut crowded = false;
         if let CollectionIndex::Colbert(Some(c)) = &mut handle.index {
             if let Some(o) = old {
@@ -2536,8 +2556,7 @@ fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32
             c.insert(internal, vector)?;
             crowded = c.deleted_fraction() >= HNSW_REBUILD_DELETED_FRACTION;
         }
-        handle.ext_to_int.insert(ext_id.to_owned(), internal);
-        handle.int_to_ext.push(ext_id.to_owned());
+        handle.idmap.push(ext_id);
         if crowded {
             mark_stale(handle);
         }
@@ -2553,19 +2572,18 @@ fn index_upsert_point(handle: &mut CollectionHandle, ext_id: &str, vector: &[f32
 // its deletion set (ADR-0033); each amortizes a rebuild when tombstones dominate.
 // The id→internal mapping is kept so a later re-insert allocates afresh. Shared by
 // the single-vector `delete` and each token row of `delete_document` (ADR-0034).
-fn index_delete_point(handle: &mut CollectionHandle, ext_id: &str) {
+fn index_delete_point(handle: &mut CollectionHandle, ext_id: &str) -> Result<()> {
     // MVCC mode: tombstone the id in the published overlay (ADR-0064); the base
     // stays immutable. Bumps the write generation itself.
     if mvcc_served(handle) {
-        overlay_delete(handle, ext_id);
-        return;
+        return overlay_delete(handle, ext_id);
     }
     // Every write bumps the generation, even one skipped here (see `index_upsert_point`).
     bump_write_gen(handle);
     if handle.stale {
-        return;
+        return Ok(());
     }
-    let internal = handle.ext_to_int.get(ext_id).copied();
+    let internal = handle.idmap.internal(ext_id)?;
     let live_ivf = matches!(handle.index, CollectionIndex::Ivf(Some(_)));
     let live_hnsw = matches!(handle.index, CollectionIndex::Hnsw(_));
     let live_graph = matches!(
@@ -2618,6 +2636,7 @@ fn index_delete_point(handle: &mut CollectionHandle, ext_id: &str) {
         }
         _ => mark_stale(handle),
     }
+    Ok(())
 }
 
 // The product of scanning a collection's live rows: the dense id maps + contiguous
@@ -2625,8 +2644,10 @@ fn index_delete_point(handle: &mut CollectionHandle, ext_id: &str) {
 // index — everything a rebuild needs from the store, owned so the build can then
 // proceed with no store and no lock (ADR-0062).
 struct RebuildScan {
+    // The live ext ids in `store.scan()` (internal-id) order; sealed into the
+    // on-disk base column at commit (ADR-0073). The reverse map is no longer built —
+    // the column's forward index replaces it.
     int_to_ext: Vec<String>,
-    ext_to_int: HashMap<String, u64>,
     // The full-precision corpus, materialized for the standard build path. Empty
     // when `source` is set (a streaming IVF build reads vectors from disk instead).
     flat: Vec<f32>,
@@ -2664,7 +2685,6 @@ fn scan_collection(store: &Store, handle: &CollectionHandle) -> Result<RebuildSc
     let multivector = handle.descriptor.multivector;
     let streaming = streams_rebuild(&handle.descriptor);
     let mut int_to_ext = Vec::new();
-    let mut ext_to_int = HashMap::new();
     let mut flat: Vec<f32> = Vec::new();
     let mut docs: BTreeMap<String, u32> = BTreeMap::new();
     // Only single-vector, server-searchable collections carry a sparse index, and
@@ -2675,18 +2695,15 @@ fn scan_collection(store: &Store, handle: &CollectionHandle) -> Result<RebuildSc
         // Payload-only pass (no vectors) + a separate lock-free vector capture;
         // both walk the store's primary index in the same id order.
         for (ext_id, payload) in store.scan_payloads(handle.id)? {
-            let internal = int_to_ext.len() as u64;
             if let Some(idx) = sparse.as_mut()
                 && let Some(sv) = sparse_vector_from_payload(&payload)
             {
                 idx.upsert(&ext_id, &sv);
             }
-            ext_to_int.insert(ext_id.clone(), internal);
             int_to_ext.push(ext_id);
         }
     } else {
         for (ext_id, record) in store.scan(handle.id)? {
-            let internal = int_to_ext.len() as u64;
             flat.extend_from_slice(&record.vector);
             if multivector && let Some((doc, _)) = parse_token_id(&ext_id) {
                 *docs.entry(doc.to_owned()).or_insert(0) += 1;
@@ -2696,7 +2713,6 @@ fn scan_collection(store: &Store, handle: &CollectionHandle) -> Result<RebuildSc
             {
                 idx.upsert(&ext_id, &sv);
             }
-            ext_to_int.insert(ext_id.clone(), internal);
             int_to_ext.push(ext_id);
         }
     }
@@ -2706,7 +2722,6 @@ fn scan_collection(store: &Store, handle: &CollectionHandle) -> Result<RebuildSc
         .transpose()?;
     Ok(RebuildScan {
         int_to_ext,
-        ext_to_int,
         flat,
         docs: (multivector && !streaming).then_some(docs),
         sparse,
@@ -2727,8 +2742,7 @@ fn rebuild_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
         Some(source) => build_ivf_streaming(&handle.descriptor, &ids, source)?,
         None => build_index(store, handle.id, &handle.descriptor, &ids, &scan.flat)?,
     };
-    handle.int_to_ext = scan.int_to_ext;
-    handle.ext_to_int = scan.ext_to_int;
+    handle.idmap = build_idmap(store, handle.id, &scan.int_to_ext)?;
     handle.docs = scan.docs;
     handle.sparse = scan.sparse;
     handle.stale = false;
@@ -2764,8 +2778,9 @@ enum RebuiltKind {
 pub struct RebuiltIndex {
     collection: String,
     kind: RebuiltKind,
+    // The base ids, sealed to the on-disk column by `commit_rebuild` under the write
+    // lock (the file write must not race the prior column's `mmap`, ADR-0073).
     int_to_ext: Vec<String>,
-    ext_to_int: HashMap<String, u64>,
     docs: Option<BTreeMap<String, u32>>,
     sparse: Option<SparseInvertedIndex>,
     write_gen: u64,
@@ -2802,7 +2817,6 @@ impl RebuildInputs {
             collection: self.collection,
             kind,
             int_to_ext: self.scan.int_to_ext,
-            ext_to_int: self.scan.ext_to_int,
             docs: self.scan.docs,
             sparse: self.scan.sparse,
             write_gen: self.write_gen,
@@ -4887,6 +4901,13 @@ mod tests {
         v
     }
 
+    // The full internal-id → ext sequence, reconstructed from the (now on-disk) id
+    // map for assertions that once read `int_to_ext` directly (ADR-0073).
+    fn idmap_ids(db: &Database, collection: &str) -> Vec<String> {
+        let m = &db.collections[collection].idmap;
+        (0..m.len()).map(|i| m.ext(i).unwrap().unwrap()).collect()
+    }
+
     fn nearest(db: &mut Database, q: &[f32]) -> Vec<String> {
         db.search("c", q, &SearchParams::default())
             .unwrap()
@@ -4939,13 +4960,13 @@ mod tests {
             db.upsert("c", "b", &[3.0, 0.0, 0.0, 0.0], &json!({}))
                 .unwrap();
             db.checkpoint().unwrap();
-            assert_eq!(db.collections["c"].int_to_ext, ["a", "m", "z", "b"]);
+            assert_eq!(idmap_ids(&db, "c"), ["a", "m", "z", "b"]);
         }
         let db = open(tmp.path());
         // Loaded from the snapshot: the insertion-order mapping is preserved. A
         // rebuild would have produced the sorted order ["a", "b", "m", "z"].
         assert_eq!(
-            db.collections["c"].int_to_ext,
+            idmap_ids(&db, "c"),
             ["a", "m", "z", "b"],
             "index was rebuilt, not loaded from the snapshot"
         );
