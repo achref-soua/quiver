@@ -23,6 +23,7 @@
 mod blockfile;
 pub mod descriptor;
 pub mod error;
+pub mod extidcol;
 pub mod ids;
 pub mod keyring;
 pub mod manifest;
@@ -38,6 +39,7 @@ pub use descriptor::{
     VectorEncryption,
 };
 pub use error::{CoreError, Result};
+pub use extidcol::ExtIdColumn;
 pub use ids::{CollectionId, Lsn};
 pub use keyring::{KeyRing, SingleCodecKeyRing};
 pub use sec::{SecPredicate, SecValue};
