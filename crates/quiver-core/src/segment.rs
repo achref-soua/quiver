@@ -12,19 +12,24 @@
 //!   an `mmap` ([`crate::blockfile`]). O(1) random access, cache-friendly scans.
 //! - `seg-NNNNNNNNNN.pay` — the **payload heap**: each row's opaque payload bytes
 //!   concatenated, also `mmap`-read.
+//! - `seg-NNNNNNNNNN.ids` — the **id column** (ADR-0072): each row's external-id
+//!   bytes concatenated in row order, `mmap`-read on demand like the payload heap.
+//!   Keeping ids off the heap is what lets the primary index leave RAM.
 //! - `seg-NNNNNNNNNN.dir` — the **row directory** ([`SegmentDir`]): per row, the
-//!   external id and the payload's `(offset, length)` in the heap. A paged
+//!   `(offset, length)` of its id in the `.ids` column and of its payload in the
+//!   `.pay` heap, plus `sorted_rows` — the row numbers ordered by external id, the
+//!   forward-lookup index binary-searched by [`SealedSegment::lookup`]. A paged
 //!   `postcard` blob ([`crate::paged`]) with per-page CRC integrity.
 //! - `seg-NNNNNNNNNN.del` — the **tombstone bitmap**: a `roaring` bitmap of this
 //!   segment's row indices that are no longer live (deleted, or shadowed by a
 //!   newer upsert). Written atomically (temp + rename) since, unlike the other
-//!   three files, it is rewritten as rows die; absent means no dead rows.
+//!   immutable files, it is rewritten as rows die; absent means no dead rows.
 //!
-//! Vectors and payloads live on disk and are decrypted on demand; only the row
-//! directory (external ids + payload offsets) and the tombstone bitmap are read
-//! into RAM, where they seed the engine's primary index. On recovery, a row that
-//! is tombstoned in its segment is skipped, so each external id is live in at
-//! most one segment; the WAL tail is then applied on top.
+//! Vectors, payloads, and ids live on disk and are decrypted on demand; only the
+//! row directory (id/payload offsets + the sorted-row index) and the tombstone
+//! bitmap are read into RAM. On recovery, a row that is tombstoned in its segment
+//! is skipped, so each external id is live in at most one segment; the WAL tail is
+//! then applied on top.
 
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -38,16 +43,21 @@ use crate::sec::{SecIndex, SecPredicate};
 
 /// Current segment schema version. (v1 was the Phase-1 snapshot-delta `postcard`
 /// blob; v2 the row-addressed layout with string tombstones; v3 moves tombstones
-/// out of the directory into the roaring `.del` bitmap.)
-pub(crate) const SEGMENT_FORMAT_VERSION: u16 = 3;
+/// out of the directory into the roaring `.del` bitmap; v4 (ADR-0072) moves the
+/// external ids out of the directory into the on-demand `.ids` column and adds the
+/// `sorted_rows` forward index, so the primary index can leave RAM.)
+pub(crate) const SEGMENT_FORMAT_VERSION: u16 = 4;
 
 /// One row's entry in the segment directory. The row's vector lives at
-/// `row_index × stride` in the `.vec` column; its payload at `(pay_off, pay_len)`
-/// in the `.pay` heap. `row_index` is the entry's position in [`SegmentDir::rows`].
+/// `row_index × stride` in the `.vec` column; its external id at `(id_off, id_len)`
+/// in the `.ids` column; its payload at `(pay_off, pay_len)` in the `.pay` heap.
+/// `row_index` is the entry's position in [`SegmentDir::rows`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RowEntry {
-    /// Caller-supplied external id.
-    pub external_id: String,
+    /// Byte offset of this row's external id within the `.ids` column.
+    pub id_off: u64,
+    /// Byte length of this row's external id.
+    pub id_len: u32,
     /// Byte offset of this row's payload within the `.pay` heap.
     pub pay_off: u64,
     /// Byte length of this row's payload.
@@ -61,8 +71,13 @@ pub(crate) struct SegmentDir {
     pub format_version: u16,
     /// Segment id (matches its [`crate::manifest::SegmentRef`] and file names).
     pub segment_id: u64,
-    /// Rows sealed into this segment, in `.vec`/`.pay` row order.
+    /// Rows sealed into this segment, in `.vec`/`.pay`/`.ids` row order.
     pub rows: Vec<RowEntry>,
+    /// Row numbers ordered by their external id (ADR-0072): the forward-lookup
+    /// index. `sorted_rows[i]` is the row whose id sorts to position `i`, so
+    /// [`SealedSegment::lookup`] binary-searches it, decrypting the candidate row's
+    /// id from `.ids` to compare. Within a segment each id is unique.
+    pub sorted_rows: Vec<u32>,
 }
 
 /// A row to seal, borrowing its bytes from the engine's active buffer.
@@ -75,26 +90,31 @@ pub(crate) struct SealRow<'a> {
     pub payload: &'a [u8],
 }
 
-/// The payload location of one row within the `.pay` heap (the RAM-resident part
-/// of the directory; external ids are consumed into the engine's primary index).
+/// The location of one row's bytes within a `.pay` heap or `.ids` column: a
+/// `(offset, length)` into the paged block file, resolved by `read_range`.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PayLoc {
+pub(crate) struct ByteLoc {
     off: u64,
     len: u32,
 }
 
-/// A sealed segment opened for reads: `mmap` handles for the vector column and
-/// payload heap, the row → payload-location directory, the row → external-id map,
-/// the tombstone bitmap, and the secondary index.
+/// A sealed segment opened for reads: `mmap` handles for the vector column, payload
+/// heap, and id column; the row → (id, payload) location directory; the sorted-row
+/// forward index; the tombstone bitmap; and the secondary index.
 pub(crate) struct SealedSegment {
     /// Segment id; names the files and matches the manifest.
     pub seg_id: u64,
     vec: BlockFile,
     pay: BlockFile,
-    paylocs: Vec<PayLoc>,
-    // External id of each row (row order); reverses the primary index, e.g. to
-    // resolve a secondary-index hit back to an id.
-    row_ids: Vec<String>,
+    // `ids`/`idlocs`/`sorted_rows` back the on-demand `read_id`/`lookup` read path
+    // (ADR-0072). External ids are no longer RAM-resident — that was the ~316 B/pt
+    // wall Increment C removes; callers read a row's id on demand instead.
+    ids: BlockFile,
+    paylocs: Vec<ByteLoc>,
+    // Where each row's external id lives in the `.ids` column (row order).
+    idlocs: Vec<ByteLoc>,
+    // Row numbers ordered by external id (ADR-0072): the forward-lookup index.
+    sorted_rows: Vec<u32>,
     // Rows of this segment that are no longer live.
     dead: RoaringBitmap,
     // Secondary index over the collection's filterable fields (empty if none).
@@ -102,9 +122,47 @@ pub(crate) struct SealedSegment {
 }
 
 impl SealedSegment {
-    /// The external ids of this segment's rows, in row order.
-    pub(crate) fn row_ids(&self) -> &[String] {
-        &self.row_ids
+    /// Read row `row`'s external id from the `.ids` column, decrypting the page(s)
+    /// it touches. The on-demand path the forward lookup and live scans use in
+    /// place of a RAM-resident id vector (ADR-0072).
+    pub(crate) fn read_id(&self, codec: &dyn PageCodec, row: u32) -> Result<String> {
+        let loc = self.idlocs.get(row as usize).ok_or_else(|| {
+            CoreError::MalformedPage(format!(
+                "segment {} has no row {row} (row count {})",
+                self.seg_id,
+                self.idlocs.len()
+            ))
+        })?;
+        let bytes = self
+            .ids
+            .read_range(codec, loc.off as usize, loc.len as usize)?;
+        String::from_utf8(bytes).map_err(|e| {
+            CoreError::MalformedPage(format!(
+                "segment {} row {row} id is not valid UTF-8: {e}",
+                self.seg_id
+            ))
+        })
+    }
+
+    /// The row carrying external id `id`, or `None` if absent. Binary-searches the
+    /// `sorted_rows` forward index, decrypting each candidate row's id from `.ids`
+    /// to compare (ADR-0072, decrypt-on-compare). Ignores tombstones — liveness is
+    /// the caller's concern, as with the in-RAM primary index. Within a segment
+    /// each id is unique, so the match (if any) is the single owning row.
+    pub(crate) fn lookup(&self, codec: &dyn PageCodec, id: &str) -> Result<Option<u32>> {
+        let mut lo = 0usize;
+        let mut hi = self.sorted_rows.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let row = self.sorted_rows[mid];
+            let candidate = self.read_id(codec, row)?;
+            match candidate.as_str().cmp(id) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Ok(Some(row)),
+            }
+        }
+        Ok(None)
     }
 
     /// The rows matching a secondary-index predicate, or `None` if the field is
@@ -163,9 +221,17 @@ impl SealedSegment {
     }
 }
 
-/// Write a new sealed segment's `.vec`, `.pay`, `.dir`, and (if the collection
-/// has `filterable` fields) `.sec` files into `seg_dir` and `fsync` each. A new
-/// segment has no tombstones, so no `.del` is written.
+/// Row numbers ordered by their external id — the `sorted_rows` forward index
+/// (ADR-0072). A stable sort of `0..ids.len()` keyed by `ids[row]`.
+fn sorted_rows_by_id<S: AsRef<str>>(ids: &[S]) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..ids.len() as u32).collect();
+    order.sort_by(|&a, &b| ids[a as usize].as_ref().cmp(ids[b as usize].as_ref()));
+    order
+}
+
+/// Write a new sealed segment's `.vec`, `.pay`, `.ids`, `.dir`, and (if the
+/// collection has `filterable` fields) `.sec` files into `seg_dir` and `fsync`
+/// each. A new segment has no tombstones, so no `.del` is written.
 ///
 /// `rows` are sealed in the given order (row `i` → `.vec` slot `i`). The files are
 /// *not* directory-`fsync`'d here — the engine sequences directory `fsync`s
@@ -179,21 +245,27 @@ pub(crate) fn write_segment(
 ) -> Result<()> {
     let mut vec_blob = Vec::new();
     let mut pay_blob = Vec::new();
+    let mut id_blob = Vec::new();
     let mut dir_rows = Vec::with_capacity(rows.len());
     for row in rows {
         vec_blob.extend_from_slice(row.vector);
-        let off = pay_blob.len() as u64;
+        let pay_off = pay_blob.len() as u64;
         pay_blob.extend_from_slice(row.payload);
+        let id_off = id_blob.len() as u64;
+        id_blob.extend_from_slice(row.external_id.as_bytes());
         dir_rows.push(RowEntry {
-            external_id: row.external_id.to_owned(),
-            pay_off: off,
+            id_off,
+            id_len: row.external_id.len() as u32,
+            pay_off,
             pay_len: row.payload.len() as u32,
         });
     }
+    let ids: Vec<&str> = rows.iter().map(|r| r.external_id).collect();
     let dir = SegmentDir {
         format_version: SEGMENT_FORMAT_VERSION,
         segment_id,
         rows: dir_rows,
+        sorted_rows: sorted_rows_by_id(&ids),
     };
     let dir_blob = postcard::to_allocvec(&dir)?;
 
@@ -210,6 +282,13 @@ pub(crate) fn write_segment(
         PageType::Segment,
         segment_id,
         &pay_blob,
+    )?;
+    write_blocks(
+        &id_path(seg_dir, segment_id),
+        codec,
+        PageType::Segment,
+        segment_id,
+        &id_blob,
     )?;
     crate::paged::write_paged(
         &dir_path(seg_dir, segment_id),
@@ -238,13 +317,13 @@ pub(crate) fn write_segment(
 /// `i` → `.vec` slot `i`) until it returns `None`; `row_count` is only a capacity
 /// hint.
 ///
-/// The `.vec` and `.pay` columns are streamed page-by-page through a
-/// [`BlockWriter`]; the row directory (O(rows) of ids + offsets) and, for a
-/// collection with filterable fields, the secondary index (which `SecIndex::build`
-/// needs over all payloads) are still assembled in memory — those are the small /
-/// opt-in costs, while the vector and payload *bytes* (the dominant term) never
-/// all reside at once. Produces the same on-disk files as [`write_segment`]; not
-/// directory-`fsync`'d here.
+/// The `.vec`, `.pay`, and `.ids` columns are streamed page-by-page through a
+/// [`BlockWriter`]; the row directory (O(rows) of offsets + the sorted-row index)
+/// and, for a collection with filterable fields, the secondary index (which
+/// `SecIndex::build` needs over all payloads) are still assembled in memory —
+/// those are the small / opt-in costs, while the vector, payload, and id *bytes*
+/// (the dominant term) never all reside at once. Produces the same on-disk files
+/// as [`write_segment`]; not directory-`fsync`'d here.
 pub(crate) fn write_segment_streaming(
     seg_dir: &Path,
     segment_id: u64,
@@ -265,8 +344,17 @@ pub(crate) fn write_segment_streaming(
         PageType::Segment,
         segment_id,
     )?;
+    let mut id_w = BlockWriter::create(
+        &id_path(seg_dir, segment_id),
+        codec,
+        PageType::Segment,
+        segment_id,
+    )?;
 
     let mut dir_rows = Vec::with_capacity(row_count);
+    // Ids are kept to build the sorted-row index at finish (O(rows), the same
+    // bounded directory cost this streaming path already accepts).
+    let mut ids: Vec<String> = Vec::with_capacity(row_count);
     // Only a collection with filterable fields builds a `.sec`, and only that path
     // holds the payloads (SecIndex::build needs them all); otherwise this stays empty.
     let want_sec = !filterable.is_empty();
@@ -277,26 +365,33 @@ pub(crate) fn write_segment_streaming(
     };
 
     let mut pay_off = 0u64;
+    let mut id_off = 0u64;
     while let Some((external_id, vector, payload)) = next_row()? {
         vec_w.write(&vector)?;
         pay_w.write(&payload)?;
+        id_w.write(external_id.as_bytes())?;
         dir_rows.push(RowEntry {
-            external_id,
+            id_off,
+            id_len: external_id.len() as u32,
             pay_off,
             pay_len: payload.len() as u32,
         });
         pay_off += payload.len() as u64;
+        id_off += external_id.len() as u64;
+        ids.push(external_id);
         if want_sec {
             sec_payloads.push(payload);
         }
     }
     vec_w.finish()?;
     pay_w.finish()?;
+    id_w.finish()?;
 
     let dir = SegmentDir {
         format_version: SEGMENT_FORMAT_VERSION,
         segment_id,
         rows: dir_rows,
+        sorted_rows: sorted_rows_by_id(&ids),
     };
     crate::paged::write_paged(
         &dir_path(seg_dir, segment_id),
@@ -362,9 +457,10 @@ fn read_sec(seg_dir: &Path, segment_id: u64, codec: &dyn PageCodec) -> Result<Se
     SecIndex::decode(&blob)
 }
 
-/// Open a sealed segment for reads. The returned handle carries the row →
-/// external-id map (used to rebuild the primary index, minus the segment's dead
-/// rows) and the secondary index.
+/// Open a sealed segment for reads. The returned handle memory-maps the columns
+/// and holds only O(rows) of byte offsets, the sorted-row forward index, the
+/// tombstone bitmap, and the secondary index — external ids are read on demand
+/// from the `.ids` column (ADR-0072), not resident.
 pub(crate) fn open_segment(
     seg_dir: &Path,
     segment_id: u64,
@@ -381,24 +477,32 @@ pub(crate) fn open_segment(
     }
     let vec = BlockFile::open(&vec_path(seg_dir, segment_id), codec, PageType::Segment)?;
     let pay = BlockFile::open(&pay_path(seg_dir, segment_id), codec, PageType::Segment)?;
+    let ids = BlockFile::open(&id_path(seg_dir, segment_id), codec, PageType::Segment)?;
     let dead = read_del(seg_dir, segment_id, codec)?;
     let sec = read_sec(seg_dir, segment_id, codec)?;
 
-    let mut row_ids = Vec::with_capacity(dir.rows.len());
+    let mut idlocs = Vec::with_capacity(dir.rows.len());
     let mut paylocs = Vec::with_capacity(dir.rows.len());
-    for r in dir.rows {
-        row_ids.push(r.external_id);
-        paylocs.push(PayLoc {
+    for r in &dir.rows {
+        idlocs.push(ByteLoc {
+            off: r.id_off,
+            len: r.id_len,
+        });
+        paylocs.push(ByteLoc {
             off: r.pay_off,
             len: r.pay_len,
         });
     }
+    // External ids stay on disk in the `.ids` column and are read on demand via
+    // `read_id`/`lookup` — never materialized here (ADR-0072, Increment C).
     Ok(SealedSegment {
         seg_id: segment_id,
         vec,
         pay,
+        ids,
         paylocs,
-        row_ids,
+        idlocs,
+        sorted_rows: dir.sorted_rows,
         dead,
         sec,
     })
@@ -425,6 +529,11 @@ fn vec_path(seg_dir: &Path, seg_id: u64) -> PathBuf {
 /// File name of a segment's payload heap.
 fn pay_path(seg_dir: &Path, seg_id: u64) -> PathBuf {
     seg_dir.join(format!("seg-{seg_id:010}.pay"))
+}
+
+/// File name of a segment's id column (ADR-0072).
+fn id_path(seg_dir: &Path, seg_id: u64) -> PathBuf {
+    seg_dir.join(format!("seg-{seg_id:010}.ids"))
 }
 
 /// File name of a segment's row directory.
@@ -487,7 +596,8 @@ mod tests {
         let seg_dir = dir.path();
         write_segment(seg_dir, 1, &PlainCodec, &rows(), &[]).unwrap();
         let seg = open_segment(seg_dir, 1, &PlainCodec).unwrap();
-        assert_eq!(seg.row_ids(), &["a".to_owned(), "b".to_owned()]);
+        assert_eq!(seg.read_id(&PlainCodec, 0).unwrap(), "a");
+        assert_eq!(seg.read_id(&PlainCodec, 1).unwrap(), "b");
         assert_eq!(seg.row_count(), 2);
         assert_eq!(seg.live_count(), 2);
         assert!(!seg.is_dead(0));
@@ -529,11 +639,39 @@ mod tests {
         })
         .unwrap();
 
-        for name in ["vec", "pay", "dir"] {
+        for name in ["vec", "pay", "ids", "dir"] {
             let a = std::fs::read(whole.path().join(format!("seg-0000000001.{name}"))).unwrap();
             let b = std::fs::read(streamed.path().join(format!("seg-0000000001.{name}"))).unwrap();
             assert_eq!(a, b, "streamed .{name} differs from write_segment");
         }
+    }
+
+    #[test]
+    fn id_column_lookup_finds_every_row_and_rejects_absent() {
+        // ADR-0072: ids live in the on-demand `.ids` column and forward lookup
+        // binary-searches the sorted-row index. Rows are written in an order that
+        // is *not* id-sorted, so a passing lookup proves the sorted index is real.
+        let dir = tempfile::tempdir().unwrap();
+        let ids = ["m", "a", "z", "d", "b"]; // deliberately unsorted
+        let rows: Vec<SealRow> = ids
+            .iter()
+            .map(|id| SealRow {
+                external_id: id,
+                vector: &[0, 0, 0, 0],
+                payload: b"{}",
+            })
+            .collect();
+        write_segment(dir.path(), 1, &PlainCodec, &rows, &[]).unwrap();
+        let seg = open_segment(dir.path(), 1, &PlainCodec).unwrap();
+
+        for (row, id) in ids.iter().enumerate() {
+            assert_eq!(seg.lookup(&PlainCodec, id).unwrap(), Some(row as u32));
+            assert_eq!(&seg.read_id(&PlainCodec, row as u32).unwrap(), id);
+        }
+        assert_eq!(seg.lookup(&PlainCodec, "absent").unwrap(), None);
+        // Bracketing ids that sort outside the present range still miss.
+        assert_eq!(seg.lookup(&PlainCodec, "").unwrap(), None);
+        assert_eq!(seg.lookup(&PlainCodec, "zzzz").unwrap(), None);
     }
 
     #[test]
@@ -569,7 +707,7 @@ mod tests {
             seg.read_vector(&PlainCodec, n - 1, 4).unwrap(),
             (n - 1).to_le_bytes()
         );
-        assert_eq!(seg.row_ids()[12_345], "k12345");
+        assert_eq!(seg.read_id(&PlainCodec, 12_345).unwrap(), "k12345");
     }
 
     #[test]
@@ -632,7 +770,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_segment(dir.path(), 5, &PlainCodec, &[], &[]).unwrap();
         let seg = open_segment(dir.path(), 5, &PlainCodec).unwrap();
-        assert!(seg.row_ids().is_empty());
+        assert_eq!(seg.row_count(), 0);
         assert_eq!(seg.row_count(), 0);
         assert!(seg.read_payload(&PlainCodec, 0).is_err());
     }
