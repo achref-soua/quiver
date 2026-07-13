@@ -4,12 +4,15 @@
 # ---- builder ----
 FROM rust:1.96-slim AS builder
 WORKDIR /app
-RUN rustup target add x86_64-unknown-linux-musl \
-    && apt-get update \
+RUN apt-get update \
     && apt-get install -y --no-install-recommends musl-tools \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
-RUN cargo build --release --target x86_64-unknown-linux-musl -p quiver-cli
+# Add the musl target to the toolchain rust-toolchain.toml pins (channel = "stable"),
+# then build the static CLI binary. Adding the target after COPY — in the same layer as
+# the build — ensures it lands on the toolchain cargo actually resolves in this repo.
+RUN rustup target add x86_64-unknown-linux-musl \
+    && cargo build --release --target x86_64-unknown-linux-musl -p quiverdb-cli
 
 # ---- runtime ----
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
