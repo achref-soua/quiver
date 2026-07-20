@@ -149,6 +149,7 @@ fn scale_ingest_and_query() {
         Descriptor::new(dim as u32, Dtype::F32, DistanceMetric::L2).with_index(IndexSpec {
             kind: IndexKind::Ivf,
             pq_subspaces: quant,
+            binary: false,
         }),
     )
     .unwrap();

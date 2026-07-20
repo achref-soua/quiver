@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Disk-resident Vamana index — the memory-frugal serve path (ADR-0019).
 //!
-//! A built [`Vamana`] graph and a trained [`ProductQuantizer`] are written to a
-//! single page-structured file: `[meta][codebook][ids][PQ codes][node blocks]`,
-//! every page sealed with a [`PageCodec`] (so the index is encrypted at rest
-//! exactly like the store). On [`DiskVamana::open`] the meta, codebook, ids, and
-//! **PQ codes are read into RAM** while the node-block region is `mmap`-ed and
-//! decrypted on demand — so a 10M-vector index serves from roughly its PQ-code
-//! footprint plus the OS-resident working set, not the full vectors.
+//! A built [`Vamana`] graph and a trained navigation quantizer ([`ResidentQuant`]
+//! — product or binary, ADR-0074) are written to a single page-structured file:
+//! `[meta][codebook][ids][codes][node blocks]`, every page sealed with a
+//! [`PageCodec`] (so the index is encrypted at rest exactly like the store). On
+//! [`DiskVamana::open`] the meta, codebook, ids, and **compact codes are read into
+//! RAM** while the node-block region is `mmap`-ed and decrypted on demand — so a
+//! 10M-vector index serves from roughly its code footprint plus the OS-resident
+//! working set, not the full vectors.
 //!
 //! Each node block co-locates a node's full-precision vector and its
 //! out-neighbors, so one page read yields both. [`DiskVamana::search`] navigates
-//! by the RAM-resident PQ codes (cheap, approximate), reads the visited nodes'
-//! pages for neighbors and full vectors, and **re-ranks with exact distances** —
-//! recovering the recall lost to PQ compression.
+//! by the RAM-resident codes (cheap, approximate — PQ's ADC lookup or binary's
+//! `popcount` Hamming), reads the visited nodes' pages for neighbors and full
+//! vectors, and **re-ranks with exact distances** — recovering the recall lost to
+//! compression, so the reported distances are exact regardless of quantizer.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -27,11 +29,62 @@ use thiserror::Error;
 use quiver_core::page::{PAGE_BODY_CAP, PAGE_SIZE, PageCodec, PageType, build_page, parse_page};
 use quiver_simd::Metric;
 
-use crate::{IndexError, Neighbor, ProductQuantizer, Quantizer, Vamana};
+use crate::quant::CodeScorer;
+use crate::{BinaryQuantizer, IndexError, Neighbor, ProductQuantizer, Quantizer, Vamana};
 
 /// On-disk format version for the disk index (independent of the product
 /// SemVer); bumped only on a layout change.
-const FORMAT_VERSION: u16 = 1;
+///
+/// v2 (ADR-0074): the codebook blob is a tagged [`ResidentQuant`] rather than a
+/// bare `ProductQuantizer`, so the navigation quantizer can be PQ or binary. The
+/// disk index is a rebuildable cache, so a v1 file simply fails this gate and is
+/// rebuilt from the store on open — no migration.
+const FORMAT_VERSION: u16 = 2;
+
+/// The disk graph's resident navigation quantizer: product (default) or binary
+/// (ADR-0074). Both compress ~32× and steer the beam search; the reported
+/// distances always come from the exact on-disk re-rank, so the choice trades
+/// navigation quality/cost, not result correctness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ResidentQuant {
+    /// Product quantization — asymmetric-LUT (ADC) navigation distances.
+    Pq(ProductQuantizer),
+    /// Binary quantization — 1 bit/dim, `popcount` Hamming navigation distances.
+    Binary(BinaryQuantizer),
+}
+
+impl Quantizer for ResidentQuant {
+    fn dim(&self) -> usize {
+        match self {
+            Self::Pq(q) => q.dim(),
+            Self::Binary(q) => q.dim(),
+        }
+    }
+    fn metric(&self) -> Metric {
+        match self {
+            Self::Pq(q) => q.metric(),
+            Self::Binary(q) => q.metric(),
+        }
+    }
+    fn code_len(&self) -> usize {
+        match self {
+            Self::Pq(q) => q.code_len(),
+            Self::Binary(q) => q.code_len(),
+        }
+    }
+    fn encode_into(&self, vector: &[f32], code: &mut [u8]) {
+        match self {
+            Self::Pq(q) => q.encode_into(vector, code),
+            Self::Binary(q) => q.encode_into(vector, code),
+        }
+    }
+    fn scorer<'a>(&'a self, query: &[f32]) -> Box<dyn CodeScorer + 'a> {
+        match self {
+            Self::Pq(q) => q.scorer(query),
+            Self::Binary(q) => q.scorer(query),
+        }
+    }
+}
 
 /// Errors from building or querying a disk index.
 #[derive(Debug, Error)]
@@ -103,9 +156,9 @@ fn prepare(metric: Metric, v: &[f32]) -> Vec<f32> {
     }
 }
 
-/// Write a built `graph` and trained `pq` to an encrypted disk index at `path`.
+/// Write a built `graph` and trained `quant` to an encrypted disk index at `path`.
 ///
-/// `pq` must have been trained for the same dimensionality and metric as the
+/// `quant` must have been trained for the same dimensionality and metric as the
 /// graph. `codec` seals every page (use a `PlainCodec` for plaintext or the
 /// `quiver-crypto` AEAD codec for encryption-at-rest).
 ///
@@ -115,14 +168,14 @@ fn prepare(metric: Metric, v: &[f32]) -> Vec<f32> {
 pub fn write(
     path: &Path,
     graph: &Vamana,
-    pq: &ProductQuantizer,
+    quant: &ResidentQuant,
     codec: &dyn PageCodec,
 ) -> Result<()> {
     let n = graph.len();
     let dim = graph.dim();
     let r = graph.max_degree();
     let metric = graph.metric();
-    if pq.dim() != dim || pq.metric() != metric {
+    if quant.dim() != dim || quant.metric() != metric {
         return Err(DiskError::Index(IndexError::InvalidConfig(
             "quantizer dim/metric does not match the graph",
         )));
@@ -135,17 +188,17 @@ pub fn write(
         )));
     }
     let nodes_per_page = (PAGE_BODY_CAP / node_stride).max(1);
-    let code_len = pq.code_len();
+    let code_len = quant.code_len();
 
-    // RAM-resident regions: the codebook, the external ids, the PQ codes.
-    let codebook = postcard::to_allocvec(pq)?;
+    // RAM-resident regions: the codebook, the external ids, the navigation codes.
+    let codebook = postcard::to_allocvec(quant)?;
     let mut ids_blob = Vec::with_capacity(n * 8);
     for &id in graph.ids() {
         ids_blob.extend_from_slice(&id.to_le_bytes());
     }
     let mut codes = vec![0u8; n * code_len];
     for i in 0..n {
-        pq.encode_into(
+        quant.encode_into(
             graph.vector(i as u32),
             &mut codes[i * code_len..(i + 1) * code_len],
         );
@@ -262,7 +315,7 @@ pub struct DiskVamana {
     mmap: Mmap,
     codec: Box<dyn PageCodec>,
     meta: DiskMeta,
-    pq: ProductQuantizer,
+    quant: ResidentQuant,
     ids: Vec<u64>,
     codes: Vec<u8>,
     node_region_page0: u64,
@@ -301,7 +354,7 @@ impl DiskVamana {
             block_size,
             codec.as_ref(),
         )?;
-        let pq: ProductQuantizer = postcard::from_bytes(&codebook)?;
+        let quant: ResidentQuant = postcard::from_bytes(&codebook)?;
 
         let ids_blob = read_region(&mmap, &mut page, meta.ids_pages, block_size, codec.as_ref())?;
         let n = meta.n as usize;
@@ -330,7 +383,7 @@ impl DiskVamana {
             mmap,
             codec,
             meta,
-            pq,
+            quant,
             ids,
             codes,
             node_region_page0: page,
@@ -384,7 +437,7 @@ impl DiskVamana {
         }
         let metric = self.meta.metric;
         let prepared = prepare(metric, query);
-        let scorer = self.pq.scorer(&prepared);
+        let scorer = self.quant.scorer(&prepared);
         let code_len = self.meta.code_len as usize;
         let approx = |node: u32| -> f32 {
             let start = node as usize * code_len;
@@ -594,7 +647,26 @@ mod tests {
         let graph = Vamana::build(&ids, &flat, dim, metric, VamanaConfig::default()).unwrap();
         let pq = ProductQuantizer::train(&flat, n, dim, dim / 4, metric, 7).unwrap();
         let path = dir.join("index.qvx");
-        write(&path, &graph, &pq, codec).unwrap();
+        write(&path, &graph, &ResidentQuant::Pq(pq), codec).unwrap();
+        (data, path)
+    }
+
+    // As `build_disk`, but with a binary navigation quantizer (ADR-0074).
+    fn build_disk_binary(
+        dir: &std::path::Path,
+        n: usize,
+        dim: usize,
+        metric: Metric,
+        codec: &dyn PageCodec,
+    ) -> (Vec<Vec<f32>>, std::path::PathBuf) {
+        let mut rng = SplitMix64::new(0xB1 ^ n as u64);
+        let data: Vec<Vec<f32>> = (0..n).map(|_| rand_vec(&mut rng, dim)).collect();
+        let flat: Vec<f32> = data.iter().flatten().copied().collect();
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let graph = Vamana::build(&ids, &flat, dim, metric, VamanaConfig::default()).unwrap();
+        let bq = BinaryQuantizer::train(&flat, n, dim, metric);
+        let path = dir.join("index-bq.qvx");
+        write(&path, &graph, &ResidentQuant::Binary(bq), codec).unwrap();
         (data, path)
     }
 
@@ -698,5 +770,52 @@ mod tests {
             .search(&data[42], 1, &DiskSearchParams { l_search: 100 })
             .unwrap();
         assert_eq!(got[0].id, 42);
+    }
+
+    #[test]
+    fn binary_disk_index_recall_recovers() {
+        // Binary navigation is coarser than PQ, so lean on the beam width; the
+        // exact on-disk re-rank is what recovers recall (ADR-0074).
+        let tmp = tempfile::tempdir().unwrap();
+        let (dim, n, queries, k) = (32, 1000, 50, 10);
+        let (data, path) = build_disk_binary(tmp.path(), n, dim, Metric::L2, &PlainCodec);
+        let idx = DiskVamana::open(&path, Box::new(PlainCodec)).unwrap();
+        assert_eq!(idx.len(), n);
+
+        let mut rng = SplitMix64::new(0xB1A2);
+        let mut hits = 0usize;
+        for _ in 0..queries {
+            let q = rand_vec(&mut rng, dim);
+            let truth = brute_force(&data, &q, k, Metric::L2);
+            // Binary codes are coarse, so widen the beam — the exact re-rank over
+            // the extra candidates is what recovers recall (ADR-0074).
+            let got = idx
+                .search(&q, k, &DiskSearchParams { l_search: 256 })
+                .unwrap();
+            hits += got
+                .iter()
+                .filter(|nbr| truth.contains(&(nbr.id as usize)))
+                .count();
+        }
+        let recall = hits as f64 / (queries * k) as f64;
+        assert!(recall >= 0.85, "binary disk recall@10 was {recall:.3}");
+    }
+
+    #[test]
+    fn binary_disk_returns_exact_distances() {
+        // The reported distance comes from the exact re-rank, not the Hamming
+        // pre-filter — querying a stored vector returns it at distance ~0.
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, path) = build_disk_binary(tmp.path(), 300, 16, Metric::L2, &PlainCodec);
+        let idx = DiskVamana::open(&path, Box::new(PlainCodec)).unwrap();
+        let got = idx
+            .search(&data[42], 1, &DiskSearchParams { l_search: 128 })
+            .unwrap();
+        assert_eq!(got[0].id, 42);
+        assert!(
+            got[0].distance.abs() < 1e-4,
+            "exact re-rank should report ~0 for the stored vector, got {}",
+            got[0].distance
+        );
     }
 }

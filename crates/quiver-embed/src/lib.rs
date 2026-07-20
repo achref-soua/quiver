@@ -49,9 +49,9 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use quiver_core::{ExtIdColumn, SecPredicate, SecValue, Store, VectorSource};
 use quiver_index::{
-    ColbertConfig, ColbertIndex, DiskVamana, FreshDiskVamana, FreshVamana, Hnsw, HnswConfig, Index,
-    Ivf, IvfConfig, Metric, Neighbor, ProductQuantizer, Vamana, VamanaConfig, max_sim,
-    ordering_distance, report_metric,
+    BinaryQuantizer, ColbertConfig, ColbertIndex, DiskVamana, FreshDiskVamana, FreshVamana, Hnsw,
+    HnswConfig, Index, Ivf, IvfConfig, Metric, Neighbor, ProductQuantizer, ResidentQuant, Vamana,
+    VamanaConfig, max_sim, ordering_distance, report_metric,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1018,12 +1018,12 @@ impl Database {
         };
         match rebuilt.kind {
             RebuiltKind::Ready(index) => handle.index = *index,
-            RebuiltKind::Disk { graph, pq } => {
+            RebuiltKind::Disk { graph, quant } => {
                 // Drop the prior index before sealing the artifact in place: its
                 // `mmap` assumes an immutable file. Safe under the write lock — no
                 // read can observe the momentary empty index.
                 handle.index = empty_index(&handle.descriptor);
-                let disk = write_disk_index(store, handle.id, &graph, &pq)?;
+                let disk = write_disk_index(store, handle.id, &graph, &quant)?;
                 handle.index = CollectionIndex::Disk(Some(FreshDiskVamana::new(disk)?));
             }
         }
@@ -2207,9 +2207,9 @@ fn build_index(
     Ok(match build_in_memory_index(descriptor, ids, flat)? {
         Some(index) => index,
         None => {
-            let (graph, pq) = build_disk_graph_pq(descriptor, ids, flat)?;
+            let (graph, quant) = build_disk_graph_quant(descriptor, ids, flat)?;
             CollectionIndex::Disk(Some(FreshDiskVamana::new(write_disk_index(
-                store, cid, &graph, &pq,
+                store, cid, &graph, &quant,
             )?)?))
         }
     })
@@ -2274,20 +2274,34 @@ fn build_in_memory_index(
 // Build the Vamana graph + PQ codebook for the disk-resident index. Pure (no
 // store, no I/O), so the off-lock rebuild (ADR-0062) does the expensive graph build
 // and PQ training without a lock; `write_disk_index` then seals the result.
-fn build_disk_graph_pq(
+fn build_disk_graph_quant(
     descriptor: &Descriptor,
     ids: &[u64],
     flat: &[f32],
-) -> Result<(Vamana, ProductQuantizer)> {
+) -> Result<(Vamana, ResidentQuant)> {
     let dim = descriptor.dim as usize;
     let metric = to_index_metric(descriptor.metric);
     let graph = Vamana::build(ids, flat, dim, metric, VamanaConfig::default())?;
-    let m = descriptor
-        .index
-        .pq_subspaces
-        .map_or_else(|| default_pq_m(dim), |x| x as usize);
-    let pq = ProductQuantizer::train(flat, ids.len(), dim, m, metric, PQ_SEED)?;
-    Ok((graph, pq))
+    // Binary quantization (ADR-0074) navigates by Hamming and re-ranks exactly off
+    // disk; `pq_subspaces` does not apply to it. Otherwise train a product
+    // quantizer with the configured (or dimension-default) subspace count.
+    let quant = if descriptor.index.binary {
+        ResidentQuant::Binary(BinaryQuantizer::train(flat, ids.len(), dim, metric))
+    } else {
+        let m = descriptor
+            .index
+            .pq_subspaces
+            .map_or_else(|| default_pq_m(dim), |x| x as usize);
+        ResidentQuant::Pq(ProductQuantizer::train(
+            flat,
+            ids.len(),
+            dim,
+            m,
+            metric,
+            PQ_SEED,
+        )?)
+    };
+    Ok((graph, quant))
 }
 
 // Seal a prebuilt disk artifact under the collection's index dir with the store's
@@ -2298,7 +2312,7 @@ fn write_disk_index(
     store: &Store,
     cid: CollectionId,
     graph: &Vamana,
-    pq: &ProductQuantizer,
+    quant: &ResidentQuant,
 ) -> Result<DiskVamana> {
     let dir = store.index_dir(cid);
     std::fs::create_dir_all(&dir).map_err(quiver_index::DiskError::Io)?;
@@ -2313,7 +2327,7 @@ fn write_disk_index(
     // durable load path could `mmap` and serve. The caller has already dropped any
     // prior `DiskVamana` (its mmap assumed the old inode), so the rename is safe.
     let tmp = dir.join(format!("{DISK_INDEX_FILE}.tmp"));
-    quiver_index::disk::write(&tmp, graph, pq, codec.as_ref())?;
+    quiver_index::disk::write(&tmp, graph, quant, codec.as_ref())?;
     std::fs::rename(&tmp, &path).map_err(quiver_index::DiskError::Io)?;
     let _ = std::fs::File::open(&dir).and_then(|f| f.sync_all());
     open_disk_index(store, cid, codec)
@@ -2769,7 +2783,7 @@ enum RebuiltKind {
     Ready(Box<CollectionIndex>),
     Disk {
         graph: Box<Vamana>,
-        pq: Box<ProductQuantizer>,
+        quant: Box<ResidentQuant>,
     },
 }
 
@@ -2805,10 +2819,11 @@ impl RebuildInputs {
             match build_in_memory_index(&self.descriptor, &ids, &self.scan.flat)? {
                 Some(index) => RebuiltKind::Ready(Box::new(index)),
                 None => {
-                    let (graph, pq) = build_disk_graph_pq(&self.descriptor, &ids, &self.scan.flat)?;
+                    let (graph, quant) =
+                        build_disk_graph_quant(&self.descriptor, &ids, &self.scan.flat)?;
                     RebuiltKind::Disk {
                         graph: Box::new(graph),
-                        pq: Box::new(pq),
+                        quant: Box::new(quant),
                     }
                 }
             }
@@ -3857,6 +3872,7 @@ mod tests {
         Descriptor::new(4, Dtype::F32, DistanceMetric::L2).with_index(IndexSpec {
             kind,
             pq_subspaces: None,
+            binary: false,
         })
     }
 
@@ -4207,6 +4223,7 @@ mod tests {
             Descriptor::new(4, Dtype::F32, DistanceMetric::Dot).with_index(IndexSpec {
                 kind: IndexKind::Vamana,
                 pq_subspaces: None,
+                binary: false,
             });
         assert!(matches!(
             db.create_collection("a", dot_vamana),
@@ -4216,6 +4233,7 @@ mod tests {
         let dot_disk = Descriptor::new(4, Dtype::F32, DistanceMetric::Dot).with_index(IndexSpec {
             kind: IndexKind::DiskVamana,
             pq_subspaces: None,
+            binary: false,
         });
         assert!(matches!(
             db.create_collection("b", dot_disk),
@@ -4541,6 +4559,7 @@ mod tests {
                 .with_index(IndexSpec {
                     kind,
                     pq_subspaces: None,
+                    binary: false,
                 });
             let mut db = open(tmp.path());
             db.create_collection("m", desc).unwrap();
@@ -4618,6 +4637,7 @@ mod tests {
         let single = Descriptor::new(4, Dtype::F32, DistanceMetric::Cosine).with_index(IndexSpec {
             kind: IndexKind::Colbert,
             pq_subspaces: None,
+            binary: false,
         });
         assert!(matches!(
             db.create_collection("c", single),
@@ -4629,6 +4649,7 @@ mod tests {
             .with_index(IndexSpec {
                 kind: IndexKind::Colbert,
                 pq_subspaces: None,
+                binary: false,
             });
         assert!(db.create_collection("m", multi).is_ok());
     }

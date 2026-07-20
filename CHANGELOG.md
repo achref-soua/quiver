@@ -10,6 +10,30 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Added
+
+- **Binary quantization for the disk graph** ([ADR-0074](docs/adr/0074-binary-quantization-disk-graph.md)).
+  The disk-resident Vamana index's navigation codes can now be binary (1 bit/dim,
+  `popcount` Hamming) instead of product quantization, selected per collection via
+  a new `IndexSpec.binary` flag (`binary: true` on the REST/MCP create-collection
+  API; `pq_subspaces` is ignored when set). Binary codes compress ~32× like PQ but
+  score by a hardware Hamming distance; the coarser navigation is fully absorbed by
+  the disk path's existing **exact re-rank against on-disk full vectors**, so the
+  reported distances stay exact and recall is recovered by the beam width
+  (`l_search`). `BinaryQuantizer` was already trained and tested but wired into no
+  serving index; this is that wiring.
+
+### Changed
+
+- **Disk index `FORMAT_VERSION` 1 → 2** (ADR-0074): the codebook blob is now a
+  tagged `ResidentQuant` (PQ or binary) rather than a bare `ProductQuantizer`. The
+  disk index is a derived, rebuildable artifact that never joins the crash path, so
+  a v1 file fails the version gate and is transparently rebuilt from the store on
+  open — no migration. Persisted collection descriptors remain fully
+  backward-compatible: the new `binary` field defaults to `false` for every
+  descriptor written before this release (a dedicated `DescriptorPreBinary` decode
+  fallback preserves all trailing fields).
+
 ## [0.35.0] — Gossamer — 2026-07-12
 
 The on-disk id map for the embedded index
