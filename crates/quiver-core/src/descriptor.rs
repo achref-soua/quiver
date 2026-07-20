@@ -64,6 +64,12 @@ pub struct IndexSpec {
     /// Product-quantization subspaces for quantized kinds (the disk graph,
     /// IVF+PQ). `None` selects a kind-appropriate default or no quantization.
     pub pq_subspaces: Option<u32>,
+    /// Use binary quantization (1 bit/dim, Hamming-navigated, exact on-disk
+    /// re-rank) instead of product quantization for the disk graph (ADR-0074).
+    /// Only applies to [`IndexKind::DiskVamana`]; `pq_subspaces` is ignored when
+    /// set. `#[serde(default)]` keeps every pre-existing descriptor deserializing.
+    #[serde(default)]
+    pub binary: bool,
 }
 
 /// The type of a filterable payload field, which fixes how its values are keyed
@@ -242,6 +248,7 @@ impl Descriptor {
     /// Returns the postcard error if the bytes match no known layout.
     pub fn decode(bytes: &[u8]) -> std::result::Result<Self, postcard::Error> {
         postcard::from_bytes::<Self>(bytes)
+            .or_else(|_| postcard::from_bytes::<DescriptorPreBinary>(bytes).map(Self::from))
             .or_else(|_| postcard::from_bytes::<DescriptorV4>(bytes).map(Self::from))
             .or_else(|_| postcard::from_bytes::<DescriptorV3>(bytes).map(Self::from))
             .or_else(|_| postcard::from_bytes::<DescriptorV2>(bytes).map(Self::from))
@@ -255,6 +262,55 @@ impl Descriptor {
     }
 }
 
+// The pre-`binary` [`IndexSpec`] wire layout (two fields, no `binary`). Every
+// descriptor written before ADR-0074 nests this. It is `IndexSpec`'s inline
+// postcard prefix, so all the older `DescriptorV*` fallbacks embed it too.
+#[derive(Serialize, Deserialize)]
+struct IndexSpecV1 {
+    kind: IndexKind,
+    pq_subspaces: Option<u32>,
+}
+
+impl From<IndexSpecV1> for IndexSpec {
+    fn from(v: IndexSpecV1) -> Self {
+        Self {
+            kind: v.kind,
+            pq_subspaces: v.pq_subspaces,
+            binary: false,
+        }
+    }
+}
+
+// The current top-level layout but with the pre-`binary` `IndexSpec` (ADR-0074).
+// `binary` is nested mid-record, not a trailing field, so a pre-binary descriptor
+// cannot be defaulted by `#[serde(default)]` under postcard — this fallback reads
+// it in full (keeping `vector_encryption`) and defaults `binary` to `false`. Tried
+// right after `Self` so a current descriptor never falls through to it.
+#[derive(Deserialize)]
+struct DescriptorPreBinary {
+    dim: u32,
+    dtype: Dtype,
+    metric: DistanceMetric,
+    index: IndexSpecV1,
+    filterable: Vec<FilterableField>,
+    multivector: bool,
+    vector_encryption: VectorEncryption,
+}
+
+impl From<DescriptorPreBinary> for Descriptor {
+    fn from(v: DescriptorPreBinary) -> Self {
+        Self {
+            dim: v.dim,
+            dtype: v.dtype,
+            metric: v.metric,
+            index: v.index.into(),
+            filterable: v.filterable,
+            multivector: v.multivector,
+            vector_encryption: v.vector_encryption,
+        }
+    }
+}
+
 // The six-field layout (through `multivector`, no `vector_encryption`), kept only
 // to migrate descriptors written before client-side encryption existed, via
 // [`Descriptor::decode`].
@@ -265,7 +321,7 @@ struct DescriptorV4 {
     dim: u32,
     dtype: Dtype,
     metric: DistanceMetric,
-    index: IndexSpec,
+    index: IndexSpecV1,
     filterable: Vec<FilterableField>,
     multivector: bool,
 }
@@ -276,7 +332,7 @@ impl From<DescriptorV4> for Descriptor {
             dim: v.dim,
             dtype: v.dtype,
             metric: v.metric,
-            index: v.index,
+            index: v.index.into(),
             filterable: v.filterable,
             multivector: v.multivector,
             vector_encryption: VectorEncryption::None,
@@ -293,7 +349,7 @@ struct DescriptorV3 {
     dim: u32,
     dtype: Dtype,
     metric: DistanceMetric,
-    index: IndexSpec,
+    index: IndexSpecV1,
     filterable: Vec<FilterableField>,
 }
 
@@ -303,7 +359,7 @@ impl From<DescriptorV3> for Descriptor {
             dim: v.dim,
             dtype: v.dtype,
             metric: v.metric,
-            index: v.index,
+            index: v.index.into(),
             filterable: v.filterable,
             multivector: false,
             vector_encryption: VectorEncryption::None,
@@ -318,7 +374,7 @@ struct DescriptorV2 {
     dim: u32,
     dtype: Dtype,
     metric: DistanceMetric,
-    index: IndexSpec,
+    index: IndexSpecV1,
 }
 
 impl From<DescriptorV2> for Descriptor {
@@ -327,7 +383,7 @@ impl From<DescriptorV2> for Descriptor {
             dim: v.dim,
             dtype: v.dtype,
             metric: v.metric,
-            index: v.index,
+            index: v.index.into(),
             filterable: Vec::new(),
             multivector: false,
             vector_encryption: VectorEncryption::None,
@@ -377,6 +433,7 @@ mod tests {
         let d = Descriptor::new(8, Dtype::F32, DistanceMetric::Cosine).with_index(IndexSpec {
             kind: IndexKind::DiskVamana,
             pq_subspaces: Some(16),
+            binary: false,
         });
         let bytes = postcard::to_allocvec(&d).unwrap();
         let back: Descriptor = postcard::from_bytes(&bytes).unwrap();
@@ -413,6 +470,7 @@ mod tests {
         let d = Descriptor::new(8, Dtype::F32, DistanceMetric::Dot).with_index(IndexSpec {
             kind: IndexKind::Ivf,
             pq_subspaces: Some(8),
+            binary: false,
         });
         let bytes = postcard::to_allocvec(&d).unwrap();
         assert_eq!(Descriptor::decode(&bytes).unwrap(), d);
@@ -428,13 +486,13 @@ mod tests {
             dim: u32,
             dtype: Dtype,
             metric: DistanceMetric,
-            index: IndexSpec,
+            index: IndexSpecV1,
         }
         let old = DescriptorV2 {
             dim: 8,
             dtype: Dtype::F32,
             metric: DistanceMetric::L2,
-            index: IndexSpec {
+            index: IndexSpecV1 {
                 kind: IndexKind::DiskVamana,
                 pq_subspaces: Some(16),
             },
@@ -481,14 +539,14 @@ mod tests {
             dim: u32,
             dtype: Dtype,
             metric: DistanceMetric,
-            index: IndexSpec,
+            index: IndexSpecV1,
             filterable: Vec<FilterableField>,
         }
         let old = DescriptorV3 {
             dim: 8,
             dtype: Dtype::F32,
             metric: DistanceMetric::Cosine,
-            index: IndexSpec {
+            index: IndexSpecV1 {
                 kind: IndexKind::Ivf,
                 pq_subspaces: Some(8),
             },
@@ -526,7 +584,7 @@ mod tests {
             dim: u32,
             dtype: Dtype,
             metric: DistanceMetric,
-            index: IndexSpec,
+            index: IndexSpecV1,
             filterable: Vec<FilterableField>,
             multivector: bool,
             encrypted_vectors: bool,
@@ -535,7 +593,10 @@ mod tests {
             dim: 8,
             dtype: Dtype::F32,
             metric: DistanceMetric::L2,
-            index: IndexSpec::default(),
+            index: IndexSpecV1 {
+                kind: IndexKind::Hnsw,
+                pq_subspaces: None,
+            },
             filterable: Vec::new(),
             multivector: false,
             encrypted_vectors: enc,
@@ -563,7 +624,7 @@ mod tests {
             dim: u32,
             dtype: Dtype,
             metric: DistanceMetric,
-            index: IndexSpec,
+            index: IndexSpecV1,
             filterable: Vec<FilterableField>,
             multivector: bool,
         }
@@ -571,7 +632,10 @@ mod tests {
             dim: 8,
             dtype: Dtype::F32,
             metric: DistanceMetric::Cosine,
-            index: IndexSpec::default(),
+            index: IndexSpecV1 {
+                kind: IndexKind::Hnsw,
+                pq_subspaces: None,
+            },
             filterable: vec![FilterableField::numeric("score")],
             multivector: true,
         };
@@ -584,5 +648,64 @@ mod tests {
         assert!(back.multivector);
         assert_eq!(back.filterable, vec![FilterableField::numeric("score")]);
         assert_eq!(back.vector_encryption, VectorEncryption::None);
+    }
+
+    // A descriptor serialized before `binary` existed (ADR-0074) has the current
+    // top-level shape but a two-field `IndexSpec` nested mid-record. It must decode
+    // via the `DescriptorPreBinary` fallback — defaulting `binary` to false while
+    // preserving every trailing field (notably `vector_encryption`).
+    #[test]
+    fn pre_binary_descriptor_decodes_and_keeps_vector_encryption() {
+        #[derive(serde::Serialize)]
+        struct OldIndex {
+            kind: IndexKind,
+            pq_subspaces: Option<u32>,
+        }
+        #[derive(serde::Serialize)]
+        struct DescriptorPreBinary {
+            dim: u32,
+            dtype: Dtype,
+            metric: DistanceMetric,
+            index: OldIndex,
+            filterable: Vec<FilterableField>,
+            multivector: bool,
+            vector_encryption: VectorEncryption,
+        }
+        let old = DescriptorPreBinary {
+            dim: 8,
+            dtype: Dtype::F32,
+            metric: DistanceMetric::Cosine,
+            index: OldIndex {
+                kind: IndexKind::DiskVamana,
+                pq_subspaces: Some(16),
+            },
+            filterable: vec![FilterableField::keyword("city")],
+            multivector: true,
+            vector_encryption: VectorEncryption::ClientSide,
+        };
+        let bytes = postcard::to_allocvec(&old).unwrap();
+        // The current decode fails on the shorter (binary-less) buffer...
+        assert!(postcard::from_bytes::<Descriptor>(&bytes).is_err());
+        // ...but `decode` falls back and keeps everything, defaulting `binary`.
+        let back = Descriptor::decode(&bytes).unwrap();
+        assert_eq!(back.index.kind, IndexKind::DiskVamana);
+        assert_eq!(back.index.pq_subspaces, Some(16));
+        assert!(!back.index.binary);
+        assert!(back.multivector);
+        assert_eq!(back.filterable, vec![FilterableField::keyword("city")]);
+        assert_eq!(back.vector_encryption, VectorEncryption::ClientSide);
+    }
+
+    #[test]
+    fn binary_index_roundtrips() {
+        let d = Descriptor::new(8, Dtype::F32, DistanceMetric::L2).with_index(IndexSpec {
+            kind: IndexKind::DiskVamana,
+            pq_subspaces: None,
+            binary: true,
+        });
+        let bytes = postcard::to_allocvec(&d).unwrap();
+        let back = Descriptor::decode(&bytes).unwrap();
+        assert_eq!(back, d);
+        assert!(back.index.binary);
     }
 }

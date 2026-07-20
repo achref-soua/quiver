@@ -525,6 +525,7 @@ components:
         metric: { $ref: '#/components/schemas/Metric' }
         index: { $ref: '#/components/schemas/IndexKind' }
         pq_subspaces: { type: integer, nullable: true, description: Product-quantization subspaces (for quantized/disk indexes). }
+        binary: { type: boolean, default: false, description: 'Use binary quantization (1 bit/dim, Hamming-navigated, exact on-disk re-rank) instead of PQ for the disk graph (ADR-0074); pq_subspaces is ignored when set.' }
         filterable: { type: array, items: { $ref: '#/components/schemas/FilterableField' } }
         multivector: { type: boolean, default: false }
         vector_encryption: { $ref: '#/components/schemas/VectorEncryption' }

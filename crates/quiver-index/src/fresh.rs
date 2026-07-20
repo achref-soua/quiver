@@ -343,7 +343,7 @@ mod tests {
                 ProductQuantizer::train(&flat, self.split, self.dim, self.dim / 4, self.metric, 7)
                     .unwrap();
             let path = dir.join("base.qvx");
-            crate::disk::write(&path, &graph, &pq, &PlainCodec).unwrap();
+            crate::disk::write(&path, &graph, &crate::ResidentQuant::Pq(pq), &PlainCodec).unwrap();
             DiskVamana::open(&path, Box::new(PlainCodec)).unwrap()
         }
 

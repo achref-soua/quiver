@@ -404,6 +404,9 @@ struct CreateCollectionBody {
     index: IndexKindDto,
     #[serde(default)]
     pq_subspaces: Option<u32>,
+    /// Use binary quantization for the disk graph instead of PQ (ADR-0074).
+    #[serde(default)]
+    binary: bool,
     #[serde(default)]
     filterable: Vec<FilterableFieldDto>,
     #[serde(default)]
@@ -420,6 +423,7 @@ async fn create_collection(
     let index = IndexSpec {
         kind: body.index.into(),
         pq_subspaces: body.pq_subspaces,
+        binary: body.binary,
     };
     let filterable = body.filterable.into_iter().map(Into::into).collect();
     let info = state

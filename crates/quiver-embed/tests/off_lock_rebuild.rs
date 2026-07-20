@@ -20,6 +20,7 @@ fn desc(kind: IndexKind) -> Descriptor {
     Descriptor::new(4, Dtype::F32, DistanceMetric::Cosine).with_index(IndexSpec {
         kind,
         pq_subspaces: None,
+        binary: false,
     })
 }
 

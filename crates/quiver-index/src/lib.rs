@@ -21,7 +21,7 @@ mod score;
 mod vamana;
 
 pub use colbert::{ColbertConfig, ColbertIndex};
-pub use disk::{DiskError, DiskSearchParams, DiskVamana};
+pub use disk::{DiskError, DiskSearchParams, DiskVamana, ResidentQuant};
 pub use fresh::{FreshDiskVamana, FreshVamana};
 pub use hnsw::{Hnsw, HnswConfig};
 pub use ivf::{Ivf, IvfConfig, SnapshotError};
