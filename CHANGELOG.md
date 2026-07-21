@@ -10,6 +10,20 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Security
+
+- **WAL records are now bound to their position in the AEAD AAD**
+  ([ADR-0075](docs/adr/0075-wal-record-aad-binding.md)). Encrypted WAL records
+  previously sealed with an empty AAD, so an adversary with write access to the log
+  files (but not the key) could reorder, duplicate, or relocate intact sealed
+  records and every one would still authenticate. Each record now folds its frame
+  byte offset into the AAD — exactly as pages bind `page_id` — so a moved record
+  fails authentication on recovery (a hard error, never a silently replayed frame).
+  The WAL format version bumps **1 → 2**; a pre-2 encrypted log left un-checkpointed
+  by a crash before an upgrade is still recovered losslessly (its records used the
+  empty AAD), and all new logs are position-bound. Plaintext (unencrypted) WALs are
+  unaffected.
+
 ### Added
 
 - **Binary quantization for the disk graph** ([ADR-0074](docs/adr/0074-binary-quantization-disk-graph.md)).

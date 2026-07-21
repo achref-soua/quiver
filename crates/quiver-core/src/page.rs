@@ -238,14 +238,23 @@ pub trait PageCodec: Send + Sync {
     /// self-describing on-disk blob. The default is the identity transform used
     /// by [`PlainCodec`]; an AEAD codec overrides it to return
     /// `[nonce][ciphertext+tag]`, so no plaintext record ever reaches the disk.
-    fn seal_record(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+    ///
+    /// `pos` binds the record to its position so it cannot be reordered,
+    /// duplicated, or relocated within the log and still authenticate (ADR-0075):
+    /// `Some(offset)` folds the record's byte offset into the AEAD's AAD, while
+    /// `None` uses an empty AAD — the pre-ADR-0075 behaviour, kept only for reading
+    /// legacy (v1) WAL files. `PlainCodec` ignores it.
+    fn seal_record(&self, pos: Option<u64>, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let _ = pos;
         Ok(plaintext.to_vec())
     }
 
     /// Open a record produced by [`PageCodec::seal_record`]. The default is the
     /// identity transform; an AEAD codec authenticates and decrypts, returning an
-    /// error on a wrong key or any tampering.
-    fn open_record(&self, sealed: &[u8]) -> Result<Vec<u8>> {
+    /// error on a wrong key, any tampering, or a `pos` that does not match the one
+    /// the record was sealed with (a relocated/reordered record).
+    fn open_record(&self, pos: Option<u64>, sealed: &[u8]) -> Result<Vec<u8>> {
+        let _ = pos;
         Ok(sealed.to_vec())
     }
 }
