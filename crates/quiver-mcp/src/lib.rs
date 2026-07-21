@@ -980,7 +980,12 @@ fn want_index_spec(args: &Value) -> Result<IndexSpec, String> {
         .get("pq_subspaces")
         .and_then(Value::as_u64)
         .map(|v| v as u32);
-    Ok(IndexSpec { kind, pq_subspaces })
+    let binary = args.get("binary").and_then(Value::as_bool).unwrap_or(false);
+    Ok(IndexSpec {
+        kind,
+        pq_subspaces,
+        binary,
+    })
 }
 
 // Parse the optional `filterable` argument: an array of {path, field_type}

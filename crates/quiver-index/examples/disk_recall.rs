@@ -68,7 +68,7 @@ fn build(base_path: &Path, out: &Path, pq_arg: Option<&String>) -> Result<(), Bo
     let timer = Instant::now();
     let graph = Vamana::build(&ids, &flat, dim, Metric::L2, VamanaConfig::default())?;
     let pq = ProductQuantizer::train(&flat, n, dim, m, Metric::L2, 0x5176_5044_5141_5453)?;
-    disk::write(out, &graph, &pq, &PlainCodec)?;
+    disk::write(out, &graph, &disk::ResidentQuant::Pq(pq), &PlainCodec)?;
     println!("  built in {:.1}s", timer.elapsed().as_secs_f64());
 
     let pq_ram = n * m;

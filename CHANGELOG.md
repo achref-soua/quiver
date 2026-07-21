@@ -10,6 +10,52 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.36.0] — Filigree — 2026-07-21
+
+Two features on the hardening-and-frugality axis: **binary quantization for the
+disk graph** ([ADR-0074](docs/adr/0074-binary-quantization-disk-graph.md)) makes
+the disk index's navigation codes selectable (binary or product), and **WAL records
+are now position-bound in their AEAD AAD** ([ADR-0075](docs/adr/0075-wal-record-aad-binding.md)),
+closing a tamper-evidence gap on the encrypted crash path.
+
+### Security
+
+- **WAL records are now bound to their position in the AEAD AAD**
+  ([ADR-0075](docs/adr/0075-wal-record-aad-binding.md)). Encrypted WAL records
+  previously sealed with an empty AAD, so an adversary with write access to the log
+  files (but not the key) could reorder, duplicate, or relocate intact sealed
+  records and every one would still authenticate. Each record now folds its frame
+  byte offset into the AAD — exactly as pages bind `page_id` — so a moved record
+  fails authentication on recovery (a hard error, never a silently replayed frame).
+  The WAL format version bumps **1 → 2**; a pre-2 encrypted log left un-checkpointed
+  by a crash before an upgrade is still recovered losslessly (its records used the
+  empty AAD), and all new logs are position-bound. Plaintext (unencrypted) WALs are
+  unaffected.
+
+### Added
+
+- **Binary quantization for the disk graph** ([ADR-0074](docs/adr/0074-binary-quantization-disk-graph.md)).
+  The disk-resident Vamana index's navigation codes can now be binary (1 bit/dim,
+  `popcount` Hamming) instead of product quantization, selected per collection via
+  a new `IndexSpec.binary` flag (`binary: true` on the REST/MCP create-collection
+  API; `pq_subspaces` is ignored when set). Binary codes compress ~32× like PQ but
+  score by a hardware Hamming distance; the coarser navigation is fully absorbed by
+  the disk path's existing **exact re-rank against on-disk full vectors**, so the
+  reported distances stay exact and recall is recovered by the beam width
+  (`l_search`). `BinaryQuantizer` was already trained and tested but wired into no
+  serving index; this is that wiring.
+
+### Changed
+
+- **Disk index `FORMAT_VERSION` 1 → 2** (ADR-0074): the codebook blob is now a
+  tagged `ResidentQuant` (PQ or binary) rather than a bare `ProductQuantizer`. The
+  disk index is a derived, rebuildable artifact that never joins the crash path, so
+  a v1 file fails the version gate and is transparently rebuilt from the store on
+  open — no migration. Persisted collection descriptors remain fully
+  backward-compatible: the new `binary` field defaults to `false` for every
+  descriptor written before this release (a dedicated `DescriptorPreBinary` decode
+  fallback preserves all trailing fields).
+
 ## [0.35.0] — Gossamer — 2026-07-12
 
 The on-disk id map for the embedded index

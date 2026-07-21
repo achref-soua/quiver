@@ -90,7 +90,14 @@ fn index_spec_from_proto(kind: i32, pq_subspaces: Option<u32>) -> IndexSpec {
         Ok(v1::IndexKind::Colbert) => IndexKind::Colbert,
         _ => IndexKind::Hnsw,
     };
-    IndexSpec { kind, pq_subspaces }
+    // ponytail: binary quantization (ADR-0074) isn't on the gRPC wire yet — it needs
+    // a proto field + codegen. REST and MCP expose it today; add the proto field when
+    // a gRPC client needs it.
+    IndexSpec {
+        kind,
+        pq_subspaces,
+        binary: false,
+    }
 }
 
 fn index_kind_to_proto(kind: IndexKind) -> i32 {

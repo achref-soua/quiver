@@ -19,6 +19,13 @@ Master Key (MK)            ── from env file (0600) or external KMS; never on
 - **DEKs** are random 256-bit keys, one per collection, stored **wrapped** by the MK in the collection metadata (wrap via AES-256-GCM-SIV / AES-KW, or KMS Encrypt). Plaintext DEKs live only in RAM and are **zeroized** (`zeroize`) on drop.
 - **Per-page subkeys** are derived with HKDF-SHA-256 from the DEK and a unique context, so **nonce reuse is impossible by construction** (each page-version is sealed under a unique key) — this side-steps AES-GCM's catastrophic nonce-reuse failure mode without relying on a global nonce counter.
 
+## Position binding (tamper-evidence)
+
+Every sealed unit is bound to its **position** through the AEAD's additional authenticated data (AAD), so an adversary with write access to the files — but not the key — cannot silently relocate an intact ciphertext:
+
+- **Pages** fold their `page_id` into both the subkey and the AAD; a block moved to a different page slot fails to authenticate.
+- **WAL records** fold their **byte offset** into the AAD ([ADR-0075](../adr/0075-wal-record-aad-binding.md)); a record reordered, duplicated, or relocated within the log fails on recovery — a hard error, not a silently replayed frame. (The record's own `lsn` lives inside the ciphertext, so it cannot police the record's physical position.) The WAL format version bumped to 2 for this; pre-2 logs — an un-checkpointed encrypted log from a crash before an upgrade — are still read losslessly (their records used an empty AAD), while all new logs are position-bound.
+
 ## AEAD selection
 
 Both options are standard, audited AEADs; the choice is recorded in the collection key metadata so data stays decryptable if the default changes:
