@@ -10,6 +10,14 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.36.0] — Filigree — 2026-07-21
+
+Two features on the hardening-and-frugality axis: **binary quantization for the
+disk graph** ([ADR-0074](docs/adr/0074-binary-quantization-disk-graph.md)) makes
+the disk index's navigation codes selectable (binary or product), and **WAL records
+are now position-bound in their AEAD AAD** ([ADR-0075](docs/adr/0075-wal-record-aad-binding.md)),
+closing a tamper-evidence gap on the encrypted crash path.
+
 ### Security
 
 - **WAL records are now bound to their position in the AEAD AAD**
