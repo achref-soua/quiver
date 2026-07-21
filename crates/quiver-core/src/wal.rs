@@ -43,7 +43,13 @@ use crate::page::PageCodec;
 /// Magic identifying a WAL segment file (`b"QVWL"`, little-endian).
 pub const WAL_MAGIC: u32 = u32::from_le_bytes(*b"QVWL");
 /// Current WAL format version.
-pub const WAL_FORMAT_VERSION: u16 = 1;
+pub const WAL_FORMAT_VERSION: u16 = 2;
+
+/// The pre-ADR-0075 WAL format, whose records bind no position in their AEAD AAD.
+/// Still readable (`read_all` opens its records with an empty AAD) so an
+/// un-checkpointed encrypted log from a pre-upgrade crash recovers losslessly; new
+/// logs are always written at [`WAL_FORMAT_VERSION`].
+const WAL_FORMAT_VERSION_LEGACY: u16 = 1;
 
 const WAL_FILE_HEADER_SIZE: usize = 16;
 const FRAME_PREFIX_SIZE: usize = 8; // len:u32 + crc32c:u32
@@ -119,6 +125,9 @@ pub struct WalWriter {
     file: File,
     path: PathBuf,
     unsynced: bool,
+    // Byte offset at which the next frame will be written. Bound into each
+    // record's AEAD AAD so a record cannot be relocated within the log (ADR-0075).
+    write_offset: u64,
 }
 
 impl WalWriter {
@@ -142,6 +151,7 @@ impl WalWriter {
             file,
             path: path.to_path_buf(),
             unsynced: false,
+            write_offset: WAL_FILE_HEADER_SIZE as u64,
         })
     }
 
@@ -164,16 +174,25 @@ impl WalWriter {
             });
         }
         let ver = u16::from_le_bytes([hdr[4], hdr[5]]);
+        // Appending is only ever done to a file this build created, so it must be
+        // the current version — a legacy (v1) file is read-only (recovered then
+        // rotated away), never continued, so its records never mix AAD schemes.
         if ver != WAL_FORMAT_VERSION {
             return Err(CoreError::UnsupportedVersion {
                 found: ver,
                 supported: WAL_FORMAT_VERSION,
             });
         }
+        let write_offset = file
+            .metadata()
+            .map_err(|e| CoreError::io(path, e))?
+            .len()
+            .max(WAL_FILE_HEADER_SIZE as u64);
         Ok(Self {
             file,
             path: path.to_path_buf(),
             unsynced: false,
+            write_offset,
         })
     }
 
@@ -182,7 +201,10 @@ impl WalWriter {
     /// record is durable only after a subsequent [`WalWriter::sync`].
     pub fn append(&mut self, codec: &dyn PageCodec, entry: &WalEntry) -> Result<()> {
         let plaintext = postcard::to_allocvec(entry)?;
-        let sealed = codec.seal_record(&plaintext)?;
+        // Bind the frame's byte offset into the record AAD so it cannot be
+        // reordered/replayed/relocated within the log (ADR-0075). `read_all`
+        // reproduces the same offset while scanning.
+        let sealed = codec.seal_record(Some(self.write_offset), &plaintext)?;
         let len = u32::try_from(sealed.len())
             .map_err(|_| CoreError::TooLarge(format!("wal record {} bytes", sealed.len())))?;
         if len > MAX_RECORD_BYTES {
@@ -200,6 +222,7 @@ impl WalWriter {
         self.file
             .write_all(&frame)
             .map_err(|e| CoreError::io(&self.path, e))?;
+        self.write_offset += frame.len() as u64;
         self.unsynced = true;
         Ok(())
     }
@@ -309,12 +332,16 @@ pub fn read_all(path: &Path, codec: &dyn PageCodec) -> Result<WalReplay> {
         });
     }
     let ver = u16::from_le_bytes([hdr[4], hdr[5]]);
-    if ver != WAL_FORMAT_VERSION {
+    // Read both the current and the legacy format: a v1 log (records sealed with an
+    // empty AAD) is recovered so an un-checkpointed encrypted log from a pre-upgrade
+    // crash is not lost (ADR-0075); v2 records are position-bound.
+    if ver != WAL_FORMAT_VERSION && ver != WAL_FORMAT_VERSION_LEGACY {
         return Err(CoreError::UnsupportedVersion {
             found: ver,
             supported: WAL_FORMAT_VERSION,
         });
     }
+    let position_bound = ver == WAL_FORMAT_VERSION;
     let base_lsn = Lsn(u64::from_le_bytes([
         hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
     ]));
@@ -361,7 +388,9 @@ pub fn read_all(path: &Path, codec: &dyn PageCodec) -> Result<WalReplay> {
         // under the plaintext codec this is the identity, and under the AEAD codec
         // a failure means a wrong key or tampering on an otherwise-complete,
         // acknowledged record — a hard error, not a recoverable torn tail.
-        let plaintext = codec.open_record(&buf)?;
+        // v2 records bind their frame offset; v1 records used an empty AAD.
+        let pos = position_bound.then_some(offset);
+        let plaintext = codec.open_record(pos, &buf)?;
         match postcard::from_bytes::<WalEntry>(&plaintext) {
             Ok(entry) => {
                 entries.push(entry);
@@ -434,6 +463,148 @@ mod tests {
             w.append(&PlainCodec, e).unwrap();
         }
         w.sync().unwrap();
+    }
+
+    // A codec that binds the record position the way the AEAD codec does, so the
+    // WAL wiring (per-version AAD) can be tested without the crypto crate: it
+    // prefixes each sealed record with `[some: u8][pos: u64]` and rejects an open
+    // whose `pos` differs — mirroring the AEAD AAD check (ADR-0075).
+    #[derive(Debug)]
+    struct PosCodec;
+    impl PageCodec for PosCodec {
+        fn block_size(&self) -> usize {
+            crate::page::PAGE_SIZE
+        }
+        fn seal(
+            &self,
+            _id: u64,
+            plaintext: &[u8; crate::page::PAGE_SIZE],
+            out: &mut [u8],
+        ) -> Result<()> {
+            out.copy_from_slice(plaintext);
+            Ok(())
+        }
+        fn open(
+            &self,
+            _id: u64,
+            block: &[u8],
+            out: &mut [u8; crate::page::PAGE_SIZE],
+        ) -> Result<()> {
+            out.copy_from_slice(block);
+            Ok(())
+        }
+        fn clone_box(&self) -> Box<dyn PageCodec> {
+            Box::new(PosCodec)
+        }
+        fn seal_record(&self, pos: Option<u64>, plaintext: &[u8]) -> Result<Vec<u8>> {
+            let mut v = Vec::with_capacity(9 + plaintext.len());
+            v.push(u8::from(pos.is_some()));
+            v.extend_from_slice(&pos.unwrap_or(0).to_le_bytes());
+            v.extend_from_slice(plaintext);
+            Ok(v)
+        }
+        fn open_record(&self, pos: Option<u64>, sealed: &[u8]) -> Result<Vec<u8>> {
+            if sealed.len() < 9 {
+                return Err(CoreError::MalformedPage(
+                    "pos-codec record too short".into(),
+                ));
+            }
+            let sealed_some = sealed[0] == 1;
+            let sealed_pos = u64::from_le_bytes(sealed[1..9].try_into().unwrap());
+            if (sealed_some, sealed_pos) != (pos.is_some(), pos.unwrap_or(0)) {
+                return Err(CoreError::MalformedPage("record position mismatch".into()));
+            }
+            Ok(sealed[9..].to_vec())
+        }
+    }
+
+    // Two Checkpoint entries that postcard-encode to the same length, so their
+    // on-disk frames are byte-swappable for the reorder test.
+    fn equal_len_entries() -> Vec<WalEntry> {
+        (1..=2)
+            .map(|lsn| WalEntry {
+                lsn: Lsn(lsn),
+                op: WalOp::Checkpoint {
+                    last_checkpointed_lsn: Lsn(1),
+                    manifest_version: 1,
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn v2_replay_round_trips_position_bound_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-1.log");
+        let entries = entries_from(&sample_ops());
+        {
+            let mut w = WalWriter::create(&path, Lsn(1)).unwrap();
+            for e in &entries {
+                w.append(&PosCodec, e).unwrap();
+            }
+            w.sync().unwrap();
+        }
+        // read_all passes Some(offset) for a v2 file; PosCodec verifies each record
+        // was sealed at exactly that offset.
+        let replay = read_all(&path, &PosCodec).unwrap();
+        assert_eq!(replay.entries, entries);
+        assert_eq!(replay.torn_at, None);
+    }
+
+    #[test]
+    fn v2_reordered_record_fails_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-1.log");
+        let entries = equal_len_entries();
+        {
+            let mut w = WalWriter::create(&path, Lsn(1)).unwrap();
+            for e in &entries {
+                w.append(&PosCodec, e).unwrap();
+            }
+            w.sync().unwrap();
+        }
+        // Swap the two equal-length frames on disk. Each still has an intact CRC,
+        // but each is now at the other's offset, so position binding must reject it.
+        let bytes = std::fs::read(&path).unwrap();
+        let hdr = WAL_FILE_HEADER_SIZE;
+        let frame_len = (bytes.len() - hdr) / 2;
+        let mut tampered = bytes[..hdr].to_vec();
+        tampered.extend_from_slice(&bytes[hdr + frame_len..]); // frame 2
+        tampered.extend_from_slice(&bytes[hdr..hdr + frame_len]); // frame 1
+        std::fs::write(&path, &tampered).unwrap();
+        assert!(
+            read_all(&path, &PosCodec).is_err(),
+            "a reordered position-bound record must fail replay"
+        );
+    }
+
+    #[test]
+    fn v1_legacy_records_replay_with_empty_binding() {
+        // Hand-build a pre-ADR-0075 (v1) log whose records are sealed with `None`
+        // (empty binding). read_all must recover it — the no-data-loss-on-upgrade
+        // guarantee — by opening records with `None` because the header is v1.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-legacy.log");
+        let entries = entries_from(&sample_ops());
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&WAL_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&WAL_FORMAT_VERSION_LEGACY.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes()); // reserved padding
+        buf.extend_from_slice(&1u64.to_le_bytes()); // base_lsn
+        for e in &entries {
+            let pt = postcard::to_allocvec(e).unwrap();
+            let sealed = PosCodec.seal_record(None, &pt).unwrap();
+            let len = u32::try_from(sealed.len()).unwrap();
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(&crc32c::crc32c(&sealed).to_le_bytes());
+            buf.extend_from_slice(&sealed);
+        }
+        std::fs::write(&path, &buf).unwrap();
+
+        let replay = read_all(&path, &PosCodec).unwrap();
+        assert_eq!(replay.entries, entries);
+        assert_eq!(replay.torn_at, None);
+        assert_eq!(replay.base_lsn, Lsn(1));
     }
 
     #[test]

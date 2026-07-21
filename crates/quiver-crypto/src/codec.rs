@@ -206,12 +206,22 @@ impl PageCodec for AeadCodec {
         Ok(())
     }
 
-    fn seal_record(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        self.seal_bytes(&[WAL_INFO], &[], plaintext)
+    fn seal_record(&self, pos: Option<u64>, plaintext: &[u8]) -> Result<Vec<u8>> {
+        // Bind the record's byte offset into the AAD so it cannot be reordered,
+        // duplicated, or relocated within the log and still authenticate
+        // (ADR-0075). `None` keeps the pre-ADR empty AAD, byte-identical, for
+        // reading legacy (v1) WAL files.
+        match pos {
+            Some(off) => self.seal_bytes(&[WAL_INFO], &off.to_le_bytes(), plaintext),
+            None => self.seal_bytes(&[WAL_INFO], &[], plaintext),
+        }
     }
 
-    fn open_record(&self, sealed: &[u8]) -> Result<Vec<u8>> {
-        self.open_bytes(&[WAL_INFO], &[], sealed)
+    fn open_record(&self, pos: Option<u64>, sealed: &[u8]) -> Result<Vec<u8>> {
+        match pos {
+            Some(off) => self.open_bytes(&[WAL_INFO], &off.to_le_bytes(), sealed),
+            None => self.open_bytes(&[WAL_INFO], &[], sealed),
+        }
     }
 
     fn clone_box(&self) -> Box<dyn PageCodec> {
@@ -393,21 +403,27 @@ mod tests {
     fn record_seal_open_roundtrips() {
         let codec = AeadCodec::new(key(6));
         let record = b"collection=secret;id=alice;payload={\"ssn\":\"123-45-6789\"}";
-        let sealed = codec.seal_record(record).unwrap();
+        let sealed = codec.seal_record(Some(64), record).unwrap();
         assert_ne!(&sealed[..], &record[..]);
-        let opened = codec.open_record(&sealed).unwrap();
+        let opened = codec.open_record(Some(64), &sealed).unwrap();
         assert_eq!(opened, record);
     }
 
     #[test]
     fn record_wrong_key_and_tamper_fail() {
         let record = b"sensitive-wal-record";
-        let sealed = AeadCodec::new(key(1)).seal_record(record).unwrap();
-        assert!(AeadCodec::new(key(2)).open_record(&sealed).is_err());
+        let sealed = AeadCodec::new(key(1))
+            .seal_record(Some(16), record)
+            .unwrap();
+        assert!(
+            AeadCodec::new(key(2))
+                .open_record(Some(16), &sealed)
+                .is_err()
+        );
         let mut t = sealed.clone();
         let last = t.len() - 1;
         t[last] ^= 0x01;
-        assert!(AeadCodec::new(key(1)).open_record(&t).is_err());
+        assert!(AeadCodec::new(key(1)).open_record(Some(16), &t).is_err());
     }
 
     #[test]
@@ -415,8 +431,35 @@ mod tests {
         // A blob sealed as a record must not open as a page block, and a too-short
         // blob is rejected rather than panicking.
         let codec = AeadCodec::new(key(7));
-        assert!(codec.open_record(&[0u8; NONCE_LEN]).is_err());
-        assert!(codec.open_record(b"short").is_err());
+        assert!(codec.open_record(Some(0), &[0u8; NONCE_LEN]).is_err());
+        assert!(codec.open_record(Some(0), b"short").is_err());
+    }
+
+    #[test]
+    fn record_position_binding_detects_relocation() {
+        // A record sealed at one offset must not authenticate at another — this is
+        // the WAL reorder/replay/relocation defence (ADR-0075).
+        let codec = AeadCodec::new(key(6));
+        let record = b"lsn=7;op=upsert";
+        let sealed = codec.seal_record(Some(4096), record).unwrap();
+        assert_eq!(codec.open_record(Some(4096), &sealed).unwrap(), record);
+        assert!(
+            codec.open_record(Some(8192), &sealed).is_err(),
+            "a relocated record must fail authentication"
+        );
+        // And a position-bound record must not open as an unbound (legacy) one.
+        assert!(codec.open_record(None, &sealed).is_err());
+    }
+
+    #[test]
+    fn record_none_position_is_legacy_empty_aad() {
+        // `None` reproduces the pre-ADR-0075 empty-AAD sealing exactly, so legacy
+        // (v1) WAL records still open. It is distinct from any bound position.
+        let codec = AeadCodec::new(key(6));
+        let record = b"legacy-v1-record";
+        let sealed = codec.seal_record(None, record).unwrap();
+        assert_eq!(codec.open_record(None, &sealed).unwrap(), record);
+        assert!(codec.open_record(Some(0), &sealed).is_err());
     }
 
     #[test]
