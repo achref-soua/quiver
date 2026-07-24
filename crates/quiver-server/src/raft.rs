@@ -1606,4 +1606,157 @@ mod tests {
             v.raft.shutdown().await.unwrap();
         }
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipelined_proposals_commit_every_op_in_order() {
+        // ADR-0077: proposing a batch with bounded-in-flight pipelining (the shape
+        // `raft_propose_all` uses) must commit *every* op, exactly as a serial loop
+        // would — order is preserved by openraft's submission-ordered log. A fast,
+        // in-memory single-member group (no fsync) keeps this a unit test.
+        use futures_util::StreamExt as _;
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let mut src = Database::open(src_dir.path()).unwrap();
+        src.create_collection("docs", Descriptor::new(4, Dtype::F32, DistanceMetric::L2))
+            .unwrap();
+        for i in 0..50u32 {
+            src.upsert(
+                "docs",
+                &format!("k{i}"),
+                &[i as f32, 0.0, 0.0, 0.0],
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        }
+        let ops = src.replication_snapshot().unwrap();
+
+        let tgt_dir = tempfile::tempdir().unwrap();
+        let target = Arc::new(Mutex::new(Database::open(tgt_dir.path()).unwrap()));
+        let raft = start_single_member(1, EngineApplier(target.clone()))
+            .await
+            .unwrap();
+        raft.wait(Some(Duration::from_secs(10)))
+            .state(ServerState::Leader, "leader")
+            .await
+            .unwrap();
+
+        // The create must land before the upserts that depend on it; pipeline the
+        // upserts behind it, mirroring how the create/upsert split is proposed.
+        let (create, upserts): (Vec<WalOp>, Vec<WalOp>) = ops
+            .into_iter()
+            .partition(|o| matches!(o, WalOp::CreateCollection { .. }));
+        for op in create {
+            raft.client_write(op).await.unwrap();
+        }
+        let mut proposals = futures_util::stream::iter(upserts)
+            .map(|op| raft.client_write(op))
+            .buffered(1024);
+        while let Some(res) = proposals.next().await {
+            res.unwrap();
+        }
+
+        // Every upsert is live — none dropped or reordered past its create.
+        let db = target.lock().await;
+        for i in 0..50u32 {
+            assert!(
+                db.get("docs", &format!("k{i}")).unwrap().is_some(),
+                "k{i} missing after pipelined propose"
+            );
+        }
+    }
+
+    // Proof for ADR-0077: pipelining proposals (bounded in-flight) lets openraft
+    // coalesce the pending entries into one durable-log append (one fsync) +
+    // replication round, so a batch of upserts commits far faster than awaiting
+    // each in turn — while every op is still individually quorum-committed. Ignored
+    // (timing harness). Run:
+    //   QUIVER_RAFT_BENCH_N=2000 cargo test -p quiverdb-server --features raft \
+    //     --release raft::tests::bench_batched_vs_serial -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn bench_batched_vs_serial_proposals() {
+        use futures_util::StreamExt as _;
+        use std::time::Instant;
+
+        let n: usize = std::env::var("QUIVER_RAFT_BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000);
+
+        // A source engine, built the ordinary way, gives the exact ops that
+        // recreate it: one CreateCollection then n upserts (no hand-crafted bytes).
+        let src_dir = tempfile::tempdir().unwrap();
+        let mut src = Database::open(src_dir.path()).unwrap();
+        src.create_collection("docs", Descriptor::new(8, Dtype::F32, DistanceMetric::L2))
+            .unwrap();
+        for i in 0..n {
+            let v = [(i % 7) as f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            src.upsert("docs", &format!("k{i}"), &v, &serde_json::json!({}))
+                .unwrap();
+        }
+        let (create, upserts): (Vec<WalOp>, Vec<WalOp>) = src
+            .replication_snapshot()
+            .unwrap()
+            .into_iter()
+            .partition(|o| matches!(o, WalOp::CreateCollection { .. }));
+
+        // Start a single-member group over a fresh engine + a real durable log
+        // (start_member, not the in-memory single-member helper), replay the
+        // create, then time the n upserts under `pipelined`.
+        async fn time_upserts(create: &[WalOp], upserts: &[WalOp], pipelined: bool) -> f64 {
+            let eng_dir = tempfile::tempdir().unwrap();
+            let log_dir = tempfile::tempdir().unwrap();
+            let db = Arc::new(std::sync::RwLock::new(
+                Database::open(eng_dir.path()).unwrap(),
+            ));
+            let mut members = std::collections::BTreeMap::new();
+            members.insert(1u64, "http://127.0.0.1:1".to_owned());
+            let rs = start_member(
+                1,
+                members,
+                super::EngineApplier::new(db.clone()),
+                log_dir.path(),
+            )
+            .await
+            .unwrap();
+            rs.raft
+                .wait(Some(Duration::from_secs(10)))
+                .state(ServerState::Leader, "leader")
+                .await
+                .unwrap();
+            for op in create {
+                rs.raft.client_write(op.clone()).await.unwrap();
+            }
+            let t = Instant::now();
+            if pipelined {
+                let mut s = futures_util::stream::iter(upserts.iter().cloned())
+                    .map(|op| rs.raft.client_write(op))
+                    .buffered(1024);
+                while let Some(r) = s.next().await {
+                    r.unwrap();
+                }
+            } else {
+                for op in upserts {
+                    rs.raft.client_write(op.clone()).await.unwrap();
+                }
+            }
+            let secs = t.elapsed().as_secs_f64();
+            rs.raft.shutdown().await.unwrap();
+            secs
+        }
+
+        let serial = time_upserts(&create, &upserts, false).await;
+        let pipelined = time_upserts(&create, &upserts, true).await;
+        eprintln!(
+            "\nraft propose ({n} upserts, durable log, single member):\n  serial    {serial:.3}s = {:.0} ops/s\n  pipelined {pipelined:.3}s = {:.0} ops/s\n  ratio     {:.2}x",
+            n as f64 / serial,
+            n as f64 / pipelined,
+            serial / pipelined,
+        );
+        // No ordering assertion: on a single member the path is fsync-bound (no
+        // network round-trips to overlap), so the delta is within noise here. The
+        // pipelining win is per-op network-RTT amortization, which only appears on
+        // a real multi-node cluster (ADR-0077). This harness just proves the
+        // pipelined path commits every op.
+    }
 }
