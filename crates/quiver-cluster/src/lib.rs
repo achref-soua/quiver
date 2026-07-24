@@ -43,6 +43,10 @@ pub enum ClusterError {
     /// A membership operation referenced a shard id that is not in the map.
     #[error("no shard with id {0}")]
     UnknownShard(u64),
+    /// A drain was requested for a shard that cannot be drained: it is already
+    /// leaving, or it is still joining (abort a join by removing the shard instead).
+    #[error("shard id {0} cannot be drained (it is already leaving or still joining)")]
+    NotDrainable(u64),
 }
 
 /// One shard: a single-writer **primary** (ADR-0006) plus optional **read
@@ -122,6 +126,17 @@ pub struct ShardMap {
     /// donor) and to exclude joining shards from search until they are promoted.
     #[serde(default)]
     joining: Vec<u64>,
+    /// Ids of shards currently **leaving** (ADR-0080): still in the map and still
+    /// serving — they hold the authoritative copy of their slice until the drain
+    /// completes — but excluded from [`shard_for`](Self::shard_for), so ownership of
+    /// their slice has already moved to the survivors. The mirror image of
+    /// [`joining`](Self::is_joining): there the destination is in the map early and
+    /// the donor keeps serving; here the donor stays in the map late and the
+    /// destinations own immediately. A router dual-writes the slice (to the new owner
+    /// **and** the leaving shard) and keeps searching the leaving shard until it is
+    /// removed.
+    #[serde(default)]
+    leaving: Vec<u64>,
 }
 
 impl ShardMap {
@@ -171,6 +186,7 @@ impl ShardMap {
             version: 0,
             shards,
             joining: Vec::new(),
+            leaving: Vec::new(),
         })
     }
 
@@ -251,26 +267,95 @@ impl ShardMap {
         self.joining.contains(&id)
     }
 
-    /// The **donor** for `point_id` during a migration: when `point_id`'s HRW owner is
-    /// a *joining* shard, this is the shard that still owns the slice — the HRW winner
-    /// among the **active** (non-joining) shards. `None` when the owner is already
-    /// active (no migration in flight for this id). Writes are dual-written to the
-    /// owner **and** this donor; gets and searches for the slice go here until the
-    /// flip.
+    /// Mark a shard as **leaving** — the start of a drain (ADR-0080) — and bump the
+    /// version. It stays in the map and keeps serving (it still holds its slice), but
+    /// [`shard_for`](Self::shard_for) skips it, so the survivors own its slice from
+    /// this version on and the router dual-writes it to both. The drain then copies
+    /// the slice out and [`remove_shard`](Self::remove_shard) flips it away for good;
+    /// [`cancel_leave`](Self::cancel_leave) aborts.
+    ///
+    /// # Errors
+    /// [`ClusterError::UnknownShard`] if `id` is not in the map,
+    /// [`ClusterError::NotDrainable`] if it is already leaving or still joining,
+    /// [`ClusterError::NoShards`] if no shard would be left to drain onto.
+    pub fn mark_leaving(&mut self, id: u64) -> Result<(), ClusterError> {
+        if !self.shards.iter().any(|s| s.id == id) {
+            return Err(ClusterError::UnknownShard(id));
+        }
+        if self.is_leaving(id) || self.is_joining(id) {
+            return Err(ClusterError::NotDrainable(id));
+        }
+        // A drain needs somewhere to drain *to*: at least one shard that is neither
+        // leaving nor joining (a joining shard does not own its slice yet).
+        let destinations = self
+            .shards
+            .iter()
+            .filter(|s| s.id != id && !self.is_leaving(s.id) && !self.is_joining(s.id))
+            .count();
+        if destinations == 0 {
+            return Err(ClusterError::NoShards);
+        }
+        self.leaving.push(id);
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Abort a drain: clear the shard's leaving flag and bump the version, so its
+    /// slice routes back to it. Safe at any point before the removal — the shard has
+    /// been dual-written throughout the drain, so it is still current.
+    ///
+    /// # Errors
+    /// [`ClusterError::UnknownShard`] if `id` is not currently leaving.
+    pub fn cancel_leave(&mut self, id: u64) -> Result<(), ClusterError> {
+        if !self.is_leaving(id) {
+            return Err(ClusterError::UnknownShard(id));
+        }
+        self.leaving.retain(|&l| l != id);
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Whether the shard with `id` is currently leaving (draining; still serving, but
+    /// no longer the owner of its slice).
+    #[must_use]
+    pub fn is_leaving(&self, id: u64) -> bool {
+        self.leaving.contains(&id)
+    }
+
+    /// The **donor** for `point_id` during a migration: the shard that still holds the
+    /// id's authoritative data while ownership sits elsewhere. `None` in the steady
+    /// state (no migration in flight for this id). Writes are dual-written to the owner
+    /// **and** this donor, and gets are served from it, so the flip loses nothing
+    /// whichever direction the slice is moving:
+    ///
+    /// - **Grow** — the id's owner is a *joining* shard, so the donor is the HRW winner
+    ///   among the shards that are neither joining nor leaving.
+    /// - **Drain** — the id's pre-drain owner (HRW over *every* shard) is a *leaving*
+    ///   shard: it is no longer the owner but still holds the data, so it is the donor
+    ///   until the drain removes it (ADR-0080).
     #[must_use]
     pub fn donor_for(&self, point_id: &str) -> Option<&Shard> {
+        if !self.leaving.is_empty() {
+            let pre_drain_owner = self.hrw_among(point_id, |_| true)?;
+            if self.is_leaving(pre_drain_owner.id) {
+                return Some(pre_drain_owner);
+            }
+        }
         if !self.is_joining(self.shard_for(point_id).id) {
             return None;
         }
-        self.shards
-            .iter()
-            .filter(|s| !self.is_joining(s.id))
-            .max_by_key(|s| hrw_score(s.id, point_id))
+        self.hrw_among(point_id, |s| {
+            !self.is_joining(s.id) && !self.is_leaving(s.id)
+        })
     }
 
-    /// The shards that may serve **searches** — the active (non-joining) ones. A
+    /// The shards that may serve **searches** — every shard except the joining ones. A
     /// joining shard is excluded because its donor still holds the authoritative
-    /// slice; including both would double-count (the donor covers the slice).
+    /// slice; including both would double-count (the donor covers the slice). A
+    /// *leaving* shard is **included**: it still holds its slice until the drain
+    /// finishes, so excluding it would hide points that have not been copied yet. Where
+    /// a leaving shard and a new owner both hold a copy, the router's id-dedup in the
+    /// gather collapses them (the same dedup that covers the post-promote window).
     #[must_use]
     pub fn active_shards(&self) -> Vec<&Shard> {
         self.shards
@@ -294,7 +379,9 @@ impl ShardMap {
             return Err(ClusterError::NoShards);
         }
         self.shards.retain(|s| s.id != id);
-        self.joining.retain(|&j| j != id); // an aborted join is fully cleaned up
+        // An aborted join / a completed drain is fully cleaned up.
+        self.joining.retain(|&j| j != id);
+        self.leaving.retain(|&l| l != id);
         self.version += 1;
         Ok(())
     }
@@ -347,15 +434,30 @@ impl ShardMap {
     /// `hash(shard_id ‖ point_id)` is highest wins. Deterministic, stable across
     /// releases, and minimal-reshuffle if the shard set changes (only the keys of a
     /// removed shard remap; survivors keep their ids and so their data).
+    ///
+    /// **Leaving** shards are skipped (ADR-0080), so marking a shard as draining moves
+    /// ownership of its slice to the survivors immediately — one atomic map version,
+    /// exactly the ~1/N remap the removal would eventually cause — while the leaving
+    /// shard keeps serving the data as the [`donor_for`](Self::donor_for) until the
+    /// copy finishes.
     #[must_use]
     pub fn shard_for(&self, point_id: &str) -> &Shard {
-        // `from_shards` guarantees at least one shard, so `max_by_key` is `Some`; the
-        // `unwrap_or` fallback (shard 0) is unreachable but keeps this total and
-        // panic-free (the project bans `unwrap`/`expect`).
+        // `from_shards` guarantees at least one shard, so the fallbacks are
+        // unreachable, but they keep this total and panic-free (the project bans
+        // `unwrap`/`expect`). Every shard leaving at once is likewise impossible —
+        // `mark_leaving` refuses to drain the last destination.
+        self.hrw_among(point_id, |s| !self.is_leaving(s.id))
+            .or_else(|| self.hrw_among(point_id, |_| true))
+            .unwrap_or(&self.shards[0])
+    }
+
+    // The HRW winner for `point_id` among the shards satisfying `eligible`, or `None`
+    // if none do. The one place the rendezvous comparison lives.
+    fn hrw_among<F: Fn(&Shard) -> bool>(&self, point_id: &str, eligible: F) -> Option<&Shard> {
         self.shards
             .iter()
+            .filter(|s| eligible(s))
             .max_by_key(|s| hrw_score(s.id, point_id))
-            .unwrap_or(&self.shards[0])
     }
 
     /// Partition `items` into per-shard groups (preserving input order within each
@@ -816,6 +918,100 @@ mod tests {
         assert!((0..2_000).all(|i| m.donor_for(&format!("k{i}")).is_none()));
         // Promoting a non-joining shard is an error.
         assert_eq!(m.promote(2).unwrap_err(), ClusterError::UnknownShard(2));
+    }
+
+    #[test]
+    fn leaving_shard_hands_ownership_over_but_keeps_serving_until_removed() {
+        // Three shards; shard 2 starts draining.
+        let mut m = ShardMap::from_urls(["http://a", "http://b", "http://c"]).unwrap();
+        m.mark_leaving(2).unwrap();
+        assert!(m.is_leaving(2));
+        assert_eq!(m.version(), 1);
+        // It still serves searches — it holds its slice until the copy finishes.
+        assert_eq!(m.active_shards().len(), 3);
+
+        // The survivors own the drained slice from this version on, and the leaving
+        // shard is its donor — exactly the owner the *post-removal* map will name, so
+        // the drain copies each point straight to its final home.
+        let after = ShardMap::from_urls(["http://a", "http://b"]).unwrap();
+        let mut drained = 0;
+        for i in 0..2_000 {
+            let id = format!("k{i}");
+            let owner = m.shard_for(&id).id;
+            assert_ne!(owner, 2, "a leaving shard never owns a key");
+            assert_eq!(
+                owner,
+                after.shard_for(&id).id,
+                "owner == post-removal owner"
+            );
+            match m.donor_for(&id) {
+                // Its slice: the leaving shard still holds the data (dual-write + get).
+                Some(donor) => {
+                    assert_eq!(donor.id, 2);
+                    drained += 1;
+                }
+                // Everything else is untouched by the drain — no extra work.
+                None => assert!(owner == 0 || owner == 1),
+            }
+        }
+        assert!(drained > 0, "some keys should hash to the draining shard");
+
+        // Aborting restores it as an ordinary owner, with no donor anywhere.
+        m.cancel_leave(2).unwrap();
+        assert!(!m.is_leaving(2));
+        assert_eq!(m.version(), 2);
+        assert!((0..2_000).all(|i| m.donor_for(&format!("k{i}")).is_none()));
+        assert_eq!(
+            m.cancel_leave(2).unwrap_err(),
+            ClusterError::UnknownShard(2)
+        );
+    }
+
+    #[test]
+    fn mark_leaving_validates_and_survives_removal() {
+        let mut m = ShardMap::from_urls(["http://a", "http://b"]).unwrap();
+        assert_eq!(
+            m.mark_leaving(7).unwrap_err(),
+            ClusterError::UnknownShard(7)
+        );
+        m.mark_leaving(0).unwrap();
+        // No double drain, and the last remaining destination cannot also leave.
+        assert_eq!(
+            m.mark_leaving(0).unwrap_err(),
+            ClusterError::NotDrainable(0)
+        );
+        assert_eq!(m.mark_leaving(1).unwrap_err(), ClusterError::NoShards);
+        // A joining shard is not a drain candidate (remove it to abort the join).
+        m.add_joining_shard(2, "http://c", vec![]).unwrap();
+        assert_eq!(
+            m.mark_leaving(2).unwrap_err(),
+            ClusterError::NotDrainable(2)
+        );
+
+        // Removing the drained shard clears the flag: no stale leaving id survives to
+        // skew `shard_for` if the id were ever seen again.
+        m.remove_shard(0).unwrap();
+        assert!(!m.is_leaving(0));
+        assert_eq!(m.shard_for("k1").id, m.shard_for("k1").id);
+    }
+
+    #[test]
+    fn a_drain_dual_writes_exactly_the_drained_slice() {
+        let mut m = ShardMap::from_urls(["http://a", "http://b", "http://c"]).unwrap();
+        let ids: Vec<String> = (0..200).map(|i| format!("k{i}")).collect();
+        assert!(m.partition_to_donors(&ids, |s| s.as_str()).is_empty());
+
+        // Before the drain, note which keys shard 2 holds — that is exactly the set
+        // that must be dual-written while it drains.
+        let held: Vec<&String> = ids.iter().filter(|id| m.shard_for(id).id == 2).collect();
+        m.mark_leaving(2).unwrap();
+        let groups = m.partition_to_donors(&ids, |s| s.as_str());
+        assert_eq!(groups.len(), 1, "one donor: the draining shard");
+        let (donor, group) = &groups[0];
+        assert_eq!(donor.id, 2);
+        assert_eq!(group.len(), held.len());
+        assert!(!held.is_empty());
+        assert!(group.iter().all(|id| held.contains(id)));
     }
 
     #[test]

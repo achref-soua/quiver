@@ -10,6 +10,23 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Added
+
+- **Automated online scale-in — the reverse-migration drain**
+  ([ADR-0080](docs/adr/0080-online-scale-in-drain.md)). Growing a cluster was one
+  call; shrinking had no equivalent — `DELETE /cluster/shards/{id}` is safe only for
+  an already-drained shard, so scale-in was a manual, multi-step procedure. A shard
+  can now be marked **leaving**, the mirror image of **joining**: ownership of its
+  slice moves to the survivors in one atomic map version (and to exactly the owners
+  the post-removal map names), while the shard keeps holding and serving that slice
+  as the dual-write donor until the copy finishes. `POST /cluster/shards/{id}/drain`
+  runs the whole reverse migration in the background — copy, remove, drop — holding
+  the same invariants as a grow: **the slice stays queryable throughout and no
+  acknowledged write is lost**, aborts included. The router's data plane is
+  unchanged; the drain rides the routing the join path already established. Drops are
+  now **presence-checked in both directions**: a copy is deleted from its source only
+  after the destination is confirmed to hold that point.
+
 ### Documentation
 
 - **ADR-0079: wiring the GPU kernel into the build and search paths**

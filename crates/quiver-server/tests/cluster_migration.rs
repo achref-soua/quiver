@@ -286,6 +286,115 @@ async fn wait_total(http: &reqwest::Client, shards: &[&str], expected: u64) {
     panic!("cluster never settled to {expected} points (drop incomplete?)");
 }
 
+// The mirror of the grow test (ADR-0080): one call drains a shard out of the cluster.
+// Marking it **leaving** hands its slice to the survivors in a single map version while
+// the shard keeps serving it as the donor; the coordinator then copies, removes it from
+// the map, and drops the copies it no longer owns. The invariants are the same in this
+// direction: the slice is queryable throughout and no acknowledged write is lost —
+// including one written *while* the drain is running.
+#[tokio::test]
+async fn auto_drain_moves_the_slice_off_the_leaving_shard_with_no_loss() {
+    let dirs: Vec<_> = (0..6).map(|_| tempfile::tempdir().unwrap()).collect();
+    let state = tempfile::tempdir().unwrap();
+    let http = reqwest::Client::new();
+
+    let s0 = boot(Config {
+        data_dir: dirs[0].path().into(),
+        ..Default::default()
+    })
+    .await;
+    let s1 = boot(Config {
+        data_dir: dirs[1].path().into(),
+        ..Default::default()
+    })
+    .await;
+    let s2 = boot(Config {
+        data_dir: dirs[2].path().into(),
+        ..Default::default()
+    })
+    .await;
+    let baseline = boot(Config {
+        data_dir: dirs[3].path().into(),
+        ..Default::default()
+    })
+    .await;
+    for b in [&s0, &s1, &s2, &baseline] {
+        wait_ready(&http, b).await;
+    }
+    let shards = vec![s0.clone(), s1.clone(), s2.clone()];
+    let coordinator = boot(Config {
+        data_dir: dirs[4].path().into(),
+        coordinator: true,
+        coordinator_state: Some(state.path().join("coord.json")),
+        autoscale: Default::default(),
+        raft_node_id: None,
+        raft_members: Vec::new(),
+        cluster_shards: shards.clone(),
+        ..Default::default()
+    })
+    .await;
+    wait_ready(&http, &coordinator).await;
+    let router = boot(Config {
+        data_dir: dirs[5].path().into(),
+        cluster_shards: shards,
+        coordinator_url: Some(coordinator.clone()),
+        ..Default::default()
+    })
+    .await;
+    wait_ready(&http, &router).await;
+
+    for b in [&s0, &s1, &s2, &baseline] {
+        create(&http, b).await;
+    }
+    upsert_range(&http, &router, 0, 120).await;
+    upsert_range(&http, &baseline, 0, 120).await;
+    assert!(
+        count(&http, &s2).await > 0,
+        "the shard to drain holds no slice, so the test would prove nothing"
+    );
+    assert_router_matches_baseline(&http, &router, &baseline).await;
+
+    // One call drains s2; the coordinator copies, removes, and drops in the background.
+    // The response is the leaving map (v1) — ownership of the slice has already moved.
+    let resp: Value = http
+        .post(format!("{coordinator}/cluster/shards/2/drain"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["version"].as_u64().unwrap(), 1);
+
+    // A write *during* the drain must survive: it is routed to the new owner and
+    // dual-written to the draining shard, so neither the copy nor the removal loses it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    upsert_range(&http, &router, 120, 180).await;
+    upsert_range(&http, &baseline, 120, 180).await;
+    // Queryable while draining: the leaving shard still serves the slice it holds.
+    assert_all_present(&http, &router, 180).await;
+
+    // The drain removes s2 from the map (v2) and drops its copies, settling the two
+    // survivors at exactly 180 points and leaving s2 empty and ready to shut down.
+    wait_router_version(&http, &router, 2).await;
+    wait_total(&http, &[&s0, &s1], 180).await;
+    for _ in 0..400 {
+        if count(&http, &s2).await == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        count(&http, &s2).await,
+        0,
+        "the drained shard still holds data"
+    );
+
+    // Queryable + correct throughout, and every acknowledged write survived the drain.
+    assert_router_matches_baseline(&http, &router, &baseline).await;
+    assert_all_present(&http, &router, 180).await;
+}
+
 #[tokio::test]
 async fn auto_grow_migrates_the_slice_with_no_loss() {
     let dirs: Vec<_> = (0..6).map(|_| tempfile::tempdir().unwrap()).collect();
