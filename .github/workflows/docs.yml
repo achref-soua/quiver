@@ -1,0 +1,59 @@
+# Builds the mdBook documentation site (apps/docs) and publishes it to GitHub
+# Pages. The book reuses the canonical top-level docs/ via {{#include}}, so this
+# renders the single source of truth — it does not fork the content (ADR-0078).
+#
+# Deploy runs only on push to main (the released state), so the live site matches
+# the published version, never unreleased develop. Pull requests build the book as
+# a health gate without deploying; workflow_dispatch allows a manual re-publish.
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/docs/**"
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "apps/docs/**"
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+# Least privilege: only the deploy path needs pages/id-token; build-only PR runs
+# get read.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One live publish at a time; never cancel an in-progress deploy mid-write.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: "0.5.3" # matches the locally verified toolchain
+      - name: Build the book
+        run: mdbook build apps/docs
+
+      # Deploy only for the released branch / manual runs — PRs stop at the build.
+      - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: apps/docs/book
+      - id: deploy
+        uses: actions/deploy-pages@v4
+        if: github.event_name != 'pull_request'

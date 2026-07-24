@@ -6,6 +6,10 @@ language = "en"
 src = "src"
 
 [output.html]
+# Served as a GitHub project page under /quiver/ (ADR-0078); site-url makes the
+# 404 page and absolute asset/link references resolve under that subpath. Page
+# navigation is relative, so local `mdbook serve` at / is unaffected.
+site-url = "/quiver/"
 preferred-dark-theme = "coal"
 git-repository-url = "https://github.com/achref-soua/quiver"
 edit-url-template = "https://github.com/achref-soua/quiver/edit/main/apps/docs/{path}"

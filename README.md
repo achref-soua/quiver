@@ -59,7 +59,7 @@ A Cargo workspace: a from-scratch storage engine, index structures, SIMD distanc
 
 ## Quickstart
 
-> **Full documentation** lives in the [docs site](./apps/docs) (an mdBook; build it with `just docs`, or read the chapters under [`apps/docs/src`](./apps/docs/src)) — concepts, self-hosting, every feature, the API/MCP/SDK references, the security docs, and an architecture deep dive.
+> **Full documentation** lives at **[achref-soua.github.io/quiver](https://achref-soua.github.io/quiver/)** (an mdBook — source under [`apps/docs`](./apps/docs), build it locally with `just docs`) — concepts, self-hosting, every feature, the API/MCP/SDK references, the security docs, and an architecture deep dive.
 
 **Install (Linux / macOS) — one command, no Rust toolchain required:**
 
@@ -309,7 +309,7 @@ Every option is an environment variable with a secure default; see [`.env.exampl
 
 ## Project
 
-- **Documentation site** — [`apps/docs`](./apps/docs) (mdBook; `just docs`)
+- **Documentation site** — **[achref-soua.github.io/quiver](https://achref-soua.github.io/quiver/)** (mdBook; source [`apps/docs`](./apps/docs), `just docs`)
 - **Roadmap & Definitions of Done** — [`docs/roadmap.md`](./docs/roadmap.md)
 - **Changelog** — [`CHANGELOG.md`](./CHANGELOG.md)
 - **Security policy** — [`SECURITY.md`](./SECURITY.md) · **Threat model** — [`docs/security/threat-model.md`](./docs/security/threat-model.md) · **Security audit (OWASP ZAP + static + fuzz)** — [`docs/security/audit-0.29.0.md`](./docs/security/audit-0.29.0.md)
