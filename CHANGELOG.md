@@ -10,6 +10,21 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Documentation
+
+- **ADR-0079: wiring the GPU kernel into the build and search paths**
+  ([ADR-0079](docs/adr/0079-gpu-build-search-wiring.md)). The GPU batch-distance
+  kernel has shipped since `v0.28.0` ([ADR-0052](docs/adr/0052-gpu-acceleration.md))
+  but is wired into no path; what blocked the wiring was the **numeric contract**,
+  not the kernel. Settled: **the GPU narrows, the CPU scores** — a device produces
+  candidate shortlists and every value returned to a caller is recomputed by the
+  SIMD kernel, so reported distances and recall stay bit-identical to a CPU-only
+  run, while build-side (k-means) determinism is honestly **per-backend**. The seam
+  stays the single `gpu` module, gaining a device-fused assign (the
+  `points × centroids` matrix cannot be returned to the host). No persisted byte and
+  no default-build change. Design only: the wiring increments and every GPU number
+  are gated on real hardware.
+
 ## [0.37.0] — Quicksilver — 2026-07-24
 
 Three post-Filigree changes centred on speed and reach: the single-box **100M
