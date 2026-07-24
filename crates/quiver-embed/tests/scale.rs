@@ -165,7 +165,12 @@ fn scale_ingest_and_query() {
         let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(this);
         for j in 0..this {
             let idx = i + j as u64;
-            ids.push(format!("p{idx}"));
+            // Zero-padded so ids sort lexicographically in ingest order — the
+            // realistic large-N shape (sequences/ULIDs/timestamps) and the one the
+            // per-segment id-range fingerprint (ADR-0076) prunes: each new id sorts
+            // beyond every sealed segment's max, so the existence-check skips them
+            // with a compare instead of a decrypting binary search.
+            ids.push(format!("p{idx:012}"));
             synth(idx, dim, &mut vecbuf);
             vecs.push(vecbuf.clone());
         }
@@ -192,6 +197,19 @@ fn scale_ingest_and_query() {
     }
     let ingest_s = t0.elapsed().as_secs_f64();
     let rate = n as f64 / ingest_s;
+
+    // Ingest-only mode: report the measured ingest rate + peak RSS and stop,
+    // skipping the (much slower) lazy index build + query phase. Lets an ingest
+    // A/B (e.g. the ADR-0076 id-range fingerprint before/after) run cheaply and
+    // repeatably without paying the build each time.
+    if env_usize("QUIVER_SCALE_INGEST_ONLY", 0) != 0 {
+        eprintln!("\n================ INGEST RESULT (measured) ================");
+        eprintln!("vectors ...... {n}  (dim {dim})");
+        eprintln!("ingest ....... {ingest_s:.1}s  → {rate:.0} vec/s (bulk)");
+        eprintln!("peak RSS ..... {} MiB", peak_rss_kib() / 1024);
+        eprintln!("=========================================================");
+        return;
+    }
 
     // Force the index build + flush so RSS/disk reflect a queryable state.
     let tb = Instant::now();

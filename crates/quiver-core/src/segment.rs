@@ -115,6 +115,14 @@ pub(crate) struct SealedSegment {
     idlocs: Vec<ByteLoc>,
     // Row numbers ordered by external id (ADR-0072): the forward-lookup index.
     sorted_rows: Vec<u32>,
+    // Resident min/max id range (ADR-0076): the smallest and largest external id
+    // in this segment, i.e. the ids of `sorted_rows` first and last. Derived on
+    // open from the on-disk column (two decrypts, no format change), so `lookup`
+    // can reject an out-of-range id with one string compare instead of a
+    // decrypting binary search. `None` for an empty segment. This is the named
+    // upgrade path of ADR-0072 — RAM-neutral (two strings per segment, and
+    // segment count is bounded by compaction).
+    id_range: Option<(String, String)>,
     // Rows of this segment that are no longer live.
     dead: RoaringBitmap,
     // Secondary index over the collection's filterable fields (empty if none).
@@ -150,6 +158,14 @@ impl SealedSegment {
     /// the caller's concern, as with the in-RAM primary index. Within a segment
     /// each id is unique, so the match (if any) is the single owning row.
     pub(crate) fn lookup(&self, codec: &dyn PageCodec, id: &str) -> Result<Option<u32>> {
+        // Resident-range fast reject (ADR-0076): if the id sorts outside this
+        // segment's [min, max], it cannot be here — skip the decrypting binary
+        // search. Same lexicographic `str` ordering the search below uses.
+        match &self.id_range {
+            None => return Ok(None),
+            Some((min, max)) if id < min.as_str() || id > max.as_str() => return Ok(None),
+            Some(_) => {}
+        }
         let mut lo = 0usize;
         let mut hi = self.sorted_rows.len();
         while lo < hi {
@@ -495,7 +511,7 @@ pub(crate) fn open_segment(
     }
     // External ids stay on disk in the `.ids` column and are read on demand via
     // `read_id`/`lookup` — never materialized here (ADR-0072, Increment C).
-    Ok(SealedSegment {
+    let mut seg = SealedSegment {
         seg_id: segment_id,
         vec,
         pay,
@@ -503,9 +519,19 @@ pub(crate) fn open_segment(
         paylocs,
         idlocs,
         sorted_rows: dir.sorted_rows,
+        id_range: None,
         dead,
         sec,
-    })
+    };
+    // Resident min/max range fingerprint (ADR-0076): decrypt just the two extreme
+    // ids — `sorted_rows` is id-sorted, so its first/last rows are the min/max —
+    // and hold them so `lookup` can range-reject without a per-comparison decrypt.
+    if let (Some(&first), Some(&last)) = (seg.sorted_rows.first(), seg.sorted_rows.last()) {
+        let min = seg.read_id(codec, first)?;
+        let max = seg.read_id(codec, last)?;
+        seg.id_range = Some((min, max));
+    }
+    Ok(seg)
 }
 
 /// Open just a sealed segment's immutable `.vec` column as a standalone `mmap`,
@@ -672,6 +698,33 @@ mod tests {
         // Bracketing ids that sort outside the present range still miss.
         assert_eq!(seg.lookup(&PlainCodec, "").unwrap(), None);
         assert_eq!(seg.lookup(&PlainCodec, "zzzz").unwrap(), None);
+    }
+
+    #[test]
+    fn resident_id_range_is_the_true_min_and_max() {
+        // ADR-0076: the resident fingerprint is the id-sorted min/max (from
+        // `sorted_rows`), not the write-order first/last, so range-rejection is
+        // sound regardless of the order rows were sealed in.
+        let dir = tempfile::tempdir().unwrap();
+        let ids = ["m", "a", "z", "d", "b"]; // min "a", max "z"; write order differs
+        let rows: Vec<SealRow> = ids
+            .iter()
+            .map(|id| SealRow {
+                external_id: id,
+                vector: &[0, 0, 0, 0],
+                payload: b"{}",
+            })
+            .collect();
+        write_segment(dir.path(), 1, &PlainCodec, &rows, &[]).unwrap();
+        let seg = open_segment(dir.path(), 1, &PlainCodec).unwrap();
+        assert_eq!(seg.id_range, Some(("a".to_owned(), "z".to_owned())));
+
+        // An empty segment carries no range and rejects every lookup.
+        let empty = tempfile::tempdir().unwrap();
+        write_segment(empty.path(), 2, &PlainCodec, &[], &[]).unwrap();
+        let seg = open_segment(empty.path(), 2, &PlainCodec).unwrap();
+        assert_eq!(seg.id_range, None);
+        assert_eq!(seg.lookup(&PlainCodec, "a").unwrap(), None);
     }
 
     #[test]
