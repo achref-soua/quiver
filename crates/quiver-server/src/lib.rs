@@ -1060,17 +1060,33 @@ impl AppState {
             .map_err(map_client_write_err)
     }
 
-    // Propose a batch of prepared ops in order, returning how many committed. Stops
-    // at the first failure (e.g. a mid-batch leadership change) and surfaces it, so
-    // a partial batch is reported honestly rather than as a silent success.
+    // Propose a batch of prepared ops, returning how many committed on success or
+    // the first failure (ADR-0077). The proposals are **pipelined** (bounded
+    // in-flight) rather than awaited one commit at a time, so openraft coalesces
+    // the pending entries into one durable log append (a single `fsync`) plus one
+    // replication round instead of one per op. `buffered` preserves order, so
+    // openraft still assigns log indices in submission order (linearizability
+    // unchanged), and each op is individually quorum-committed and `fsync`ed before
+    // its future resolves (durability unchanged). Every submitted op's result is
+    // drained — never cancelled mid-flight — so a mid-batch leadership change is
+    // reported as its first error, honestly, rather than leaving a silent partial.
     #[cfg(feature = "raft")]
     async fn raft_propose_all(&self, rs: &raft::RaftShard, ops: Vec<WalOp>) -> Result<u64, Error> {
-        let mut committed = 0u64;
-        for op in ops {
-            self.raft_propose(rs, op).await?;
-            committed += 1;
+        use futures_util::StreamExt as _;
+        let total = ops.len() as u64;
+        let mut proposals = futures_util::stream::iter(ops)
+            .map(|op| self.raft_propose(rs, op))
+            .buffered(RAFT_PROPOSE_MAX_INFLIGHT);
+        let mut first_err: Option<Error> = None;
+        while let Some(res) = proposals.next().await {
+            if let Err(e) = res {
+                first_err.get_or_insert(e);
+            }
         }
-        Ok(committed)
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(total),
+        }
     }
 
     // Refuse a mutating operation on a read-only replication follower (ADR-0030);
@@ -2185,6 +2201,14 @@ pub async fn serve(
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
+
+// Max Raft proposals a batch keeps in flight while pipelining (ADR-0077). Caps
+// memory/backpressure on a large bulk request; openraft coalesces the pending
+// entries into one log append + replication round, so this is effectively the
+// batch size. ponytail: a fixed bound, not a config knob — no workload has asked
+// to tune it; lift to config only if one does.
+#[cfg(feature = "raft")]
+const RAFT_PROPOSE_MAX_INFLIGHT: usize = 1024;
 
 // Parse `["<id>=<url>", …]` Raft member entries into an id→URL map (ADR-0067).
 // Mirrors the `cluster_replicas` `<idx>=<url>` form; the bracketed

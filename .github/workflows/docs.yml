@@ -1,0 +1,64 @@
+# Builds the mdBook documentation site (apps/docs) and publishes it to GitHub
+# Pages. The book reuses the canonical top-level docs/ via {{#include}}, so this
+# renders the single source of truth — it does not fork the content (ADR-0078).
+#
+# Two jobs: `build` runs on every trigger (a health gate that also catches a
+# broken {{#include}} or SUMMARY link on PRs); `deploy` runs only on push to main
+# (the released state) and workflow_dispatch, so the live site matches the
+# published version. The deploy job is separate because it targets the
+# github-pages environment, whose branch policy only permits deployments from
+# main — declaring that environment on a PR run would reject the whole job.
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/docs/**"
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "apps/docs/**"
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One live publish at a time; never cancel an in-progress deploy mid-write.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: "0.5.3" # matches the locally verified toolchain
+      - name: Build the book
+        run: mdbook build apps/docs
+      # Only the released branch / manual runs go on to deploy, so PRs stop here.
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: apps/docs/book
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -10,6 +10,58 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.37.0] — Quicksilver — 2026-07-24
+
+Three post-Filigree changes centred on speed and reach: the single-box **100M
+wall-clock gate is cleared** by a resident per-segment id-range fingerprint
+([ADR-0076](docs/adr/0076-resident-id-range-fingerprint.md)) that makes ingest
+~6.1× faster with no extra RAM; **bulk writes under Raft now pipeline their
+proposals** ([ADR-0077](docs/adr/0077-batched-raft-proposals.md)); and the **hosted
+documentation site is live** on GitHub Pages
+([ADR-0078](docs/adr/0078-docs-site-deploy.md)).
+
+### Performance
+
+- **Resident per-segment id-range fingerprint**
+  ([ADR-0076](docs/adr/0076-resident-id-range-fingerprint.md)). Moving the primary
+  index to disk (v0.34.0) turned every write's existence check into an
+  `O(segments · log rows)` decrypt-on-compare probe, so single-threaded ingest
+  slowed as sealed segments accumulated — RAM-feasible at 100M but
+  wall-clock-prohibitive. Each sealed segment now keeps its min/max external id
+  (two strings, derived on open from the id-sorted forward index — **no on-disk
+  format change and no per-point RAM**), so `lookup` range-rejects an out-of-range
+  id with one string compare before the decrypting search. For sortable ids
+  (sequences/ULIDs/timestamps) the probe collapses to `O(segments)` compares with
+  zero decrypts. Measured on the scale harness (1M vectors, IVF+PQ m=16, sealing
+  every 100k rows): **ingest 113.7 s → 18.7 s (~6.1×), peak RSS 567 → 568 MiB
+  (unchanged)**. Random-id workloads fall through to the existing search — no
+  regression.
+- **Pipelined bulk Raft proposals**
+  ([ADR-0077](docs/adr/0077-batched-raft-proposals.md)). `raft_propose_all` awaited
+  each op's quorum commit before proposing the next, so an `N`-op bulk write paid
+  `N` serialized consensus round-trips. Proposals now pipeline through a bounded
+  in-flight window (`buffered(1024)`), so openraft coalesces the pending entries
+  into one `fsync`'d log append and one replication round. Order — and therefore
+  linearizability — is preserved (submission order = log order), each op is still
+  individually quorum-committed and durable, and results are drained (never
+  cancelled) on error. **No on-disk or Raft-log format change.** The win is per-op
+  network-RTT amortization on a multi-node cluster; the single-box harness is
+  `fsync`-bound (~1.1×, measured), and the cluster figure is deferred to real
+  multi-node hardware rather than fabricated.
+
+### Documentation
+
+- **The hosted documentation site is live**
+  ([ADR-0078](docs/adr/0078-docs-site-deploy.md)) at
+  [achref-soua.github.io/quiver](https://achref-soua.github.io/quiver/). The
+  existing `apps/docs` mdBook — which reuses the canonical top-level `docs/` via
+  `{{#include}}`, so there is one source of truth — is now built and published to
+  GitHub Pages by a CI workflow on every release to `main`; pull requests build the
+  book as a health gate without deploying. A Fumadocs/Nextra site was rejected (it
+  would fork the content and add a Node toolchain for no gain). The
+  `quiver-explained` field guide gains the pipelined-Raft narrative and reflects the
+  now-live site.
+
 ## [0.36.0] — Filigree — 2026-07-21
 
 Two features on the hardening-and-frugality axis: **binary quantization for the
@@ -1050,7 +1102,9 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.35.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.37.0...HEAD
+[0.37.0]: https://github.com/achref-soua/quiver/compare/v0.36.0...v0.37.0
+[0.36.0]: https://github.com/achref-soua/quiver/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/achref-soua/quiver/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/achref-soua/quiver/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/achref-soua/quiver/compare/v0.32.0...v0.33.0
