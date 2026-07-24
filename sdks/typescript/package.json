@@ -78,7 +78,7 @@
     "@stablelib/xchacha20poly1305": "^2.0.1",
     "@types/node": "^25.0.0",
     "typescript": "^6.0.0",
-    "vitest": "^4.1.0"
+    "vitest": "^4.1.10"
   },
   "repository": {
     "type": "git",
