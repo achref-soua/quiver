@@ -6,6 +6,8 @@
   into the planner's exact-scan path and the IVF/k-means build kernels remains.
 - **Date:** 2026-06-23 (implemented 2026-06-26)
 - **Deciders:** Achref Soua
+- **Refined by:** [ADR-0079](0079-gpu-build-search-wiring.md) — where the kernel
+  plugs into build and search, and the numeric contract that wiring must honour.
 
 ## Context
 
