@@ -78,7 +78,7 @@ message SearchResponse { repeated Match matches = 1; string next_cursor = 2; }
 | `POST /cluster/raft/voters` · `DELETE /cluster/raft/voters/{id}` | Add/remove a per-shard Raft voter at runtime (ADR-0067 increment 4c, admin; requires the `raft` build feature) |
 | `GET /healthz` · `GET /readyz` · `GET /metrics` | ops |
 
-The complete, machine-readable contract for this surface is the committed [OpenAPI 3.1 spec](./openapi.yaml) (`docs/api/openapi.yaml`), pinned to the router by a coverage test. The cluster **coordinator** runs a separate admin API (`/cluster/shards`, `/cluster/shards/grow`, `/cluster/shards/{id}/promote`, `DELETE /cluster/shards/{id}`, `/cluster/health`) — authenticated like the data plane (ADR-0011): reads need any valid key, the mutating shard ops need the admin role.
+The complete, machine-readable contract for this surface is the committed [OpenAPI 3.1 spec](./openapi.yaml) (`docs/api/openapi.yaml`), pinned to the router by a coverage test. The cluster **coordinator** runs a separate admin API (`/cluster/shards`, `/cluster/shards/grow`, `/cluster/shards/{id}/promote`, `/cluster/shards/{id}/drain`, `DELETE /cluster/shards/{id}`, `/cluster/health`) — authenticated like the data plane (ADR-0011): reads need any valid key, the mutating shard ops need the admin role.
 
 `CreateCollection` selects the per-collection index (ADR-0007): the JSON body and
 the proto request carry `index` (`hnsw` | `vamana` | `disk_vamana` | `ivf`,
