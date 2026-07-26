@@ -78,6 +78,28 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # The roadmap has asserted a >=80% coverage gate since Phase 3, but nothing
+      # enforced it — `just coverage` was a local HTML report run by hand, so the
+      # number in the docs was an unverified claim. The measured workspace figure is
+      # ~90.6% line, so the gate is set at 85%: comfortably above what the roadmap
+      # promises, with enough headroom that ordinary churn does not trip it. Skips the
+      # same crash-recovery stress test the `check` job runs separately, whose kill -9
+      # timing is runner-sensitive.
+      - name: Coverage (workspace, gate at 85% lines)
+        run: >-
+          cargo llvm-cov --workspace --summary-only --fail-under-lines 85
+          -- --skip kill_mid_write_preserves_acknowledged_writes
+
   package:
     name: package (publishability)
     runs-on: ubuntu-latest

@@ -99,4 +99,6 @@ Forward-looking work already scoped and honestly sequenced (not yet gated to a r
 
 ## Testing posture (every phase)
 
-Unit; `proptest` for index/storage invariants; `cargo-fuzz` for wire-protocol + on-disk parsers; crash-recovery tests; `loom` for index concurrency; recall/latency regression gates on a fixed dataset; full server+SDK integration round-trip; `criterion` microbenchmarks for SIMD. Coverage gate starts at 70% and rises to 80%+.
+Unit; `proptest` for index/storage invariants; `cargo-fuzz` for wire-protocol + on-disk parsers; crash-recovery tests; `loom` for index concurrency; recall/latency regression gates on a fixed dataset; full server+SDK integration round-trip; `criterion` microbenchmarks for SIMD.
+
+**Coverage is enforced in CI**, not asserted: the `coverage` job runs `cargo llvm-cov` over the workspace and fails below **85% lines**. The measured workspace figure is ~90.6%. Earlier phases stated a rising 70% → 80%+ gate but nothing checked it — `just coverage` was a local HTML report run by hand — so the number in these docs was an unverified claim until the gate landed.
