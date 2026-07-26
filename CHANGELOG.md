@@ -12,6 +12,21 @@ for the per-release rationale and Definitions of Done.
 
 ### Added
 
+- **The acceptance run is now a CI gate, and it exercises the TypeScript SDK too.**
+  `scripts/acceptance.sh` boots a real encryption-at-rest server and drives every
+  external surface — REST, the Python SDK, the CLI importer, the MCP server over
+  stdio — but it only ever ran by hand, so none of it gated a pull request. It now
+  runs as the `acceptance` job on every PR, in well under a minute.
+
+  This closes the largest hole in the test matrix: **both SDK suites mock the
+  transport entirely** (`respx` for Python, a stubbed `fetch` for TypeScript), so
+  they prove the client's shape but never that the shape matches what the server
+  sends — a renamed field or a reclassified status code passes green under mocks and
+  fails in a user's hands. A new `scripts/acceptance_sdk.mjs` drives the built
+  TypeScript client across a real socket (lifecycle, filtered search, `getPoint`,
+  `scroll`, and that a 404 and a 401 arrive as `QuiverError` with the server's
+  status), joining the Python script that was already there.
+
 - **Binary quantization is now reachable over gRPC** ([ADR-0074](docs/adr/0074-binary-quantization-disk-graph.md)).
   `CreateCollectionRequest` gains a `binary` field and `Collection` reports it back;
   the handler previously passed a hard-coded `false`, so a gRPC client could not create

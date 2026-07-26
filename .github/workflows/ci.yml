@@ -140,6 +140,29 @@ jobs:
           pnpm test
           npm pack --dry-run
 
+  # Boots a real encrypted server and drives every external surface the way an
+  # operator does — REST, both SDKs, the CLI importer, and the MCP server over
+  # stdio. This existed as `just acceptance` but ran only by hand, which left the
+  # SDKs effectively untested against a live server: their own suites mock the
+  # transport entirely, so a wire-format change on the server ships green. It takes
+  # well under a minute, which is cheap for the surface it covers.
+  acceptance:
+    name: acceptance (live server, every surface)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: "11.6.0" # matches packageManager; pnpm 11 needs Node >= 22.13
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Acceptance run
+        run: bash scripts/acceptance.sh
+
   helm:
     name: helm lint + template
     runs-on: ubuntu-latest

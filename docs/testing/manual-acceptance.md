@@ -18,14 +18,22 @@ real-server migration imports).
 just verify          # the full gate: fmt · clippy -D · cargo test --workspace · doc · deny · audit
 just test-py         # Python SDK suite (HTTP mocked)
 just test-ts         # TypeScript SDK suite (fetch mocked)
-just acceptance      # boots a real encrypted server, drives REST + Python SDK + CLI + MCP
+just acceptance      # boots a real encrypted server, drives REST + both SDKs + CLI + MCP
 ```
 
 `just acceptance` ([`scripts/acceptance.sh`](../../scripts/acceptance.sh) +
-[`scripts/acceptance_sdk.py`](../../scripts/acceptance_sdk.py)) is the live
+[`scripts/acceptance_sdk.py`](../../scripts/acceptance_sdk.py) +
+[`scripts/acceptance_sdk.mjs`](../../scripts/acceptance_sdk.mjs)) is the live
 end-to-end run: it starts a server with **encryption-at-rest ON** on loopback alt
 ports and exercises the lifecycle (create → upsert → filtered search → get →
 delete → drop) across every surface and mode below.
+
+**It also runs in CI** (the `acceptance` job), so these surfaces are gated on every
+pull request rather than only before a release. That matters most for the SDKs: both
+suites (`just test-py`, `just test-ts`) mock the transport entirely, so they prove the
+client's shape but never that the shape matches what the server sends — a renamed
+field or a reclassified status code passes under mocks and fails in a user's hands.
+The acceptance run is what crosses a real socket.
 
 For the deeper deterministic guarantees, see also:
 
@@ -92,6 +100,7 @@ Legend: ✅ automated (named test / script) · 🖐 manual step.
 | --- | --- |
 | client lifecycle, search, fetch (fetch mocked) | ✅ `sdks/typescript/test/*` via `just test-ts` |
 | native DCPE / vector ciphers + cross-lang KAT | ✅ `test/dcpe.test.ts`, `test/vector.test.ts` |
+| **wire contract against a live server** | ✅ `scripts/acceptance_sdk.mjs` via `acceptance.sh` |
 
 ### CLI (`quiver`)
 
