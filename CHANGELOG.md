@@ -10,7 +10,34 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Added
+
+- **`index_ready` on the collection API** ([ADR-0081](docs/adr/0081-index-readiness.md)).
+  `GET /v1/collections/{name}` (and the list endpoint) now report whether a search is
+  answered from a built index. A search does not need it — it waits for the first build
+  rather than returning an empty result — so this is for callers that would rather poll
+  than block: an ingestion job, an operator, a dashboard.
+
 ### Fixed
+
+- **A freshly loaded collection no longer returns an empty result set**
+  ([ADR-0081](docs/adr/0081-index-readiness.md)). Two correct decisions composed into a
+  wrong answer: a bulk load defers its index work and marks the collection stale
+  ([ADR-0045](docs/adr/0045-hybrid-everywhere-and-fast-ingest.md)), and a stale
+  collection's read serves the **prior** snapshot rather than blocking
+  ([ADR-0062](docs/adr/0062-off-lock-index-rebuild.md)) — but a collection whose index
+  has never been built has no prior snapshot, so the read was answered from *nothing*.
+  `GET` reported the full point count while `query` returned `200 OK` with zero
+  matches, and a client could not tell "nothing matched" from "the index does not exist
+  yet". Measured before the fix: 1500 points written, then `0` hits for ~0.55 s; the
+  window is a *build*, so it scales with the collection (the recorded first build for
+  1M vectors is 236 s). A read against an index that was never built now waits for that
+  build — once per collection, single-flighted across concurrent readers — and returns
+  the right answer. Steady-state reads are untouched: a collection with a built index
+  never takes the new path, so ADR-0062's non-blocking rebuild still applies.
+
+  The engine was always correct here (its `search` rebuilds in place); only the server
+  diverged, which is why the embedded tests never caught it.
 
 - **The GPU seam now actually falls back to the CPU.** The `gpu` module promised the
   GPU was "a pure accelerator … never a correctness dependency", but a `cuda`-feature
