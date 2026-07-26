@@ -1,6 +1,6 @@
 {
   "name": "quiver-client",
-  "version": "0.37.0",
+  "version": "0.38.0",
   "description": "TypeScript client for Quiver — a security-first, memory-frugal vector database.",
   "license": "AGPL-3.0-only",
   "packageManager": "pnpm@11.6.0",
@@ -78,7 +78,7 @@
     "@stablelib/xchacha20poly1305": "^2.0.1",
     "@types/node": "^25.0.0",
     "typescript": "^6.0.0",
-    "vitest": "^4.1.0"
+    "vitest": "^4.1.10"
   },
   "repository": {
     "type": "git",

@@ -10,6 +10,57 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+## [0.38.0] — Ebb — 2026-07-25
+
+Elastic scaling now runs in **both** directions. The named gap in cluster operations —
+automated, safe **scale-in** — is closed by a reverse-migration drain
+([ADR-0080](docs/adr/0080-online-scale-in-drain.md)): one call takes a shard out of a
+live cluster online, with the same two guarantees a grow has always held. The release
+also settles where the GPU kernel plugs into build and search, and what it must promise
+when it does ([ADR-0079](docs/adr/0079-gpu-build-search-wiring.md)).
+
+### Added
+
+- **Automated online scale-in — the reverse-migration drain**
+  ([ADR-0080](docs/adr/0080-online-scale-in-drain.md)). Growing a cluster was one
+  call; shrinking had no equivalent — `DELETE /cluster/shards/{id}` is safe only for
+  an already-drained shard, so scale-in was a manual, multi-step procedure. A shard
+  can now be marked **leaving**, the mirror image of **joining**: ownership of its
+  slice moves to the survivors in one atomic map version (and to exactly the owners
+  the post-removal map names), while the shard keeps holding and serving that slice
+  as the dual-write donor until the copy finishes. `POST /cluster/shards/{id}/drain`
+  runs the whole reverse migration in the background — copy, remove, drop — holding
+  the same invariants as a grow: **the slice stays queryable throughout and no
+  acknowledged write is lost**, aborts included. The router's data plane is
+  unchanged; the drain rides the routing the join path already established. Drops are
+  now **presence-checked in both directions**: a copy is deleted from its source only
+  after the destination is confirmed to hold that point.
+
+### Security
+
+- **Cleared the SDK lockfile advisories.** Sixteen open advisories (eleven high) sat
+  against development-only transitive dependencies of the SDK and benchmark lockfiles —
+  none in a published package or in the Rust dependency graph, which `cargo-deny` and
+  `cargo-audit` keep clean. Bumped anyway, because a security-first project should not
+  carry a wall of open high-severity alerts a reader cannot tell are dev-only: pillow
+  `12.2.0 → 12.3.0` (thirteen advisories), setuptools `82.0.1 → 83.0.0`, and postcss
+  `8.5.16 → 8.5.22` via vitest `4.1.8 → 4.1.10`.
+
+### Documentation
+
+- **ADR-0079: wiring the GPU kernel into the build and search paths**
+  ([ADR-0079](docs/adr/0079-gpu-build-search-wiring.md)). The GPU batch-distance
+  kernel has shipped since `v0.28.0` ([ADR-0052](docs/adr/0052-gpu-acceleration.md))
+  but is wired into no path; what blocked the wiring was the **numeric contract**,
+  not the kernel. Settled: **the GPU narrows, the CPU scores** — a device produces
+  candidate shortlists and every value returned to a caller is recomputed by the
+  SIMD kernel, so reported distances and recall stay bit-identical to a CPU-only
+  run, while build-side (k-means) determinism is honestly **per-backend**. The seam
+  stays the single `gpu` module, gaining a device-fused assign (the
+  `points × centroids` matrix cannot be returned to the host). No persisted byte and
+  no default-build change. Design only: the wiring increments and every GPU number
+  are gated on real hardware.
+
 ## [0.37.0] — Quicksilver — 2026-07-24
 
 Three post-Filigree changes centred on speed and reach: the single-box **100M
@@ -1102,7 +1153,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.37.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.38.0...HEAD
+[0.38.0]: https://github.com/achref-soua/quiver/compare/v0.37.0...v0.38.0
 [0.37.0]: https://github.com/achref-soua/quiver/compare/v0.36.0...v0.37.0
 [0.36.0]: https://github.com/achref-soua/quiver/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/achref-soua/quiver/compare/v0.34.0...v0.35.0
