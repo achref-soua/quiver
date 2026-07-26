@@ -136,9 +136,12 @@ collection through the Python SDK, and prints how to open the cockpit. In the
 cockpit, press `v` (or `enter`) on a collection to open the **constellation
 view** — a 2-D random-projection scatter of its vector space with the query's
 nearest neighbour highlighted; move the cursor and press `enter` to re-query
-around any point. _(The recorded cockpit cast lands in `docs/assets/`; produce
-it on a real terminal with `scripts/record-cockpit-cast.sh`.)_ To build and
-exercise the workspace directly:
+around any point. A recorded tour of exactly that — the dashboard, the keybindings,
+a 256-point constellation and a re-query — ships at
+[`docs/assets/cockpit.cast`](./docs/assets/cockpit.cast); play it with
+`asciinema play docs/assets/cockpit.cast`, or re-record it in one command with
+`scripts/record-cockpit-cast.sh` (interactive on a TTY, scripted anywhere else).
+To build and exercise the workspace directly:
 
 ```bash
 just build            # compile the workspace
