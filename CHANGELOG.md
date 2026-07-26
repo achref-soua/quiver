@@ -12,6 +12,14 @@ for the per-release rationale and Definitions of Done.
 
 ### Added
 
+- **Binary quantization is now reachable over gRPC** ([ADR-0074](docs/adr/0074-binary-quantization-disk-graph.md)).
+  `CreateCollectionRequest` gains a `binary` field and `Collection` reports it back;
+  the handler previously passed a hard-coded `false`, so a gRPC client could not create
+  the collection it wanted and could not see what it had got. REST and the MCP server
+  already exposed it. `Collection` also gains `index_ready`, matching REST. Both are
+  additive proto fields, and `binary` defaults to `false`, so product quantization
+  remains the default.
+
 - **`index_ready` on the collection API** ([ADR-0081](docs/adr/0081-index-readiness.md)).
   `GET /v1/collections/{name}` (and the list endpoint) now report whether a search is
   answered from a built index. A search does not need it — it waits for the first build

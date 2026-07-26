@@ -40,10 +40,12 @@ mod tests {
             }],
             multivector: false,
             vector_encryption: v1::VectorEncryption::None as i32,
+            binary: true,
         };
         assert_eq!(req.dim, 8);
         assert_eq!(req.index, v1::IndexKind::DiskVamana as i32);
         assert_eq!(req.filterable.len(), 1);
+        assert!(req.binary, "binary quantization is on the wire (ADR-0074)");
         let resp = v1::SearchResponse::default();
         assert!(resp.matches.is_empty());
     }
