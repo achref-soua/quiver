@@ -10,6 +10,21 @@ for the per-release rationale and Definitions of Done.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The GPU seam now actually falls back to the CPU.** The `gpu` module promised the
+  GPU was "a pure accelerator … never a correctness dependency", but a `cuda`-feature
+  build on a machine without a loadable CUDA driver **panicked** out of
+  `batch_l2_sq` instead of using the CPU kernel: cudarc loads the driver from a lazy
+  static that panics when `dlopen` fails, so `CudaDevice::new(0)?` never got the
+  chance to return `Err`. Any failure to reach a device — `Err` or panic — is now
+  contained and answers on the CPU SIMD kernel, as documented. No impact on a default
+  build (the feature is off, and the kernel currently has no callers), but it would
+  have become a crash the moment [ADR-0079](docs/adr/0079-gpu-build-search-wiring.md)
+  wired the kernel into the IVF build path. CI now *runs* the `cuda`-feature tests on
+  its GPU-less runner rather than only compiling them, which is the case that matters
+  and the reason this went unnoticed.
+
 ## [0.38.0] — Ebb — 2026-07-25
 
 Elastic scaling now runs in **both** directions. The named gap in cluster operations —
