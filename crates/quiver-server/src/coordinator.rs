@@ -47,9 +47,11 @@ const COPY_PAGE: usize = 1_000;
 /// `standby_urls` — driving the same safe online migration as a manual
 /// `POST /cluster/shards/grow`. An explicit policy, not magic: nothing scales
 /// without a configured threshold and a standby to grow into, a cooldown bounds the
-/// rate, and a migration in flight is never interrupted. Scale-*in* is deliberately
-/// **not** automated here (a safe online drain is a separate increment); shrink
-/// stays a manual, drained `DELETE /cluster/shards/{id}`.
+/// rate, and a migration in flight is never interrupted. Scale-*in* has an equally
+/// safe automated operation — `POST /cluster/shards/{id}/drain` (ADR-0080) — but is
+/// deliberately still **operator-triggered**: shrinking on a low-water signal invites
+/// flapping (drain out, refill, drain again) and, unlike a grow, it decommissions a
+/// machine. A low-water policy is a separate, opt-in decision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoscaleConfig {
@@ -260,6 +262,20 @@ impl CoordinatorState {
         .map(|_| ())
     }
 
+    // Whether `url` already holds `id` in `collection`. Unreachable or errored reads
+    // answer `false` — the callers treat "not known to be present" as absent, which is
+    // the safe answer for both of them (the copy re-sends the point; the drop keeps it).
+    async fn has_point(&self, url: &str, collection: &str, id: &str) -> bool {
+        self.auth(
+            self.http
+                .get(format!("{url}/v1/collections/{collection}/points/{id}")),
+        )
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+    }
+
     // One page of a donor's points (id + payload, and the vector when `with_vector`).
     async fn fetch_page(
         &self,
@@ -278,44 +294,44 @@ impl CoordinatorState {
         Ok(body["points"].as_array().cloned().unwrap_or_default())
     }
 
-    // Copy the slice owned by `new_id` from one donor to the new shard, paginated.
-    // **Get-if-absent**: a point already on the new shard was put there by a concurrent
+    // Copy the migrating points out of `source`, paginated: `destination` maps a point
+    // id to the shard URL that must end up holding it (`None` = not migrating, skip).
+    // One loop serves both directions — a **join** sends the joining shard's slice from
+    // each donor to that one shard, a **drain** ([ADR-0080]) sends every point of the
+    // leaving shard to whichever survivor now owns it.
+    //
+    // **Get-if-absent**: a point already on the destination was put there by a concurrent
     // dual-write (the latest value), so the copy skips it. For a point still absent we
-    // re-read the donor's *current* value (the donor also receives the dual-write during
+    // re-read the source's *current* value (the source also receives the dual-write during
     // migration) rather than the paginated snapshot, so the copied value is as fresh as
     // possible. A residual best-effort window remains — a dual-write landing between the
     // absence check and this write can still be overwritten — which is harmless because
     // upserts are idempotent and last-write-wins; a fully lost-update-free handoff needs
     // version-stamped writes (future work). The copy never invents data.
-    async fn copy_slice(
+    async fn copy_points<F>(
         &self,
-        donor: &str,
-        new_url: &str,
+        source: &str,
         collection: &str,
-        map: &ShardMap,
-        new_id: u64,
-    ) -> Result<(), Error> {
+        destination: F,
+    ) -> Result<(), Error>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let mut offset = 0usize;
         loop {
-            let page = self.fetch_page(donor, collection, offset, true).await?;
+            let page = self.fetch_page(source, collection, offset, true).await?;
             let n = page.len();
             for pt in &page {
                 let Some(id) = pt["id"].as_str() else {
                     continue;
                 };
-                if map.shard_for(id).id != new_id {
+                let Some(new_url) = destination(id) else {
+                    continue;
+                };
+                if self.has_point(&new_url, collection, id).await {
                     continue;
                 }
-                let get = format!("{new_url}/v1/collections/{collection}/points/{id}");
-                let present = self
-                    .auth(self.http.get(&get))
-                    .send()
-                    .await
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false);
-                if present {
-                    continue;
-                }
+                let donor = source;
                 // Re-read the donor's current value so we copy the freshest data
                 // (the donor also receives dual-writes during migration). A 404
                 // means the point was deleted concurrently — skip it; any other
@@ -342,24 +358,40 @@ impl CoordinatorState {
         }
     }
 
-    // After the flip, delete the donor's now-stale copies of `new_id`'s slice.
-    async fn drop_slice(
+    // After the flip, delete `source`'s now-stale copies of the migrated points —
+    // the donor's copy of a joined slice, or every point of a drained shard.
+    // `destination` is the same mapping the copy used.
+    //
+    // A copy is deleted **only after confirming the destination holds it**, so a drop
+    // can never remove the last copy of a point: a point the copy somehow missed stays
+    // put (and is counted in the returned "kept" tally) rather than being deleted on
+    // the strength of an assumption.
+    async fn drop_copies<F>(
         &self,
-        donor: &str,
+        source: &str,
         collection: &str,
-        map: &ShardMap,
-        new_id: u64,
-    ) -> Result<(), Error> {
+        destination: F,
+    ) -> Result<usize, Error>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let mut offset = 0usize;
         let mut ids: Vec<String> = Vec::new();
+        let mut kept = 0usize;
         loop {
-            let page = self.fetch_page(donor, collection, offset, false).await?;
+            let page = self.fetch_page(source, collection, offset, false).await?;
             let n = page.len();
             for pt in &page {
-                if let Some(id) = pt["id"].as_str()
-                    && map.shard_for(id).id == new_id
-                {
+                let Some(id) = pt["id"].as_str() else {
+                    continue;
+                };
+                let Some(new_url) = destination(id) else {
+                    continue;
+                };
+                if self.has_point(&new_url, collection, id).await {
                     ids.push(id.to_owned());
+                } else {
+                    kept += 1;
                 }
             }
             offset += n;
@@ -370,12 +402,12 @@ impl CoordinatorState {
         for chunk in ids.chunks(COPY_PAGE) {
             self.send_json(
                 reqwest::Method::DELETE,
-                &format!("{donor}/v1/collections/{collection}/points"),
+                &format!("{source}/v1/collections/{collection}/points"),
                 json!({ "ids": chunk }),
             )
             .await?;
         }
-        Ok(())
+        Ok(kept)
     }
 
     // The full migration: wait for dual-write to be live, copy each donor's slice to
@@ -410,12 +442,14 @@ impl CoordinatorState {
                 "auto-migration does not yet support multivector collections".into(),
             ));
         }
+        // The joining shard owns exactly the ids HRW routes to it; everything else on a
+        // donor stays put.
+        let destination = |id: &str| (map.shard_for(id).id == new_id).then(|| new_url.clone());
         for c in &collections {
             let name = c["name"].as_str().unwrap_or_default().to_owned();
             self.ensure_collection(&new_url, c).await?;
             for donor in &donors {
-                self.copy_slice(donor, &new_url, &name, &map, new_id)
-                    .await?;
+                self.copy_points(donor, &name, destination).await?;
             }
         }
         // Flip ownership atomically.
@@ -429,11 +463,115 @@ impl CoordinatorState {
         for c in &collections {
             let name = c["name"].as_str().unwrap_or_default().to_owned();
             for donor in &donors {
-                self.drop_slice(donor, &name, &map, new_id).await?;
+                let kept = self.drop_copies(donor, &name, destination).await?;
+                if kept > 0 {
+                    tracing::warn!(
+                        shard = new_id,
+                        collection = %name,
+                        kept,
+                        "kept slice points the new shard does not hold (drop is presence-checked)"
+                    );
+                }
             }
         }
         tracing::info!(shard = new_id, "cluster migration complete");
         Ok(())
+    }
+
+    // --- Drain (scale-in, ADR-0080) ----------------------------------------
+
+    // The full reverse migration of a **leaving** shard: wait for the routers to adopt
+    // the leaving map (ownership of its slice has already moved to the survivors, and
+    // it is being dual-written as the donor), copy every point it holds to its new
+    // owner, remove it from the map, wait for the routers to adopt the removal, then
+    // drop the copies it no longer owns. The mirror of `run_migration`, and it holds the
+    // same invariants: the slice stays queryable throughout (the leaving shard keeps
+    // serving searches and gets until the removal) and no acknowledged write is lost
+    // (every write to the slice lands on both the new owner and the leaving shard for
+    // the whole copy). Single-vector collections only, like the join path.
+    async fn run_drain(&self, id: u64) -> Result<(), Error> {
+        tokio::time::sleep(MIGRATION_GRACE).await;
+        // One snapshot serves the whole drain: `shard_for` already skips the leaving
+        // shard, so the destination it names is the *post-removal* owner and does not
+        // move at the flip. Membership is otherwise stable (no concurrent migration).
+        let map = self.map.read().await.clone();
+        let leaving_url = map
+            .shards()
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.primary_url.clone())
+            .ok_or_else(|| Error::Internal("draining shard left the map".into()))?;
+        let collections = self.list_collection_metas(&leaving_url).await?;
+        if collections
+            .iter()
+            .any(|c| c["multivector"].as_bool().unwrap_or(false))
+        {
+            return Err(Error::BadRequest(
+                "auto-drain does not yet support multivector collections".into(),
+            ));
+        }
+        let destination = |pid: &str| Some(map.shard_for(pid).primary_url.clone());
+        for c in &collections {
+            let name = c["name"].as_str().unwrap_or_default().to_owned();
+            // A survivor may have joined after this collection was created, so make
+            // sure every destination can receive the slice.
+            for s in map.shards().iter().filter(|s| s.id != id) {
+                self.ensure_collection(&s.primary_url, c).await?;
+            }
+            self.copy_points(&leaving_url, &name, destination).await?;
+        }
+        // Flip: the shard leaves the map. Ownership moved at `mark_leaving`, so this
+        // ends the dual-write and takes the shard out of the search fan-out.
+        {
+            let mut m = self.map.write().await;
+            m.remove_shard(id)
+                .map_err(|e| Error::BadRequest(e.to_string()))?;
+            self.persist(&m)?;
+        }
+        tokio::time::sleep(MIGRATION_GRACE).await;
+        for c in &collections {
+            let name = c["name"].as_str().unwrap_or_default().to_owned();
+            let kept = self.drop_copies(&leaving_url, &name, destination).await?;
+            if kept > 0 {
+                tracing::warn!(
+                    shard = id,
+                    collection = %name,
+                    kept,
+                    "kept points the new owner does not hold (drop is presence-checked)"
+                );
+            }
+        }
+        tracing::info!(shard = id, "cluster drain complete");
+        Ok(())
+    }
+
+    // Mark a shard as leaving and run the drain in the background, returning the
+    // leaving map immediately. The body of `POST /cluster/shards/{id}/drain`. On
+    // failure the drain is aborted and the shard resumes owning its slice — it has been
+    // dual-written throughout, so an abort loses nothing either.
+    async fn drain_shard(self: &Arc<Self>, id: u64) -> Result<ShardMap, Error> {
+        let snapshot = {
+            let mut map = self.map.write().await;
+            if map.shards().iter().any(|s| map.is_joining(s.id)) {
+                return Err(Error::BadRequest(
+                    "a migration is already in flight; retry once it completes".into(),
+                ));
+            }
+            map.mark_leaving(id)
+                .map_err(|e| Error::BadRequest(e.to_string()))?;
+            self.persist(&map)?;
+            map.clone()
+        };
+        let bg = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = bg.run_drain(id).await {
+                tracing::error!(shard = id, error = %e, "cluster drain failed; aborting the drain");
+                let mut map = bg.map.write().await;
+                let _ = map.cancel_leave(id);
+                let _ = bg.persist(&map);
+            }
+        });
+        Ok(snapshot)
     }
 
     // --- Grow (shared by the manual endpoint and the autoscaler) -----------
@@ -498,7 +636,10 @@ impl CoordinatorState {
                 .iter()
                 .map(|s| s.primary_url.clone())
                 .collect();
-            let migrating = map.shards().iter().any(|s| map.is_joining(s.id));
+            let migrating = map
+                .shards()
+                .iter()
+                .any(|s| map.is_joining(s.id) || map.is_leaving(s.id));
             (active, migrating)
         };
         if migrating {
@@ -590,6 +731,7 @@ pub async fn serve_coordinator(config: Config, listener: TcpListener) -> Result<
         .route("/cluster/shards/grow", post(grow))
         .route("/cluster/shards/joining", post(add_joining_shard))
         .route("/cluster/shards/{id}/promote", post(promote_shard))
+        .route("/cluster/shards/{id}/drain", post(drain))
         .route("/cluster/shards/{id}", axum::routing::delete(remove_shard))
         .route("/cluster/health", get(health))
         .layer(middleware::from_fn_with_state(
@@ -683,6 +825,24 @@ async fn grow(
 ) -> Result<Json<ShardMap>, Error> {
     principal.require(Action::Admin, None)?;
     let snapshot = st.grow_shard(req.primary_url, req.replica_urls).await?;
+    Ok(Json(snapshot))
+}
+
+// Shrink the cluster by one shard (ADR-0080): mark it **leaving** — which hands its
+// slice to the survivors in one map version while the shard keeps serving and is
+// dual-written — then run the whole reverse migration (copy its points to their new
+// owners, remove it from the map, drop the copies it no longer owns) in the background,
+// so the request returns immediately with the leaving map. The slice stays queryable and
+// no acknowledged write is lost throughout. On any failure the drain is aborted and the
+// shard resumes ownership. The drained shard ends up empty and out of the map, ready to
+// be shut down.
+async fn drain(
+    State(st): State<Arc<CoordinatorState>>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<u64>,
+) -> Result<Json<ShardMap>, Error> {
+    principal.require(Action::Admin, None)?;
+    let snapshot = st.drain_shard(id).await?;
     Ok(Json(snapshot))
 }
 
