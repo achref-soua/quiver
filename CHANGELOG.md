@@ -43,6 +43,15 @@ for the per-release rationale and Definitions of Done.
 
 ### Fixed
 
+- **The Raft router failover test no longer flakes.** It asserted that a write issued
+  immediately after killing the leader succeeds on the first attempt — but a write
+  during a leader election legitimately fails, because the router has nobody to route
+  it to and says so rather than accepting a write it cannot commit. The test was
+  demanding that an election take zero time, not that the router recovers. It now
+  retries through the election, exactly as the create above it already did, and
+  asserts the guarantee that actually matters: the router rediscovers the new leader
+  and no acknowledged write is lost. Confirmed over **30 consecutive runs**.
+
 - **A freshly loaded collection no longer returns an empty result set**
   ([ADR-0081](docs/adr/0081-index-readiness.md)). Two correct decisions composed into a
   wrong answer: a bulk load defers its index work and marks the collection stale
