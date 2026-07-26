@@ -82,7 +82,7 @@ fn metric_to_proto(metric: DistanceMetric) -> i32 {
     value as i32
 }
 
-fn index_spec_from_proto(kind: i32, pq_subspaces: Option<u32>) -> IndexSpec {
+fn index_spec_from_proto(kind: i32, pq_subspaces: Option<u32>, binary: bool) -> IndexSpec {
     let kind = match v1::IndexKind::try_from(kind) {
         Ok(v1::IndexKind::Vamana) => IndexKind::Vamana,
         Ok(v1::IndexKind::DiskVamana) => IndexKind::DiskVamana,
@@ -90,13 +90,10 @@ fn index_spec_from_proto(kind: i32, pq_subspaces: Option<u32>) -> IndexSpec {
         Ok(v1::IndexKind::Colbert) => IndexKind::Colbert,
         _ => IndexKind::Hnsw,
     };
-    // ponytail: binary quantization (ADR-0074) isn't on the gRPC wire yet — it needs
-    // a proto field + codegen. REST and MCP expose it today; add the proto field when
-    // a gRPC client needs it.
     IndexSpec {
         kind,
         pq_subspaces,
-        binary: false,
+        binary,
     }
 }
 
@@ -176,6 +173,8 @@ fn collection_to_proto(info: CollectionInfo) -> v1::Collection {
         filterable: filterable_to_proto(info.filterable),
         multivector: info.multivector,
         vector_encryption: vector_encryption_to_proto(info.vector_encryption),
+        binary: info.index.binary,
+        index_ready: info.index_ready,
     }
 }
 
@@ -327,7 +326,7 @@ impl Quiver for QuiverService {
     ) -> Result<Response<v1::Collection>, Status> {
         let principal = self.authenticate(&request)?;
         let req = request.into_inner();
-        let index = index_spec_from_proto(req.index, req.pq_subspaces);
+        let index = index_spec_from_proto(req.index, req.pq_subspaces, req.binary);
         let filterable = filterable_from_proto(req.filterable);
         let info = self
             .state
