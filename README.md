@@ -8,7 +8,8 @@
 
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 [![rust](https://img.shields.io/badge/rust-stable-orange)](./rust-toolchain.toml)
-[![CI](https://img.shields.io/badge/CI-manual%20dispatch-informational)](.github/workflows)
+[![CI](https://img.shields.io/badge/CI-every%20PR-brightgreen)](.github/workflows)
+[![coverage](https://img.shields.io/badge/coverage-90.9%25-brightgreen)](.github/workflows/ci.yml)
 [![release](https://img.shields.io/badge/release-v0.38.0-FFB000)](https://github.com/achref-soua/quiver/releases)
 [![status](https://img.shields.io/badge/status-v0.38.0%20·%20phase%205-FFB000)](./docs/roadmap.md)
 [![stars](https://img.shields.io/badge/Star_on-GitHub-FFB000?logo=github)](https://github.com/achref-soua/quiver/stargazers)
@@ -81,7 +82,7 @@ verify its SHA-256 checksum before touching your disk, and install to `~/.local/
 (Linux/macOS) or `%LOCALAPPDATA%\quiver\bin` (Windows). On Linux the installer also
 creates a `.desktop` entry and app-launcher icon. On macOS it creates a `Quiver.app`
 bundle with the custom icon so you can pin it to the Dock. The Windows binary has the
-icon embedded natively. To pin a specific version, set `QUIVER_VERSION=0.17.0` before running.
+icon embedded natively. To pin a specific version, set `QUIVER_VERSION=0.38.0` before running.
 
 Once installed, keep Quiver up to date with:
 
@@ -171,11 +172,15 @@ All developer tasks run through [`just`](./justfile):
 | `just test-py` | Python SDK test suite (via `uv`) |
 | `just run` / `just tui` | run the server / the cockpit |
 | `just demo` | encrypted server + seeded demo collection |
+| `just acceptance` | boot a real server and drive every surface (REST · both SDKs · CLI · MCP) |
 | `just bench *ARGS` | run the benchmark harness (e.g. `just bench --synthetic`) |
-| `just coverage` | HTML coverage report |
+| `just coverage` | HTML coverage report (CI gates the same measurement at 85%) |
+| `just fuzz <target> <secs>` | fuzz a parser (`filter_json` · `page_decode` · `wal_decode`) |
 | `just docker` | build the container image |
 
-The `ci` (fmt · clippy · test · doc) and `security` (deny · audit · gitleaks) workflows under [`.github/workflows`](.github/workflows) run automatically on every pull request and on pushes to `main`/`develop`; the heavier `build` workflow stays manual (`workflow_dispatch`). Local `just verify` runs the same steps as the fast pre-commit gate, so the two never drift ([ADR-0015](./docs/adr/0015-ci-policy.md)).
+The `ci` and `security` workflows under [`.github/workflows`](.github/workflows) run on every pull request and on pushes to `main`/`develop`; the heavier `build` workflow stays manual (`workflow_dispatch`). `ci` gates **fmt · clippy · test · doc**, a **coverage** floor of 85% lines (`cargo llvm-cov`), the **acceptance** run below, `helm lint`, and crate publishability; `security` gates **deny · audit · gitleaks**. Local `just verify` runs the same fast pre-commit steps, so the two never drift ([ADR-0015](./docs/adr/0015-ci-policy.md)).
+
+The **acceptance** job is the one worth knowing about: it boots a real encryption-at-rest server and drives every external surface the way an operator does — REST, both SDKs, the CLI importer, and the MCP server over stdio. Both SDK unit suites mock their transport, so they prove the client's shape but never that it matches what the server sends; the acceptance run is what crosses a real socket.
 
 ## SDK & benchmarks
 
