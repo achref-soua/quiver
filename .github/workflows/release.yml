@@ -222,7 +222,7 @@ jobs:
       - uses: pnpm/action-setup@v6
         with:
           version: "11.6.0" # matches packageManager; pnpm 11 needs Node >= 22.13
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
