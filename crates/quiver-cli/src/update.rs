@@ -336,6 +336,88 @@ mod tests {
     }
 
     #[test]
+    fn asset_name_matches_the_release_artifacts() {
+        // These strings are how `quiver update` finds its download. They must match
+        // the artifacts release.yml publishes, and nothing else in the tree ties the
+        // two together — a rename on either side is silent until a user updates.
+        assert_eq!(asset_name("linux", "x86_64"), "quiver-linux-x86_64");
+        assert_eq!(asset_name("linux", "aarch64"), "quiver-linux-aarch64");
+        assert_eq!(asset_name("macos", "x86_64"), "quiver-macos-x86_64");
+        assert_eq!(asset_name("macos", "aarch64"), "quiver-macos-aarch64");
+        // Only Windows carries the suffix.
+        assert_eq!(asset_name("windows", "x86_64"), "quiver-windows-x86_64.exe");
+    }
+
+    #[test]
+    fn this_platform_resolves_to_a_published_target() {
+        // Guards the host the tests run on: if `platform()`/`arch()` cannot name
+        // this machine, self-update is broken here and should say so.
+        let os = platform().expect("this OS should be supported");
+        let cpu = arch().expect("this architecture should be supported");
+        assert!(!asset_name(os, cpu).is_empty());
+    }
+
+    #[test]
+    fn semver_tolerates_the_v_prefix_and_short_or_junk_versions() {
+        // The GitHub tag carries a `v`; the crate version does not.
+        assert!(is_newer("0.38.0", "v0.39.0"));
+        assert!(
+            !is_newer("v0.39.0", "0.39.0"),
+            "the same version is not newer"
+        );
+        // Missing components read as zero rather than panicking.
+        assert!(is_newer("1.0", "1.0.1"));
+        assert!(!is_newer("1.0.0", "1"));
+        // Unparseable input degrades to 0.0.0 instead of crashing the updater.
+        assert!(!is_newer("0.1.0", "not-a-version"));
+        assert!(is_newer("not-a-version", "0.1.0"));
+    }
+
+    // `atomic_replace` overwrites the binary the user runs. If it half-completes,
+    // it leaves them with no working `quiver` at all, so it is worth pinning
+    // properly rather than trusting the rename.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replace_swaps_the_binary_and_leaves_no_debris() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("quiver");
+        std::fs::write(&exe, b"OLD BINARY").unwrap();
+
+        atomic_replace(&exe, b"NEW BINARY").unwrap();
+
+        assert_eq!(std::fs::read(&exe).unwrap(), b"NEW BINARY");
+        let mode = std::fs::metadata(&exe).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "the replacement must stay executable");
+
+        // No `quiver-update-<pid>.tmp` left behind for the next run to trip over.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("update") && n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replace_reports_where_it_failed_instead_of_panicking() {
+        // A directory that does not exist stands in for any unwritable target: the
+        // updater must return an error the caller can print, not unwind.
+        let missing = std::path::PathBuf::from("/nonexistent-quiver-dir/quiver");
+        let err = atomic_replace(&missing, b"NEW").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("temp file") || format!("{err:#}").contains("replace"),
+            "the error should say what it was doing: {err:#}"
+        );
+    }
+
+    #[test]
     fn sha256_checksum_file_format() {
         // checksum files often look like "abc123  filename"
         let data = b"quiver binary content";
