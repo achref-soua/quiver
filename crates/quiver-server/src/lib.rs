@@ -630,6 +630,11 @@ pub(crate) struct AppState {
     // observes a deferred rebuild schedules one here, single-flighted so concurrent
     // readers never kick off duplicate builds for the same collection.
     rebuilding: Arc<Mutex<HashSet<String>>>,
+    // Per-collection gates for the **first** index build (ADR-0081). A stale index
+    // has a prior snapshot to serve while it rebuilds; an unbuilt one does not, so a
+    // reader must wait for it rather than be answered from nothing. Concurrent first
+    // readers queue on the same gate, so they wait for one build, not N.
+    first_build: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     // Lock-free MVCC read cache (ADR-0064 increment 3): cached `arc-swap` snapshot
     // cells for MVCC-served collections. A pure-vector search loads the cell and
     // searches it **without taking the database lock**, so it never blocks on a
@@ -665,6 +670,11 @@ pub(crate) struct CollectionInfo {
     pub filterable: Vec<FilterableField>,
     pub multivector: bool,
     pub vector_encryption: VectorEncryption,
+    /// Whether a search would be answered from a built index (ADR-0081). `false`
+    /// only between a first write and that collection's first index build; a search
+    /// waits for the build rather than returning an empty result, so this exists for
+    /// callers that would rather poll than block.
+    pub index_ready: bool,
 }
 
 /// A point to upsert.
@@ -799,6 +809,10 @@ impl AppState {
         T: Send + 'static,
         F: FnOnce(&Database) -> quiver_embed::Result<T> + Send + 'static,
     {
+        // A collection whose index has never been built has no prior snapshot to be
+        // isolated to, so the read below would answer from nothing (ADR-0081). Wait
+        // for the first build instead — once per collection, not per read.
+        self.ensure_index_built(&collection).await?;
         let db = Arc::clone(&self.db);
         let cells = Arc::clone(&self.snapshot_cells);
         let coll = collection.clone();
@@ -828,6 +842,49 @@ impl AppState {
             self.schedule_rebuild(collection);
         }
         Ok(result)
+    }
+
+    // Whether `collection` can answer a search correctly right now (ADR-0081): its
+    // index is built, or it has no points so an empty answer is the right one.
+    async fn index_ready(&self, collection: &str) -> Result<bool, Error> {
+        let db = Arc::clone(&self.db);
+        let coll = collection.to_owned();
+        tokio::task::spawn_blocking(move || {
+            db.read()
+                .ok()
+                // A collection that is missing here raced a drop; report it ready and
+                // let the read itself produce the honest "not found".
+                .is_none_or(|g| g.index_ready(&coll).unwrap_or(true))
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))
+    }
+
+    // Wait for `collection`'s first index build (ADR-0081), single-flighted per
+    // collection so concurrent first readers share one build. Steady-state reads take
+    // only the cheap readiness check and never reach the gate: once an index exists it
+    // stays built, and later staleness is handled by the off-lock rebuild (ADR-0062).
+    async fn ensure_index_built(&self, collection: &str) -> Result<(), Error> {
+        if self.index_ready(collection).await? {
+            return Ok(());
+        }
+        let gate = {
+            let mut gates = self
+                .first_build
+                .lock()
+                .map_err(|_| Error::Internal("first-build lock poisoned".to_owned()))?;
+            Arc::clone(
+                gates
+                    .entry(collection.to_owned())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _held = gate.lock().await;
+        // Re-check under the gate: whoever held it before us may have done the build.
+        if !self.index_ready(collection).await? {
+            self.run_rebuild(collection).await;
+        }
+        Ok(())
     }
 
     // The cached lock-free snapshot cell for `collection`, if one has been warmed
@@ -1172,6 +1229,7 @@ impl AppState {
                 filterable,
                 multivector,
                 vector_encryption,
+                index_ready: true,
             });
         }
         let descriptor = Descriptor::new(dim, Dtype::F32, metric)
@@ -1199,6 +1257,7 @@ impl AppState {
             filterable,
             multivector,
             vector_encryption,
+            index_ready: true,
         })
     }
 
@@ -1234,6 +1293,7 @@ impl AppState {
             } else {
                 db.len(&name)? as u64
             };
+            let index_ready = db.index_ready(&name)?;
             Ok(CollectionInfo {
                 name,
                 dim: descriptor.dim,
@@ -1243,6 +1303,7 @@ impl AppState {
                 filterable: descriptor.filterable,
                 multivector: descriptor.multivector,
                 vector_encryption: descriptor.vector_encryption,
+                index_ready,
             })
         })
         .await
@@ -1264,6 +1325,7 @@ impl AppState {
                         } else {
                             db.len(&name)? as u64
                         };
+                        let index_ready = db.index_ready(&name)?;
                         out.push(CollectionInfo {
                             name,
                             dim: descriptor.dim,
@@ -1273,6 +1335,7 @@ impl AppState {
                             filterable: descriptor.filterable,
                             multivector: descriptor.multivector,
                             vector_encryption: descriptor.vector_encryption,
+                            index_ready,
                         });
                     }
                 }
@@ -1312,11 +1375,15 @@ impl AppState {
             Outcome::of(&result),
         );
         // Evict the dropped collection's cached lock-free cell (ADR-0064 increment 3)
-        // so a later same-named collection never serves a stale cell.
-        if matches!(result, Ok(true))
-            && let Ok(mut map) = self.snapshot_cells.write()
-        {
-            map.remove(&resource);
+        // so a later same-named collection never serves a stale cell, and its
+        // first-build gate (ADR-0081) so the map tracks live collections only.
+        if matches!(result, Ok(true)) {
+            if let Ok(mut map) = self.snapshot_cells.write() {
+                map.remove(&resource);
+            }
+            if let Ok(mut gates) = self.first_build.lock() {
+                gates.remove(&resource);
+            }
         }
         result
     }
@@ -2129,6 +2196,7 @@ pub async fn serve(
         rate_limiter: Arc::new(RateLimiter::new(config.rate_limit)),
         metrics: Arc::new(metrics::Metrics::default()),
         rebuilding: Arc::new(Mutex::new(HashSet::new())),
+        first_build: Arc::new(Mutex::new(HashMap::new())),
         snapshot_cells: Arc::new(RwLock::new(HashMap::new())),
         mvcc,
         cluster,

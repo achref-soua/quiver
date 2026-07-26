@@ -276,6 +276,12 @@ struct CollectionHandle {
     // Internal-id ↔ external-id map, base on disk + resident tail (ADR-0073).
     idmap: IdMap,
     stale: bool,
+    // Whether an index has ever been installed for this collection (ADR-0081).
+    // `stale` says a rebuild is owed; this says whether there is a *prior snapshot*
+    // to serve in the meantime. Serving a slightly-out-of-date index while it
+    // rebuilds off-lock (ADR-0062) is a good trade; serving an index that was never
+    // built answers a loaded collection with nothing, which is not.
+    ever_built: bool,
     // Monotonic per-collection write counter, bumped every time a write defers a
     // rebuild (`mark_stale`). An off-lock rebuild (ADR-0062) captures it before
     // building and re-checks it at commit: if it advanced, a write landed during
@@ -409,6 +415,7 @@ impl Database {
                 descriptor,
                 idmap: IdMap::empty(),
                 stale: true,
+                ever_built: false,
                 write_gen: 0,
                 docs: None,
                 // Populated by `load_index` / `rebuild_index` from the store.
@@ -473,6 +480,7 @@ impl Database {
                 index,
                 idmap: IdMap::empty(),
                 stale: false,
+                ever_built: false,
                 write_gen: 0,
                 docs,
                 sparse,
@@ -570,6 +578,7 @@ impl Database {
                         index,
                         idmap: IdMap::empty(),
                         stale: false,
+                        ever_built: false,
                         write_gen: 0,
                         docs,
                         sparse: None,
@@ -984,6 +993,27 @@ impl Database {
     /// searches rebuild synchronously via [`Database::ensure_indexed`]).
     pub fn needs_rebuild(&self, collection: &str) -> Result<bool> {
         Ok(self.handle(collection)?.stale)
+    }
+
+    /// Whether a collection can answer a search *correctly* right now (ADR-0081).
+    ///
+    /// This is a different question from [`Database::needs_rebuild`], and conflating
+    /// the two is what made a freshly-loaded collection return an empty result set.
+    /// A **stale** index has a prior snapshot, so serving it while a rebuild runs
+    /// off-lock is merely slightly out of date — the ADR-0062 trade. An **unbuilt**
+    /// index has no prior snapshot at all, so the same code path answers from
+    /// nothing and reports "no matches" for a collection full of points.
+    ///
+    /// Only HNSW is live from creation (`CollectionIndex::Hnsw` is not an `Option`);
+    /// IVF, Vamana, DiskVamana and ColBERT are all built on first use. An empty
+    /// collection is always ready — returning no matches is the right answer — as is
+    /// a fetch-only client-side-encrypted collection, which has no index to build.
+    pub fn index_ready(&self, collection: &str) -> Result<bool> {
+        let handle = self.handle(collection)?;
+        // Not stale: the index is current, by definition ready. Ever built: there is
+        // a real prior snapshot, so ADR-0062's "serve it while the rebuild runs"
+        // applies. Empty: no data to miss, so an empty answer is the correct one.
+        Ok(handle.ever_built || !handle.stale || self.store.len(handle.id)? == 0)
     }
 
     /// Capture everything an off-lock rebuild needs (ADR-0062): under the shared
@@ -2418,6 +2448,7 @@ fn restore_disk_snapshot(store: &Store, handle: &mut CollectionHandle, blob: &[u
     }
     handle.index = CollectionIndex::Disk(Some(fresh));
     handle.stale = false;
+    handle.ever_built = true;
     replay_recovery_tail(store, handle)
 }
 
@@ -2456,6 +2487,7 @@ fn restore_ivf_snapshot(store: &Store, handle: &mut CollectionHandle, blob: &[u8
     }
     handle.index = CollectionIndex::Ivf(Some(ivf));
     handle.stale = false;
+    handle.ever_built = true;
 
     let tail = store.recovery_tail(handle.id)?;
     for ext in &tail.deleted {
@@ -2760,6 +2792,7 @@ fn rebuild_index(store: &Store, handle: &mut CollectionHandle) -> Result<()> {
     handle.docs = scan.docs;
     handle.sparse = scan.sparse;
     handle.stale = false;
+    handle.ever_built = true;
     Ok(())
 }
 

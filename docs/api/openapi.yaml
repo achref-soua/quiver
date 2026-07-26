@@ -531,7 +531,7 @@ components:
         vector_encryption: { $ref: '#/components/schemas/VectorEncryption' }
     Collection:
       type: object
-      required: [name, dim, metric, count, index]
+      required: [name, dim, metric, count, index, index_ready]
       properties:
         name: { type: string }
         dim: { type: integer }
@@ -542,6 +542,13 @@ components:
         filterable: { type: array, items: { $ref: '#/components/schemas/FilterableField' } }
         multivector: { type: boolean }
         vector_encryption: { $ref: '#/components/schemas/VectorEncryption' }
+        index_ready:
+          type: boolean
+          description: >-
+            Whether a search is answered from a built index. False only between a
+            collection's first write and its first index build. A search does not
+            need this — it waits for that build rather than returning an empty
+            result — so it exists for callers that would rather poll than block.
     Point:
       type: object
       required: [id, vector]
