@@ -995,6 +995,17 @@ impl Database {
         Ok(self.handle(collection)?.stale)
     }
 
+    /// Whether an index has ever been built for `collection` (ADR-0081).
+    ///
+    /// Unlike [`Database::index_ready`] this is **monotonic**: once true it stays
+    /// true for the life of the collection, so a caller may cache it and skip the
+    /// readiness check entirely on the hot path. `index_ready` is not cacheable —
+    /// it also returns true for an *empty* collection, which stops being true the
+    /// moment data is loaded.
+    pub fn index_ever_built(&self, collection: &str) -> Result<bool> {
+        Ok(self.handle(collection)?.ever_built)
+    }
+
     /// Whether a collection can answer a search *correctly* right now (ADR-0081).
     ///
     /// This is a different question from [`Database::needs_rebuild`], and conflating
@@ -1008,6 +1019,9 @@ impl Database {
     /// IVF, Vamana, DiskVamana and ColBERT are all built on first use. An empty
     /// collection is always ready — returning no matches is the right answer — as is
     /// a fetch-only client-side-encrypted collection, which has no index to build.
+    ///
+    /// Not cacheable: the empty-collection case stops being true the moment data is
+    /// loaded. Use [`Database::index_ever_built`] for the monotonic half.
     pub fn index_ready(&self, collection: &str) -> Result<bool> {
         let handle = self.handle(collection)?;
         // Not stale: the index is current, by definition ready. Ever built: there is
@@ -1060,6 +1074,10 @@ impl Database {
         handle.idmap = build_idmap(store, handle.id, &rebuilt.int_to_ext)?;
         handle.docs = rebuilt.docs;
         handle.sparse = rebuilt.sparse;
+        // An index now exists, whichever branch above installed it. This is the
+        // server's rebuild path (ADR-0062), so without it `ever_built` would stay
+        // false forever on a server and every read would re-derive readiness.
+        handle.ever_built = true;
         // Clear stale only if no write landed since the inputs were captured;
         // otherwise leave it set so the driver rebuilds again for the newer write.
         let still_stale = handle.write_gen != rebuilt.write_gen;

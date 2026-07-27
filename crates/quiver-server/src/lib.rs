@@ -635,6 +635,11 @@ pub(crate) struct AppState {
     // reader must wait for it rather than be answered from nothing. Concurrent first
     // readers queue on the same gate, so they wait for one build, not N.
     first_build: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    // Collections whose index has been built at least once (ADR-0081). `ever_built`
+    // is monotonic, so this can be cached: the alternative is a `spawn_blocking` and
+    // a database read lock on *every* search just to re-learn something that cannot
+    // change back, which measured at 35% of query throughput.
+    index_built: Arc<RwLock<HashSet<String>>>,
     // Lock-free MVCC read cache (ADR-0064 increment 3): cached `arc-swap` snapshot
     // cells for MVCC-served collections. A pure-vector search loads the cell and
     // searches it **without taking the database lock**, so it never blocks on a
@@ -844,28 +849,21 @@ impl AppState {
         Ok(result)
     }
 
-    // Whether `collection` can answer a search correctly right now (ADR-0081): its
-    // index is built, or it has no points so an empty answer is the right one.
-    async fn index_ready(&self, collection: &str) -> Result<bool, Error> {
-        let db = Arc::clone(&self.db);
-        let coll = collection.to_owned();
-        tokio::task::spawn_blocking(move || {
-            db.read()
-                .ok()
-                // A collection that is missing here raced a drop; report it ready and
-                // let the read itself produce the honest "not found".
-                .is_none_or(|g| g.index_ready(&coll).unwrap_or(true))
-        })
-        .await
-        .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))
-    }
-
     // Wait for `collection`'s first index build (ADR-0081), single-flighted per
     // collection so concurrent first readers share one build. Steady-state reads take
     // only the cheap readiness check and never reach the gate: once an index exists it
     // stays built, and later staleness is handled by the off-lock rebuild (ADR-0062).
     async fn ensure_index_built(&self, collection: &str) -> Result<(), Error> {
-        if self.index_ready(collection).await? {
+        // Hot path: one uncontended read-lock lookup. A collection that has been
+        // built stays built, so this can never wrongly skip the gate.
+        if self
+            .index_built
+            .read()
+            .is_ok_and(|built| built.contains(collection))
+        {
+            return Ok(());
+        }
+        if self.check_and_cache_readiness(collection).await? {
             return Ok(());
         }
         let gate = {
@@ -881,10 +879,42 @@ impl AppState {
         };
         let _held = gate.lock().await;
         // Re-check under the gate: whoever held it before us may have done the build.
-        if !self.index_ready(collection).await? {
+        if !self.check_and_cache_readiness(collection).await? {
             self.run_rebuild(collection).await;
+            // The rebuild installed an index, so record it and skip the check next time.
+            let _ = self
+                .check_and_cache_readiness(collection)
+                .await
+                .map_err(|_| ());
         }
         Ok(())
+    }
+
+    // Whether `collection` can answer correctly now, caching the monotonic half of
+    // the answer. Readiness is `ever_built || !stale || empty`; only `ever_built` is
+    // permanent, so only that is cached — an empty collection is "ready" until the
+    // moment data lands, and caching *that* would reintroduce the very bug ADR-0081
+    // fixes.
+    async fn check_and_cache_readiness(&self, collection: &str) -> Result<bool, Error> {
+        let db = Arc::clone(&self.db);
+        let coll = collection.to_owned();
+        let (ready, ever_built) = tokio::task::spawn_blocking(move || {
+            let Ok(guard) = db.read() else {
+                return (true, false);
+            };
+            // A collection missing here raced a drop; report ready and let the read
+            // itself produce the honest "not found".
+            (
+                guard.index_ready(&coll).unwrap_or(true),
+                guard.index_ever_built(&coll).unwrap_or(false),
+            )
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task failed: {e}")))?;
+        if ever_built && let Ok(mut built) = self.index_built.write() {
+            built.insert(collection.to_owned());
+        }
+        Ok(ready)
     }
 
     // The cached lock-free snapshot cell for `collection`, if one has been warmed
@@ -1383,6 +1413,9 @@ impl AppState {
             }
             if let Ok(mut gates) = self.first_build.lock() {
                 gates.remove(&resource);
+            }
+            if let Ok(mut built) = self.index_built.write() {
+                built.remove(&resource);
             }
         }
         result
@@ -2197,6 +2230,7 @@ pub async fn serve(
         metrics: Arc::new(metrics::Metrics::default()),
         rebuilding: Arc::new(Mutex::new(HashSet::new())),
         first_build: Arc::new(Mutex::new(HashMap::new())),
+        index_built: Arc::new(RwLock::new(HashSet::new())),
         snapshot_cells: Arc::new(RwLock::new(HashMap::new())),
         mvcc,
         cluster,
