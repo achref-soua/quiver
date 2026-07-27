@@ -121,11 +121,54 @@ Related: the primary index (`ext_id → location`) is fully resident (~316 B/poi
 an inherent O(N) RAM cost (~31 GiB at 100M) that a large single box or an on-disk
 primary index would address.
 
-### Running 100M
-
-On reference hardware with ≥ ~64 GiB RAM (or after finding 2's streaming build):
+### Running 100M — attempted on the reference laptop, and it does not fit
 
 ```bash
 QUIVER_SCALE_N=100000000 QUIVER_SCALE_DIR=/data/scale \
   cargo test -p quiverdb-embed --release --test scale -- --ignored --nocapture
 ```
+
+Run on the reference machine (i7-12700H, 10 physical / 20 logical cores, **15.5 GiB
+RAM**, 4 GiB swap, WSL2) on 2026-07-27. **It did not complete.** Exactly how far it
+got, and why:
+
+| | |
+| --- | --- |
+| Ingested before the kernel intervened | **70,400,000 / 100,000,000** (70.4%) |
+| Wall clock to that point | **8,103 s** (~2 h 15 m) |
+| Peak RSS | **10,324 MiB** (kernel recorded `anon-rss: 10,862,876 kB` at kill) |
+| Virtual size at kill | 45.8 GiB |
+| On-disk data directory | **71 GB** |
+| Ingest rate | ~11,165 vec/s at 56.4M, decaying to **9,142 vec/s** at 70.4M |
+| Outcome | **SIGKILL by the Linux OOM killer** |
+
+The kernel's own record, which is the only reason this is stated as fact rather than
+inference:
+
+```
+Out of memory: Killed process 929030 (scale-e71e0b3c4)
+  total-vm:47981532kB, anon-rss:10862876kB, file-rss:1488kB, pgtables:92600kB
+```
+
+**This corrects an earlier estimate in this project's own notes.** A previous trial
+extrapolated the resident state at 100M to "a few GiB" and concluded that RAM would
+fit in 15 GiB. That extrapolation was wrong. Resident memory did not plateau — it
+climbed steadily through ingest and reached ~10.4 GiB at 70M, and the box ran out
+before the index build was even reached. The three O(n) resident terms closed in
+`v0.33.0`–`v0.35.0` were real and necessary, but they were not the whole bill.
+
+What this run *does* establish, measured rather than argued:
+
+- Ingest is **stable and bounded in the short run** — RSS moves in a sawtooth as each
+  checkpoint seals segments and releases memory, and the process survived more than
+  two hours of continuous writing at that scale.
+- The remaining growth is **gradual, not a cliff**, which is consistent with resident
+  per-segment state accumulating as segment count grows rather than with a per-point
+  leak.
+- The ingest rate decays slowly with collection size, roughly 18% across the last
+  14M points.
+
+What it does **not** establish, and what is therefore not published anywhere: a 100M
+recall, latency, or serving-RSS figure. A 100M run needs a machine with materially
+more RAM than 15.5 GiB. Until one is available, this section reports a failed attempt
+with its exact stopping point, which is the honest form of that gap.
