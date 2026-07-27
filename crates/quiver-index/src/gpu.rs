@@ -60,13 +60,16 @@ use crate::score::ordering_distance;
 /// launch latency exceeds the arithmetic saved, so dispatching to the device is a
 /// net loss on small batches.
 ///
-/// This is a **hardware constant, measured, not assumed** — see [ADR-0082] for the
-/// calibration run on the reference card and the sweep it came from. A different GPU
-/// has a different crossover; it stays a named constant precisely so it can be
+/// This is a **hardware constant, measured, not assumed**: on the reference card
+/// (RTX 3070 Laptop, WSL2) the assign pass at `dim = 128`, `nlist = 1024` runs
+/// 0.82× the CPU's speed at 6144 points and 1.07× at 8192 — so 8192 is the smallest
+/// batch above which the device stays ahead, reaching 4.08× at 1M. The sweep it came
+/// from is in [ADR-0082] and is re-runnable (`tests/gpu_calibration.rs`). A different
+/// GPU has a different crossover; it stays a named constant precisely so it can be
 /// re-measured rather than guessed at forever.
 ///
 /// [ADR-0082]: https://github.com/achref-soua/quiver/blob/main/docs/adr/0082-gpu-seam-and-dispatch-policy.md
-pub const GPU_MIN_BATCH: usize = 4096;
+pub const GPU_MIN_BATCH: usize = 8192;
 
 /// Whether a batch of `n` rows is large enough to be worth a device dispatch.
 /// Split out from the call sites so the policy is stated once and tested directly —
@@ -180,6 +183,15 @@ pub fn batch_assign(points: &[f32], centroids: &[f32], dim: usize) -> Vec<u32> {
     debug_assert!(
         dim > 0 && points.len().is_multiple_of(dim) && centroids.len().is_multiple_of(dim)
     );
+    #[cfg(feature = "cuda")]
+    {
+        if worth_dispatching(points.len() / dim)
+            && let Some(ctx) = cuda::context()
+            && let Ok(out) = ctx.batch_assign(points, centroids, dim)
+        {
+            return out;
+        }
+    }
     cpu_batch_assign(points, centroids, dim)
 }
 
@@ -222,6 +234,30 @@ pub fn gpu_available() -> bool {
     cuda::context().is_some()
 }
 
+/// The device assign path with the [`GPU_MIN_BATCH`] threshold **bypassed**, or
+/// `None` if no device is reachable.
+///
+/// This exists so the calibration harness can measure *where* the CPU/GPU crossover
+/// actually is, rather than only confirming whatever the constant currently says —
+/// below the threshold `batch_assign` runs the CPU path, so a sweep through it would
+/// otherwise be timing the CPU against itself and calling the result a speedup.
+/// Not part of the supported surface: it does not exist on a default build.
+#[cfg(feature = "cuda")]
+#[doc(hidden)]
+#[must_use]
+pub fn device_batch_assign(points: &[f32], centroids: &[f32], dim: usize) -> Option<Vec<u32>> {
+    cuda::context().and_then(|ctx| ctx.batch_assign(points, centroids, dim).ok())
+}
+
+/// The device scan path with the [`GPU_MIN_BATCH`] threshold bypassed. Same purpose
+/// and same caveats as [`device_batch_assign`].
+#[cfg(feature = "cuda")]
+#[doc(hidden)]
+#[must_use]
+pub fn device_batch_l2_sq(query: &[f32], batch: &[f32], dim: usize) -> Option<Vec<f32>> {
+    cuda::context().and_then(|ctx| ctx.batch_l2_sq(query, batch, dim).ok())
+}
+
 /// Whether a GPU is available — always `false` without the `cuda` feature.
 #[cfg(not(feature = "cuda"))]
 #[must_use]
@@ -236,7 +272,21 @@ mod cuda {
     use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
     use cudarc::nvrtc::compile_ptx;
 
-    // One NVRTC-compiled batch-L2 kernel: out[r] = Σ_j (a[r*d+j] − q[j])².
+    /// Points per device tile, as a byte budget rather than a row count: a tile has
+    /// to fit in VRAM alongside the centroids, and `dim` varies by three orders of
+    /// magnitude across collections. 256 MiB is comfortably inside the reference
+    /// card's 8 GiB with room for the centroid table and the output.
+    ///
+    /// This is what keeps ADR-0079's "no dataset residency in VRAM" non-goal true:
+    /// the corpus streams, so a build is never capped at the card's memory.
+    const TILE_BYTES: usize = 256 << 20;
+
+    // Two NVRTC-compiled kernels:
+    //   l2sq   — out[r] = Σ_j (a[r*d+j] − q[j])², one query against many rows.
+    //   assign — the fused argmin: one u32 per point, never the n×k distance matrix
+    //            (16 GB at 1M × 4096). Ties take the lowest centroid index, matching
+    //            the CPU `nearest_centroid`, so the backends agree wherever float
+    //            arithmetic lets them.
     const KERNEL: &str = r#"
 extern "C" __global__ void l2sq(const float* q, const float* a, float* out, int n, int d) {
   int r = blockIdx.x * blockDim.x + threadIdx.x;
@@ -244,6 +294,23 @@ extern "C" __global__ void l2sq(const float* q, const float* a, float* out, int 
   float s = 0.0f;
   for (int j = 0; j < d; j++) { float diff = a[r * d + j] - q[j]; s += diff * diff; }
   out[r] = s;
+}
+
+extern "C" __global__ void assign(const float* pts, const float* cents, unsigned int* out,
+                                  int n, int k, int d) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float* p = pts + (long long)i * d;
+  float best = 0.0f;
+  for (int j = 0; j < d; j++) { float diff = p[j] - cents[j]; best += diff * diff; }
+  unsigned int bi = 0;
+  for (int c = 1; c < k; c++) {
+    const float* q = cents + (long long)c * d;
+    float s = 0.0f;
+    for (int j = 0; j < d; j++) { float diff = p[j] - q[j]; s += diff * diff; }
+    if (s < best) { best = s; bi = (unsigned int)c; }
+  }
+  out[i] = bi;
 }"#;
 
     pub(super) struct Context {
@@ -254,8 +321,47 @@ extern "C" __global__ void l2sq(const float* q, const float* a, float* out, int 
         fn new() -> Result<Self, Box<dyn std::error::Error>> {
             let dev = CudaDevice::new(0)?;
             let ptx = compile_ptx(KERNEL)?;
-            dev.load_ptx(ptx, "quiver_l2", &["l2sq"])?;
+            dev.load_ptx(ptx, "quiver_l2", &["l2sq", "assign"])?;
             Ok(Self { dev })
+        }
+
+        /// The fused argmin over `centroids` for every `dim`-length point, tiled so
+        /// the corpus streams through VRAM instead of having to fit in it. The
+        /// centroid table is uploaded once and reused across tiles.
+        pub(super) fn batch_assign(
+            &self,
+            points: &[f32],
+            centroids: &[f32],
+            dim: usize,
+        ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+            let n = points.len() / dim;
+            let k = centroids.len() / dim;
+            if n == 0 || k == 0 {
+                return Ok(vec![0u32; n]);
+            }
+            let cents = self.dev.htod_sync_copy(centroids)?;
+            let f = self
+                .dev
+                .get_func("quiver_l2", "assign")
+                .ok_or("assign kernel not loaded")?;
+            let tile_rows = (TILE_BYTES / (dim * size_of::<f32>())).max(1);
+            let mut out = Vec::with_capacity(n);
+            for tile in points.chunks(tile_rows * dim) {
+                let rows = tile.len() / dim;
+                let pts = self.dev.htod_sync_copy(tile)?;
+                let mut dst = self.dev.alloc_zeros::<u32>(rows)?;
+                let cfg = LaunchConfig::for_num_elems(rows as u32);
+                // Safety: the kernel reads `pts[0..rows*d]` and `cents[0..k*d]` and
+                // writes `dst[0..rows]`, all sized exactly here.
+                unsafe {
+                    f.clone().launch(
+                        cfg,
+                        (&pts, &cents, &mut dst, rows as i32, k as i32, dim as i32),
+                    )?;
+                }
+                out.extend_from_slice(&self.dev.dtoh_sync_copy(&dst)?);
+            }
+            Ok(out)
         }
 
         pub(super) fn batch_l2_sq(

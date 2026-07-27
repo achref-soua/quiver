@@ -73,13 +73,97 @@ exist as functions because they are the dispatch **policy**, and a policy that l
 inline inside a `#[cfg(feature = "cuda")]` block is a policy no default-build test can
 reach.)*
 
-### 3. `GPU_MIN_BATCH` ships at 4096 in G1 and is **re-measured in G4**
+### 3. `GPU_MIN_BATCH` is **8192**, measured — not ADR-0079's guessed 4096
 
-ADR-0079 said "start at 4096 and calibrate on the target card". G1 is pure CPU and
-cannot calibrate anything, so it carries the placeholder — and the constant's doc
-comment says outright that it is a hardware number pending measurement. **G4 replaces
-it with a swept, measured crossover, or the sweep is published showing why 4096
-stands.** It is never left as a guess wearing the word "calibrated".
+ADR-0079 said "start at 4096 and calibrate on the target card". The sweep
+(`crates/quiver-index/tests/gpu_calibration.rs`, re-runnable) puts the crossover
+between 6144 and 8192 points, so the constant is **8192**.
+
+The sweep measures the device path with the threshold **bypassed**
+(`device_batch_assign`), because a sweep that respects the threshold spends its
+sub-threshold rows timing the CPU against itself and calling the ratio a speedup.
+
+**Assign pass, `dim = 128`, `nlist = 1024`, reference card (RTX 3070 Laptop, WSL2),
+median of 5:**
+
+| points | CPU ms | GPU ms | speedup | ties resolved differently |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 11.31 | 79.87 | 0.14× | 0 |
+| 2,048 | 23.49 | 79.96 | 0.29× | 0 |
+| 4,096 | 43.38 | 79.97 | 0.54× | 0 |
+| 6,144 | 66.14 | 80.22 | 0.82× | 0 |
+| **8,192** | **86.15** | **80.47** | **1.07×** | 0 |
+| 12,288 | 134.36 | 80.25 | 1.67× | 0 |
+| 16,384 | 176.99 | 81.60 | 2.17× | 0 |
+| 65,536 | 716.00 | 205.20 | 3.49× | 1 |
+| 262,144 | 2843.28 | 739.84 | 3.84× | 1 |
+| 1,048,576 | 12155.11 | 2977.06 | **4.08×** | 3 |
+
+Two things worth reading off that table rather than glossing:
+
+- **Device time is flat at ~80 ms up to 16 K points.** That is fixed per-dispatch cost
+  (launch and synchronisation through WSL2's paravirtualised `/dev/dxg`), not
+  arithmetic — which is precisely why a threshold has to exist and why it is this
+  high. On a bare-metal Linux host the crossover would very likely be lower; the
+  constant is documented as re-measurable for exactly that reason.
+- **The "ties resolved differently" column is the per-backend determinism ADR-0079
+  predicted, quantified: 3 points in 1,048,576.** The harness does not merely count
+  them — it asserts each one is a genuine tie, i.e. the device's centroid sits at
+  float-equal distance to the CPU's. A materially worse assignment fails the run.
+
+**End-to-end IVF build (`n = 200,000`, `dim = 128`, `nlist = 1024`), three runs per
+backend, same process except for `QUIVER_GPU`:**
+
+| backend | runs (s) | median | |
+| --- | --- | ---: | --- |
+| CPU (`QUIVER_GPU=0`) | 57.88, 58.26, 57.88 | **57.88 s** | |
+| GPU | 24.36, 23.96, 24.07 | **24.07 s** | **2.40× faster** |
+
+The kernel is 4× on the assign pass and the whole build is 2.4×, which is the honest
+shape: the assign pass is the largest block in a build, not the only one. The probe
+asserts the built index returns 10 results before reporting any timing — the
+[1.0 A/B trap](../benchmarks/scale-characterization.md) was a five-run, tight-range,
+utterly convincing measurement of an index that was never built.
+
+### 3a. The measure-gate outcome: **G2 ships, G3 is retired**
+
+The same harness sweeps the search-side shape — one query against `n` contiguous rows,
+which is what an IVF flat posting scan and a DiskVamana shortlist re-rank do. It loses
+at **every** size measured:
+
+| rows | CPU ms | GPU ms | speedup |
+| ---: | ---: | ---: | ---: |
+| 1,024 | 0.01 | 0.30 | 0.05× |
+| 4,096 | 0.06 | 0.44 | 0.13× |
+| 16,384 | 0.25 | 1.00 | 0.25× |
+| 65,536 | 2.11 | 6.93 | 0.30× |
+| 262,144 | 7.75 | 23.42 | 0.33× |
+| 1,048,576 | 31.12 | 86.76 | **0.36×** |
+
+Even at a million rows the device is **2.8× slower**, and the curve is still climbing
+toward — not past — parity. The reason is arithmetic intensity, and it was implicit in
+ADR-0079's own table without being drawn out: the assign pass reads `n × dim` floats
+and does `n × nlist × dim` work, reusing every byte transferred 1024 times. A scan
+reads the same `n × dim` floats and does `n × dim` work — one pass, no reuse, ~0.25
+flop per byte. That is a PCIe bandwidth problem wearing a compute problem's clothes,
+and no amount of kernel tuning fixes it while the vectors live in host memory.
+
+Therefore, under the measure-gate:
+
+- **G2 (build wiring) ships.** Wired at the two sites whose shape wins: the k-means
+  Lloyd assignment step and the IVF `build` / `build_streaming` assign pass. The
+  streaming path buffers a bounded 64 Ki-row tile before dispatching, so it keeps the
+  property it exists for — no `n × dim` arena.
+- **G3 (search wiring) is retired, not deferred.** It is measured to make search
+  slower on the reference card. Shipping it behind a threshold high enough to never
+  trigger would be shipping dead code with a promise attached.
+- **k-means++ seeding is also not wired**, though ADR-0079 listed it as a site: it is
+  one centroid against `train_n` points — the *scan* shape, on the losing side of the
+  same table.
+
+The honest one-line summary: **the GPU helps where a byte is reused a thousand times,
+and hurts where it is read once.** Quiver's builds do the former; its searches do the
+latter.
 
 ### 4. The measure-gate: G2 and G3 land only on a measured win
 
@@ -117,9 +201,18 @@ every GPU number is owner-run on real hardware or it does not exist.
 - **−** `GPU_MIN_BATCH` is a single global constant, not per-metric or per-dimension.
   A real crossover surface depends on `dim` as well as `n`. Accepted: one constant is
   honest and tunable; a fitted model would be unmeasurable precision.
-- **−** `Dot` and `Cosine` batches never reach the device. Accepted for now — the
-  build-side assign pass, which is the largest arithmetic block, is L2 by
-  construction (k-means is L2).
+- **−** `Dot` and `Cosine` batches never reach the device. Accepted, and now moot:
+  the only site that wins is the build-side assign pass, which is L2 by construction
+  (k-means is L2). The metrics that lack a device kernel are exactly the ones that
+  would only ever have used the losing scan path.
+- **−** The GPU accelerates **builds only**. A user expecting "GPU acceleration" to
+  mean faster queries will be disappointed, so the README and the field guide say
+  build-side explicitly rather than saying "GPU support" and letting the reader
+  assume. This is the single most important thing to state plainly.
+- **−** The wiring ships in the project's final release and therefore gets no
+  field-hardening. Stated in the release notes rather than left for a user to
+  discover. Containment: it is off by default (`cuda` is not a default feature), the
+  CPU path is unchanged and still the fallback, and no persisted byte differs.
 
 ## Alternatives considered
 
