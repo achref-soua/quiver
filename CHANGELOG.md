@@ -12,6 +12,65 @@ statement, including what is deliberately **not** covered.
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-07-28 — *Cairn*
+
+**This is the final planned release.** Quiver is complete: finished, not
+abandoned. What it does, what it deliberately never did, and whether anyone is
+still watching it are all stated in the project-status block in the
+[README](README.md), in [`SECURITY.md`](SECURITY.md), and — item by item, with
+reasoning — in [ADR-0083](docs/adr/0083-closing-the-backlog.md).
+
+A cairn is a stone marker left on a trail by someone who has moved on, so
+whoever comes next can find the way.
+
+### Added
+
+- **GPU-accelerated index builds**, behind the off-by-default `cuda` feature
+  ([ADR-0082](docs/adr/0082-gpu-seam-and-dispatch-policy.md), implementing
+  [ADR-0079](docs/adr/0079-gpu-build-search-wiring.md)). The device runs the assign
+  pass — every point against every centroid — in the k-means Lloyd step and the IVF
+  `build` / `build_streaming` paths. Measured on an RTX 3070 Laptop: **4.08×** on the
+  assign kernel at 1M points × 1024 centroids, and **2.40×** on an end-to-end IVF
+  build of 200k × 128 at `nlist = 1024` (57.88s → 24.07s, median of three runs each).
+  **Builds only — not search** (see *Not shipped*, below).
+  - The GPU narrows, the CPU scores: every value handed to a caller is still computed
+    by the SIMD kernel, so reported distances and recall are unchanged.
+  - `GPU_MIN_BATCH` is **8192**, the measured crossover on the reference card, not a
+    guess. Below it the CPU path runs.
+  - `QUIVER_GPU=0` forces the CPU path in a `cuda`-enabled build.
+  - A default build has no `cudarc` and is byte-identical in behaviour to `1.0.0`.
+  - New in the final release, and therefore **less field-hardened than the rest of the
+    engine**. It is off by default, the CPU path is unchanged and still the fallback,
+    and no persisted byte differs.
+- `crates/quiver-index/tests/gpu_calibration.rs` — the re-runnable sweep behind every
+  number above, including an end-to-end GPU-assisted build with a recall check.
+
+### Changed
+
+- `SECURITY.md` now states what actually happens to a vulnerability report on a
+  finished project: best-effort support for `1.1.0`, no SLA, reports still read and
+  answered, and a serious one still gets a fix and a release.
+
+### Not shipped, deliberately
+
+Every item still deferred at `1.0.0` is resolved individually in
+[ADR-0083](docs/adr/0083-closing-the-backlog.md) — delivered, or retired with its
+reasoning. The notable retirements:
+
+- **GPU search wiring**, and GPU k-means++ seeding. Measured, and the measurement said
+  no: on the reference card the device is **2.8× slower than the CPU at a million
+  rows** on the scan shape, and loses at every smaller size. The assign pass reuses
+  every transferred byte 1024 times; a scan reads each byte once.
+- **AES-256-GCM as an alternative AEAD** — worth roughly **2.7×** on this AES-NI CPU
+  (`openssl speed`, 8 KiB block), and declined anyway: selecting a cipher per seal
+  changes the at-rest format, and a late mistake there means unreadable data rather
+  than a slow query.
+- **Single-log-entry Raft batches** — a durable Raft-log format change, largely
+  redundant with the pipelining shipped in `0.37.0` wherever RTT dominates `fsync`.
+- **Per-segment bloom filters for random ids** — resident RAM *and* a format change.
+- **Fully off-lock background compaction** — cross-boundary, XL.
+- **The 10M disk-path head-to-head** — needs more RAM than the reference box.
+
 ## [1.0.0] — 2026-07-27
 
 The compatibility promise starts here. The **REST and gRPC wire protocols**, the
@@ -1274,7 +1333,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/achref-soua/quiver/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/achref-soua/quiver/compare/v0.38.0...v1.0.0
 [0.38.0]: https://github.com/achref-soua/quiver/compare/v0.37.0...v0.38.0
 [0.37.0]: https://github.com/achref-soua/quiver/compare/v0.36.0...v0.37.0

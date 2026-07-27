@@ -73,18 +73,15 @@ pub(crate) fn kmeans(
     let mut counts = vec![0u64; k];
     for _ in 0..iters {
         let mut changed = false;
-        // Assignment step.
-        for (i, slot) in assign.iter_mut().enumerate() {
-            let p = point(i);
-            let mut best = 0u32;
-            let mut best_d = f32::INFINITY;
-            for c in 0..k {
-                let d = l2_sq_f32(p, &centroids[c * dim..(c + 1) * dim]);
-                if d < best_d {
-                    best_d = d;
-                    best = c as u32;
-                }
-            }
+        // Assignment step — every point against every centroid, which is the
+        // `n · k · dim` block a device is good at (ADR-0082: 4.08× at 1M points on
+        // the reference card, CPU below `GPU_MIN_BATCH`). `batch_assign` resolves
+        // ties to the lowest centroid index exactly as the per-row loop it replaces
+        // did, so the CPU backend's output is unchanged.
+        for (slot, &best) in assign
+            .iter_mut()
+            .zip(&crate::gpu::batch_assign(data, &centroids, dim))
+        {
             if *slot != best {
                 *slot = best;
                 changed = true;
