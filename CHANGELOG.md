@@ -4,11 +4,51 @@ All notable changes to Quiver are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-Quiver is pre-1.0: minor releases ship coherent, owner-gated feature sets and
-may include pre-1.0 API refinements. See [`docs/roadmap.md`](docs/roadmap.md)
-for the per-release rationale and Definitions of Done.
+As of `1.0.0` Quiver follows Semantic Versioning as a promise, not a habit: the
+REST and gRPC wire protocols, the Python and TypeScript SDK APIs, and the on-disk
+format with its version gates are stable, and breaking any of them requires a
+major version. See [`docs/roadmap.md`](docs/roadmap.md) for the full compatibility
+statement, including what is deliberately **not** covered.
 
 ## [Unreleased]
+
+## [1.0.0] — 2026-07-27
+
+The compatibility promise starts here. The **REST and gRPC wire protocols**, the
+**Python and TypeScript SDK APIs**, and the **on-disk format with its version gates**
+are stable from this release; breaking any of them requires a major version. Not
+covered, and labelled as such: internal crate APIs, the still-maturing cluster HTTP
+surface, and anything documented as experimental — the DCPE vector-encryption mode in
+particular.
+
+`1.0.0` is a statement about stability, not about being finished. What is still open
+is recorded in [`docs/roadmap.md`](docs/roadmap.md) rather than left to be discovered:
+the GPU kernel is wired into no build or search path yet ([ADR-0079](docs/adr/0079-gpu-build-search-wiring.md)
+settles where it plugs in), and the 10M disk-path head-to-head needs a machine with
+more RAM than the reference laptop.
+
+### The evidence behind the release
+
+- **Benchmarks on documented reference hardware.** Quiver, Qdrant, LanceDB and FAISS
+  measured in one run, on the same data, on the same machine
+  ([`comparison-v1.0.0`](docs/benchmarks/results/comparison-v1.0.0/comparison-v1.0.0.md)).
+  At recall@10 ≥ 0.95 Quiver is second only to FAISS on throughput and tail latency.
+  The reference machine is a laptop and is labelled as one throughout; every run now
+  records its own manifest — CPU model, core counts, free RAM, load average at start,
+  and the exact Quiver binary — so a run taken on a busy machine can be recognised
+  rather than quietly published.
+- **The recall curve is unchanged across sixteen releases**, reproducing the v0.22.0
+  sweep to three decimal places. Single-thread throughput is *lower* than that run
+  while resident memory fell from ~2069 MB to 1454 MB — consistent with the on-disk
+  resident-state work of ADR-0072/0073, but not isolated by a controlled experiment,
+  so it is published as the likely explanation and not as a measured fact.
+- **Fuzz soak**: ~342 million executions across the three parser targets, no crashes
+  ([fuzzing.md](docs/security/fuzzing.md)). Previously a ~25 s smoke pass.
+- **Coverage is enforced**, not asserted: CI fails below 85% lines; measured ~90.9%.
+- **The acceptance run gates every pull request** — a real encrypted server driven
+  over REST, both SDKs, the CLI importer and the MCP server. Both SDK unit suites mock
+  their transport, so this is the only thing that crosses a real socket.
+- **The cockpit tour is recorded** and regenerable in one command.
 
 ### Added
 
@@ -1227,7 +1267,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.38.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/achref-soua/quiver/compare/v0.38.0...v1.0.0
 [0.38.0]: https://github.com/achref-soua/quiver/compare/v0.37.0...v0.38.0
 [0.37.0]: https://github.com/achref-soua/quiver/compare/v0.36.0...v0.37.0
 [0.36.0]: https://github.com/achref-soua/quiver/compare/v0.35.0...v0.36.0
