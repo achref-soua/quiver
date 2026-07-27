@@ -91,7 +91,24 @@ Unlike the earlier phases, Phase 4 is a **backlog shipped incrementally**: each 
 
 **Per-release DoD (`v0.4.0`, `v0.5.0`, …):** the release's features are tested and documented (ADR/README/`.env.example`); coverage ≥ 80%; `just verify` and the SDK suites green; an owner-approved tag via the fast-forward release mechanic.
 
-**Launch DoD (`v1.0.0`, several releases out):** the README benchmark table is complete and reproducible (on documented reference hardware, never fabricated); the quickstart works from a clean clone in minutes; the docs site is live (✓ as of `v0.37.0`, [ADR-0078](adr/0078-docs-site-deploy.md)); the cockpit cast is recorded; all tests/property-tests/fuzzers green; history clean and entirely the owner's. Tag **`v1.0.0`** on `main`.
+**Launch DoD (`v1.0.0`) — item by item:**
+
+| Item | Status |
+| --- | --- |
+| README benchmark table complete and reproducible on documented reference hardware, never fabricated | ✅ [`comparison-v1.0.0`](benchmarks/results/comparison-v1.0.0/comparison-v1.0.0.md) — Quiver, Qdrant, LanceDB and FAISS in one run on the same box; every run records its own machine manifest |
+| Quickstart works from a clean clone | ✅ verified: fresh `git clone` → `cargo build -p quiverdb-cli` → seeded encrypted server → first query |
+| Docs site live | ✅ as of `v0.37.0` ([ADR-0078](adr/0078-docs-site-deploy.md)) |
+| Cockpit cast recorded | ✅ [`docs/assets/cockpit.cast`](assets/cockpit.cast), regenerable with `scripts/record-cockpit-cast.sh` |
+| All tests / property tests / fuzzers green | ✅ `just verify` green; fuzz soak ~342M executions, no crashes ([fuzzing.md](security/fuzzing.md)) |
+| Coverage gate enforced | ✅ CI fails below 85% lines; measured ~90.9% |
+| History clean and entirely the owner's | ✅ |
+| Tag **`v1.0.0`** on `main` | — the release itself |
+
+**What `1.0.0` promises.** The compatibility surface is frozen: the **REST and gRPC wire protocols**, the **Python and TypeScript SDK APIs**, and the **on-disk format together with its version gates**. Breaking any of them requires a major version. The pre-1.0 licence to refine an API in a minor release has expired.
+
+**What it does not promise.** Internal crate APIs (`quiverdb-*` as libraries), the cluster/coordinator HTTP surface (still maturing), and anything documented as experimental — notably the DCPE vector-encryption mode — remain free to change in a minor release, and are labelled as such where they appear.
+
+**Honestly still open at 1.0**, recorded rather than hidden: the GPU kernel is wired into no build or search path ([ADR-0079](adr/0079-gpu-build-search-wiring.md) settles where it plugs in and what it must promise; the wiring is next-release work now that hardware is in hand); the 10M disk-path head-to-head against Qdrant/LanceDB needs a machine with more RAM than the reference laptop; and the single-box 100M run is attempted and reported honestly rather than claimed.
 
 ## Future / next
 
