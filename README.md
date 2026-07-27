@@ -9,16 +9,56 @@
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 [![rust](https://img.shields.io/badge/rust-stable-orange)](./rust-toolchain.toml)
 [![CI](https://img.shields.io/badge/CI-every%20PR-brightgreen)](.github/workflows)
-[![coverage](https://img.shields.io/badge/coverage-90.9%25-brightgreen)](.github/workflows/ci.yml)
-[![release](https://img.shields.io/badge/release-v1.0.0-FFB000)](https://github.com/achref-soua/quiver/releases)
-[![status](https://img.shields.io/badge/status-v1.0.0%20·%20stable-brightgreen)](./docs/roadmap.md)
+[![coverage](https://img.shields.io/badge/coverage-91.0%25-brightgreen)](.github/workflows/ci.yml)
+[![release](https://img.shields.io/badge/release-v1.1.0-FFB000)](https://github.com/achref-soua/quiver/releases)
+[![status](https://img.shields.io/badge/status-complete%20·%20final%20release-blue)](./docs/roadmap.md)
 [![stars](https://img.shields.io/badge/Star_on-GitHub-FFB000?logo=github)](https://github.com/achref-soua/quiver/stargazers)
 
 </div>
 
-> **Status: `v1.0.0` — stable.** The compatibility promise starts here: the **REST and gRPC wire protocols**, the **Python and TypeScript SDK APIs**, and the **on-disk format with its version gates** are stable, and breaking any of them requires a major version. Not covered, and labelled as such wherever it appears: internal crate APIs, the still-maturing cluster HTTP surface, and anything documented as experimental — the DCPE vector-encryption mode in particular.
+> ## Project status: complete
 >
-> `1.0.0` is a statement about stability, not a claim of being finished. The engine is complete for the job it advertises — encrypted storage with a `kill -9` crash gate, HNSW / IVF / DiskANN with product, scalar and binary quantization, hybrid and BM25 search, MVCC reads, per-shard Raft write HA, elastic scaling in both directions, an MCP server, REST and gRPC, both SDKs, and the cockpit. What is still open is written down in the [roadmap](./docs/roadmap.md) rather than left to be discovered: the GPU kernel is wired into no build or search path yet ([ADR-0079](./docs/adr/0079-gpu-build-search-wiring.md) settles where it plugs in), and the 10M disk-path head-to-head needs a machine with more RAM than the reference laptop. Everything published below was measured on hardware described down to its load average; nothing here is estimated. Per-release history lives in the [changelog](./CHANGELOG.md).
+> **`v1.1.0` is the final planned release. Quiver is finished, not abandoned** — and
+> the difference between those is entirely in the paperwork, so here is the paperwork.
+>
+> **What is supported.** `v1.1.0`, the latest release. The compatibility promise made
+> at `1.0.0` holds: the **REST and gRPC wire protocols**, the **Python and TypeScript
+> SDK APIs**, and the **on-disk format with its version gates** are stable, and
+> breaking any of them would require a major version. Not covered, and labelled as
+> such wherever it appears: internal crate APIs, the cluster HTTP surface, and anything
+> documented as experimental — the DCPE vector-encryption mode in particular. Nothing
+> here is deprecated and nothing is scheduled for removal; there is simply no further
+> feature work planned.
+>
+> **What will still happen.** Security reports are read and answered by the author at
+> the addresses in [`SECURITY.md`](./SECURITY.md), on a best-effort basis with no SLA.
+> A serious, credible vulnerability will get a fix and a release — "final planned
+> release" is a statement about features, not a decision to walk away from a security
+> bug in a database other people may be running.
+>
+> **What will not happen.** New features, performance work, and the deferred items
+> that accumulated across eighty-three ADRs. Each of those is now resolved
+> individually — delivered, or retired with its reasoning — in
+> [ADR-0083](./docs/adr/0083-closing-the-backlog.md), including the ones where real
+> performance was knowingly left on the table and the number is stated rather than
+> glossed. If you want a thread picked up: **Quiver is AGPL-3.0 and forkable**, and the
+> full history, every ADR, the threat model and the test suite come with it.
+>
+> **What the engine does.** Encrypted storage with a `kill -9` crash gate, HNSW / IVF
+> / DiskANN with product, scalar and binary quantization, hybrid and BM25 search, MVCC
+> reads, per-shard Raft write HA, elastic scaling in both directions, an MCP server,
+> REST and gRPC, both SDKs, and the cockpit. New in this release: **GPU-accelerated
+> index builds** behind the off-by-default `cuda` feature — 2.40× on a real IVF build,
+> and **builds only, not search**, because search was measured and the GPU lost
+> ([ADR-0082](./docs/adr/0082-gpu-seam-and-dispatch-policy.md)).
+>
+> **What was never measured stays unmeasured.** The 10M disk-path head-to-head needs
+> more RAM than the reference laptop and was retired rather than left pending forever.
+> The single-box 100M run was attempted, and it **failed** — 70.4M of 100M vectors
+> before the OOM killer, published in full because it corrects this project's own
+> earlier extrapolation. Everything below was measured on hardware described down to
+> its load average; nothing here is estimated, and no number was ever rounded up to
+> look better. Per-release history lives in the [changelog](./CHANGELOG.md).
 
 ## Why Quiver
 
@@ -247,7 +287,7 @@ Quiver is **second only to FAISS** on both throughput and tail latency at this r
 
 Two things worth stating rather than burying. **Recall is unchanged across sixteen releases**: the `ef` sweep reproduces the v0.22.0 curve to three decimal places (0.793 / 0.895 / 0.958 / 0.986 / 0.995), which is a stronger correctness signal than any single number in the table. And **single-thread QPS is below the v0.22.0 run** while RSS fell from ~2069 MB to 1454 MB. Those two moves are consistent with the on-disk resident-state work of [ADR-0072](./docs/adr/0072-on-disk-primary-index.md)/[ADR-0073](./docs/adr/0073-on-disk-embed-id-map.md), which deliberately trades RAM for lookups — but that attribution is **not isolated by a controlled experiment**, so it is offered as the likely explanation, not as a measured fact.
 
-**GIST1M** (1M × 960, L2) is the harder, higher-dimensional test. These figures are from the **`v0.20.0`** run and were **not re-measured for `v1.0.0`** — the SIFT1M table above is the current one. Same box, each system at its most efficient config reaching recall@10 ≥ 0.95, or its best point at `ef_search ≤ 256` (960-d needs a wide beam, so most plateau below 0.95 in this sweep):
+**GIST1M** (1M × 960, L2) is the harder, higher-dimensional test. These figures are from the **`v0.20.0`** run and were **not re-measured for `v1.0.0` or `v1.1.0`** — the SIFT1M table above is the current one. Re-measuring Quiver's row alone would have been *worse* than leaving the label: it would put a current number beside six competitor numbers from months earlier, inviting exactly the comparison the data cannot support. A full multi-competitor re-run at 960-d is hours of machine time on a box where LanceDB already exhausted memory once at this scale. A stale number that says it is stale is honest; a fresh number in a stale table is not. Same box, each system at its most efficient config reaching recall@10 ≥ 0.95, or its best point at `ef_search ≤ 256` (960-d needs a wide beam, so most plateau below 0.95 in this sweep):
 
 | System | recall@10 | QPS (1T) | p95 (ms) | RSS (MB) | ef/nprobe |
 |---|---:|---:|---:|---:|---:|

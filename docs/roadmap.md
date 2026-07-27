@@ -110,13 +110,72 @@ Unlike the earlier phases, Phase 4 is a **backlog shipped incrementally**: each 
 
 **Honestly still open at 1.0**, recorded rather than hidden: the GPU kernel is wired into no build or search path ([ADR-0079](adr/0079-gpu-build-search-wiring.md) settles where it plugs in and what it must promise; the wiring is next-release work now that hardware is in hand); the 10M disk-path head-to-head against Qdrant/LanceDB needs a machine with more RAM than the reference laptop; and the single-box 100M run is attempted and reported honestly rather than claimed.
 
-## Future / next
+## `v1.1.0` — the final release
 
-> **Closed.** `v1.1.0` is the final planned release, and every item that was still
-> deferred at `v1.0.0` has been resolved individually — delivered or retired, each
-> with its reasoning — in [ADR-0083](adr/0083-closing-the-backlog.md). Read that
-> alongside the history below: this section records how the work was sequenced, and
-> ADR-0083 records where each remaining thread ended.
+**Quiver is complete.** `v1.1.0` is the last planned release, and this roadmap is
+closed: every phase above is delivered, and every item that was still deferred at
+`v1.0.0` is resolved individually — delivered, or retired with its reasoning — in
+[ADR-0083](adr/0083-closing-the-backlog.md).
+
+**What `v1.1.0` adds.** One capability: **GPU-accelerated index builds**, behind the
+off-by-default `cuda` feature. [ADR-0079](adr/0079-gpu-build-search-wiring.md) had
+settled the design and left the wiring hardware-gated; a CUDA device became reachable
+on the reference machine, so [ADR-0082](adr/0082-gpu-seam-and-dispatch-policy.md)
+implemented it under a **measure-gate**: an increment ships only if it is measured to
+beat the CPU path it replaces, and is retired in writing otherwise. Because this is
+the final release, that bar is deliberately stricter than usual — the normal
+justification for landing a plausible optimisation, that the next release will refine
+it, does not exist.
+
+The gate split the feature cleanly:
+
+| Increment | Outcome | Measured on the reference card (RTX 3070 Laptop) |
+| --- | --- | --- |
+| G1 — the seam | **Shipped** | Pure CPU; testable on a GPU-less runner, which is where CI runs |
+| G2 — build wiring | **Shipped** | 4.08× on the assign kernel at 1M × 1024; **2.40× on an end-to-end IVF build** |
+| G3 — search wiring | **Retired** | 0.36× at 1M rows — the device is 2.8× *slower*, and loses at every smaller size |
+| G4 — hardware validation | **Done** | `GPU_MIN_BATCH` calibrated to **8192**, the measured crossover, not ADR-0079's guessed 4096 |
+
+The reason G2 wins and G3 loses is arithmetic intensity, and it is worth stating
+because it generalises: the assign pass reads `n × dim` floats and does
+`n × nlist × dim` work, reusing every transferred byte a thousand times, while a scan
+reads the same floats and does one pass over them. **The GPU helps where a byte is
+reused a thousand times and hurts where it is read once.** Quiver's builds do the
+former; its searches do the latter.
+
+### Definition of Done — met
+
+| Item | Status |
+| --- | --- |
+| GPU wiring delivered or retired, with measurements | ✅ [ADR-0082](adr/0082-gpu-seam-and-dispatch-policy.md) — G1/G2/G4 shipped, G3 retired on evidence |
+| Every deferred item resolved in writing | ✅ [ADR-0083](adr/0083-closing-the-backlog.md) |
+| `SECURITY.md` states what actually happens to a report now | ✅ best-effort, no SLA, still answered, serious bugs still get a release |
+| Project status prominent and honest in the README | ✅ complete; supported surface, what will and will not happen, fork invitation |
+| Fuzz soak re-run and recorded | ✅ [fuzzing.md](security/fuzzing.md) |
+| `just verify` + acceptance green | ✅ every PR |
+| No fabricated, extrapolated or rounded-up number anywhere | ✅ — the 100M run's *failure* is published for exactly this reason |
+
+### What Quiver never did
+
+Recorded here so it is visible without reading eighty-three ADRs. None of these is an
+oversight; each is a decision with its reasoning in
+[ADR-0083](adr/0083-closing-the-backlog.md).
+
+- **GPU-accelerated search.** Measured; the hardware says no.
+- **AES-256-GCM at rest**, worth ~2.7× on an AES-NI CPU. Declined: it changes the
+  at-rest format of an encrypted database in a release with no successor.
+- **Atomic bulk writes via single-log-entry Raft batches.** A durable-log format
+  change, largely redundant with the pipelining that shipped.
+- **A published 100M single-box result.** Attempted and OOM-killed at 70.4M. The
+  failure is the result.
+- **A 10M disk-path head-to-head.** Needs more RAM than the reference box.
+- **Fully off-lock background compaction**, and ADR-0041's filtered/churn sweeps.
+
+The code is AGPL-3.0. Anyone who wants one of these is welcome to fork it — the
+history, the ADRs, the threat model and the test suite are the actual asset, and they
+all come along.
+
+## How the work was sequenced
 
 Forward-looking work already scoped and honestly sequenced (not yet gated to a release). The **single-box 100M enabler** — removing the two O(n) resident terms that stood between a laptop and a 100M-vector build — is now **fully shipped across three increments**: the batch build's resident n×dim float scan (~51 GiB at 100M) went first, via Increment A (the `Ivf::build_streaming` primitive, `v0.32.0`) and Increment B (the lock-free `VectorSource` wired through the live IVF rebuild so `flat` is never materialised, `v0.33.0`, [ADR-0070](adr/0070-streaming-index-build.md)/[ADR-0071](adr/0071-streaming-rebuild-vector-source.md)); then **Increment C** — the **on-disk primary index** ([ADR-0072](adr/0072-on-disk-primary-index.md), `v0.34.0`) — removed the `ext_id`→location map (~316 B/point, ~31 GiB at 100M) by serving external ids from a segment column with an on-disk forward index, dropping resident state per collection to ~1.6 GiB at 100M. The final increment — **Increment D** ([ADR-0073](adr/0073-on-disk-embed-id-map.md), `v0.35.0`) — dropped the embedded index's own `int_to_ext`/`ext_to_int` residency (a separate resident term, indexed collections only, ~90–110 B/point) into a codec-sealed `ExtIdColumn`, leaving only ~12 B/point. All that now remains is the honest **100M run** itself — and at `v1.0.0` it was attempted on the reference laptop and **did not complete**: it reached **70.4M of 100M vectors in ~2 h 15 m before the kernel OOM killer stopped it**, at ~10.4 GiB resident and 71 GB on disk ([scale characterisation](benchmarks/scale-characterization.md)). That result corrects this project's own earlier extrapolation, which had put 100M resident state at "a few GiB" and concluded 15.5 GiB would be enough; resident memory climbed steadily through ingest instead of plateauing. The three O(n) resident terms closed in `v0.33.0`–`v0.35.0` were real and necessary, but they were not the whole bill. No 100M recall, latency or serving-RSS figure is published, because none was measured. Two more of the sequenced items shipped in **`v0.36.0` (Filigree)**: **binary quantization for the disk graph** ([ADR-0074](adr/0074-binary-quantization-disk-graph.md)) — the disk index's navigation codes are now selectable (binary or product), binary navigating by Hamming with the exact on-disk re-rank recovering recall — and **WAL-record AAD binding** ([ADR-0075](adr/0075-wal-record-aad-binding.md)) — each encrypted WAL record is bound to its position, so a reordered/relocated record fails authentication on recovery. **`v0.37.0` (Quicksilver)** then cleared the last barrier between the laptop and 100M — the *wall-clock* one: a **resident per-segment id-range fingerprint** ([ADR-0076](adr/0076-resident-id-range-fingerprint.md)) prunes the `O(segments·log rows)` decrypt-on-compare existence probe the on-disk primary index (`v0.34.0`) had introduced, so ingest of sortable ids runs **~6.1× faster at 1M with unchanged RSS** and the 100M run is finally wall-clock-practical on the same modest box. The same release **pipelined bulk Raft proposals** ([ADR-0077](adr/0077-batched-raft-proposals.md)) — a bulk write no longer pays `N` serialized quorum round-trips (the cluster throughput win, deferred to real multi-node hardware for its number) — and stood up the **live documentation site** on GitHub Pages ([ADR-0078](adr/0078-docs-site-deploy.md)). The **per-collection codec cache** turned out to be a non-item: the per-collection codec and the HKDF extract are already cached, and the residual is a measured ~0.4% of a seal (the real seal cost is the AEAD cipher itself — a separate, crypto-adjacent item). **`v0.38.0` (Ebb)** closed the last named gap in cluster operations: **automated online scale-in** ([ADR-0080](adr/0080-online-scale-in-drain.md)). A shard marked **leaving** — the exact mirror of **joining** — hands ownership of its slice to the survivors in one atomic map version while it keeps holding and serving that slice as the dual-write donor, so `POST /cluster/shards/{id}/drain` takes a machine out of a live cluster with the same two invariants a grow has always held (the slice stays queryable, no acknowledged write is lost), and copies are presence-checked before deletion in both directions. Elastic scaling now runs both ways; only the *decision* to shrink stays the operator's. Still sequenced: **GPU build/search** — the batch-distance kernel has shipped since `v0.28.0` ([ADR-0052](adr/0052-gpu-acceleration.md)) but is wired into no path yet; [ADR-0079](adr/0079-gpu-build-search-wiring.md) fixes where it plugs in (the `O(n · nlist · dim)` build assign pass first) and the contract it must honour — **the GPU narrows, the CPU scores**, so every reported number stays bit-identical to a CPU-only run — with the wiring itself sequenced for the release after `1.0.0` now that a CUDA device is reachable on the reference machine — and continued **distributed sharding maturity**. (Concurrent scatter-gather cluster search shipped in `v0.32.0`.)
 
