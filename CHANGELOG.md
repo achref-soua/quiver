@@ -12,8 +12,16 @@ statement, including what is deliberately **not** covered.
 
 ## [Unreleased]
 
-**This is the final planned release.** See the project-status block in the
-[README](README.md) and [ADR-0083](docs/adr/0083-closing-the-backlog.md).
+## [1.1.0] — 2026-07-28 — *Cairn*
+
+**This is the final planned release.** Quiver is complete: finished, not
+abandoned. What it does, what it deliberately never did, and whether anyone is
+still watching it are all stated in the project-status block in the
+[README](README.md), in [`SECURITY.md`](SECURITY.md), and — item by item, with
+reasoning — in [ADR-0083](docs/adr/0083-closing-the-backlog.md).
+
+A cairn is a stone marker left on a trail by someone who has moved on, so
+whoever comes next can find the way.
 
 ### Added
 
@@ -1325,7 +1333,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/achref-soua/quiver/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/achref-soua/quiver/compare/v0.38.0...v1.0.0
 [0.38.0]: https://github.com/achref-soua/quiver/compare/v0.37.0...v0.38.0
 [0.37.0]: https://github.com/achref-soua/quiver/compare/v0.36.0...v0.37.0
