@@ -71,6 +71,13 @@ fn training_sample(prepared: &[f32], n: usize, dim: usize, seed: u64) -> (Cow<'_
 /// locality.
 const REASSIGN_NEIGHBORS: usize = 32;
 
+/// Points buffered before the streaming build dispatches an assign batch. Large
+/// enough to clear `gpu::GPU_MIN_BATCH` by a wide margin so the device is worth its
+/// transfer, small enough that the buffer stays bounded — 64 Ki rows is 32 MiB at
+/// `dim = 128`, against the `n × dim` arena this path exists to avoid (51 GiB at
+/// 100M).
+const ASSIGN_TILE: usize = 65_536;
+
 /// Build parameters for [`Ivf`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct IvfConfig {
@@ -258,12 +265,14 @@ impl Ivf {
                 config.seed,
             )
         };
+        // The assign pass: every point against every centroid — `O(n · nlist · dim)`,
+        // the largest arithmetic block in a build, and the one site the GPU
+        // measurably wins (ADR-0082). `prepared` is already resident here, so the
+        // batched call replaces the per-row loop with no extra allocation.
+        let node_cell = crate::gpu::batch_assign(&prepared, &centroids, dim);
         let mut postings = vec![Vec::new(); nlist];
-        let mut node_cell = vec![0u32; n];
-        for i in 0..n {
-            let cell = nearest_centroid(&prepared[i * dim..(i + 1) * dim], &centroids, dim);
-            postings[cell].push(i as u32);
-            node_cell[i] = cell as u32;
+        for (i, &cell) in node_cell.iter().enumerate() {
+            postings[cell as usize].push(i as u32);
         }
 
         let storage = match config.quantization {
@@ -397,23 +406,46 @@ impl Ivf {
                 let pq = ProductQuantizer::train(&sample, train_n, dim, m, metric, config.seed)?;
                 let code_len = pq.code_len();
                 let mut codes = vec![0u8; n * code_len];
-                for (i, v) in source().enumerate() {
-                    let p = prepare(metric, &v);
-                    let cell = nearest_centroid(&p, &centroids, dim);
-                    postings[cell].push(i as u32);
-                    node_cell[i] = cell as u32;
-                    pq.encode_into(&p, &mut codes[i * code_len..(i + 1) * code_len]);
+                // Assign in bounded tiles rather than per row: batched enough for the
+                // device to earn its transfer (ADR-0082), while never holding the
+                // `n × dim` arena this streaming path exists to avoid.
+                let mut tile: Vec<f32> = Vec::with_capacity(ASSIGN_TILE * dim);
+                let mut base = 0usize;
+                let mut drain = |tile: &mut Vec<f32>, base: &mut usize| {
+                    for (t, &cell) in crate::gpu::batch_assign(tile, &centroids, dim)
+                        .iter()
+                        .enumerate()
+                    {
+                        let i = *base + t;
+                        postings[cell as usize].push(i as u32);
+                        node_cell[i] = cell;
+                        pq.encode_into(
+                            &tile[t * dim..(t + 1) * dim],
+                            &mut codes[i * code_len..(i + 1) * code_len],
+                        );
+                    }
+                    *base += tile.len() / dim;
+                    tile.clear();
+                };
+                for v in source() {
+                    tile.extend_from_slice(&prepare(metric, &v));
+                    if tile.len() >= ASSIGN_TILE * dim {
+                        drain(&mut tile, &mut base);
+                    }
                 }
+                drain(&mut tile, &mut base);
                 Storage::Pq { pq, codes }
             }
             None => {
+                // IVF-Flat holds every vector resident by definition, so there is
+                // nothing here to tile around — materialise, then assign in one pass.
                 let mut vectors = vec![0f32; n * dim];
                 for (i, v) in source().enumerate() {
-                    let p = prepare(metric, &v);
-                    vectors[i * dim..(i + 1) * dim].copy_from_slice(&p);
-                    let cell = nearest_centroid(&p, &centroids, dim);
-                    postings[cell].push(i as u32);
-                    node_cell[i] = cell as u32;
+                    vectors[i * dim..(i + 1) * dim].copy_from_slice(&prepare(metric, &v));
+                }
+                node_cell = crate::gpu::batch_assign(&vectors, &centroids, dim);
+                for (i, &cell) in node_cell.iter().enumerate() {
+                    postings[cell as usize].push(i as u32);
                 }
                 Storage::Flat { vectors }
             }
