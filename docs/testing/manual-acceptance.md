@@ -3,9 +3,16 @@
 This is the human-facing acceptance checklist for a release (the v0.17.0
 launch-hardening pass, Phase A). It enumerates everything Quiver does, across
 every external surface and every index / quantization / encryption mode, and maps
-each item to the automated coverage that proves it — plus the manual steps for the
-two surfaces that cannot be asserted headless (the interactive cockpit and
-real-server migration imports).
+each item to the automated coverage that proves it — plus the manual steps for what
+genuinely still needs a human (chiefly real-server migration imports against a live
+Qdrant/Chroma/Postgres).
+
+The interactive cockpit **used to be on that list and no longer is.** A pty is a
+terminal, which is all `asciinema` and `crossterm` require, so
+[`scripts/record-cockpit-cast.sh`](../../scripts/record-cockpit-cast.sh) drives a
+scripted tour unattended and [`docs/assets/cockpit.cast`](../assets/cockpit.cast)
+regenerates in one command. A human tour is still the better *demo*; it is no longer
+the only way to get one.
 
 > **Honesty.** This is a *correctness* acceptance pass. Performance numbers come
 > only from the documented reference hardware
@@ -110,7 +117,7 @@ Legend: ✅ automated (named test / script) · 🖐 manual step.
 | `mcp` | ✅ `acceptance.sh` |
 | `admin import` (offline, encrypted at rest) | ✅ `admin.rs` tests; `acceptance.sh` |
 | `admin import` cleartext-credential warning | ✅ `live.rs` tests; `acceptance.sh` |
-| `tui` | 🖐 manual (see below); render path ✅ `crates/quiver-tui/tests/live.rs` |
+| `tui` | ✅ scripted tour via `scripts/record-cockpit-cast.sh` (pty-driven, asserts it reached both views); render path ✅ `crates/quiver-tui/tests/live.rs`; 🖐 a human tour is still worth doing before a launch |
 
 ### TUI cockpit
 
