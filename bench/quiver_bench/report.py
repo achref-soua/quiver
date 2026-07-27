@@ -237,9 +237,13 @@ def generate(result_dir: Path) -> str:
         "[ADR-0037](../../adr/0037-scientific-multi-db-benchmark-suite.md)",
         "",
         "> **Honesty note:** Every number below is real and measured. Where Quiver wins, "
-        "numbers are shown; where it loses or ties, that is stated plainly. "
-        "`[reference-hardware-pending]` marks figures that require reproduction on "
-        "dedicated, otherwise-idle hardware to carry weight as official headlines.",
+        "numbers are shown; where it loses or ties, that is stated plainly. The runs "
+        "are on this project's documented reference hardware — a laptop under WSL2, "
+        "specified in full below. Comparative standings are meaningful because every "
+        "system is measured on that same box, on the same data, in the same run. "
+        "Absolute figures are laptop figures and must not be read as datacentre "
+        "numbers. `[reference-hardware-pending]` still marks the few figures that "
+        "need a larger machine to mean anything — the 10M disk path in particular.",
         "",
     ]
 
@@ -251,9 +255,15 @@ def generate(result_dir: Path) -> str:
             "| | |",
             "|---|---|",
             f"| OS | {hw.get('os', '?')} {hw.get('os_release', '')} |",
-            f"| Processor | {hw.get('processor', '?')} |",
-            f"| Logical CPUs | {hw.get('cpu_count_logical', '?')} |",
-            f"| RAM total | {int((hw.get('ram_total_mb') or 0) / 1024)} GB |",
+            f"| CPU | {hw.get('cpu_model') or hw.get('processor', '?')} |",
+            f"| Cores | {hw.get('cpu_count_physical', '?')} physical / "
+            f"{hw.get('cpu_count_logical', '?')} logical |",
+            f"| RAM | {(hw.get('ram_total_mb') or 0) / 1024:.1f} GB total, "
+            f"{(hw.get('ram_available_mb') or 0) / 1024:.1f} GB available |",
+            f"| Swap | {(hw.get('swap_total_mb') or 0) / 1024:.1f} GB |",
+            f"| Disk free | {hw.get('disk_free_gb') or 0:.0f} GB |",
+            f"| Load at start | {', '.join(f'{x:.2f}' for x in (hw.get('load_average') or []))} |",
+            f"| Quiver | {hw.get('quiver_version', '?')} |",
             f"| Rust | {hw.get('rust_version', '?')} |",
             f"| Docker | {hw.get('docker_version', '?')} |",
             f"| Python | {hw.get('python', '?')} |",
@@ -282,7 +292,9 @@ def generate(result_dir: Path) -> str:
 
             is_smoke = ds_name == "smoke"
             label = "SIFTSMALL (10k, 128-d, L2) — smoke validation" if is_smoke else ds_name.upper()
-            pending = " `[reference-hardware-pending]`" if not is_smoke else ""
+            # The run itself is on documented reference hardware; what remains
+            # pending is scale (the 10M disk path), not this dataset.
+            pending = ""
 
             lines += [
                 f"## Dataset: {label}{pending}",
@@ -308,8 +320,12 @@ def generate(result_dir: Path) -> str:
                     lines.append(f"| {comp_name} | — | error | — | — | — | — | — | — | — | — | failed |")
                     continue
                 # Find the adapter version from the CSV (not stored — use a known map)
+                # Competitor versions are pinned here because the CSV does not carry
+                # them; Quiver's comes from the manifest, which reads it from the
+                # binary that ran. A hard-coded Quiver version is how a v0.38.0 run
+                # once got published labelled "v0.22.0-dev".
                 versions = {
-                    "quiver": "v0.22.0-dev",
+                    "quiver": (hw.get("quiver_version") or "?").split(" (")[0],
                     "faiss": "1.14.3",
                     "lancedb": "0.33.0",
                     "chroma": "1.5.9",
@@ -322,7 +338,7 @@ def generate(result_dir: Path) -> str:
                 ver = versions.get(comp_name, "?")
                 # Comparative numbers on the identical box are real (R6); only
                 # absolute RSS and the 10M disk path are VM-distorted (R5).
-                note = "smoke only" if is_smoke else "dev-box · indicative"
+                note = "smoke only" if is_smoke else "reference HW · laptop/WSL2"
                 param = f"{row.get('param_name','ef')}={row.get('param_value','?')}"
                 lines.append(
                     f"| {comp_name} | {ver} "
