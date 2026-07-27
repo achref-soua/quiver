@@ -27,6 +27,63 @@
 //! WSL ships `libcuda.so.1` with no `libcuda.so` in the cache — looks exactly like
 //! "no GPU" and takes the same path; export `LD_LIBRARY_PATH=/usr/lib/wsl/lib` to
 //! let the GPU be found there.)
+//!
+//! # The seam ([ADR-0079], [ADR-0082])
+//!
+//! Every distance batch in the engine reduces to one primitive — *one vector against
+//! a contiguous batch, argmin or top-k over the result* — so the seam is two free
+//! functions rather than a backend trait:
+//!
+//! - [`batch_ordering_distance`] — the smaller-is-closer ordering key for all three
+//!   metrics, so callers do not each re-derive the orientation.
+//! - [`batch_assign`] — the argmin over centroids for every point, **fused**: the
+//!   intermediate `points × centroids` matrix is 16 GB at 1M × 4096 and must never
+//!   be returned to the host.
+//!
+//! Dispatch is governed by three rules, all of them here and nowhere else:
+//!
+//! 1. **The CPU is the default and the fallback**, always compiled.
+//! 2. **Below [`GPU_MIN_BATCH`] rows the CPU wins** — transfer plus launch latency
+//!    exceeds the arithmetic. The constant is a *hardware* number, calibrated
+//!    against a real card, not a universal one.
+//! 3. **`QUIVER_GPU=0` forces the CPU path** in a `cuda`-enabled build, so an A/B
+//!    measurement and a CPU-backend reproduction stay possible on a GPU box.
+//!
+//! [ADR-0079]: https://github.com/achref-soua/quiver/blob/main/docs/adr/0079-gpu-build-search-wiring.md
+//! [ADR-0082]: https://github.com/achref-soua/quiver/blob/main/docs/adr/0082-gpu-seam-and-dispatch-policy.md
+
+use quiver_simd::Metric;
+
+use crate::score::ordering_distance;
+
+/// Row count below which the CPU kernel wins outright: PCIe transfer plus kernel
+/// launch latency exceeds the arithmetic saved, so dispatching to the device is a
+/// net loss on small batches.
+///
+/// This is a **hardware constant, measured, not assumed** — see [ADR-0082] for the
+/// calibration run on the reference card and the sweep it came from. A different GPU
+/// has a different crossover; it stays a named constant precisely so it can be
+/// re-measured rather than guessed at forever.
+///
+/// [ADR-0082]: https://github.com/achref-soua/quiver/blob/main/docs/adr/0082-gpu-seam-and-dispatch-policy.md
+pub const GPU_MIN_BATCH: usize = 4096;
+
+/// Whether a batch of `n` rows is large enough to be worth a device dispatch.
+/// Split out from the call sites so the policy is stated once and tested directly —
+/// including on a default (GPU-less) build, which is where CI runs.
+#[cfg(any(feature = "cuda", test))]
+#[must_use]
+fn worth_dispatching(n: usize) -> bool {
+    n >= GPU_MIN_BATCH
+}
+
+/// Whether `QUIVER_GPU` asks for the CPU path. Takes the value rather than reading
+/// the environment so the policy is testable without a process-global mutation.
+#[cfg(any(feature = "cuda", test))]
+#[must_use]
+fn disabled_by_env(value: Option<&str>) -> bool {
+    matches!(value, Some("0"))
+}
 
 /// Run `build`, turning **any** failure into `None`: an `Err`, or a panic from a
 /// dependency that panics where it should return (the CUDA driver loader does).
@@ -61,13 +118,90 @@ pub fn batch_l2_sq(query: &[f32], batch: &[f32], dim: usize) -> Vec<f32> {
     debug_assert!(dim > 0 && batch.len().is_multiple_of(dim) && query.len() == dim);
     #[cfg(feature = "cuda")]
     {
-        if let Some(ctx) = cuda::context()
+        if worth_dispatching(batch.len() / dim)
+            && let Some(ctx) = cuda::context()
             && let Ok(out) = ctx.batch_l2_sq(query, batch, dim)
         {
             return out;
         }
     }
     cpu_batch_l2_sq(query, batch, dim)
+}
+
+/// The **ordering key** — smaller is closer — from `query` to each `dim`-length row
+/// of the contiguous `batch`, under `metric`. Equivalent row-for-row to
+/// [`crate::ordering_distance`], batched so the work can go to a device.
+///
+/// Only [`Metric::L2`] has a device kernel today; [`Metric::Dot`] and
+/// [`Metric::Cosine`] fall back per-metric to the CPU kernel, which is exactly what
+/// a caller that has not been ported yet already did.
+#[must_use]
+pub fn batch_ordering_distance(
+    metric: Metric,
+    query: &[f32],
+    batch: &[f32],
+    dim: usize,
+) -> Vec<f32> {
+    debug_assert!(dim > 0 && batch.len().is_multiple_of(dim) && query.len() == dim);
+    match metric {
+        Metric::L2 => batch_l2_sq(query, batch, dim),
+        Metric::Dot | Metric::Cosine => cpu_batch_ordering_distance(metric, query, batch, dim),
+    }
+}
+
+/// The always-compiled CPU path for [`batch_ordering_distance`].
+#[must_use]
+pub fn cpu_batch_ordering_distance(
+    metric: Metric,
+    query: &[f32],
+    batch: &[f32],
+    dim: usize,
+) -> Vec<f32> {
+    batch
+        .chunks_exact(dim)
+        .map(|row| ordering_distance(metric, query, row))
+        .collect()
+}
+
+/// For each `dim`-length point in the contiguous `points`, the index of its nearest
+/// centroid by squared L2 — the k-means assignment step and the IVF build's assign
+/// pass, which together are the largest arithmetic block in a large build
+/// (`O(n · nlist · dim)`).
+///
+/// The argmin is **fused into the kernel** rather than computed from a returned
+/// distance matrix: that matrix is `points × centroids × 4 B` — 16 GB at 1M points
+/// and 4096 centroids — so materialising it would cost more than the arithmetic it
+/// is meant to accelerate. Only `n` `u32`s ever cross back.
+///
+/// Returns all-zero assignments when `centroids` is empty, mirroring the
+/// single-point path.
+#[must_use]
+pub fn batch_assign(points: &[f32], centroids: &[f32], dim: usize) -> Vec<u32> {
+    debug_assert!(
+        dim > 0 && points.len().is_multiple_of(dim) && centroids.len().is_multiple_of(dim)
+    );
+    cpu_batch_assign(points, centroids, dim)
+}
+
+/// The always-compiled CPU path for [`batch_assign`]: the SIMD L2 kernel per
+/// (point, centroid) pair, taking the first minimum on a tie.
+#[must_use]
+pub fn cpu_batch_assign(points: &[f32], centroids: &[f32], dim: usize) -> Vec<u32> {
+    points
+        .chunks_exact(dim)
+        .map(|p| {
+            let mut best = 0u32;
+            let mut best_d = f32::INFINITY;
+            for (c, centroid) in centroids.chunks_exact(dim).enumerate() {
+                let d = quiver_simd::l2_sq_f32(p, centroid);
+                if d < best_d {
+                    best_d = d;
+                    best = c as u32;
+                }
+            }
+            best
+        })
+        .collect()
 }
 
 /// The always-compiled CPU path (and the GPU fallback): the SIMD `l2_sq_f32` per row.
@@ -151,14 +285,30 @@ extern "C" __global__ void l2sq(const float* q, const float* a, float* out, int 
         }
     }
 
-    // The process-wide GPU context, built once. `None` if no device is present or
-    // init fails — callers fall back to the CPU kernel. Init runs through
+    // The process-wide GPU context, built once. `None` if no device is present, init
+    // fails, or `QUIVER_GPU=0` asks for the CPU path. Init runs through
     // `init_or_none` because cudarc's driver loader panics rather than returning
     // `Err` when `dlopen` cannot find the CUDA library.
+    //
+    // Which backend the process settled on is logged exactly once, here — never per
+    // batch, which would be one line per query.
     pub(super) fn context() -> Option<&'static Context> {
         static CTX: OnceLock<Option<Context>> = OnceLock::new();
-        CTX.get_or_init(|| super::init_or_none("cuda: GPU acceleration", Context::new))
-            .as_ref()
+        CTX.get_or_init(|| {
+            if super::disabled_by_env(std::env::var("QUIVER_GPU").ok().as_deref()) {
+                eprintln!("cuda: disabled by QUIVER_GPU=0; using the CPU kernel");
+                return None;
+            }
+            let ctx = super::init_or_none("cuda: GPU acceleration", Context::new);
+            if ctx.is_some() {
+                eprintln!(
+                    "cuda: GPU acceleration active (batches of ≥ {} rows)",
+                    super::GPU_MIN_BATCH
+                );
+            }
+            ctx
+        })
+        .as_ref()
     }
 
     #[cfg(test)]
@@ -192,7 +342,12 @@ extern "C" __global__ void l2sq(const float* q, const float* a, float* out, int 
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_l2_sq, cpu_batch_l2_sq, init_or_none};
+    use quiver_simd::Metric;
+
+    use super::{
+        GPU_MIN_BATCH, batch_assign, batch_l2_sq, batch_ordering_distance, cpu_batch_assign,
+        cpu_batch_l2_sq, disabled_by_env, init_or_none, worth_dispatching,
+    };
 
     #[test]
     fn init_or_none_passes_through_a_working_backend() {
@@ -215,6 +370,75 @@ mod tests {
             panic!("Unable to dynamically load the \"cuda\" shared library")
         };
         assert_eq!(init_or_none("test", build), None);
+    }
+
+    // --- Dispatch policy (ADR-0082): the three rules, each asserted directly. ---
+
+    #[test]
+    fn small_batches_stay_on_the_cpu() {
+        assert!(!worth_dispatching(0));
+        assert!(!worth_dispatching(GPU_MIN_BATCH - 1));
+        assert!(worth_dispatching(GPU_MIN_BATCH));
+        assert!(worth_dispatching(GPU_MIN_BATCH * 16));
+    }
+
+    #[test]
+    fn quiver_gpu_zero_is_the_escape_hatch() {
+        assert!(disabled_by_env(Some("0")));
+        // Anything else — unset, or any other value — leaves the GPU enabled, so a
+        // stray `QUIVER_GPU=1` cannot accidentally turn the accelerator off.
+        assert!(!disabled_by_env(None));
+        assert!(!disabled_by_env(Some("1")));
+        assert!(!disabled_by_env(Some("")));
+        assert!(!disabled_by_env(Some("false")));
+    }
+
+    // --- The batched seam agrees with the per-row functions it replaces. ---
+
+    #[test]
+    fn batch_ordering_distance_matches_the_per_row_kernel_for_every_metric() {
+        let dim = 8usize;
+        let n = 64usize;
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32).mul_add(0.31, 0.5)).collect();
+        let batch: Vec<f32> = (0..n * dim)
+            .map(|i| ((i % 37) as f32).mul_add(0.17, -2.0))
+            .collect();
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            let got = batch_ordering_distance(metric, &query, &batch, dim);
+            let want: Vec<f32> = batch
+                .chunks_exact(dim)
+                .map(|row| crate::score::ordering_distance(metric, &query, row))
+                .collect();
+            assert_eq!(got, want, "batched != per-row for {metric:?}");
+        }
+    }
+
+    #[test]
+    fn batch_assign_is_the_argmin_over_centroids() {
+        let dim = 3usize;
+        // Three axis centroids; three points each nearest an obvious one, in order.
+        let centroids = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let points = [0.0f32, 0.0, 0.9, 0.9, 0.1, 0.0, 0.0, 0.8, 0.1];
+        assert_eq!(batch_assign(&points, &centroids, dim), vec![2, 0, 1]);
+        assert_eq!(
+            batch_assign(&points, &centroids, dim),
+            cpu_batch_assign(&points, &centroids, dim)
+        );
+    }
+
+    #[test]
+    fn batch_assign_ties_take_the_first_centroid() {
+        // Equidistant from two identical centroids: the argmin must be stable and
+        // pick the lower index, or a build's output depends on iteration order.
+        let dim = 2usize;
+        let centroids = [1.0f32, 0.0, 1.0, 0.0];
+        assert_eq!(batch_assign(&[0.0, 0.0], &centroids, dim), vec![0]);
+    }
+
+    #[test]
+    fn batch_assign_without_centroids_assigns_zero() {
+        assert_eq!(batch_assign(&[1.0, 2.0], &[], 2), vec![0]);
+        assert!(batch_assign(&[], &[1.0, 2.0], 2).is_empty());
     }
 
     #[test]
