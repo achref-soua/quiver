@@ -37,18 +37,29 @@ A crash writes a reproducer to `fuzz/artifacts/<target>/`; replay it with
 
 ## Status
 
-A bounded local pass (~25 s per target) on development hardware found **no
-crashes**:
+The `v1.0.0` pass ran each target for **900 s** (15 minutes) on the reference
+hardware — a 12th Gen Intel Core i7-12700H (10 physical / 20 logical cores),
+15 GiB RAM, under WSL2 — for **~342 million executions in total**, and found
+**no crashes**:
 
-| Target | Runs | Coverage (features) | Result |
+| Target | Runs | Duration | Result |
 | --- | --- | --- | --- |
-| `filter_json` | ~3.9M | 2039 | clean |
-| `page_decode` | ~11.2M | 95 | clean |
-| `wal_decode` | ~0.87M | 166 | clean |
+| `filter_json` | 43,650,901 | 901 s | clean |
+| `page_decode` | 279,437,122 | 901 s | clean |
+| `wal_decode` | 18,887,581 | 901 s | clean |
 
-These are smoke-level runs that wire the targets into the workflow and catch
-obvious faults — not a long soak. The durable value is that the targets exist
-and run clean, so a maintainer or CI can fuzz for longer (raise
-`-max_total_time`, seed a corpus) on any change to a parser. The run counts are
-host-dependent (exec/s scales with the machine) and are recorded as evidence the
-targets run, not as a benchmark.
+`fuzz/artifacts/` is empty after the run: libFuzzer writes a reproducer there for
+any crash, timeout or OOM, so an empty directory is the assertion, not the
+absence of one.
+
+Reproduce with `just fuzz <target> 900`. The exec counts are host-dependent
+(exec/s scales with the machine and with input size, which is why `page_decode`
+runs an order of magnitude hotter than `wal_decode`) and are recorded as evidence
+of how much ground the run covered — not as a performance benchmark.
+
+Earlier releases recorded a ~25 s smoke pass per target, which was enough to wire
+the targets into the workflow and catch obvious faults. This one is a real soak.
+It is still not a proof of absence: fuzzing shows the absence of the bugs it
+found, and a longer run on a seeded corpus can always find more. The durable
+value is that the targets exist and run clean, so a maintainer can fuzz for
+longer on any change to a parser.
