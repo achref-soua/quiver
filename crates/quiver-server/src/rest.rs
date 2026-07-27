@@ -368,6 +368,9 @@ struct CollectionDto {
     multivector: bool,
     #[serde(skip_serializing_if = "is_none_encryption")]
     vector_encryption: VectorEncryption,
+    /// Whether a search is answered from a built index (ADR-0081). Always present so
+    /// a client can poll for readiness instead of blocking on the first query.
+    index_ready: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -390,6 +393,7 @@ impl From<CollectionInfo> for CollectionDto {
             filterable: info.filterable.into_iter().map(Into::into).collect(),
             multivector: info.multivector,
             vector_encryption: info.vector_encryption,
+            index_ready: info.index_ready,
         }
     }
 }

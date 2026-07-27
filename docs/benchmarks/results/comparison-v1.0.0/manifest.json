@@ -1,0 +1,26 @@
+{
+  "timestamp": "2026-07-27T00:33:03.904584+00:00",
+  "os": "Linux",
+  "os_release": "6.6.87.2-microsoft-standard-WSL2",
+  "os_version": "#1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025",
+  "machine": "x86_64",
+  "cpu_model": "12th Gen Intel(R) Core(TM) i7-12700H",
+  "processor": "x86_64",
+  "python": "3.12.13",
+  "cpu_count_logical": 20,
+  "cpu_count_physical": 10,
+  "ram_total_mb": 15855.16796875,
+  "ram_available_mb": 11041.484375,
+  "swap_total_mb": 4096.0,
+  "disk_free_gb": 756.1736755371094,
+  "load_average": [
+    1.15869140625,
+    2.11669921875,
+    1.99462890625
+  ],
+  "quiver_version": "quiver 0.38.0 (/home/achref/projects/github-portfolio/quiver/target/release/quiver)",
+  "rust_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "cargo_version": "cargo 1.96.0 (30a34c682 2026-05-25)",
+  "docker_version": "Docker version 29.4.3, build 055a478",
+  "note": "Reference hardware for this project is the laptop described by the fields above, running under WSL2. That is a legitimate, reproducible data point and it is labelled as one: it is not a datacentre result, and absolute numbers should not be read as one. Comparative standings are meaningful because every system is measured on this same box with the same data. `load_average` is recorded so a run taken on a busy machine can be recognised as such rather than quietly published. See docs/benchmarks/methodology.md."
+}

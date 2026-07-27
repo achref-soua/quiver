@@ -129,6 +129,15 @@ message Collection {
   // (plaintext, server ranks), DCPE (server ranks ciphertexts, leaks distance
   // ordering by design), or CLIENT_SIDE (opaque AEAD, server does not rank).
   VectorEncryption vector_encryption = 9;
+  // Whether the disk graph navigates by binary (Hamming) codes rather than
+  // product-quantization codes (ADR-0074). Distances stay exact either way: the
+  // shortlist is re-ranked against the full vectors on disk.
+  bool binary = 10;
+  // Whether a search is answered from a built index (ADR-0081). False only
+  // between a collection's first write and its first index build; a search waits
+  // for that build rather than returning an empty result, so this is for callers
+  // that would rather poll than block.
+  bool index_ready = 11;
 }
 
 message CreateCollectionRequest {
@@ -147,6 +156,10 @@ message CreateCollectionRequest {
   // plaintext; DCPE = property-preserving (requires the L2 metric); CLIENT_SIDE =
   // opaque AEAD, searched client-side.
   VectorEncryption vector_encryption = 8;
+  // Navigate the disk graph by binary (Hamming) codes instead of product
+  // quantization (ADR-0074). Applies to the disk-resident graph index; the exact
+  // on-disk re-rank means reported distances are unchanged.
+  bool binary = 9;
 }
 
 message GetCollectionRequest {

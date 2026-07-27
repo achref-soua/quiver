@@ -253,3 +253,159 @@ async fn main() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    // Every flag, default and env binding below is a **public contract**: a user's
+    // scripts, systemd units and Dockerfiles are written against them, and 1.0
+    // promises they keep working. clap derives them, so a refactor can rename or
+    // drop one silently — nothing else in the tree references these strings. These
+    // tests are what makes that break loudly.
+
+    #[test]
+    fn the_cli_definition_is_internally_consistent() {
+        // clap's own audit: duplicate flags, conflicting shorts, bad defaults.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn serve_takes_no_arguments() {
+        let cli = Cli::try_parse_from(["quiver", "serve"]).unwrap();
+        assert!(matches!(cli.command, Command::Serve));
+    }
+
+    #[test]
+    fn tui_defaults_to_loopback_and_no_key() {
+        let cli = Cli::try_parse_from(["quiver", "tui"]).unwrap();
+        let Command::Tui { url, api_key } = cli.command else {
+            panic!("expected tui");
+        };
+        assert_eq!(url, "http://127.0.0.1:6333");
+        assert!(api_key.is_none());
+    }
+
+    #[test]
+    fn tui_accepts_an_explicit_url_and_key() {
+        let cli = Cli::try_parse_from(["quiver", "tui", "--url", "http://h:1/", "--api-key", "k"])
+            .unwrap();
+        let Command::Tui { url, api_key } = cli.command else {
+            panic!("expected tui");
+        };
+        assert_eq!(url, "http://h:1/");
+        assert_eq!(api_key.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn mcp_defaults_are_secure_by_default() {
+        let cli = Cli::try_parse_from(["quiver", "mcp"]).unwrap();
+        let Command::Mcp {
+            data_dir,
+            encryption_key,
+            insecure,
+            config,
+        } = cli.command
+        else {
+            panic!("expected mcp");
+        };
+        assert_eq!(data_dir, PathBuf::from("./data"));
+        assert_eq!(config, PathBuf::from("quiver.toml"));
+        assert!(encryption_key.is_none());
+        // The one that matters: encryption-at-rest is never off unless asked for.
+        assert!(!insecure, "insecure must default to false");
+    }
+
+    #[test]
+    fn update_defaults_to_installing_not_just_checking() {
+        let cli = Cli::try_parse_from(["quiver", "update"]).unwrap();
+        assert!(matches!(cli.command, Command::Update { check: false }));
+        let cli = Cli::try_parse_from(["quiver", "update", "--check"]).unwrap();
+        assert!(matches!(cli.command, Command::Update { check: true }));
+    }
+
+    #[test]
+    fn admin_import_parses_the_offline_form() {
+        let cli = Cli::try_parse_from([
+            "quiver",
+            "admin",
+            "import",
+            "--source",
+            "qdrant",
+            "--input",
+            "export.jsonl",
+            "--collection",
+            "items",
+            "--dim",
+            "8",
+        ])
+        .unwrap();
+        let Command::Admin { command } = cli.command else {
+            panic!("expected admin");
+        };
+        let AdminCommand::Import {
+            source,
+            input,
+            collection,
+            dim,
+            insecure,
+            ..
+        } = *command;
+        assert_eq!(source, "qdrant");
+        assert_eq!(input.as_deref(), Some(std::path::Path::new("export.jsonl")));
+        assert_eq!(collection, "items");
+        assert_eq!(dim, Some(8));
+        assert!(
+            !insecure,
+            "imports are encrypted at rest unless asked otherwise"
+        );
+    }
+
+    #[test]
+    fn admin_import_parses_the_live_connector_form() {
+        let cli = Cli::try_parse_from([
+            "quiver",
+            "admin",
+            "import",
+            "--source",
+            "chroma",
+            "--chroma-url",
+            "http://127.0.0.1:8000",
+            "--collection",
+            "docs",
+        ])
+        .unwrap();
+        let Command::Admin { command } = cli.command else {
+            panic!("expected admin");
+        };
+        let AdminCommand::Import {
+            source, chroma_url, ..
+        } = *command;
+        assert_eq!(source, "chroma");
+        assert_eq!(chroma_url.as_deref(), Some("http://127.0.0.1:8000"));
+    }
+
+    #[test]
+    fn an_unknown_subcommand_or_flag_is_rejected() {
+        assert!(Cli::try_parse_from(["quiver", "nope"]).is_err());
+        assert!(Cli::try_parse_from(["quiver", "tui", "--nope"]).is_err());
+        // A subcommand is required — bare `quiver` must not silently do nothing.
+        assert!(Cli::try_parse_from(["quiver"]).is_err());
+    }
+
+    #[test]
+    fn admin_import_requires_a_source_and_collection() {
+        assert!(Cli::try_parse_from(["quiver", "admin", "import"]).is_err());
+        assert!(
+            Cli::try_parse_from(["quiver", "admin", "import", "--source", "qdrant"]).is_err(),
+            "a collection name is required"
+        );
+    }
+
+    #[test]
+    fn the_styles_helper_builds() {
+        // Exercised only by the derive at startup otherwise.
+        let _ = quiver_styles();
+    }
+}

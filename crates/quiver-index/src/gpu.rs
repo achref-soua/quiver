@@ -16,6 +16,41 @@
 //! *running* the GPU path needs a device. Validated on real hardware: the
 //! `cuda`-gated test asserts the GPU result equals the CPU kernel and is otherwise
 //! skipped (so it is a no-op where no GPU is present).
+//!
+//! "Never a correctness dependency" has to survive the driver being *absent*, which
+//! is the common case on a self-hosted box. That is less automatic than it looks:
+//! cudarc loads the driver from a lazy static that **panics** when `dlopen` fails,
+//! so a fallible-looking `CudaDevice::new(0)?` does not, on its own, degrade to the
+//! CPU path — it unwinds out of the caller. `init_or_none` is where that is
+//! contained: any failure to reach a device, `Err` or panic, becomes `None` and the
+//! CPU kernel answers. (A driver present under a name the loader does not search —
+//! WSL ships `libcuda.so.1` with no `libcuda.so` in the cache — looks exactly like
+//! "no GPU" and takes the same path; export `LD_LIBRARY_PATH=/usr/lib/wsl/lib` to
+//! let the GPU be found there.)
+
+/// Run `build`, turning **any** failure into `None`: an `Err`, or a panic from a
+/// dependency that panics where it should return (the CUDA driver loader does).
+///
+/// Kept out of the `cuda` module, and so always compiled and always tested, because
+/// it is the thing standing between "the GPU is an accelerator" and "the GPU is a
+/// crash on machines that do not have one".
+#[cfg(any(feature = "cuda", test))]
+fn init_or_none<T>(
+    what: &str,
+    build: impl FnOnce() -> Result<T, Box<dyn std::error::Error>>,
+) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(e)) => {
+            eprintln!("{what} unavailable ({e}); using the CPU kernel");
+            None
+        }
+        Err(_) => {
+            eprintln!("{what} unavailable (the driver could not be loaded); using the CPU kernel");
+            None
+        }
+    }
+}
 
 /// Squared-L2 distance from `query` to each `dim`-length row of the contiguous
 /// `batch` (so `batch.len() == n * dim`), returning the `n` distances in row order.
@@ -117,17 +152,13 @@ extern "C" __global__ void l2sq(const float* q, const float* a, float* out, int 
     }
 
     // The process-wide GPU context, built once. `None` if no device is present or
-    // init fails — callers fall back to the CPU kernel.
+    // init fails — callers fall back to the CPU kernel. Init runs through
+    // `init_or_none` because cudarc's driver loader panics rather than returning
+    // `Err` when `dlopen` cannot find the CUDA library.
     pub(super) fn context() -> Option<&'static Context> {
         static CTX: OnceLock<Option<Context>> = OnceLock::new();
-        CTX.get_or_init(|| match Context::new() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                eprintln!("cuda: GPU acceleration unavailable ({e}); using the CPU kernel");
-                None
-            }
-        })
-        .as_ref()
+        CTX.get_or_init(|| super::init_or_none("cuda: GPU acceleration", Context::new))
+            .as_ref()
     }
 
     #[cfg(test)]
@@ -161,7 +192,30 @@ extern "C" __global__ void l2sq(const float* q, const float* a, float* out, int 
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_l2_sq, cpu_batch_l2_sq};
+    use super::{batch_l2_sq, cpu_batch_l2_sq, init_or_none};
+
+    #[test]
+    fn init_or_none_passes_through_a_working_backend() {
+        assert_eq!(init_or_none("test", || Ok(7u32)), Some(7));
+    }
+
+    #[test]
+    fn init_or_none_turns_an_error_into_the_cpu_path() {
+        let build = || -> Result<u32, Box<dyn std::error::Error>> { Err("no device".into()) };
+        assert_eq!(init_or_none("test", build), None);
+    }
+
+    // The regression that matters: cudarc loads the CUDA driver from a lazy static
+    // that *panics* when `dlopen` fails, so a backend that panics on init — the
+    // ordinary state of any machine without CUDA installed — must still degrade to
+    // the CPU kernel rather than unwinding into the caller.
+    #[test]
+    fn init_or_none_contains_a_panicking_backend() {
+        let build = || -> Result<u32, Box<dyn std::error::Error>> {
+            panic!("Unable to dynamically load the \"cuda\" shared library")
+        };
+        assert_eq!(init_or_none("test", build), None);
+    }
 
     #[test]
     fn batch_l2_sq_is_correct_per_row() {
