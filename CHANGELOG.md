@@ -4,11 +4,132 @@ All notable changes to Quiver are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-Quiver is pre-1.0: minor releases ship coherent, owner-gated feature sets and
-may include pre-1.0 API refinements. See [`docs/roadmap.md`](docs/roadmap.md)
-for the per-release rationale and Definitions of Done.
+As of `1.0.0` Quiver follows Semantic Versioning as a promise, not a habit: the
+REST and gRPC wire protocols, the Python and TypeScript SDK APIs, and the on-disk
+format with its version gates are stable, and breaking any of them requires a
+major version. See [`docs/roadmap.md`](docs/roadmap.md) for the full compatibility
+statement, including what is deliberately **not** covered.
 
 ## [Unreleased]
+
+## [1.0.0] — 2026-07-27
+
+The compatibility promise starts here. The **REST and gRPC wire protocols**, the
+**Python and TypeScript SDK APIs**, and the **on-disk format with its version gates**
+are stable from this release; breaking any of them requires a major version. Not
+covered, and labelled as such: internal crate APIs, the still-maturing cluster HTTP
+surface, and anything documented as experimental — the DCPE vector-encryption mode in
+particular.
+
+`1.0.0` is a statement about stability, not about being finished. What is still open
+is recorded in [`docs/roadmap.md`](docs/roadmap.md) rather than left to be discovered:
+the GPU kernel is wired into no build or search path yet ([ADR-0079](docs/adr/0079-gpu-build-search-wiring.md)
+settles where it plugs in), and the 10M disk-path head-to-head needs a machine with
+more RAM than the reference laptop.
+
+### The evidence behind the release
+
+- **Benchmarks on documented reference hardware.** Quiver, Qdrant, LanceDB and FAISS
+  measured in one run, on the same data, on the same machine
+  ([`comparison-v1.0.0`](docs/benchmarks/results/comparison-v1.0.0/comparison-v1.0.0.md)).
+  At recall@10 ≥ 0.95 Quiver is second only to FAISS on throughput and tail latency.
+  The reference machine is a laptop and is labelled as one throughout; every run now
+  records its own manifest — CPU model, core counts, free RAM, load average at start,
+  and the exact Quiver binary — so a run taken on a busy machine can be recognised
+  rather than quietly published.
+- **The recall curve is unchanged across sixteen releases**, reproducing the v0.22.0
+  sweep to three decimal places. Single-thread throughput is *lower* than that run
+  while resident memory fell from ~2069 MB to 1454 MB — consistent with the on-disk
+  resident-state work of ADR-0072/0073, but not isolated by a controlled experiment,
+  so it is published as the likely explanation and not as a measured fact.
+- **Fuzz soak**: ~342 million executions across the three parser targets, no crashes
+  ([fuzzing.md](docs/security/fuzzing.md)). Previously a ~25 s smoke pass.
+- **Coverage is enforced**, not asserted: CI fails below 85% lines; measured ~90.9%.
+- **The acceptance run gates every pull request** — a real encrypted server driven
+  over REST, both SDKs, the CLI importer and the MCP server. Both SDK unit suites mock
+  their transport, so this is the only thing that crosses a real socket.
+- **The cockpit tour is recorded** and regenerable in one command.
+- **The single-box 100M run was attempted and failed, and is reported as such.** It
+  reached **70.4M of 100M vectors in ~2 h 15 m** before the Linux OOM killer stopped
+  it, at ~10.4 GiB resident and 71 GB on disk. This corrects an earlier estimate in
+  the project's own notes that had put 100M resident state at "a few GiB": resident
+  memory climbed steadily through ingest rather than plateauing. No 100M recall,
+  latency or serving-RSS figure is published, because none was measured
+  ([scale characterisation](docs/benchmarks/scale-characterization.md)).
+
+### Added
+
+- **The acceptance run is now a CI gate, and it exercises the TypeScript SDK too.**
+  `scripts/acceptance.sh` boots a real encryption-at-rest server and drives every
+  external surface — REST, the Python SDK, the CLI importer, the MCP server over
+  stdio — but it only ever ran by hand, so none of it gated a pull request. It now
+  runs as the `acceptance` job on every PR, in well under a minute.
+
+  This closes the largest hole in the test matrix: **both SDK suites mock the
+  transport entirely** (`respx` for Python, a stubbed `fetch` for TypeScript), so
+  they prove the client's shape but never that the shape matches what the server
+  sends — a renamed field or a reclassified status code passes green under mocks and
+  fails in a user's hands. A new `scripts/acceptance_sdk.mjs` drives the built
+  TypeScript client across a real socket (lifecycle, filtered search, `getPoint`,
+  `scroll`, and that a 404 and a 401 arrive as `QuiverError` with the server's
+  status), joining the Python script that was already there.
+
+- **Binary quantization is now reachable over gRPC** ([ADR-0074](docs/adr/0074-binary-quantization-disk-graph.md)).
+  `CreateCollectionRequest` gains a `binary` field and `Collection` reports it back;
+  the handler previously passed a hard-coded `false`, so a gRPC client could not create
+  the collection it wanted and could not see what it had got. REST and the MCP server
+  already exposed it. `Collection` also gains `index_ready`, matching REST. Both are
+  additive proto fields, and `binary` defaults to `false`, so product quantization
+  remains the default.
+
+- **`index_ready` on the collection API** ([ADR-0081](docs/adr/0081-index-readiness.md)).
+  `GET /v1/collections/{name}` (and the list endpoint) now report whether a search is
+  answered from a built index. A search does not need it — it waits for the first build
+  rather than returning an empty result — so this is for callers that would rather poll
+  than block: an ingestion job, an operator, a dashboard.
+
+### Fixed
+
+- **The Raft router failover test no longer flakes.** It asserted that a write issued
+  immediately after killing the leader succeeds on the first attempt — but a write
+  during a leader election legitimately fails, because the router has nobody to route
+  it to and says so rather than accepting a write it cannot commit. The test was
+  demanding that an election take zero time, not that the router recovers. It now
+  retries through the election, exactly as the create above it already did, and
+  asserts the guarantee that actually matters: the router rediscovers the new leader
+  and no acknowledged write is lost. Confirmed over **30 consecutive runs**.
+
+- **A freshly loaded collection no longer returns an empty result set**
+  ([ADR-0081](docs/adr/0081-index-readiness.md)). Two correct decisions composed into a
+  wrong answer: a bulk load defers its index work and marks the collection stale
+  ([ADR-0045](docs/adr/0045-hybrid-everywhere-and-fast-ingest.md)), and a stale
+  collection's read serves the **prior** snapshot rather than blocking
+  ([ADR-0062](docs/adr/0062-off-lock-index-rebuild.md)) — but a collection whose index
+  has never been built has no prior snapshot, so the read was answered from *nothing*.
+  `GET` reported the full point count while `query` returned `200 OK` with zero
+  matches, and a client could not tell "nothing matched" from "the index does not exist
+  yet". Measured before the fix: 1500 points written, then `0` hits for ~0.55 s; the
+  window is a *build*, so it scales with the collection (the recorded first build for
+  1M vectors is 236 s). A read against an index that was never built now waits for that
+  build — once per collection, single-flighted across concurrent readers — and returns
+  the right answer. Steady-state reads are untouched: a collection with a built index
+  never takes the new path, so ADR-0062's non-blocking rebuild still applies.
+
+  The engine was always correct here (its `search` rebuilds in place); only the server
+  diverged, which is why the embedded tests never caught it.
+
+- **The GPU seam now actually falls back to the CPU.** The `gpu` module promised the
+  GPU was "a pure accelerator … never a correctness dependency", but a `cuda`-feature
+  build on a machine without a loadable CUDA driver **panicked** out of
+  `batch_l2_sq` instead of using the CPU kernel: cudarc loads the driver from a lazy
+  static that panics when `dlopen` fails, so `CudaDevice::new(0)?` never got the
+  chance to return `Err`. Any failure to reach a device — `Err` or panic — is now
+  contained and answers on the CPU SIMD kernel, as documented. No impact on a default
+  build (the feature is off, and the kernel currently has no callers), but it would
+  have become a crash the moment [ADR-0079](docs/adr/0079-gpu-build-search-wiring.md)
+  wired the kernel into the IVF build path. CI now *runs* the `cuda`-feature tests on
+  its GPU-less runner rather than only compiling them, which is the case that matters
+  and the reason this went unnoticed.
 
 ## [0.38.0] — Ebb — 2026-07-25
 
@@ -1153,7 +1274,8 @@ and dynamic, elastic membership with online rebalancing behind a coordinator
   SIMD kernels; REST + gRPC; encryption-at-rest by default; TLS via `rustls`; the
   TUI MVP; the benchmark harness with first SIFT1M numbers; the Python SDK.
 
-[Unreleased]: https://github.com/achref-soua/quiver/compare/v0.38.0...HEAD
+[Unreleased]: https://github.com/achref-soua/quiver/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/achref-soua/quiver/compare/v0.38.0...v1.0.0
 [0.38.0]: https://github.com/achref-soua/quiver/compare/v0.37.0...v0.38.0
 [0.37.0]: https://github.com/achref-soua/quiver/compare/v0.36.0...v0.37.0
 [0.36.0]: https://github.com/achref-soua/quiver/compare/v0.35.0...v0.36.0

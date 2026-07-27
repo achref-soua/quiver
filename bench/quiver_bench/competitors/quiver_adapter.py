@@ -16,7 +16,27 @@ import numpy as np
 
 from .base import CompetitorAdapter
 
-QUIVER_VERSION = "0.20.0"
+def quiver_version() -> str:
+    """The version of the Quiver binary being benchmarked.
+
+    This was a hard-coded "0.20.0" for several releases, so every result set
+    published since then carried the wrong version label — the one thing a
+    benchmark result must never be vague about. It is now read from the binary.
+
+    Caveat worth knowing: when the server is externally managed (the default, and
+    what the reference-hardware runbook describes), the harness cannot see that
+    process, so this reports the binary it *would* have launched. Run the runbook's
+    `./target/release/quiver serve` and the two are the same.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.check_output(
+            [quiver_binary(), "--version"], stderr=subprocess.DEVNULL, timeout=5
+        )
+        return out.decode().strip().removeprefix("quiver ")
+    except Exception:  # noqa: BLE001
+        return "unknown"
 COLLECTION = "quiver_bench"
 
 # Keep each bulk request comfortably under the server's default 32 MiB body cap
@@ -41,9 +61,37 @@ def bulk_batch_size(dim: int) -> int:
     return max(1, min(_MAX_BULK_BATCH, by_bytes))
 
 
+
+def quiver_binary() -> str:
+    """Resolve the `quiver` binary to benchmark.
+
+    Prefers this checkout's own release build over whatever is on PATH, because a
+    stale `quiver` installed in ~/.cargo/bin silently benchmarks the wrong version
+    and the result looks entirely normal. Override with QUIVER_BIN.
+    """
+    import os
+    import shutil
+    from pathlib import Path
+
+    override = os.environ.get("QUIVER_BIN")
+    if override:
+        return override
+    repo = Path(__file__).resolve().parents[3]
+    for candidate in (repo / "target/release/quiver", repo / "target/debug/quiver"):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    found = shutil.which("quiver")
+    if not found:
+        raise RuntimeError(
+            "no quiver binary found: build one (`cargo build --release -p quiverdb-cli`) "
+            "or set QUIVER_BIN"
+        )
+    return found
+
+
 class QuiverAdapter(CompetitorAdapter):
     name = "quiver"
-    version = QUIVER_VERSION
+    version = quiver_version()
     param_name = "ef_search"
 
     def __init__(
@@ -115,7 +163,7 @@ class QuiverAdapter(CompetitorAdapter):
         if self._api_key:
             env["QUIVER_API_KEYS"] = self._api_key
         self._proc = subprocess.Popen(
-            ["quiver", "serve"],
+            [quiver_binary(), "serve"],
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

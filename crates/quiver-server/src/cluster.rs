@@ -396,6 +396,9 @@ impl Cluster {
             filterable,
             multivector,
             vector_encryption,
+            // Just created on every shard, so empty everywhere — and an empty
+            // collection answers correctly without an index (ADR-0081).
+            index_ready: true,
         })
     }
 

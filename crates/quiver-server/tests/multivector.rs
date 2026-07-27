@@ -352,6 +352,7 @@ async fn colbert_index_round_trip() {
                 filterable: Vec::new(),
                 multivector: true,
                 vector_encryption: v1::VectorEncryption::None as i32,
+                binary: false,
             },
         ))
         .await

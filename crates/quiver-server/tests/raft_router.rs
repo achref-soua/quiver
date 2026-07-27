@@ -114,15 +114,32 @@ fn point(i: u32) -> Value {
 
 // Upsert through the router. The router resolves the shard's Raft leader and
 // retries internally, so this succeeds whichever voter is currently leader.
+// Upsert through the router, retrying through a leader election.
+//
+// A write issued while Raft has no elected leader legitimately fails — the router
+// has nobody to route it to, and it says so rather than accepting a write it cannot
+// commit. That is the correct product behaviour, so a single-shot POST here made the
+// test assert something stronger than the guarantee: that an election takes zero
+// time. The guarantee is that the router *rediscovers* the new leader and the write
+// lands, which is what retrying asserts. Upserts are keyed by id, so a retry is
+// idempotent by construction and cannot double-count.
 async fn router_upsert(http: &reqwest::Client, router: &str, ids: &[u32]) {
     let points: Vec<Value> = ids.iter().map(|&i| point(i)).collect();
-    http.post(format!("{router}/v1/collections/c/points"))
-        .json(&json!({ "points": points }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+    let mut last = String::from("never attempted");
+    for _ in 0..240 {
+        match http
+            .post(format!("{router}/v1/collections/c/points"))
+            .json(&json!({ "points": points }))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => return,
+            Ok(r) => last = format!("HTTP {}", r.status()),
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("router never accepted the upsert of {ids:?}; last attempt: {last}");
 }
 
 // The set of ids the router's scatter-gather search returns for a query near `qi`.

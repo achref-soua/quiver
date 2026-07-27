@@ -33,11 +33,16 @@ jobs:
         run: cargo clippy -p quiverdb-server --features otlp --all-targets -- -D warnings
       - name: Clippy (optional raft feature — keeps the gated consensus adapter from rotting)
         run: cargo clippy -p quiverdb-server --features raft --all-targets -- -D warnings
-      - name: Clippy (optional cuda feature — build-only; keeps the gated GPU kernel from rotting)
+      - name: Clippy (optional cuda feature — keeps the gated GPU kernel from rotting)
         # cudarc dynamically loads the CUDA driver at runtime, so the feature
-        # *compiles* without a CUDA toolchain. The GPU is validated on real hardware
-        # locally — it cannot run on the GPU-less CI runner, so this only builds it.
+        # *compiles* without a CUDA toolchain.
         run: cargo clippy -p quiverdb-index --features cuda --all-targets -- -D warnings
+      - name: Test (optional cuda feature — the CPU fallback on a GPU-less machine)
+        # This runner has no CUDA driver, which is exactly the case worth gating: a
+        # `cuda` build must degrade to the CPU kernel there, not fail. Only clippy ran
+        # here before, which is why a panicking driver load shipped unnoticed — the
+        # GPU-side assertions self-skip without a device, so this is safe everywhere.
+        run: cargo test -p quiverdb-index --features cuda gpu
       - name: Format + clippy (cockpit-shots — its own workspace, not in --workspace above)
         run: |
           cargo fmt --manifest-path tools/cockpit-shots/Cargo.toml --check
@@ -73,6 +78,28 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # The roadmap has asserted a >=80% coverage gate since Phase 3, but nothing
+      # enforced it — `just coverage` was a local HTML report run by hand, so the
+      # number in the docs was an unverified claim. The measured workspace figure is
+      # ~90.6% line, so the gate is set at 85%: comfortably above what the roadmap
+      # promises, with enough headroom that ordinary churn does not trip it. Skips the
+      # same crash-recovery stress test the `check` job runs separately, whose kill -9
+      # timing is runner-sensitive.
+      - name: Coverage (workspace, gate at 85% lines)
+        run: >-
+          cargo llvm-cov --workspace --summary-only --fail-under-lines 85
+          -- --skip kill_mid_write_preserves_acknowledged_writes
+
   package:
     name: package (publishability)
     runs-on: ubuntu-latest
@@ -101,7 +128,7 @@ jobs:
       - uses: pnpm/action-setup@v6
         with:
           version: "11.6.0" # matches packageManager; pnpm 11 needs Node >= 22.13
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
       - name: Build + test + dry-run pack the TypeScript SDK
@@ -112,6 +139,29 @@ jobs:
           # Run the SDK test suite — includes the cross-language cipher KAT (F-13).
           pnpm test
           npm pack --dry-run
+
+  # Boots a real encrypted server and drives every external surface the way an
+  # operator does — REST, both SDKs, the CLI importer, and the MCP server over
+  # stdio. This existed as `just acceptance` but ran only by hand, which left the
+  # SDKs effectively untested against a live server: their own suites mock the
+  # transport entirely, so a wire-format change on the server ships green. It takes
+  # well under a minute, which is cheap for the surface it covers.
+  acceptance:
+    name: acceptance (live server, every surface)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: "11.6.0" # matches packageManager; pnpm 11 needs Node >= 22.13
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Acceptance run
+        run: bash scripts/acceptance.sh
 
   helm:
     name: helm lint + template

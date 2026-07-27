@@ -112,6 +112,19 @@ QUIVER_URL="$BASE" QUIVER_API_KEY="$API_KEY" \
   uv run --quiet --project "$REPO/sdks/python" python "$REPO/scripts/acceptance_sdk.py" \
   || fail "Python SDK acceptance"
 
+hdr "TypeScript SDK surface (wire contract against the live server)"
+# The TS suite mocks fetch entirely, so it proves the client's shape but never that
+# the shape matches what the server sends. This crosses a real socket. Needs pnpm +
+# node to build the SDK; skipped loudly rather than silently where they are absent,
+# and CI provides both so it always runs there.
+if command -v pnpm >/dev/null && command -v node >/dev/null; then
+  (cd "$REPO/sdks/typescript" && pnpm install --frozen-lockfile --silent && pnpm build >/dev/null) \
+    || fail "TypeScript SDK build"
+  node "$REPO/scripts/acceptance_sdk.mjs" "$BASE" "$API_KEY" || fail "TypeScript SDK acceptance"
+else
+  red "  SKIPPED: pnpm/node not found — the TypeScript SDK was not exercised"
+fi
+
 hdr "CLI surface (quiver admin import, encrypted-at-rest)"
 EXPORT="$IMPORT_DIR/qdrant.jsonl"
 cat >"$EXPORT" <<'JSONL'
@@ -150,4 +163,4 @@ echo "$MCP_OUT" | grep -qF '\"id\":\"x\"' || fail "MCP search did not return poi
 pass "create_collection + upsert + search round-trips over MCP"
 
 hdr "ACCEPTANCE PASSED"
-grn "All surfaces (REST, Python SDK, CLI, MCP) exercised against a live encrypted server."
+grn "All surfaces (REST, Python SDK, TypeScript SDK, CLI, MCP) exercised against a live encrypted server."

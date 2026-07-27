@@ -3,9 +3,16 @@
 This is the human-facing acceptance checklist for a release (the v0.17.0
 launch-hardening pass, Phase A). It enumerates everything Quiver does, across
 every external surface and every index / quantization / encryption mode, and maps
-each item to the automated coverage that proves it — plus the manual steps for the
-two surfaces that cannot be asserted headless (the interactive cockpit and
-real-server migration imports).
+each item to the automated coverage that proves it — plus the manual steps for what
+genuinely still needs a human (chiefly real-server migration imports against a live
+Qdrant/Chroma/Postgres).
+
+The interactive cockpit **used to be on that list and no longer is.** A pty is a
+terminal, which is all `asciinema` and `crossterm` require, so
+[`scripts/record-cockpit-cast.sh`](../../scripts/record-cockpit-cast.sh) drives a
+scripted tour unattended and [`docs/assets/cockpit.cast`](../assets/cockpit.cast)
+regenerates in one command. A human tour is still the better *demo*; it is no longer
+the only way to get one.
 
 > **Honesty.** This is a *correctness* acceptance pass. Performance numbers come
 > only from the documented reference hardware
@@ -18,14 +25,22 @@ real-server migration imports).
 just verify          # the full gate: fmt · clippy -D · cargo test --workspace · doc · deny · audit
 just test-py         # Python SDK suite (HTTP mocked)
 just test-ts         # TypeScript SDK suite (fetch mocked)
-just acceptance      # boots a real encrypted server, drives REST + Python SDK + CLI + MCP
+just acceptance      # boots a real encrypted server, drives REST + both SDKs + CLI + MCP
 ```
 
 `just acceptance` ([`scripts/acceptance.sh`](../../scripts/acceptance.sh) +
-[`scripts/acceptance_sdk.py`](../../scripts/acceptance_sdk.py)) is the live
+[`scripts/acceptance_sdk.py`](../../scripts/acceptance_sdk.py) +
+[`scripts/acceptance_sdk.mjs`](../../scripts/acceptance_sdk.mjs)) is the live
 end-to-end run: it starts a server with **encryption-at-rest ON** on loopback alt
 ports and exercises the lifecycle (create → upsert → filtered search → get →
 delete → drop) across every surface and mode below.
+
+**It also runs in CI** (the `acceptance` job), so these surfaces are gated on every
+pull request rather than only before a release. That matters most for the SDKs: both
+suites (`just test-py`, `just test-ts`) mock the transport entirely, so they prove the
+client's shape but never that the shape matches what the server sends — a renamed
+field or a reclassified status code passes under mocks and fails in a user's hands.
+The acceptance run is what crosses a real socket.
 
 For the deeper deterministic guarantees, see also:
 
@@ -92,6 +107,7 @@ Legend: ✅ automated (named test / script) · 🖐 manual step.
 | --- | --- |
 | client lifecycle, search, fetch (fetch mocked) | ✅ `sdks/typescript/test/*` via `just test-ts` |
 | native DCPE / vector ciphers + cross-lang KAT | ✅ `test/dcpe.test.ts`, `test/vector.test.ts` |
+| **wire contract against a live server** | ✅ `scripts/acceptance_sdk.mjs` via `acceptance.sh` |
 
 ### CLI (`quiver`)
 
@@ -101,7 +117,7 @@ Legend: ✅ automated (named test / script) · 🖐 manual step.
 | `mcp` | ✅ `acceptance.sh` |
 | `admin import` (offline, encrypted at rest) | ✅ `admin.rs` tests; `acceptance.sh` |
 | `admin import` cleartext-credential warning | ✅ `live.rs` tests; `acceptance.sh` |
-| `tui` | 🖐 manual (see below); render path ✅ `crates/quiver-tui/tests/live.rs` |
+| `tui` | ✅ scripted tour via `scripts/record-cockpit-cast.sh` (pty-driven, asserts it reached both views); render path ✅ `crates/quiver-tui/tests/live.rs`; 🖐 a human tour is still worth doing before a launch |
 
 ### TUI cockpit
 
