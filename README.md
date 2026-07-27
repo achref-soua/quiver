@@ -216,28 +216,36 @@ An `ann-benchmarks`-style harness lives in [`bench/`](./bench). On **SIFT1M** (1
 
 | `ef_search` | 16 | 32 | 64 | 128 | 256 |
 |---|---|---|---|---|---|
+| **recall@1** | 0.853 | 0.928 | 0.966 | 0.984 | 0.988 |
 | **recall@10** | 0.793 | 0.895 | 0.958 | 0.986 | 0.995 |
-| **QPS** (1 thread) | 1539 | 1424 | 1222 | 955 | 701 |
-| **p95 latency** (ms) | 0.8 | 0.8 | 1.0 | 1.3 | 1.7 |
+| **recall@100** | 0.918 | 0.918 | 0.918 | 0.944 | 0.983 |
+| **QPS** (1 thread) | 675 | 726 | 625 | 553 | 419 |
+| **QPS** (8 threads) | 649 | 592 | 644 | 626 | 600 |
+| **p95 latency** (ms) | 2.4 | 1.9 | 2.3 | 2.5 | 3.3 |
 
-**Head-to-head on SIFT1M**, every system on the *same* box (i7-12700H · 20 threads · 15.5 GB), peak single-thread QPS at **recall@10 ≥ 0.95** (full method, sweeps, and the wins/losses matrix: [`comparison-v0.20.0`](./docs/benchmarks/results/comparison-v0.20.0/comparison-v0.20.0.md)):
+`ef_search` is the one knob: it buys recall with latency. Read the concurrency row
+honestly — a single-process Python client is itself a ceiling, so *light* queries are
+client-bound and 8 threads buy nothing; the server-side win only shows on heavier
+queries, reaching **1.43× at `ef=256`**, not a flattering "8×".
 
-| System | recall@10 | QPS (1T) | p95 (ms) | RSS (MB) | build |
-|---|---:|---:|---:|---:|---:|
-| FAISS 1.14 | 0.968 | **3842** | 0.4 | 1234 ¹ | 82 s |
-| **Quiver v0.20** | 0.958 | **1222** | **1.0** | 2069 | 581 s ² |
-| Chroma 1.5 | 0.977 | 1009 | 1.1 | 3752 ¹ | 153 s |
-| Weaviate 1.27 | 0.983 | 663 | 1.7 | 2218 | 38 min |
-| Milvus 2.5 (server) | 0.986 | 649 | 1.9 | 2075 | 26 s |
-| Qdrant 1.13 | 0.974 | 358 | 4.5 | **258** ³ | 98 s |
-| pgvector 0.7 | 0.980 | 118 | 11.8 | 1291 | 132 s |
-| LanceDB 0.33 | 0.557 ⁴ | 219 | 5.3 | 2475 ¹ | 15 s |
+**Head-to-head on SIFT1M** (`v1.0.0` run, [full results + sweeps](./docs/benchmarks/results/comparison-v1.0.0/comparison-v1.0.0.md)). Every system measured in the same run, on the same data, on the documented reference hardware below — peak single-thread QPS at **recall@10 ≥ 0.95**:
 
-Quiver is **second only to FAISS** on both throughput and tail latency at this recall bar, with recall on par with the field — and on the v0.20.0 engine its single-thread QPS rose ~40% over v0.18.0 (870 → 1222 at recall ≥ 0.95) while p95 dropped from 1.5 ms to 1.0 ms.
+| System | recall@1 | recall@10 | recall@100 | QPS (1T) | QPS (8T) | p95 (ms) | RSS (MB) | build (s) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| FAISS 1.14 | 0.976 | 0.968 | 0.868 | **2998** | **8198** | **0.45** | 2181 ¹ | 142 |
+| **Quiver v1.0** | 0.966 | 0.958 | 0.918 | **625** | 644 | **2.28** | 1454 | 807 ² |
+| Qdrant 1.13 | 0.979 | 0.977 | 0.937 | 267 | 329 | 6.58 | **263** ³ | 182 |
+| LanceDB 0.33 | 0.459 | 0.557 ⁴ | 0.634 | 157 | 308 | 7.99 | 1675 ¹ | 42 |
 
-The honesty that makes the table trustworthy: this is an **in-memory HNSW** comparison for *every* system, so RSS here is full-vectors-in-RAM — Quiver's memory-frugality wedge is its **disk-resident path** (only PQ codes resident; ~32× less RAM, see [`disk-path.md`](./docs/benchmarks/results/disk-path.md)), **not** this table. ¹ FAISS/Chroma/LanceDB run in-process so their RSS includes the Python harness + the resident 512 MB dataset (inflated; only Quiver/Milvus/Qdrant/Weaviate report the isolated DB). ² Quiver's "build" is now the **bulk-ingest** path (`POST …/points:bulk`, [ADR-0045](./docs/adr/0045-hybrid-everywhere-and-fast-ingest.md)) — one WAL fsync per request plus a single deferred index pass, with the first query forcing the rebuild so the number is the honest *time-until-queryable* (581 s, down from v0.18.0's 854 s REST-upload path). In-process FAISS still builds fastest as it skips the network entirely. ³ Qdrant mmaps vectors to disk by default. ⁴ LanceDB's IVF-PQ config doesn't reach 0.95 recall in this sweep (shown at its best). Numbers are **dev-box, indicative** — comparative standings on the identical box are real (per the [methodology](./docs/benchmarks/methodology.md)); **absolute** RSS, saturated multi-thread QPS, and the 10M disk path are reference-hardware-pending; we never fabricate. Milvus is benchmarked as the **server** (Docker), not the in-process Lite build.
+**Reference hardware:** 12th Gen Intel Core i7-12700H · 10 physical / 20 logical cores · 15.5 GB RAM (10.8 GB available) · 4 GB swap · WSL2 (kernel 6.6.87.2) · Ubuntu 22.04.5. That is **a laptop**, and it is labelled as one: these are reproducible comparative results, not datacentre numbers. Every run records its own machine manifest — CPU model, core counts, free RAM, load average at start, and the exact Quiver binary — so a run taken on a busy machine can be recognised rather than quietly published.
 
-**GIST1M** (1M × 960, L2) is the harder, higher-dimensional test. Same box, each system at its most efficient config reaching recall@10 ≥ 0.95, or its best point at `ef_search ≤ 256` (960-d needs a wide beam, so most plateau below 0.95 in this sweep):
+Quiver is **second only to FAISS** on both throughput and tail latency at this recall bar. FAISS is an in-process library that skips the network entirely; Quiver is answering over HTTP. Qdrant reaches slightly higher recall at ~2.3× lower throughput, and holds far less RAM because it mmaps vectors to disk by default — which is the honest comparison to make, since **this table is an in-memory HNSW comparison for every system**. Quiver's memory-frugality wedge is its **disk-resident path** (only quantized codes resident, ~32× less RAM — see [`disk-path.md`](./docs/benchmarks/results/disk-path.md)), *not* this table.
+
+¹ FAISS and LanceDB run in-process, so their RSS includes the Python harness and the resident 512 MB dataset — inflated; only Quiver and Qdrant report an isolated server. ² Quiver's "build" is *time-until-queryable* over the bulk-ingest path ([ADR-0045](./docs/adr/0045-hybrid-everywhere-and-fast-ingest.md)) — one WAL fsync per request plus a single deferred index pass, with the first query forcing and now **awaiting** that build ([ADR-0081](./docs/adr/0081-index-readiness.md)); before ADR-0081 the forcing query returned without waiting, so part of the build fell outside the timer. ³ Qdrant mmaps vectors to disk by default. ⁴ LanceDB's IVF-PQ config does not reach 0.95 recall in this sweep and is shown at its best point — an honest DNF, not a tuned-down row.
+
+Two things worth stating rather than burying. **Recall is unchanged across sixteen releases**: the `ef` sweep reproduces the v0.22.0 curve to three decimal places (0.793 / 0.895 / 0.958 / 0.986 / 0.995), which is a stronger correctness signal than any single number in the table. And **single-thread QPS is below the v0.22.0 run** while RSS fell from ~2069 MB to 1454 MB. Those two moves are consistent with the on-disk resident-state work of [ADR-0072](./docs/adr/0072-on-disk-primary-index.md)/[ADR-0073](./docs/adr/0073-on-disk-embed-id-map.md), which deliberately trades RAM for lookups — but that attribution is **not isolated by a controlled experiment**, so it is offered as the likely explanation, not as a measured fact.
+
+**GIST1M** (1M × 960, L2) is the harder, higher-dimensional test. These figures are from the **`v0.20.0`** run and were **not re-measured for `v1.0.0`** — the SIFT1M table above is the current one. Same box, each system at its most efficient config reaching recall@10 ≥ 0.95, or its best point at `ef_search ≤ 256` (960-d needs a wide beam, so most plateau below 0.95 in this sweep):
 
 | System | recall@10 | QPS (1T) | p95 (ms) | RSS (MB) | ef/nprobe |
 |---|---:|---:|---:|---:|---:|
