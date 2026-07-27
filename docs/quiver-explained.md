@@ -875,19 +875,41 @@ That last sentence was, for several releases, simply false — and it is worth k
 
 > **FIGURE_GPU**
 
-This is the **batch-distance kernel** (the part of GPU acceleration that earns its keep), validated against the CPU kernel on real hardware. Folding it into the planner's exact-scan path and the k-means / quantizer training batches is the next step; the point today is the seam — Quiver can borrow a GPU's muscle where one exists, and lose nothing where one doesn't.
+For several releases that seam sat there wired into **nothing** — a kernel with no callers. In `v1.1.0` a CUDA device finally became reachable on the reference machine, and the wiring went in under a rule worth stating: an increment ships **only if it is measured to beat the CPU path it replaces**, and is retired in writing otherwise ([ADR-0082](./adr/0082-gpu-seam-and-dispatch-policy.md)). That is a stricter bar than usual, and deliberately so — this is the final release, so the ordinary excuse for landing a plausible optimisation ("the next release will refine it") does not exist.
 
-## 9.14 What is finished, and what comes next
+The measurement then did something more interesting than confirm the plan. It **split it in half**.
 
-This is `v1.0.0`, so the honest thing is to separate what is *done* from what is *sequenced*.
+On the **build** side the GPU wins comfortably. The assign pass — every point measured against every centroid, which is what k-means does on repeat and what an IVF build does once over the whole corpus — ran **4.08× faster** than the CPU at a million points against 1024 centroids, and a complete IVF build of 200,000 × 128-d dropped from a median **57.9 s to 24.1 s: 2.40×**.
 
-**Done.** The big features stand: write HA (§9.11), elastic scaling in both directions — grow and the reverse-migration **drain** (§9.12) — sharding and scatter-gather (§9.8), read replicas (§9.9), and the GPU distance kernel behind its seam (§9.13). The launch polish is complete too: the docs site is live at [`achref-soua.github.io/quiver`](https://achref-soua.github.io/quiver/), publishing these same canonical documents so there is one source of truth ([ADR-0078](./adr/0078-docs-site-deploy.md)); the cockpit tour is recorded and regenerable in one command; the benchmark table is filled in from a real run on documented reference hardware, competitors and all; and the parser fuzzers have a recorded soak rather than a smoke test.
+On the **search** side the GPU loses. Not narrowly, and not only on small batches: scanning one query against a million rows, the device was **2.8× slower** than the CPU, and it lost at every smaller size too.
 
-**What `1.0` means here.** It is a promise about compatibility, not a claim of completion: the REST and gRPC wire surfaces, the SDK APIs, and the on-disk format with its version gates are stable from this point, and breaking any of them requires a major version. The pre-1.0 licence to refine an API on the way past has expired.
+That looks like a contradiction — the same hardware, the same arithmetic, opposite verdicts — until you count the bytes instead of the flops. The assign pass reads `n × dim` floats and does `n × nlist × dim` work: **every byte that crosses the bus is used a thousand times.** A scan reads the same floats and does one pass over them: **every byte is used once.** A GPU is not fast because it computes quickly; it is fast because it computes quickly *on data already sitting in its memory*. Feed it a stream it must read once and the bus becomes the whole story, and the bus is slower than the CPU's own cache.
 
-**Next.** The GPU kernel is wired into no build or search path yet. Where it plugs in and the contract it must honour are settled — *the GPU narrows, the CPU scores*, so every reported distance stays bit-identical to a CPU-only run ([ADR-0079](./adr/0079-gpu-build-search-wiring.md)) — and the hardware to do it on is now in hand, so the wiring is sequenced for the next release rather than gated on equipment. Beyond that: continued distributed-sharding maturity, and the honest remaining measurement work — the 10M disk-path head-to-head, which needs a machine with more RAM than a laptop to mean anything.
+So the honest headline is narrower than "GPU support", and it is worth being blunt about because the phrase misleads by default in a database: **Quiver's GPU acceleration makes builds faster, not queries.** Search wiring was designed, implemented far enough to measure, measured, and **retired** — because shipping it behind a threshold high enough never to fire would be shipping dead code with a promise attached.
+
+Two smaller things fell out of the same discipline. The dispatch threshold below which the CPU wins is **8192 rows**, measured, replacing the 4096 the design guessed at; below it the device's fixed launch cost (a flat ~80 ms here, an artefact of WSL2's paravirtualised GPU) swamps the arithmetic. And the "per-backend determinism" the design predicted — that a GPU and a CPU can pick different centroids for the same point when two are equidistant — turned out to be real and *tiny*: **3 points in 1,048,576**. The test does not merely count those; it asserts each one is a genuine tie, so a device that assigned a materially worse centroid would fail rather than be waved through as float noise.
+
+## 9.14 What is finished — and what Quiver never did
+
+This is `v1.1.0`, and it is the **last** one. So this section does not separate *done* from *sequenced*, the way every previous version of it did. There is nothing sequenced. There is only what was built, and what was deliberately not.
+
+**What stands.** Encrypted storage with a `kill -9` crash gate. HNSW, IVF and DiskANN with product, scalar and binary quantization. Hybrid and BM25 search. Lock-free MVCC reads. Per-shard Raft write HA (§9.11). Elastic scaling in both directions — grow, and the reverse-migration **drain** (§9.12). Sharding and scatter-gather (§9.8), read replicas (§9.9), an MCP server, REST and gRPC, both SDKs, the cockpit. And, new here, GPU-accelerated **builds** (§9.13). The docs site is live, the cockpit tour is recorded and regenerable, the benchmark tables come from real runs on hardware described down to its load average, and the parser fuzzers have a recorded soak rather than a smoke test.
+
+**What the compatibility promise covers.** The REST and gRPC wire surfaces, the Python and TypeScript SDK APIs, and the on-disk format with its version gates. Those are stable. Nothing is deprecated and nothing is scheduled for removal — there is simply no further feature work planned.
+
+**What Quiver never did, and why.** A finished project owes this list; an abandoned one leaves you to infer it. Every item below is a decision with its reasoning recorded in [ADR-0083](./adr/0083-closing-the-backlog.md).
+
+- **GPU-accelerated *search*.** Measured, and the hardware said no — 2.8× slower than the CPU at a million rows (§9.13).
+- **AES-256-GCM at rest**, which `openssl speed` puts at roughly **2.7×** the throughput of the XChaCha20-Poly1305 Quiver actually uses, on this AES-NI CPU. That number is not small, and it was declined anyway: selecting a cipher per seal changes the at-rest format, and a mistake in the at-rest format of an *encrypted* database is not a slow query, it is unreadable data. There is no follow-up release in which to fix it.
+- **Atomic bulk writes** via single-log-entry Raft batches — a durable Raft-log format change, and largely redundant on a real cluster with the proposal pipelining that did ship.
+- **A published 100M single-box number.** Attempted, and it **failed**: 70.4 million vectors of 100 million in about two and a quarter hours, then the Linux OOM killer, at ~10.3 GiB resident and 71 GB on disk. The failure is published in full, because it corrects a prediction this very document once made.
+- **A 10M disk-path head-to-head** against Qdrant and LanceDB, which needs more RAM than the reference laptop. Retired rather than left "pending" forever, because pending forever is not a status.
+
+**The pattern worth taking away.** Two of those refusals — the Raft log format and the AEAD cipher — are the same refusal: *do not change a durable format in a release that has no successor.* A version gate is a promise that a later release will handle what the first attempt got wrong on real data. When there is no later release, that promise cannot be made, so the change cannot be made either. It costs measurable performance. It is still correct.
 
 None of this compromises the single static binary, and single-node remains the default everywhere.
+
+Quiver is AGPL-3.0. If any line above reads as an opening rather than a closing, the repository is a fork away — and the history, every ADR, the threat model and the test suite come with it, which is most of what maintaining a database actually is.
 
 ---
 
