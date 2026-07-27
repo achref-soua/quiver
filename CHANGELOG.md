@@ -49,6 +49,13 @@ more RAM than the reference laptop.
   over REST, both SDKs, the CLI importer and the MCP server. Both SDK unit suites mock
   their transport, so this is the only thing that crosses a real socket.
 - **The cockpit tour is recorded** and regenerable in one command.
+- **The single-box 100M run was attempted and failed, and is reported as such.** It
+  reached **70.4M of 100M vectors in ~2 h 15 m** before the Linux OOM killer stopped
+  it, at ~10.4 GiB resident and 71 GB on disk. This corrects an earlier estimate in
+  the project's own notes that had put 100M resident state at "a few GiB": resident
+  memory climbed steadily through ingest rather than plateauing. No 100M recall,
+  latency or serving-RSS figure is published, because none was measured
+  ([scale characterisation](docs/benchmarks/scale-characterization.md)).
 
 ### Added
 
