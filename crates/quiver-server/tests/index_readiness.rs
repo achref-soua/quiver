@@ -239,3 +239,64 @@ async fn concurrent_first_readers_all_see_the_data() {
         );
     }
 }
+
+/// Querying a collection *before* loading it must not poison the readiness cache.
+///
+/// An empty collection is legitimately "ready" — an empty answer is correct — but
+/// that is a transient truth, unlike "an index has been built", which is permanent.
+/// Caching the wrong one would let a search that ran before the load skip the gate
+/// for every search after it, silently restoring exactly the bug ADR-0081 fixes.
+#[tokio::test]
+async fn a_query_before_the_load_does_not_poison_the_readiness_cache() {
+    let (base, http, _tmp) = boot().await;
+
+    http.post(format!("{base}/v1/collections"))
+        .json(&json!({"name": "c", "dim": 16, "metric": "l2", "index": "ivf"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // Query while genuinely empty: correct, and returns nothing.
+    let empty: Value = http
+        .post(format!("{base}/v1/collections/c/query"))
+        .json(&json!({"vector": vec![0.0f64; 16], "k": 5}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(empty["matches"].as_array().unwrap().is_empty());
+
+    // Now load it. The index has still never been built.
+    http.post(format!("{base}/v1/collections/c/points:bulk"))
+        .json(&json!({ "points": points(900, 16) }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // The very next query must wait for the first build, not sail through on a
+    // cached "ready" left over from when the collection was empty.
+    let loaded: Value = http
+        .post(format!("{base}/v1/collections/c/query"))
+        .json(&json!({"vector": vec![0.0f64; 16], "k": 10}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded["matches"].as_array().unwrap().len(),
+        10,
+        "a search that ran while the collection was empty must not have cached readiness"
+    );
+}
