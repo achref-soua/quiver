@@ -37,16 +37,28 @@ A crash writes a reproducer to `fuzz/artifacts/<target>/`; replay it with
 
 ## Status
 
-The `v1.0.0` pass ran each target for **900 s** (15 minutes) on the reference
-hardware — a 12th Gen Intel Core i7-12700H (10 physical / 20 logical cores),
-15 GiB RAM, under WSL2 — for **~342 million executions in total**, and found
-**no crashes**:
+The `v1.1.0` pass — the final release's — ran each target for **900 s**
+(15 minutes) on the reference hardware — a 12th Gen Intel Core i7-12700H
+(10 physical / 20 logical cores), 15 GiB RAM, under WSL2 — for
+**389,926,610 executions in total**, and found **no crashes**:
 
 | Target | Runs | Duration | Result |
 | --- | --- | --- | --- |
-| `filter_json` | 43,650,901 | 901 s | clean |
-| `page_decode` | 279,437,122 | 901 s | clean |
-| `wal_decode` | 18,887,581 | 901 s | clean |
+| `filter_json` | 43,008,085 | 901 s | clean |
+| `page_decode` | 324,249,502 | 901 s | clean |
+| `wal_decode` | 22,669,023 | 901 s | clean |
+
+One honest observation from this run, since it bears directly on how much the
+result proves: `filter_json` was **still finding new coverage when the clock ran
+out** — features rose from 9,365 to 9,389 and the corpus from 3,283 to 3,291
+inputs over the final third of its 15 minutes. It found no crash in any of it.
+But a target still growing its corpus at the cut-off is a target where a longer
+run would explore ground this one did not, and that is worth saying plainly
+rather than letting a large execution count imply exhaustiveness.
+
+The preceding `v1.0.0` pass, for comparison, was ~342 million executions with
+the same result. The counts move between runs because exec/s depends on the
+machine's load, not because the targets changed.
 
 `fuzz/artifacts/` is empty after the run: libFuzzer writes a reproducer there for
 any crash, timeout or OOM, so an empty directory is the assertion, not the
