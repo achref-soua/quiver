@@ -1,3 +1,5 @@
 [toolchain]
-channel = "stable"
+# Keep local builds and Actions on the last verified toolchain.
+# Upgrade deliberately so new Clippy lints do not break unchanged code.
+channel = "1.97.1"
 components = ["clippy", "rustfmt"]
